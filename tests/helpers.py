@@ -1,4 +1,6 @@
 import datetime
+import os
+import sys
 import pytest
 from flask import Flask
 from flask_restx import Api
@@ -70,12 +72,20 @@ from system.logs.schemas import api_ns as logs_ns
 from system.limiter.schemas import api_ns as limiter_ns
 from system.third_party.schemas import api_ns as third_party_ns
 
+# 添加父目录到 Python 路径，以便导入 config
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+
+# 导入配置类
+from config import TestingConfig
+
 def setup_app():
     app = Flask(__name__)
-    app.config['TESTING'] = True
+    config = TestingConfig()
+
+    # 应用配置
+    app.config.from_object(config)
+    # 确保测试环境使用内存数据库
     app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///:memory:'
-    app.config['JWT_SECRET_KEY'] = 'test_jwt_secret_key'
-    app.config['REDIS_URL'] = 'redis://username:password@host:port/database'  # Redis 地址
 
     db.init_app(app)
     jwt = JWTManager(app)
