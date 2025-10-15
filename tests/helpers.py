@@ -75,7 +75,7 @@ def setup_app():
     app.config['TESTING'] = True
     app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///:memory:'
     app.config['JWT_SECRET_KEY'] = 'test_jwt_secret_key'
-    app.config['REDIS_URL'] = 'redis://r-uf6sv22urfi9l856kt:k5RRs35VrLx9wucLfx4J@r-uf6sv22urfi9l856ktpd.redis.rds.aliyuncs.com:6379/8'  # Redis 地址
+    app.config['REDIS_URL'] = 'redis://username:password@host:port/database'  # Redis 地址
 
     db.init_app(app)
     jwt = JWTManager(app)

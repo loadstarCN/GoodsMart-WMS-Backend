@@ -44,5 +44,5 @@ celery -A tasks.celery_worker.celery worker --loglevel=info  -P eventlet
 ### Flower监控
 启动命令
 ```
-celery --broker=redis://r-uf6sv22urfi9l856kt:k5RRs35VrLx9wucLfx4J@r-uf6sv22urfi9l856ktpd.redis.rds.aliyuncs.com:6379/10 flower --basic-auth=loop:Loop@2024 --port=5555
+celery --broker=redis://username:password@host:port/database flower --basic-auth=username:password --port=5555
 ```
