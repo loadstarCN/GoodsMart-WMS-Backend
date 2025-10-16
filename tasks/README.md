@@ -1,48 +1,49 @@
-## 使用说明
+## Usage Instructions
+[中文 README](./README-zh.md)
 
-### 异步任务执行
-示例异步任务代码见 example.py 文件，任务函数应使用 @shared_task 装饰器进行标注。
+### Asynchronous Task Execution
+Example asynchronous task code can be found in the example.py file. Task functions should be decorated with the `@shared_task` decorator.
 
-系统将自动扫描并导入 tasks 目录下所有被 @task 装饰器修饰的函数。具体路径配置可参考 /config.py 文件。
+The system will automatically scan and import all functions decorated with the `@task` decorator in the tasks directory. For specific path configuration, please refer to the `/config.py` file.
 
-任务管理接口定义在 views.py 文件中。
+Task management interfaces are defined in the views.py file.
 
-celery_worker.py 文件为独立运行的 Celery 示例脚本。
+The celery_worker.py file contains a standalone Celery example script.
 
-## Celery Worker启动说明
-### 启动方式
-#### 使用 Flask 上下文启动（推荐）
-在项目根目录下执行以下命令启动 Celery Worker，确保使用 Flask 上下文：
+## Celery Worker Startup Instructions
+### Startup Methods
+#### Using Flask Context (Recommended)
+Execute the following command in the project root directory to start the Celery Worker with Flask context:
 
-#### Linux 系统
+#### Linux Systems
 ```
 celery -A app.celery worker --loglevel=info
 ```
 
-#### Windows 系统
-由于 Windows 系统默认不支持 Gevent 或 Eventlet，启动时需要安装 Eventlet：
+#### Windows Systems
+Since Windows systems do not natively support Gevent or Eventlet, you need to install Eventlet:
 ```
 pip install eventlet
-celery -A app.celery worker --loglevel=info  -P eventlet
+celery -A app.celery worker --loglevel=info -P eventlet
 ```
 
-### 独立启动（不使用 Flask 上下文）
-在无需 Flask 上下文的情况下，可以独立运行 Celery Worker。请参考 Celery_worker.py 文件中的示例代码。
+### Standalone Startup (Without Flask Context)
+When Flask context is not required, you can run the Celery Worker independently. Please refer to the example code in the celery_worker.py file.
 
-#### Linux 系统
+#### Linux Systems
 ```
 celery -A tasks.celery_worker.celery worker --loglevel=info
 ```
 
-#### Windows 系统
-同样，Windows 系统下也需要安装 Eventlet：
+#### Windows Systems
+Similarly, Windows systems require Eventlet installation:
 ```
 pip install eventlet
-celery -A tasks.celery_worker.celery worker --loglevel=info  -P eventlet
+celery -A tasks.celery_worker.celery worker --loglevel=info -P eventlet
 ```
 
-### Flower监控
-启动命令
+### Flower Monitoring
+Startup command:
 ```
 celery --broker=redis://username:password@host:port/database flower --basic-auth=username:password --port=5555
 ```

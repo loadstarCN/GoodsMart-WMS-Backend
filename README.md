@@ -1,255 +1,257 @@
-# GoodsMart WMS API 服务
+# GoodsMart WMS API Service
 
-GoodsMart WMS (Warehouse Management System) API 是一个基于 Flask 构建的仓库管理系统后端服务。提供完整的 RESTful API 接口，支持仓库管理、库存控制、订单处理、用户权限管理等核心功能。
+[中文 README](./README-zh.md)
 
-> **客户端支持**: 
-> - 🖥️ https://github.com/loadstarCN/GoodsMart-WMS-Web (推荐)
-> - 📱 移动端客户端 (开发中，即将发布)
-> - 🔧 开发者可基于API自行开发定制客户端
+GoodsMart WMS (Warehouse Management System) API is a backend service for warehouse management built on Flask. It provides comprehensive RESTful API interfaces supporting core functionalities including warehouse management, inventory control, order processing, and user permission management.
 
-## 📜 许可证
+> **Client Support**:
+> - 🖥️ https://github.com/loadstarCN/GoodsMart-WMS-Web (Recommended)
+> - 📱 Mobile Client (In Development, Coming Soon)
+> - 🔧 Developers can build custom clients based on the API
 
-本项目采用 **GNU Affero General Public License v3.0 (AGPL-3.0)** 许可证。
+## 📜 License
 
-### 重要许可条款：
-- ✅ **允许**：自由使用、修改和分发
-- ✅ **要求**：开源衍生作品，保持相同许可证
-- ✅ **要求**：明确标注版权和许可信息
-- ✅ **要求**：声明对原始代码的更改
-- ❌ **禁止**：将本软件用于商业用途（需单独授权）
-- ❌ **禁止**：闭源分发或SaaS服务（需单独授权）
+This project is licensed under the **GNU Affero General Public License v3.0 (AGPL-3.0)**.
 
-**商业使用许可**：如需将本项目用于商业用途，请联系作者获取商业许可证。
+### Important License Terms:
+- ✅ **Permitted**: Free use, modification, and distribution
+- ✅ **Required**: Open source derivative works, maintain same license
+- ✅ **Required**: Clear attribution of copyright and license information
+- ✅ **Required**: Declaration of changes to original code
+- ❌ **Prohibited**: Commercial use of this software (separate authorization required)
+- ❌ **Prohibited**: Closed-source distribution or SaaS services (separate authorization required)
 
-## 🚀 技术栈
+**Commercial Use License**: To use this project for commercial purposes, please contact the author for a commercial license.
 
-- **后端框架**: Flask 3.1.x
-- **数据库**: PostgreSQL 13+
+## 🚀 Tech Stack
+
+- **Backend Framework**: Flask 3.1.x
+- **Database**: PostgreSQL 13+
 - **ORM**: SQLAlchemy + Flask-SQLAlchemy
-- **认证授权**: JWT + Flask-JWT-Extended
-- **任务队列**: Celery + Redis
-- **API文档**: OpenAPI/Swagger
-- **消息队列**: MQTT (物联网设备集成)
-- **缓存**: Redis
+- **Authentication & Authorization**: JWT + Flask-JWT-Extended
+- **Task Queue**: Celery + Redis
+- **API Documentation**: OpenAPI/Swagger
+- **Message Queue**: MQTT (IoT Device Integration)
+- **Caching**: Redis
 
-## 📋 前置要求
+## 📋 Prerequisites
 
-在开始之前，请确保您的系统已安装：
+Before starting, ensure your system has:
 
-- Python 3.8 或更高版本
-- PostgreSQL 13 或更高版本
-- Redis 6.x 或更高版本
-- pip 包管理器
-- https://github.com/loadstarCN/GoodsMart-WMS-Web 前端项目（需同时部署）
+- Python 3.8 or higher
+- PostgreSQL 13 or higher
+- Redis 6.x or higher
+- pip package manager
+- https://github.com/loadstarCN/GoodsMart-WMS-Web frontend project (requires simultaneous deployment)
 
-## ⚡ 快速开始
+## ⚡ Quick Start
 
-### 1. 克隆项目
+### 1. Clone the Project
 
 ```bash
 git clone https://github.com/loadstarCN/GoodsMart-WMS-Backend.git
 cd GoodsMart-WMS-Backend
 ```
 
-### 2. 创建虚拟环境并安装依赖
+### 2. Create Virtual Environment and Install Dependencies
 
 ```bash
 python -m venv venv
 source venv/bin/activate  # Linux/Mac
-# 或
+# or
 venv\Scripts\activate     # Windows
 
 pip install -r requirements.txt
 ```
 
-### 3. 环境配置
+### 3. Environment Configuration
 
-复制环境变量示例文件并配置您的环境变量：
+Copy the environment variable example file and configure your environment variables:
 
 ```bash
 cp .env.example .env
 ```
 
-编辑 `.env` 文件，配置您的数据库和其他服务：
+Edit the `.env` file to configure your database and other services:
 
 ```env
-# 应用配置
+# Application Configuration
 FLASK_ENV=development
 FLASK_DEBUG=True
 
-# 数据库配置
+# Database Configuration
 SQLALCHEMY_DATABASE_URI=postgresql://username:password@localhost:5432/warehouse_db
 
-# JWT配置
+# JWT Configuration
 JWT_SECRET_KEY=your_secure_random_jwt_secret_key_here
 
-# Redis配置
+# Redis Configuration
 REDIS_URL=redis://localhost:6379/0
 
-# Celery配置
+# Celery Configuration
 CELERY_BROKER_URL=redis://localhost:6379/1
 CELERY_RESULT_BACKEND=redis://localhost:6379/1
 
-# MQTT配置
+# MQTT Configuration
 MQTT_BROKER_URL=your.mqtt.broker.url
 MQTT_BROKER_PORT=1883
 MQTT_USERNAME=your_mqtt_username
 MQTT_PASSWORD=your_mqtt_password
 
-# 客户端配置（指向前端项目地址）
+# Client Configuration (points to frontend project address)
 CLIENT_BASE_URL=http://localhost:3000
 ```
 
-### 4. 数据库初始化
+### 4. Database Initialization
 
 ```bash
-# 初始化迁移环境
+# Initialize migration environment
 flask db init
 
-# 创建初始迁移脚本
+# Create initial migration script
 flask db migrate -m "Initial migration"
 
-# 应用迁移到数据库
+# Apply migrations to database
 flask db upgrade
 ```
 
-### 5. 启动开发服务器
+### 5. Start Development Server
 
 ```bash
 flask run
-# 或
+# or
 python app.py
 ```
 
-API 服务将在 http://localhost:5000 运行。
+The API service will run at http://localhost:5000.
 
-### 6. 启动 Celery Worker (可选)
+### 6. Start Celery Worker (Optional)
 
 ```bash
 celery -A tasks.celery_worker.celery worker --loglevel=info
 ```
 
-### 7. 部署客户端项目
+### 7. Deploy Client Project
 
-请同时部署 https://github.com/loadstarCN/GoodsMart-WMS-Web 前端项目以使用完整功能：
+Please also deploy the https://github.com/loadstarCN/GoodsMart-WMS-Web frontend project for full functionality:
 
 ```bash
-# 在另一个终端中克隆并启动客户端
+# Clone and start client in another terminal
 git clone https://github.com/loadstarCN/GoodsMart-WMS-Web.git
 cd GoodsMart-WMS-Web
 npm install
 npm run dev
 ```
 
-客户端将在 http://localhost:3000 运行。
+The client will run at http://localhost:3000.
 
-## 🗂️ 项目结构
+## 🗂️ Project Structure
 
 ```
 GoodsMart-WMS-Backend/
-├── app.py                    # 主应用程序入口
-├── config.py                 # 配置文件
-├── .env                      # 环境变量文件
-├── requirements.txt          # 项目依赖
-├── migrations/               # 数据库迁移文件夹
-│   ├── versions/             # 各版本迁移脚本
-│   ├── alembic.ini           # Alembic 配置
-│   └── env.py                # Alembic 环境配置
-├── extensions/               # Flask 扩展初始化
+├── app.py                    # Main application entry point
+├── config.py                 # Configuration file
+├── .env                      # Environment variables file
+├── requirements.txt          # Project dependencies
+├── migrations/               # Database migration folder
+│   ├── versions/             # Migration scripts for each version
+│   ├── alembic.ini           # Alembic configuration
+│   └── env.py                # Alembic environment configuration
+├── extensions/               # Flask extension initialization
 │   ├── __init__.py
-│   ├── celery.py             # Celery 扩展
-│   ├── db.py                 # SQLAlchemy 数据库扩展
-│   ├── jwt.py                # JWT 扩展
-│   └── mqtt.py               # MQTT 扩展
-├── system/                   # 系统核心模块
+│   ├── celery.py             # Celery extension
+│   ├── db.py                 # SQLAlchemy database extension
+│   ├── jwt.py                # JWT extension
+│   └── mqtt.py               # MQTT extension
+├── system/                   # System core modules
 │   ├── __init__.py
-│   ├── auth/                 # 认证授权模块
+│   ├── auth/                 # Authentication & authorization module
 │   │   ├── __init__.py
 │   │   ├── models.py
 │   │   ├── views.py
 │   │   ├── schemas.py
 │   │   └── utils.py
-│   ├── inventory/            # 库存管理模块
+│   ├── inventory/            # Inventory management module
 │   │   ├── __init__.py
 │   │   ├── models.py
 │   │   ├── views.py
 │   │   ├── schemas.py
 │   │   └── utils.py
-│   ├── order/                # 订单管理模块
+│   ├── order/                # Order management module
 │   │   ├── __init__.py
 │   │   ├── models.py
 │   │   ├── views.py
 │   │   ├── schemas.py
 │   │   └── utils.py
-│   ├── warehouse/            # 仓库管理模块
+│   ├── warehouse/            # Warehouse management module
 │   │   ├── __init__.py
 │   │   ├── models.py
 │   │   ├── views.py
 │   │   ├── schemas.py
 │   │   └── utils.py
-│   └── ...                   # 其他模块
-├── tasks/                    # Celery 任务模块
+│   └── ...                   # Other modules
+├── tasks/                    # Celery task module
 │   ├── __init__.py
 │   ├── celery_worker.py      # Celery Worker
-│   ├── inventory_tasks.py    # 库存相关任务
-│   ├── order_tasks.py        # 订单相关任务
-│   └── notification_tasks.py # 通知相关任务
-├── utils/                    # 工具函数
+│   ├── inventory_tasks.py    # Inventory-related tasks
+│   ├── order_tasks.py        # Order-related tasks
+│   └── notification_tasks.py # Notification-related tasks
+├── utils/                    # Utility functions
 │   ├── __init__.py
-│   ├── validators.py         # 数据验证器
-│   ├── helpers.py            # 辅助函数
-│   └── exceptions.py         # 自定义异常
-├── tests/                    # 测试文件夹
+│   ├── validators.py         # Data validators
+│   ├── helpers.py            # Helper functions
+│   └── exceptions.py         # Custom exceptions
+├── tests/                    # Test folder
 │   ├── __init__.py
-│   ├── conftest.py           # pytest 配置
-│   ├── test_auth.py          # 认证测试
-│   ├── test_inventory.py     # 库存测试
-│   └── ...                   # 其他测试
-└── docs/                     # 文档目录
-    ├── api.md                # API 文档
-    ├── deployment.md         # 部署指南
-    └── ...                   # 其他文档
+│   ├── conftest.py           # pytest configuration
+│   ├── test_auth.py          # Authentication tests
+│   ├── test_inventory.py     # Inventory tests
+│   └── ...                   # Other tests
+└── docs/                     # Documentation directory
+    ├── api.md                # API documentation
+    ├── deployment.md         # Deployment guide
+    └── ...                   # Other documentation
 ```
 
-## 🔧 开发指南
+## 🔧 Development Guide
 
-### 数据库管理
+### Database Management
 
-#### 初始化迁移环境
+#### Initialize Migration Environment
 ```bash
 flask db init
 ```
 
-#### 创建迁移脚本
+#### Create Migration Script
 ```bash
-flask db migrate -m "描述性迁移消息"
+flask db migrate -m "Descriptive migration message"
 ```
 
-#### 应用迁移
+#### Apply Migrations
 ```bash
 flask db upgrade
 ```
 
-#### 回滚迁移
+#### Rollback Migration
 ```bash
 flask db downgrade
 ```
 
-### 依赖管理
+### Dependency Management
 
-#### 使用 pip-review 更新依赖
+#### Update Dependencies with pip-review
 ```bash
-# 检查可更新的包
+# Check for updatable packages
 pip-review --local
 
-# 自动更新所有包
+# Automatically update all packages
 pip-review --local --auto
 
-# 更新 requirements.txt
+# Update requirements.txt
 pip freeze > requirements.txt
 ```
 
-#### 安装 PostgreSQL 开发包
+#### Install PostgreSQL Development Packages
 
 **Ubuntu/Debian:**
 ```bash
@@ -261,69 +263,69 @@ sudo apt-get install libpq-dev python3-dev
 sudo yum install postgresql-devel python3-devel
 ```
 
-### 运行测试
+### Running Tests
 
 ```bash
-# 安装测试依赖
+# Install test dependencies
 pip install pytest pytest-cov
 
-# 运行所有测试
+# Run all tests
 pytest tests/
 
-# 运行特定测试文件
+# Run specific test file
 pytest tests/test_auth.py
 
-# 生成测试覆盖率报告
+# Generate test coverage report
 pytest --cov=system tests/
 ```
 
-## 📦 API 功能模块
+## 📦 API Functional Modules
 
-### 认证授权模块
-- 用户注册/登录
-- JWT Token 管理
-- 权限控制
-- 角色管理
+### Authentication & Authorization Module
+- User registration/login
+- JWT Token management
+- Permission control
+- Role management
 
-### 库存管理模块
-- 商品信息管理
-- 库存查询和调整
-- 库存预警
-- 批次管理
+### Inventory Management Module
+- Product information management
+- Inventory query and adjustment
+- Inventory alerts
+- Batch management
 
-### 订单管理模块
-- 订单创建和处理
-- 订单状态跟踪
-- 发货管理
-- 退货处理
+### Order Management Module
+- Order creation and processing
+- Order status tracking
+- Shipping management
+- Return processing
 
-### 仓库管理模块
-- 仓库信息管理
-- 库位管理
-- 库存盘点
-- 调拨管理
+### Warehouse Management Module
+- Warehouse information management
+- Location management
+- Inventory counting
+- Transfer management
 
-## 🔌 MQTT 集成
+## 🔌 MQTT Integration
 
-### 订阅消息
+### Subscribe to Messages
 ```python
 from extensions import mqtt_client
 
 def handle_sensor_data(topic, payload):
-    """处理传感器数据"""
+    """Process sensor data"""
     print(f"Received from {topic}: {payload}")
-    # 处理逻辑...
+    # Processing logic...
 
-# 订阅主题
+# Subscribe to topic
 mqtt_client.subscribe('sensors/#', handle_sensor_data)
 ```
 
-### 发布消息
+### Publish Messages
 ```python
 from extensions import mqtt_client
 
 def control_device():
-    """控制设备"""
+    """Control device"""
     success = mqtt_client.publish(
         'devices/light/control',
         {'action': 'on', 'duration': 30}
@@ -331,28 +333,28 @@ def control_device():
     return success
 ```
 
-## 🚀 部署
+## 🚀 Deployment
 
-### 完整系统部署要求
+### Complete System Deployment Requirements
 
-要运行完整的 GoodsMart WMS 系统，您需要同时部署：
+To run the complete GoodsMart WMS system, you need to deploy simultaneously:
 
-1. **本 API 服务** (当前项目)
+1. **This API Service** (current project)
 2. **https://github.com/loadstarCN/GoodsMart-WMS-Web**
-3. **PostgreSQL 数据库**
-4. **Redis 服务器**
-5. **可选**: MQTT 代理（用于物联网设备集成）
+3. **PostgreSQL Database**
+4. **Redis Server**
+5. **Optional**: MQTT Broker (for IoT device integration)
 
-### 使用 Gunicorn (生产环境)
+### Using Gunicorn (Production Environment)
 
 ```bash
 pip install gunicorn
 gunicorn -w 4 -b 0.0.0.0:5000 app:app
 ```
 
-### 使用 Supervisord
+### Using Supervisord
 
-创建 `/etc/supervisor/conf.d/wms-api.conf`：
+Create `/etc/supervisor/conf.d/wms-api.conf`:
 
 ```ini
 [program:wms-api]
@@ -366,190 +368,185 @@ stdout_logfile=/var/log/wms-api.out.log
 user=www-data
 ```
 
-管理命令：
+Management commands:
 ```bash
-# 重启服务
+# Restart service
 sudo supervisorctl restart wms-api
 
-# 查看状态
+# Check status
 sudo supervisorctl status
 
-# 重新加载配置
+# Reload configuration
 sudo supervisorctl reread
 sudo supervisorctl update
 ```
 
-### 客户端项目部署
+### Client Project Deployment
 
-请参考 https://github.com/loadstarCN/GoodsMart-WMS-Web 项目的 README 文件进行客户端部署。
+Please refer to the README file of the https://github.com/loadstarCN/GoodsMart-WMS-Web project for client deployment.
 
-### 使用 Docker (可选)
+### Using Docker (Optional)
 
-提供 Dockerfile 和 docker-compose.yml 用于容器化部署完整系统。
+Dockerfile and docker-compose.yml are provided for containerized deployment of the complete system.
 
+## Error Code Classification System
 
+| Category | Error Code Range | HTTP Status Code | Description |
+|----------|------------------|------------------|-------------|
+| **General Errors** | 10000-10999 | 400 | General business logic errors |
+| **Authentication Errors** | 11000-11999 | 401 | Identity authentication issues |
+| **Permission Errors** | 12000-12999 | 403 | Insufficient access permissions |
+| **Resource Errors** | 13000-13999 | 404 | Resource does not exist |
+| **Data Validation Errors** | 14000-14999 | 400 | Data format or content errors |
+| **Inventory Errors** | 15000-15999 | 400/403 | Inventory-related business errors |
+| **State Transition Errors** | 16000-16999 | 400 | State transition related errors |
 
-## 错误码分类体系
+## Detailed Error Code Allocation
 
-| 类别 | 错误码范围 | HTTP状态码 | 描述 |
-|------|------------|------------|------|
-| **通用错误** | 10000-10999 | 400 | 通用业务逻辑错误 |
-| **认证错误** | 11000-11999 | 401 | 身份验证相关问题 |
-| **权限错误** | 12000-12999 | 403 | 访问权限不足 |
-| **资源错误** | 13000-13999 | 404 | 资源不存在 |
-| **数据验证错误** | 14000-14999 | 400 | 数据格式或内容错误 |
-| **库存错误** | 15000-15999 | 400/403 | 库存相关业务错误 |
-| **状态流转错误** | 16000-16999 | 400 | 状态转换相关错误 |
+### 1. General Errors (10000-10999)
+| Error Code | Error Message | Description |
+|------------|---------------|-------------|
+| 10001 | Invalid file type. Only PNG, JPG, JPEG, and GIF are allowed. | Invalid file type |
+| 10002 | OSS upload failed: {e} | OSS upload failed |
+| 10003 | Old password is incorrect | Old password incorrect |
+| 10004 | Only CSV files are supported. | Only CSV files supported |
+| 10005 | Missing required columns: {', '.join(missing_columns)} | Missing required columns |
+| 10006 | Row {row_num}: Missing values for {', '.join(missing_values)} | Missing values in row data |
 
-## 详细错误码分配
+### 2. Authentication Errors (11000-11999)
+| Error Code | Error Message | Description |
+|------------|---------------|-------------|
+| 11001 | Invalid username or password | Incorrect username or password |
+| 11002 | Token is invalid | Invalid token |
+| 11003 | Unauthorized | Unauthorized access |
+| 11004 | No current user found | Current user not found |
+| 11005 | Current user is not a staff member | Current user is not staff |
+| 11006 | User is not active | User not active |
+| 11007 | Company is expired | Company expired |
 
-### 1. 通用错误 (10000-10999)
-| 错误码 | 错误消息 | 说明 |
-|--------|----------|------|
-| 10001 | Invalid file type. Only PNG, JPG, JPEG, and GIF are allowed. | 文件类型错误 |
-| 10002 | OSS upload failed: {e} | OSS上传失败 |
-| 10003 | Old password is incorrect | 旧密码不正确 |
-| 10004 | Only CSV files are supported. | 仅支持CSV文件 |
-| 10005 | Missing required columns: {', '.join(missing_columns)} | 缺少必需列 |
-| 10006 | Row {row_num}: Missing values for {', '.join(missing_values)} | 行数据缺少值 |
+### 3. Permission Errors (12000-12999)
+| Error Code | Error Message | Description |
+|------------|---------------|-------------|
+| 12001 | Access denied: insufficient permissions | Insufficient permissions (general) |
+| 12002 | Your IP is blacklisted. | IP blacklisted |
+| 12003 | Your IP is not whitelisted. | IP not whitelisted |
+| 12004 | API Key not found. | API key not found |
+| 12005 | Current user is not a staff member. | User is not staff type |
+| 12005 | Unsupported user type. | Unsupported user type |
 
-### 2. 认证错误 (11000-11999)
-| 错误码 | 错误消息 | 说明 |
-|--------|----------|------|
-| 11001 | Invalid username or password | 用户名或密码错误 |
-| 11002 | Token is invalid | Token无效 |
-| 11003 | Unauthorized | 未授权访问 |
-| 11004 | No current user found | 未找到当前用户 |
-| 11005 | Current user is not a staff member | 当前用户不是员工 |
-| 11006 | User is not active | 用户未激活 |
-| 11007 | Company is expired | 公司已过期 |
+### 4. Resource Errors (13000-13999)
+| Error Code | Error Message | Description |
+|------------|---------------|-------------|
+| 13001 | Resource not found | Resource not found (general) |
+| 13002 | User not found | User not found |
+| 13003 | Goods not found in the specified location | Goods not found in specified location |
+| 13004 | GoodsLocation not found | Goods location not found |
+| 13005 | Warehouse not found | Warehouse not found |
 
-### 3. 权限错误 (12000-12999)
-| 错误码 | 错误消息 | 说明 |
-|--------|----------|------|
-| 12001 | Access denied: insufficient permissions | 权限不足（通用） |
-| 12002 | Your IP is blacklisted. | IP被列入黑名单 |
-| 12003 | Your IP is not whitelisted. | IP不在白名单中 |
-| 12004 | API Key not found. | API密钥未找到 |
-| 12005 | Current user is not a staff member. | 用户不是员工类型 |
-| 12005 | Unsupported user type. | 不支持的用户类型 |
+### 5. Data Validation Errors (14000-14999)
+| Error Code | Error Message | Description |
+|------------|---------------|-------------|
+| 14001 | Invalid format  | Invalid format |
+| 14002 | Warehouse is not active | Warehouse not active |
+| 14003 | User must provide a valid warehouse_id when force_warehouse is True | Valid warehouse ID required |
+| 14004 | Missing 'details' in request data | Request data missing 'details' |
+| 14005 | No details provided in request data | No details provided in request data |
+| 14006 | The from_location_id and to_location_id cannot be the same | Source and target locations cannot be same |
+| 14007 | Invalid status value: {status} | Invalid status value |
+| 14008 | Invalid required_permissions format. Must be a string or list of permission strings. | Invalid permission format |
+| 14009 | Invalid warehouse ID | Invalid warehouse ID |
 
-### 4. 资源错误 (13000-13999)
-| 错误码 | 错误消息 | 说明 |
-|--------|----------|------|
-| 13001 | Resource not found | 资源未找到（通用） |
-| 13002 | User not found | 用户未找到 |
-| 13003 | Goods not found in the specified location | 指定位置未找到商品 |
-| 13004 | GoodsLocation not found | 商品位置未找到 |
-| 13005 | Warehouse not found | 仓库未找到 |
+### 6. Inventory Errors (15000-15999)
+| Error Code | Error Message | Description |
+|------------|---------------|-------------|
+| 15001 | Stock is not enough | Insufficient stock (general) |
+| 15002 | Insufficient stock for goods_id={goods_id} in location_id={location_id} | Insufficient stock for specific location goods |
+| 15003 | Insufficient stock to lock | Insufficient stock to lock |
+| 15004 | Insufficient locked stock to unlock | Insufficient locked stock to unlock |
+| 15005 | Not enough ASN stock. | Insufficient ASN stock |
+| 15006 | Not enough received stock. | Insufficient received stock |
+| 15007 | Not enough sort stock. | Insufficient sort stock |
+| 15008 | Not enough DN stock. | Insufficient DN stock |
+| 15009 | Not enough pick stock. | Insufficient pick stock |
+| 15010 | Not enough packed stock. | Insufficient packed stock |
+| 15011 | Not enough delivered stock. | Insufficient delivered stock |
+| 15012 | Not enough DN stock to close. | Insufficient DN stock to close |
+| 15013 | Low stock threshold must be non-negative or -1 to disable. | Invalid low stock threshold |
+| 15014 | High stock threshold must be non-negative or -1 to disable. | Invalid high stock threshold |
+| 15015 | High stock threshold must be greater than low stock threshold. | High stock threshold must be greater than low |
 
+### 7. State Transition Errors (16000-16999)
+| Error Code | Error Message | Description |
+|------------|---------------|-------------|
+| 16000 | Invalid state transition: {action} cannot be performed on resource in {current_state} state | Invalid state transition: cannot perform {action} on resource in {current_state} state |
+| 16001 | Cannot update a non-pending resource | Cannot update non-pending resource |
+| 16002 | Cannot delete a non-pending resource | Cannot delete non-pending resource |
+| 16003 | Cannot add details to a non-pending resource | Cannot add details to non-pending resource |
+| 16004 | Cannot update details in a non-pending resource | Cannot update details in non-pending resource |
+| 16005 | Cannot delete details from a non-pending resource | Cannot delete details from non-pending resource |
+| 16006 | Cannot sync details in non-pending resource | Cannot sync details in non-pending resource |
+| 16007 | Cannot process a non-pending resource | Cannot process non-pending resource |
+| 16008 | Cannot complete a non-in_progress resource | Cannot complete non-in-progress resource |
+| 16009 | Cannot create detail in a non-in-progress resource | Cannot create detail in non-in-progress resource |
+| 16010 | Cannot update detail in a non-in-progress resource | Cannot update detail in non-in-progress resource |
+| 16011 | Cannot delete detail in a non-in-progress resource | Cannot delete detail in non-in-progress resource |
+| 16012 | Cannot create batch in a non-in-progress resource | Cannot create batch in non-in-progress resource |
+| 16013 | Cannot update batch in a non-in-progress resource | Cannot update batch in non-in-progress resource |
+| 16014 | Cannot delete batch in a non-in-progress resource | Cannot delete batch in non-in-progress resource |
+| 16015 | 'details' must be a list | Details must be a list |
+| 16016 | Resource has no details | Resource has no details |
+| 16017 | Detail is already completed | Detail already completed |
+| 16018 | Cannot approve a resource that is not pending | Cannot approve non-pending resource |
+| 16019 | Cannot complete a resource that is not approved | Cannot complete unapproved resource |
+| 16020 | No differences found in resource details | No differences in resource details |
+| 16021 | Cannot receive a non-pending resource | Cannot receive non-pending resource |
+| 16022 | Cannot close a non-pending resource | Cannot close non-pending resource |
+| 16023 | Cannot update a completed or signed resource | Cannot update completed or signed resource |
+| 16024 | Cannot sign a non-completed resource | Cannot sign incomplete resource |
+| 16025 | Duplicate goods_id: {goods_id} | Duplicate goods ID |
+| 16026 | goods_id and warehouse_id are required to create an inventory record. | goods_id and warehouse_id required for inventory record |
+| 16027 | Manager does not belong to the same company | Manager not in same company |
+| 16028 | Cannot cancel a non-pending resource | Cannot close non-pending resource |
 
-### 5. 数据验证错误 (14000-14999)
-| 错误码 | 错误消息 | 说明 |
-|--------|----------|------|
-| 14001 | Invalid format  | 格式错误 |
-| 14002 | Warehouse is not active | 仓库未激活 |
-| 14003 | User must provide a valid warehouse_id when force_warehouse is True | 需要提供有效的仓库ID |
-| 14004 | Missing 'details' in request data | 请求数据缺少'details' |
-| 14005 | No details provided in request data | 请求数据未提供明细 |
-| 14006 | The from_location_id and to_location_id cannot be the same | 源和目标位置不能相同 |
-| 14007 | Invalid status value: {status} | 无效的状态值 |
-| 14008 | Invalid required_permissions format. Must be a string or list of permission strings. | 权限格式无效 |
-| 14009 | Invalid warehouse ID | 无效的仓库ID |
+## 🤝 Contribution Guidelines
 
+We welcome contributions of any kind! Please read our contribution guidelines:
 
-### 6. 库存错误 (15000-15999)
-| 错误码 | 错误消息 | 说明 |
-|--------|----------|------|
-| 15001 | Stock is not enough | 库存不足（通用） |
-| 15002 | Insufficient stock for goods_id={goods_id} in location_id={location_id} | 指定位置商品库存不足 |
-| 15003 | Insufficient stock to lock | 库存不足无法锁定 |
-| 15004 | Insufficient locked stock to unlock | 锁定库存不足无法解锁 |
-| 15005 | Not enough ASN stock. | ASN库存不足 |
-| 15006 | Not enough received stock. | 收货库存不足 |
-| 15007 | Not enough sort stock. | 分拣库存不足 |
-| 15008 | Not enough DN stock. | DN库存不足 |
-| 15009 | Not enough pick stock. | 拣货库存不足 |
-| 15010 | Not enough packed stock. | 打包库存不足 |
-| 15011 | Not enough delivered stock. | 配送库存不足 |
-| 15012 | Not enough DN stock to close. | DN库存不足无法关闭 |
-| 15013 | Low stock threshold must be non-negative or -1 to disable. | 低库存阈值无效 |
-| 15014 | High stock threshold must be non-negative or -1 to disable. | 高库存阈值无效 |
-| 15015 | High stock threshold must be greater than low stock threshold. | 高库存阈值必须大于低库存阈值 |
+1. Fork this project
+2. Create a feature branch (`git checkout -b feature/AmazingFeature`)
+3. Commit your changes (`git commit -m 'Add some AmazingFeature'`)
+4. Push to the branch (`git push origin feature/AmazingFeature`)
+5. Open a Pull Request
 
-### 7. 状态流转错误 (16000-16999)
-| 错误码 | 错误消息 | 说明 |
-|--------|----------|------|
-| 16000 | Invalid state transition: {action} cannot be performed on resource in {current_state} state | 无效状态转换：资源处于 {current_state} 状态时无法执行 {action} 操作 |
-| 16001 | Cannot update a non-pending resource | 无法更新非待处理资源 |
-| 16002 | Cannot delete a non-pending resource | 无法删除非待处理资源 |
-| 16003 | Cannot add details to a non-pending resource | 无法向非待处理资源添加明细 |
-| 16004 | Cannot update details in a non-pending resource | 无法更新非待处理资源的明细 |
-| 16005 | Cannot delete details from a non-pending resource | 无法从非待处理资源删除明细 |
-| 16006 | Cannot sync details in non-pending resource | 无法同步非待处理资源的明细 |
-| 16007 | Cannot process a non-pending resource | 无法处理非待处理资源 |
-| 16008 | Cannot complete a non-in_progress resource | 无法完成非进行中资源 |
-| 16009 | Cannot create detail in a non-in-progress resource | 无法在非进行中资源创建明细 |
-| 16010 | Cannot update detail in a non-in-progress resource | 无法更新非进行中资源的明细 |
-| 16011 | Cannot delete detail in a non-in-progress resource | 无法删除非进行中资源的明细 |
-| 16012 | Cannot create batch in a non-in-progress resource | 无法在非进行中资源创建批次 |
-| 16013 | Cannot update batch in a non-in-progress resource | 无法更新非进行中资源的批次 |
-| 16014 | Cannot delete batch in a non-in-progress resource | 无法删除非进行中资源的批次 |
-| 16015 | 'details' must be a list | 明细必须为列表 |
-| 16016 | Resource has no details | 资源无明细 |
-| 16017 | Detail is already completed | 明细已完成 |
-| 16018 | Cannot approve a resource that is not pending | 无法批准非待处理资源 |
-| 16019 | Cannot complete a resource that is not approved | 无法完成未批准资源 |
-| 16020 | No differences found in resource details | 资源明细无差异 |
-| 16021 | Cannot receive a non-pending resource | 无法接收非待处理资源 |
-| 16022 | Cannot close a non-pending resource | 无法关闭非待处理资源 |
-| 16023 | Cannot update a completed or signed resource | 无法更新已完成或签收的资源 |
-| 16024 | Cannot sign a non-completed resource | 无法签收未完成资源 |
-| 16025 | Duplicate goods_id: {goods_id} | 重复商品ID |
-| 16026 | goods_id and warehouse_id are required to create an inventory record. | 创建库存记录需要商品ID和仓库ID |
-| 16027 | Manager does not belong to the same company | 经理不属于同一公司 |
-| 16028 | Cannot cancel a non-pending resource | 无法关闭非待处理资源 |
+## 🆘 Support
 
+If you encounter any issues or have questions, please:
 
-## 🤝 贡献指南
+1. Check docs/api.md
+2. Search https://github.com/loadstarCN/GoodsMart-WMS-Backend/issues
+3. Ensure the client project is properly deployed
+4. Submit a new Issue
 
-我们欢迎任何形式的贡献！请阅读我们的贡献指南：
+## 🔗 Related Projects
 
-1. Fork 本项目
-2. 创建特性分支 (`git checkout -b feature/AmazingFeature`)
-3. 提交更改 (`git commit -m 'Add some AmazingFeature'`)
-4. 推送到分支 (`git push origin feature/AmazingFeature`)
-5. 开启一个 Pull Request
+This project is part of the GoodsMart WMS system. Related project links:
 
-## 🆘 支持
+https://github.com/loadstarCN/GoodsMart-WMS - Contains documentation and coordination information for the complete system  
+https://github.com/loadstarCN/GoodsMart-WMS-Web - Companion frontend system
 
-如果您遇到任何问题或有任何疑问，请：
+Developers are advised to also follow the main repository for the latest system updates and complete documentation.
 
-1. 查看 docs/api.md
-2. 搜索 https://github.com/loadstarCN/GoodsMart-WMS-Backend/issues
-3. 确保已正确部署客户端项目
-4. 提交新的 Issue
+## 🙏 Acknowledgments
 
-## 🔗 关联项目
-
-本项目是 GoodsMart WMS 系统的一部分，相关项目链接：
-
-https://github.com/loadstarCN/GoodsMart-WMS - 包含完整系统的文档和协调信息  
-https://github.com/loadstarCN/GoodsMart-WMS-Web - 配合使用的前端系统
-
-建议开发者同时关注主仓库以获取最新系统更新和完整文档。
-
-## 🙏 致谢
-
-感谢所有为这个项目做出贡献的开发者。
+Thanks to all developers who have contributed to this project.
 
 ---
 
-**重要提示**: 
-- 这是一个开源项目，请确保不要将任何敏感信息提交到版本控制系统
-- 使用环境变量来管理敏感配置
-- 本项目采用AGPLv3许可证，**禁止商业使用**，如需商业用途请联系作者获取商业许可
-- **官方客户端项目**:
+**Important Notes**: 
+- This is an open-source project, ensure no sensitive information is committed to version control
+- Use environment variables to manage sensitive configurations
+- This project uses AGPLv3 license, **commercial use is prohibited**, contact the author for commercial licensing if needed
+- **Official Client Projects**:
   - https://github.com/loadstarCN/GoodsMart-WMS-Web
-  - 移动端客户端 (即将发布)
-- 开发者可基于API自行开发定制客户端
+  - Mobile Client (Coming Soon)
+- Developers can build custom clients based on the API
