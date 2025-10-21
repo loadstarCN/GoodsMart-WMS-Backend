@@ -238,7 +238,7 @@ class ASNService:
         asn = ASNService._get_instance(asn_or_id)
         if asn.status != 'pending':
             raise BadRequestException("Cannot update a non-pending ASN", 16001)
-
+        
         # asn.warehouse_id = data.get('warehouse_id', asn.warehouse_id)
         asn.supplier_id = data.get('supplier_id', asn.supplier_id)
         asn.tracking_number = data.get('tracking_number', asn.tracking_number)
@@ -439,7 +439,10 @@ class ASNService:
                 db.session.delete(detail)
 
         db.session.flush()
-        for detail in asn.details:
+        db.session.expire(asn, ['details'])
+        latest_details = asn.details # 重新加载后的明细列表
+        
+        for detail in latest_details:
             try:
                 InventoryService.get_inventory(detail.goods_id, asn.warehouse_id)
             except NotFoundException:
@@ -450,6 +453,12 @@ class ASNService:
         
         # 更新被删除明细的库存状态
         for goods_id in deleted_goods_ids:
+            try:
+                InventoryService.get_inventory(goods_id, asn.warehouse_id)
+            except NotFoundException:
+                InventoryService.create_inventory({"goods_id": goods_id, "warehouse_id": asn.warehouse_id})
+                db.session.flush()
+
             InventoryService.update_and_calculate_dn_stock(goods_id, asn.warehouse_id)
 
         return asn.details

@@ -48,7 +48,7 @@ class Config:
 
 class DevelopmentConfig(Config):
     DEBUG = True # 只在开发环境中启用调试
-    SQLALCHEMY_ECHO=True # 打印SQL语句
+    SQLALCHEMY_ECHO=False # 打印SQL语句
     SQLALCHEMY_DATABASE_URI = os.getenv('SQLALCHEMY_DATABASE_URI_DEV', 'sqlite:///test.db')  # 数据库连接
     REDIS_URL = os.getenv('REDIS_URL_DEV', 'redis://localhost:6379/0') # REDIS配置
     OSS_ENDPOINT = os.getenv('OSS_ENDPOINT_DEV')  # 阿里云 OSS Endpoint 地址

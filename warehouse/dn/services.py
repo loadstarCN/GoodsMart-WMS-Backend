@@ -488,8 +488,11 @@ class DNService:
                 db.session.delete(detail)
         
         db.session.flush()
+        db.session.expire(dn, ['details'])
+        # 更新后的明细列表
+        latest_details = dn.details
 
-        for detail in dn.details:
+        for detail in latest_details:
             InventoryService.update_and_calculate_dn_stock(detail.goods_id,dn.warehouse_id)
         
         # 更新被删除明细的库存状态
