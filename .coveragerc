@@ -1,0 +1,17 @@
+[run]
+source = .
+omit =
+    venv/*
+    tests/*
+    migrations/*
+    */site-packages/*
+    config.py
+    app.py
+
+[report]
+exclude_lines =
+    pragma: no cover
+    def __repr__
+    if __name__ == .__main__.:
+    pass
+    raise NotImplementedError

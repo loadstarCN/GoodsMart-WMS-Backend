@@ -68,6 +68,7 @@ from warehouse.transfer.schemas import api_ns as transfer_ns
 from warehouse.payment.schemas import api_ns as payment_ns
 from warehouse.common import extract_warehouse_id
 from system.user.schemas import api_ns as user_ns
+from tasks.views import api_ns as task_ns
 from system.logs.schemas import api_ns as logs_ns
 from system.limiter.schemas import api_ns as limiter_ns
 from system.third_party.schemas import api_ns as third_party_ns
@@ -142,6 +143,7 @@ def setup_app():
     api.add_namespace(logs_ns, path='/logs')
     api.add_namespace(limiter_ns, path='/ip-lists')
     api.add_namespace(third_party_ns, path='/api-keys')
+    api.add_namespace(task_ns, path='/task')
 
     return app
 
