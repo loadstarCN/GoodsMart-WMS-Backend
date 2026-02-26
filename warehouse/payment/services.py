@@ -40,8 +40,6 @@ class PaymentService:
         根据 payment_id 获取单个 Payment，不存在时抛出 404
         """
         payment = get_object_or_404(Payment, payment_id)
-        if not payment:
-            raise NotFoundException(f"Payment (id={payment_id}) not found.", 13001)
         return payment
 
     @staticmethod
@@ -83,10 +81,12 @@ class PaymentService:
         """
         payment = PaymentService.get_payment(payment_id)
 
+        if payment.status != 'pending':
+            raise BadRequestException("Cannot update a non-pending Payment", 16003)
+
         payment.payment_method = data.get('payment_method', payment.payment_method)
         payment.amount = data.get('amount', payment.amount)
         payment.currency = data.get('currency', payment.currency)
-        payment.status = data.get('status', payment.status)
         payment.payment_time = data.get('payment_time', payment.payment_time)
         payment.remark = data.get('remark', payment.remark)
         payment.is_active = data.get('is_active', payment.is_active)

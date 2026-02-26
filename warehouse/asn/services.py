@@ -459,7 +459,7 @@ class ASNService:
                 InventoryService.create_inventory({"goods_id": goods_id, "warehouse_id": asn.warehouse_id})
                 db.session.flush()
 
-            InventoryService.update_and_calculate_dn_stock(goods_id, asn.warehouse_id)
+            InventoryService.update_and_calculate_asn_stock(goods_id, asn.warehouse_id)
 
         return asn.details
     

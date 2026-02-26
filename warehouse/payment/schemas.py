@@ -26,7 +26,7 @@ payment_model = api_ns.model('Payment', {
     'status': fields.String(
         required=True, 
         description='Payment status', 
-        enum=['pending', 'paid', 'canceled']
+        enum=['pending', 'paid', 'canceled', 'failed']
     ),
     'carrier_id': fields.Integer(required=True, description='ID of the associated carrier'),
     'payment_time': fields.DateTime(description='Payment timestamp'),
@@ -51,7 +51,7 @@ payment_input_model = api_ns.model('PaymentInput', payment_input_fields)
 # PaymentUpdate 模型：从输出模型复制后删除不允许更新的字段
 # -------------------------------------------------------------------
 payment_update_fields = payment_input_fields.copy()
-for key in ['delivery_id', 'amount', 'carrier_id', 'created_by']:
+for key in ['delivery_id', 'amount', 'carrier_id', 'created_by', 'status']:
     payment_update_fields.pop(key, None)
 payment_update_model = api_ns.model('PaymentUpdate', payment_update_fields)
 
@@ -61,7 +61,7 @@ payment_update_model = api_ns.model('PaymentUpdate', payment_update_fields)
 pagination_parser = pagination_parser.copy()
 pagination_parser.add_argument('delivery_id', type=int, help='ID of the associated delivery', location='args')
 pagination_parser.add_argument('carrier_id', type=int, help='ID of the associated carrier', location='args')
-pagination_parser.add_argument('status', type=str, help='Payment status', location='args', choices=['pending', 'paid', 'canceled'])
+pagination_parser.add_argument('status', type=str, help='Payment status', location='args', choices=['pending', 'paid', 'canceled', 'failed'])
 pagination_parser.add_argument('is_active', type=inputs.boolean, help='Is the payment active?', location='args')
 
 pagination_model = create_pagination_model(api_ns, payment_model)

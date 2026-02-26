@@ -695,7 +695,7 @@ class DNService:
         raw_data = {
             f"{int(row.year)}-{int(row.month):02d}": {
                 'pending': row.pending or 0,
-                'in_progress': row.picked or 0, 
+                'in_progress': row.in_progress or 0,
                 'picked': row.picked or 0,
                 'packed': row.packed or 0,
                 'delivered': row.delivered or 0,
