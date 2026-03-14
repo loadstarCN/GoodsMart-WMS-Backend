@@ -21,18 +21,6 @@ class Config:
     DEBUG = os.getenv('DEBUG', 'False') == 'True'  # 调试模式
     CORS_ORIGINS = os.getenv('CORS_ORIGINS', '*')  # 允许的跨域来源，生产环境应设置为具体域名
 
-    # Celery 配置
-    CELERY_BROKER_URL = os.getenv('CELERY_BROKER_URL', 'redis://localhost:6379/0')
-    CELERY_RESULT_BACKEND = os.getenv('CELERY_RESULT_BACKEND', 'redis://localhost:6379/0')
-    # 确保导入任务模块
-    CELERY_TASKS_MODULES = ['tasks']  # 自动发现任务模块的路径
-
-    CELERY_USER_OPTIONS = {
-        'task_serializer': 'json',
-        'result_expires': 3600,
-        'timezone': 'UTC'
-    }
-
     LOG_DIRECTORY = os.getenv('LOG_DIRECTORY', 'logs/large_requests')  # Default to 'logs/large_requests' if env var is not set
     MAX_LOG_SIZE = int(os.getenv('MAX_LOG_SIZE', 1 * 1024 * 1024))  # 1MB default size
 

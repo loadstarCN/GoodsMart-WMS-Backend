@@ -22,4 +22,4 @@ api = Api(
     doc='/doc',
 )
 
-api.add_namespace(task_ns,path='/task')
+api.add_namespace(task_ns, path='/task')

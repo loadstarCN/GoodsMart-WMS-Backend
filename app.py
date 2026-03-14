@@ -1,7 +1,7 @@
 from flask import Flask
 from flask_cors import CORS
 from config import Config,DevelopmentConfig, TestingConfig, ProductionConfig
-from extensions import db,get_object_or_404, jwt, migrate,celery_ext,redis_client,error,oss,cache,limit_init_app
+from extensions import db,get_object_or_404, jwt, migrate,redis_client,error,oss,cache,limit_init_app
 from system.user.models import User
 from system import blueprint as system_api
 from tasks import blueprint as task_api
@@ -27,10 +27,9 @@ def create_app():
     app.logger.info(f"Running in {Config.FLASK_ENV} mode")
 
     # 初始化扩展
-    db.init_app(app)    
-    migrate.init_app(app, db) 
+    db.init_app(app)
+    migrate.init_app(app, db)
     redis_client.init_app(app)
-    celery_ext.init_app(app)    
     limit_init_app(app)
     jwt.init_app(app)
     oss.init_app(app)
@@ -48,12 +47,12 @@ def create_app():
         identity = jwt_data.get("sub")
         if identity:
             return get_object_or_404(User, identity)
-    
+
     # 注册 JWT and API Key 验证逻辑
     app.before_request(validate_jwt_and_api_key)
 
 
-    # 确保日志目录存在  
+    # 确保日志目录存在
     log_directory = app.config['LOG_DIRECTORY']
     os.makedirs(log_directory, exist_ok=True)
     # 注册Logs中间件
@@ -67,20 +66,23 @@ def create_app():
     app.register_blueprint(task_api, url_prefix='/tasks')
     app.register_blueprint(warehouse_api, url_prefix='/warehouse')
 
-    # 注册 Webhook CLI 命令
+    # 注册 CLI 命令
     from system.webhook.commands import webhook_cli
     app.cli.add_command(webhook_cli)
 
-    # 初始化 IP 黑白名单    
+    from tasks.commands import snapshot_cli
+    app.cli.add_command(snapshot_cli)
+
+    # 初始化 IP 黑白名单
     # with app.app_context():  # 推送应用上下文
     #     initialize_ip_lists()  # 调用初始化函数
 
     # 注册错误处理器
-    error.register_error_handlers(app)    
+    error.register_error_handlers(app)
 
-    return app,celery_ext.get_client()
+    return app
 
-app,celery = create_app()
+app = create_app()
 
 if __name__ == "__main__":
     app.run(debug=app.config.get('DEBUG', False))

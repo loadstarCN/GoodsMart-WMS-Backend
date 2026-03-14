@@ -1,6 +1,5 @@
 from .db import *
 from .jwt import *
-from .celery import *
 from .limiter import *
 from .redis import *
 from .error import *
