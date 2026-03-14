@@ -74,44 +74,30 @@ def check_goods_access(goods_id:int) -> bool:
     # 非员工用户无需进一步验证
     if not _validate_staff_user():
         return True
-    
-    # 下面注释的代码，可能会导致某些情况下做多次查询，不如直接调用 InventoryService.get_inventory
-    # 需要再探讨一下
-    
-    # # 获取商品对象
-    # from warehouse.goods.models import Goods
-    # goods = db.session.get(Goods, goods_id)
-    # if not goods:
-    #     return False  # 商品不存在时拒绝访问
 
-    # # 验证商品所属公司
-    # if goods.company_id != user.company_id:
-    #     return False
+    from warehouse.inventory.models import Inventory
 
-    # # 检查公司级全局权限
-    # if user.has_role('company_all'):
-    #     return True
-    
-    # 员工用户库存权限验证
-    from warehouse.inventory.services import InventoryService
+    # 指定单一仓库时直接查该仓库
     warehouse_id = getattr(g, "warehouse_id", None)
     if warehouse_id:
-        try:
-            InventoryService.get_inventory(goods_id, warehouse_id)
-            return True
-        except NotFoundException:
-            # 指定仓库无库存
-            return False
+        return db.session.query(
+            Inventory.query
+            .filter_by(goods_id=goods_id, warehouse_id=warehouse_id)
+            .exists()
+        ).scalar()
 
-    # 检查可访问仓库列表
+    # 多仓库时用 IN 查询，避免 N+1
     accessible_warehouses = getattr(g, "accessible_warehouses", [])
-    for warehouse in accessible_warehouses:
-        try:
-            InventoryService.get_inventory(goods_id, warehouse.id)
-            return True
-        except NotFoundException:
-            continue
-    
-    # 所有仓库均无库存
-    return False
+    if not accessible_warehouses:
+        return False
+
+    warehouse_ids = [w.id for w in accessible_warehouses]
+    return db.session.query(
+        Inventory.query
+        .filter(
+            Inventory.goods_id == goods_id,
+            Inventory.warehouse_id.in_(warehouse_ids)
+        )
+        .exists()
+    ).scalar()
     

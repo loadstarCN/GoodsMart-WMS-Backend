@@ -73,7 +73,7 @@ def after_request_logging(response):
         # 获取响应数据
         response_content_type = response.content_type
         if response_content_type == 'application/json':
-            response_data = json.dumps(response.get_json())  # 将 JSON 转换为字符串存储
+            response_data = _mask_sensitive(json.dumps(response.get_json()))
         else:
             response_data = response.data.decode('utf-8')  # 存储原始响应体
 

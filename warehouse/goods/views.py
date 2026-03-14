@@ -60,7 +60,7 @@ class GoodsList(Resource):
             'production_date_max': args.get('production_date_max'),
             'keyword': args.get('keyword'),
             'goods_codes': args.get('goods_codes'),
-            'company_id': args.get('company_id') or get_api_key_company_id(),
+            'company_id': get_api_key_company_id() or args.get('company_id'),
         }
 
         filters = add_warehouse_filter(filters)
@@ -73,11 +73,10 @@ class GoodsList(Resource):
     def post(self):
         """Create a new goods"""
         data = api_ns.payload
-        # API Key 认证时自动注入 company_id
-        if not data.get('company_id'):
-            api_company_id = get_api_key_company_id()
-            if api_company_id:
-                data['company_id'] = api_company_id
+        # API Key 认证时强制注入 company_id（防止跨公司操作）
+        api_company_id = get_api_key_company_id()
+        if api_company_id:
+            data['company_id'] = api_company_id
         created_by = g.current_user.id
         return GoodsService.create_goods(data,created_by), 201
 

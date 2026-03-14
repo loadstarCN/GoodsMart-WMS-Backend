@@ -10,7 +10,8 @@ class ActivityLog(db.Model):
         # 复合索引优化
         db.Index('idx_log_endpoint_time', 'endpoint', 'created_at'),
         db.Index('idx_log_status_time', 'status_code', 'created_at'),
-        db.Index('idx_ip_prefix', 'ip_address'), 
+        db.Index('idx_log_actor_time', 'actor', 'created_at'),  # 按操作人审计查询
+        db.Index('idx_ip_prefix', 'ip_address'),
         # 数据完整性约束
         db.CheckConstraint("status_code BETWEEN 100 AND 599", name='chk_status_code'),
         db.CheckConstraint("method IN ('GET','POST','PUT','DELETE')", name='chk_method_type')

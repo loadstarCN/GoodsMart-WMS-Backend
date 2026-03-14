@@ -67,11 +67,10 @@ class ASNList(Resource):
         """
 
         data = api_ns.payload
-        # API Key 认证时自动注入 company_id（用于 goods_code 解析）
-        if not data.get('company_id'):
-            api_company_id = get_api_key_company_id()
-            if api_company_id:
-                data['company_id'] = api_company_id
+        # API Key 认证时强制注入 company_id（防止跨公司操作）
+        api_company_id = get_api_key_company_id()
+        if api_company_id:
+            data['company_id'] = api_company_id
         created_by = g.current_user.id
         new_asn = ASNService.create_asn(data, created_by)
         return new_asn, 201

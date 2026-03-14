@@ -35,7 +35,7 @@ class RecipientList(Resource):
             company_id = g.current_user.company_id
             filters['company_id'] = company_id
         else:
-            filters['company_id'] = args.get('company_id') or get_api_key_company_id()
+            filters['company_id'] = get_api_key_company_id() or args.get('company_id')
 
         # Get the filtered query using RecipientService
         query = RecipientService.list_recipients(filters)
@@ -48,11 +48,10 @@ class RecipientList(Resource):
     def post(self):
         """Create a new recipient"""
         data = api_ns.payload
-        # API Key 认证时自动注入 company_id
-        if not data.get('company_id'):
-            api_company_id = get_api_key_company_id()
-            if api_company_id:
-                data['company_id'] = api_company_id
+        # API Key 认证时强制注入 company_id（防止跨公司操作）
+        api_company_id = get_api_key_company_id()
+        if api_company_id:
+            data['company_id'] = api_company_id
         created_by = g.current_user.id
 
         # Create the new recipient using RecipientService

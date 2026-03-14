@@ -9,6 +9,22 @@ from .models import Inventory
 class InventoryService:
 
     @staticmethod
+    def _get_for_update(goods_id: int, warehouse_id: int) -> Inventory:
+        """SELECT ... FOR UPDATE — 写操作专用，防止并发更新导致库存数据竞争"""
+        from extensions.error import NotFoundException
+        inventory = (
+            Inventory.query
+            .filter_by(goods_id=goods_id, warehouse_id=warehouse_id)
+            .with_for_update()
+            .first()
+        )
+        if not inventory:
+            raise NotFoundException(
+                f"Inventory not found for goods {goods_id} in warehouse {warehouse_id}", 43001
+            )
+        return inventory
+
+    @staticmethod
     def _calculate_total_stock(inventory: Inventory) -> int:
         """计算当前库存总量（包含所有状态库存的汇总值）
 
@@ -186,9 +202,7 @@ class InventoryService:
         :param quantity: 锁定数量
         注意：这里不需要扣减 onhand_stock，使用的时候用onhand_stock - locked_stock计算可用库存
         """
-        inventory = Inventory.query.filter_by(goods_id=goods_id, warehouse_id=warehouse_id).first()
-        if inventory is None:
-            raise NotFoundException(f"Inventory not found for goods {goods_id} in warehouse {warehouse_id}", 43001)
+        inventory = InventoryService._get_for_update(goods_id, warehouse_id)
         if inventory.onhand_stock < quantity:
             raise BadRequestException("Insufficient stock to lock", 15003)
         inventory.locked_stock += quantity
@@ -203,9 +217,7 @@ class InventoryService:
         :param warehouse_id: 仓库 ID
         :param quantity: 解锁数量
         """
-        inventory = Inventory.query.filter_by(goods_id=goods_id, warehouse_id=warehouse_id).first()
-        if inventory is None:
-            raise NotFoundException(f"Inventory not found for goods {goods_id} in warehouse {warehouse_id}", 43001)
+        inventory = InventoryService._get_for_update(goods_id, warehouse_id)
         if inventory.locked_stock < quantity:
             raise BadRequestException("Insufficient locked stock to unlock", 15004)
         inventory.locked_stock -= quantity
@@ -220,7 +232,7 @@ class InventoryService:
         :param warehouse_id: 仓库 ID
         :param quantity: 到货数量
         """
-        inventory = InventoryService.get_inventory(goods_id, warehouse_id)
+        inventory = InventoryService._get_for_update(goods_id, warehouse_id)
         if inventory.asn_stock < quantity:
             raise BadRequestException("Not enough ASN stock.", 15005)
         inventory.asn_stock -= quantity
@@ -238,7 +250,7 @@ class InventoryService:
         :param actual_quantity: 实际分拣数量
         这里的实际分拣数量可能小于签收数量，表示部分商品缺货，也有可能大于签收数量，表示多拣货
         """
-        inventory = InventoryService.get_inventory(goods_id, warehouse_id)
+        inventory = InventoryService._get_for_update(goods_id, warehouse_id)
         # if inventory.received_stock < quantity:
         #     raise BadRequestException("Not enough received stock.", 15006)
         inventory.received_stock -= quantity
@@ -258,7 +270,7 @@ class InventoryService:
         :param warehouse_id: 仓库 ID
         :param quantity: 上架数量
         """
-        inventory = InventoryService.get_inventory(goods_id, warehouse_id)
+        inventory = InventoryService._get_for_update(goods_id, warehouse_id)
         if inventory.sorted_stock < quantity:
             raise BadRequestException("Not enough sort stock.",15007)
         inventory.sorted_stock -= quantity
@@ -275,7 +287,7 @@ class InventoryService:
         :param warehouse_id: 仓库 ID
         :param quantity: 下架数量
         """
-        inventory = InventoryService.get_inventory(goods_id, warehouse_id)
+        inventory = InventoryService._get_for_update(goods_id, warehouse_id)
         inventory.sorted_stock += quantity
         db.session.flush()
         InventoryService.update_and_calculate_stock(goods_id, warehouse_id)
@@ -295,7 +307,7 @@ class InventoryService:
         注意：picked_quantity 可能小于 quantity，表示部分商品缺货
         如果缺货的情况下需要重置 dn_stock 的值，否则会锁死商品dn数量。
         """
-        inventory = InventoryService.get_inventory(goods_id, warehouse_id)
+        inventory = InventoryService._get_for_update(goods_id, warehouse_id)
         if inventory.dn_stock < picked_quantity:
             raise BadRequestException("Not enough DN stock.", 15008)
         inventory.dn_stock -= picked_quantity
@@ -312,7 +324,7 @@ class InventoryService:
         :param warehouse_id: 仓库 ID
         :param quantity: 包装数量
         """
-        inventory = InventoryService.get_inventory(goods_id, warehouse_id)
+        inventory = InventoryService._get_for_update(goods_id, warehouse_id)
         if inventory.picked_stock < quantity:
             raise BadRequestException("Not enough pick stock.", 15009)
         inventory.picked_stock -= quantity
@@ -329,7 +341,7 @@ class InventoryService:
         :param warehouse_id: 仓库 ID
         :param quantity: 发货数量
         """
-        inventory = InventoryService.get_inventory(goods_id, warehouse_id)
+        inventory = InventoryService._get_for_update(goods_id, warehouse_id)
         if inventory.packed_stock < quantity:
             raise BadRequestException("Not enough packed stock.", 15010)
         inventory.packed_stock -= quantity
@@ -346,7 +358,7 @@ class InventoryService:
         :param warehouse_id: 仓库 ID
         :param quantity: 签收数量
         """
-        inventory = InventoryService.get_inventory(goods_id, warehouse_id)
+        inventory = InventoryService._get_for_update(goods_id, warehouse_id)
         if inventory.delivered_stock < quantity:
             raise BadRequestException("Not enough delivered stock.", 15011)
         inventory.delivered_stock -= quantity
@@ -362,7 +374,7 @@ class InventoryService:
         :param warehouse_id: 仓库 ID
         :param quantity: 关闭数量
         """
-        inventory = InventoryService.get_inventory(goods_id, warehouse_id)
+        inventory = InventoryService._get_for_update(goods_id, warehouse_id)
         if inventory.dn_stock < quantity:
             raise BadRequestException("Not enough DN stock to close.", 15012)
         inventory.dn_stock -= quantity
@@ -378,7 +390,7 @@ class InventoryService:
         :param warehouse_id: 仓库 ID
         :param threshold: 新的低库存阈值
         """
-        inventory = InventoryService.get_inventory(goods_id, warehouse_id)
+        inventory = InventoryService._get_for_update(goods_id, warehouse_id)
         if threshold < -1:
             raise BadRequestException("Low stock threshold must be non-negative or -1 to disable.", 15013)
         inventory.low_stock_threshold = threshold
@@ -393,7 +405,7 @@ class InventoryService:
         :param warehouse_id: 仓库 ID
         :param threshold: 新的高库存阈值
         """
-        inventory = InventoryService.get_inventory(goods_id, warehouse_id)
+        inventory = InventoryService._get_for_update(goods_id, warehouse_id)
         if threshold < 0 and threshold != -1:
             raise BadRequestException("High stock threshold must be non-negative or -1 to disable.", 15014)
         if threshold != -1 and threshold <= inventory.low_stock_threshold:
@@ -427,13 +439,13 @@ class InventoryService:
     def update_and_calculate_stock(goods_id: int, warehouse_id: int):
 
         from warehouse.goods.services import GoodsLocationService
-        
+
         """
         更新库存并计算库存状态
         :param goods_id: 关联的商品 ID
         :param warehouse_id: 仓库 ID
         """
-        inventory = InventoryService.get_inventory(goods_id, warehouse_id)
+        inventory = InventoryService._get_for_update(goods_id, warehouse_id)
         # 查找GoodsLocation表中的库存记录（这里假设支持传入 warehouse_id）
         gl_record = GoodsLocationService.get_quantity_by_location_type(goods_id, warehouse_id)
         
@@ -458,7 +470,7 @@ class InventoryService:
         :param goods_id: 关联的商品 ID
         :param warehouse_id: 仓库 ID
         """
-        inventory = InventoryService.get_inventory(goods_id, warehouse_id)
+        inventory = InventoryService._get_for_update(goods_id, warehouse_id)
 
         from warehouse.asn.models import ASN,ASNDetail
 
@@ -486,7 +498,7 @@ class InventoryService:
         :param goods_id: 关联的商品 ID
         :param warehouse_id: 仓库 ID
         """
-        inventory = InventoryService.get_inventory(goods_id, warehouse_id)
+        inventory = InventoryService._get_for_update(goods_id, warehouse_id)
 
         from warehouse.dn.models import DN,DNDetail
 

@@ -29,7 +29,7 @@ class SupplierList(Resource):
             company_id = g.current_user.company_id
             filters['company_id'] = company_id
         else:
-            filters['company_id'] = args.get('company_id') or get_api_key_company_id()
+            filters['company_id'] = get_api_key_company_id() or args.get('company_id')
 
         # Get the filtered query using SupplierService
         query = SupplierService.list_suppliers(filters)

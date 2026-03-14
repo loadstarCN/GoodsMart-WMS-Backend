@@ -232,11 +232,18 @@ class GoodsService:
             'description', 'image_url', 'thumbnail_url'
         }
 
+        # 批量预查询已存在商品，避免循环内 N+1 查询
+        lookup_keys = {(d['code'], d['company_id']) for d in data}
+        codes = [k[0] for k in lookup_keys]
+        company_ids = [k[1] for k in lookup_keys]
+        existing_goods_list = Goods.query.filter(
+            Goods.code.in_(codes),
+            Goods.company_id.in_(company_ids)
+        ).all()
+        existing_map = {(g.code, g.company_id): g for g in existing_goods_list}
+
         for goods_data in data:
-            existing = Goods.query.filter(
-                Goods.code == goods_data['code'],
-                Goods.company_id == goods_data['company_id']
-            ).first()
+            existing = existing_map.get((goods_data['code'], goods_data['company_id']))
 
             if not existing:
                 # 新增记录逻辑
