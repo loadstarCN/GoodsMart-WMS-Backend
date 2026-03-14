@@ -1,6 +1,6 @@
 from sqlalchemy import func
 from extensions.db import *
-from extensions.error import BadRequestException
+from extensions.error import BadRequestException, NotFoundException
 from extensions.transaction import transactional
 from warehouse.goods.models import Goods
 from warehouse.warehouse.models import Warehouse
@@ -187,6 +187,8 @@ class InventoryService:
         注意：这里不需要扣减 onhand_stock，使用的时候用onhand_stock - locked_stock计算可用库存
         """
         inventory = Inventory.query.filter_by(goods_id=goods_id, warehouse_id=warehouse_id).first()
+        if inventory is None:
+            raise NotFoundException(f"Inventory not found for goods {goods_id} in warehouse {warehouse_id}", 43001)
         if inventory.onhand_stock < quantity:
             raise BadRequestException("Insufficient stock to lock", 15003)
         inventory.locked_stock += quantity
@@ -202,6 +204,8 @@ class InventoryService:
         :param quantity: 解锁数量
         """
         inventory = Inventory.query.filter_by(goods_id=goods_id, warehouse_id=warehouse_id).first()
+        if inventory is None:
+            raise NotFoundException(f"Inventory not found for goods {goods_id} in warehouse {warehouse_id}", 43001)
         if inventory.locked_stock < quantity:
             raise BadRequestException("Insufficient locked stock to unlock", 15004)
         inventory.locked_stock -= quantity

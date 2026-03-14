@@ -22,27 +22,31 @@ class OSS(object):
             app.extensions = {}
         app.extensions['oss'] = self
 
-    def upload_file(self, file, path,random_name=True):
+    def upload_file(self, file, path, random_name=True):
         # 在接收文件前验证
         if not allowed_image_file(file.filename):
             raise BadRequestException("Invalid file type. Only PNG, JPG, JPEG, and GIF are allowed.", 10001)
+
+        # 防路径穿越：规范化 path，禁止 ../ 和绝对路径
+        safe_path = path.replace("\\", "/").lstrip("/")
+        if ".." in safe_path.split("/"):
+            raise BadRequestException("Invalid upload path.", 10003)
+
         # 生成安全随机文件名
-        original_filename = secure_filename(file.filename)        
+        original_filename = secure_filename(file.filename)
         if random_name:
-            file_ext = os.path.splitext(original_filename)[1].lower()  # 统一小写
-            # 生成随机文件名
-            random_name = f"{uuid.uuid4().hex}{file_ext}"
+            file_ext = os.path.splitext(original_filename)[1].lower()
+            filename = f"{uuid.uuid4().hex}{file_ext}"
         else:
-            # 使用原文件名
-            random_name = original_filename
-        
+            filename = original_filename
+
         # OSS上传
-        oss_path = path + random_name
+        oss_path = safe_path + filename
         try:
-            oss.bucket.put_object(oss_path, file)
+            self.bucket.put_object(oss_path, file)
         except oss2.exceptions.OssError as e:
             raise BadRequestException(f"OSS upload failed: {e}", 10002)
-        
-        return current_app.config.get("OSS_HOST")+"/"+oss_path
+
+        return current_app.config.get("OSS_HOST") + "/" + oss_path
 
 oss = OSS()
