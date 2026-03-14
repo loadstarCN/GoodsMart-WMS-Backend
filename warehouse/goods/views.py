@@ -236,7 +236,6 @@ class GoodsBulkUpload(Resource):
 
         # 检查必须的列
         required_columns = ['code', 'name']
-        print("reader.fieldnames",reader.fieldnames)
         missing_columns = [col for col in required_columns if col not in reader.fieldnames]
         if missing_columns:
             raise BadRequestException(f"Missing required columns: {', '.join(missing_columns)}", 10005)

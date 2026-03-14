@@ -17,9 +17,7 @@ class Test(Resource):
     
     @permission_required(["all_access","user_read"])
     def get(self):
-        # 打印当前用户信息
         _user = g.get('current_user')
-        print(f"Current User: {g.current_user}")
         if _user:
             return {"id": _user.id, "name": _user.user_name}, 200
         return {"message": "No user found"}, 404
@@ -58,6 +56,7 @@ class TokenRefresh(Resource):
 @api_ns.route('/change-password')
 class UserPassword(Resource):
 
+    @jwt_required()
     @api_ns.expect(password_change_model)
     def put(self):
         """修改用户密码"""

@@ -4,8 +4,6 @@ from system.common import paginate, permission_required
 from .schemas import api_ns, whitelist_model, blacklist_model, whitelist_input_model, blacklist_input_model, pagination_parser, whitelist_pagination_model, blacklist_pagination_model
 from .services import LimiterService
 
-from extensions import mqtt_client
-
 @api_ns.route('/test')
 class LimiterResource(Resource):
     @limiter.limit("1 per 3 seconds")

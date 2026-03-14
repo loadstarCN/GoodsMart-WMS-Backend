@@ -194,8 +194,6 @@ class CycleCountTaskService:
             actual_quantity=0
         )
         db.session.add(new_detail)
-        # db.session.commit()
-        print(new_detail)
         return new_detail
 
     @staticmethod

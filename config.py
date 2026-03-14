@@ -18,7 +18,8 @@ class Config:
     JWT_ACCESS_TOKEN_EXPIRES = timedelta(hours=int(os.getenv("JWT_ACCESS_TOKEN_EXPIRES",24)))
     JWT_REFRESH_TOKEN_EXPIRES = timedelta(hours=int(os.getenv("JWT_REFRESH_TOKEN_EXPIRES",168)))
 
-    DEBUG = os.getenv('DEBUG', True)  # 调试模式
+    DEBUG = os.getenv('DEBUG', 'False') == 'True'  # 调试模式
+    CORS_ORIGINS = os.getenv('CORS_ORIGINS', '*')  # 允许的跨域来源，生产环境应设置为具体域名
 
     # Celery 配置
     CELERY_BROKER_URL = os.getenv('CELERY_BROKER_URL', 'redis://localhost:6379/0')
@@ -40,11 +41,6 @@ class Config:
 
     CACHE_DEFAULT_TIMEOUT = int(os.getenv('CACHE_DEFAULT_TIMEOUT', 300))  # 默认缓存超时时间
     CACHE_TYPE = os.getenv('CACHE_TYPE', 'redis')  # 缓存类型
-
-    MQTT_BROKER_URL = os.getenv('MQTT_BROKER_URL', 'localhost')  # MQTT Broker URL
-    MQTT_BROKER_PORT = int(os.getenv('MQTT_BROKER_PORT', 1883))  # MQTT Broker 端口
-    MQTT_USERNAME = os.getenv('MQTT_USERNAME', 'user')  # MQTT 用户名
-    MQTT_PASSWORD = os.getenv('MQTT_PASSWORD', 'password')  # MQTT 密码   
 
 class DevelopmentConfig(Config):
     DEBUG = True # 只在开发环境中启用调试

@@ -12,7 +12,6 @@ def generate_api_key():
 def validate_api_key():
     """验证 API Key 并设置系统身份"""
     api_key = request.headers.get("X-API-KEY")
-    print(f"API Key: {api_key}")
     if api_key:
         key_entry = APIKey.query.filter_by(key=api_key, is_active=True).first()
         if key_entry:

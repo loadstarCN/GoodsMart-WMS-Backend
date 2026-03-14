@@ -13,8 +13,6 @@ def get_object_or_404(model, object_id, error_message=None):
     if not obj:
         if not error_message:
             error_message = f"{model.__name__} with id {object_id} not found"
-        print(error_message)
-        # 确保抛出的是 werkzeug 的 NotFound 异常
         raise NotFoundException(error_message,13001)
     return obj
 

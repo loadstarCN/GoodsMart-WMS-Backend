@@ -1,7 +1,7 @@
 from flask import Flask
 from flask_cors import CORS
 from config import Config,DevelopmentConfig, TestingConfig, ProductionConfig
-from extensions import db,get_object_or_404, jwt, migrate,celery_ext,redis_client,error,oss,cache,limit_init_app,mqtt_client
+from extensions import db,get_object_or_404, jwt, migrate,celery_ext,redis_client,error,oss,cache,limit_init_app
 from system.user.models import User
 from system import blueprint as system_api
 from tasks import blueprint as task_api
@@ -14,7 +14,6 @@ import os
 
 def create_app():
     app = Flask(__name__)
-    CORS(app)  # 允许所有来源的请求
 
     # 根据 FLASK_ENV 环境变量动态加载配置
     if Config.FLASK_ENV == 'production':
@@ -24,7 +23,8 @@ def create_app():
     else:
         app.config.from_object(DevelopmentConfig)
 
-    print(f"Running in {Config.FLASK_ENV} mode")
+    CORS(app, origins=app.config['CORS_ORIGINS'])
+    app.logger.info(f"Running in {Config.FLASK_ENV} mode")
 
     # 初始化扩展
     db.init_app(app)    
@@ -35,7 +35,6 @@ def create_app():
     jwt.init_app(app)
     oss.init_app(app)
     cache.init_app(app)  # 初始化缓存
-    # mqtt_client.init_app(app)  # 初始化 MQTT 客户端
 
     # 注册 JWT 回调
     @jwt.user_identity_loader
@@ -83,5 +82,5 @@ def create_app():
 
 app,celery = create_app()
 
-if __name__ == "__main__":    
-    app.run(debug=True)
+if __name__ == "__main__":
+    app.run(debug=app.config.get('DEBUG', False))

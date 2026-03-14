@@ -296,8 +296,6 @@ class SortingTaskService:
         返回: (batch, [list_of_details]) 
         """
 
-        print(data)
-
         task = SortingTaskService._get_instance(task_or_id)
         # 统一只允许在 in_progress 状态创建（批次 + 明细）
         if task.status != 'in_progress':

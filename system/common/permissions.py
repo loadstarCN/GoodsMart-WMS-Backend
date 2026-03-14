@@ -16,8 +16,6 @@ def role_required(required_roles):
                 raise NotFoundException("User not found", 13002)
 
             user_roles = [role.name for role in current_user.roles]
-            print(user_roles)
-            print(required_roles)
             if not any(role in user_roles for role in required_roles):
                 raise ForbiddenException("Access denied: insufficient role", 12001)
 
