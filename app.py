@@ -63,10 +63,14 @@ def create_app():
 
     # app.before_request(check_ip)
 
-    # 注册命名空间或蓝图    
+    # 注册命名空间或蓝图
     app.register_blueprint(system_api, url_prefix='/system')
     app.register_blueprint(task_api, url_prefix='/tasks')
     app.register_blueprint(warehouse_api, url_prefix='/warehouse')
+
+    # 注册 Webhook CLI 命令
+    from system.webhook.commands import webhook_cli
+    app.cli.add_command(webhook_cli)
 
     # 初始化 IP 黑白名单    
     # with app.app_context():  # 推送应用上下文

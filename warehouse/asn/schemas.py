@@ -23,6 +23,7 @@ asn_detail_fields = {
     'id': fields.Integer(readOnly=True, description='ASN Detail ID'),
     'asn_id': fields.Integer(required=True, description='Associated ASN ID'),
     'goods_id': fields.Integer(required=True, description='Associated Goods ID'),
+    'goods_code': fields.String(description='Goods code (alternative to goods_id)'),
     'quantity': fields.Integer(description='Expected quantity of goods'),
     'actual_quantity': fields.Integer(description='Actual quantity received'),
     'sorted_quantity': fields.Integer(description='Quantity sorted'),
@@ -56,6 +57,7 @@ asn_fields = {
     'asn_type': fields.String(required=True, description='Type of ASN', enum=ASN.ASN_TYPES),
     'status': fields.String(description='Status of the ASN', enum=ASN.ASN_STATUSES),
     'expected_arrival_date': fields.Date(description='Expected arrival date'),
+    'order_number': fields.String(description='Associated external order number'),
     'remark': fields.String(description='Remark for the ASN'),
     'is_active': fields.Boolean(description='Is the ASN active?'),
     'created_by': fields.Integer(description='User who created the ASN'),
@@ -158,6 +160,7 @@ asn_pagination_parser = pagination_parser.copy()
 asn_pagination_parser.add_argument('asn_type', type=str, help='Filter by ASN type', choices=ASN.ASN_TYPES)
 asn_pagination_parser.add_argument('status', type=str, help='Filter by ASN status', choices=ASN.ASN_STATUSES)
 asn_pagination_parser.add_argument('tracking_number', type=str, help='Filter by Tracking number')
+asn_pagination_parser.add_argument('order_number', type=str, help='Filter by order number')
 asn_pagination_parser.add_argument('supplier_id', type=int, help='Filter by Supplier ID')
 asn_pagination_parser.add_argument('carrier_id', type=int, help='Filter by Carrier ID')
 asn_pagination_parser.add_argument('expected_arrival_date', type=inputs.date_from_iso8601, help='Filter by Expected arrival date')

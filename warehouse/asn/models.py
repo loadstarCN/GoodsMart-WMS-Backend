@@ -64,6 +64,12 @@ class ASN(db.Model):
         nullable=True,
         info={'description': '预计到达日期'}
     )
+    order_number = db.Column(
+        db.String(100),
+        nullable=True,
+        index=True,
+        info={'description': '关联外部订单号'}
+    )
     remark = db.Column(
         db.String(255),
         nullable=True,

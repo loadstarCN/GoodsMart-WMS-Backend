@@ -23,6 +23,7 @@ dn_detail_fields = {
     'id': fields.Integer(readOnly=True, description='DN Detail ID'),
     'dn_id': fields.Integer(required=True, description='Associated DN ID'),
     'goods_id': fields.Integer(required=True, description='Associated Goods ID'),
+    'goods_code': fields.String(description='Goods code (alternative to goods_id)'),
     'quantity': fields.Integer(description='Planned delivery quantity'),
     'picked_quantity': fields.Integer(description='Quantity that has been picked'),
     'packed_quantity': fields.Integer(description='Quantity that has been packed'),

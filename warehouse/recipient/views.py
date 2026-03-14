@@ -1,6 +1,7 @@
 from flask import g
 from flask_restx import Resource, abort
 from system.common import paginate, permission_required
+from system.third_party.utils import get_api_key_company_id
 from .schemas import api_ns, recipient_model, recipient_input_model, recipient_pagination_parser, pagination_model
 from .services import RecipientService
 
@@ -34,7 +35,7 @@ class RecipientList(Resource):
             company_id = g.current_user.company_id
             filters['company_id'] = company_id
         else:
-            filters['company_id'] = args.get('company_id')
+            filters['company_id'] = args.get('company_id') or get_api_key_company_id()
 
         # Get the filtered query using RecipientService
         query = RecipientService.list_recipients(filters)
@@ -47,8 +48,13 @@ class RecipientList(Resource):
     def post(self):
         """Create a new recipient"""
         data = api_ns.payload
+        # API Key 认证时自动注入 company_id
+        if not data.get('company_id'):
+            api_company_id = get_api_key_company_id()
+            if api_company_id:
+                data['company_id'] = api_company_id
         created_by = g.current_user.id
-        
+
         # Create the new recipient using RecipientService
         new_recipient = RecipientService.create_recipient(data, created_by)
         

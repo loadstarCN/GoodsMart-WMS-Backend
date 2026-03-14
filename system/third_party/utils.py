@@ -18,6 +18,9 @@ def validate_api_key():
         if key_entry:
             # 设置系统身份
             g.current_system = {"api_key": key_entry}
+            # 设置 API Key 关联的 company_id（数据隔离）
+            if key_entry.company_id:
+                g.api_key_company_id = key_entry.company_id
         else:
             g.current_system = None
     else:
@@ -30,7 +33,7 @@ def validate_jwt_and_api_key():
     g.current_system = None
     g.current_user = None
 
-   
+
 
     # 尝试验证 JWT（可选）
     try:
@@ -53,14 +56,26 @@ def validate_jwt_and_api_key():
         if key_entry and key_entry.is_active:
             # 设置 g.current_system
             g.current_system = {"api_key": key_entry}
+            # 设置 API Key 关联的 company_id（数据隔离）
+            if key_entry.company_id:
+                g.api_key_company_id = key_entry.company_id
 
             # 如果 API Key 关联了 user_id，则设置 g.current_user
             if key_entry.user_id:
                 if (
-                    not hasattr(g, "current_user") or g.current_user is None 
+                    not hasattr(g, "current_user") or g.current_user is None
                     or g.current_user.id != key_entry.user_id
                 ):
                     user = db.session.get(User, key_entry.user_id)
                     if user and user.is_active:
                         g.current_user = user
+
+
+def get_api_key_company_id():
+    """获取当前 API Key 关联的 company_id
+
+    优先级：请求参数 > API Key 绑定值
+    用于 views 中替代硬编码 args.get('company_id')
+    """
+    return getattr(g, 'api_key_company_id', None)
 

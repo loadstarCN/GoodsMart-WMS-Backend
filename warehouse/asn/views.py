@@ -4,6 +4,7 @@ from flask_restx import Resource,abort
 from extensions import cache
 from extensions.error import ForbiddenException
 from system.common import permission_required,paginate
+from system.third_party.utils import get_api_key_company_id
 from warehouse.common import warehouse_required,check_warehouse_access,add_warehouse_filter
 from .schemas import (
     api_ns,
@@ -66,6 +67,11 @@ class ASNList(Resource):
         """
 
         data = api_ns.payload
+        # API Key 认证时自动注入 company_id（用于 goods_code 解析）
+        if not data.get('company_id'):
+            api_company_id = get_api_key_company_id()
+            if api_company_id:
+                data['company_id'] = api_company_id
         created_by = g.current_user.id
         new_asn = ASNService.create_asn(data, created_by)
         return new_asn, 201

@@ -51,10 +51,28 @@ class APIKey(db.Model):
     )
     
     user_id = db.Column(
-        db.Integer, 
+        db.Integer,
         db.ForeignKey('users.id', ondelete='CASCADE'),  # 用户删除级联
         index=True,  # 关联查询优化
         info={'description': '关联用户ID（可空）'}
+    )
+
+    # 归属公司（API Key 维度的数据隔离）
+    company_id = db.Column(
+        db.Integer,
+        db.ForeignKey('companies.id', ondelete='SET NULL'),
+        index=True,
+        info={'description': '归属公司ID（用于数据隔离，空值表示超级密钥）'}
+    )
+
+    # Webhook 配置
+    webhook_url = db.Column(
+        db.String(512),
+        info={'description': 'Webhook 回调 URL'}
+    )
+    webhook_secret = db.Column(
+        db.String(128),
+        info={'description': 'Webhook HMAC-SHA256 签名密钥'}
     )
 
     # 关系加载策略优化

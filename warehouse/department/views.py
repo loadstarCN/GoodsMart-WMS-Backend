@@ -2,6 +2,7 @@ from flask import g
 from flask_restx import Resource, abort
 from extensions.error import ForbiddenException
 from system.common import paginate, permission_required
+from system.third_party.utils import get_api_key_company_id
 from .schemas import api_ns, department_model, department_input_model, pagination_parser, pagination_model
 from .services import DepartmentService
 
@@ -30,8 +31,8 @@ class DepartmentList(Resource):
             company_id = g.current_user.company_id
             filters['company_id'] = company_id
         else:
-            filters['company_id'] = args.get('company_id')
-        
+            filters['company_id'] = args.get('company_id') or get_api_key_company_id()
+
         # Get the filtered query using DepartmentService
         query = DepartmentService.list_departments(filters)
 

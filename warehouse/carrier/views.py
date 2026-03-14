@@ -2,6 +2,7 @@ from flask import g
 from flask_restx import Resource, abort
 from extensions import db
 from system.common import paginate,permission_required
+from system.third_party.utils import get_api_key_company_id
 from warehouse.carrier.services import CarrierService
 from warehouse.common import warehouse_required
 from warehouse.warehouse.models import Warehouse
@@ -33,8 +34,8 @@ class CarrierList(Resource):
             company_id = g.current_user.company_id
             filters['company_id'] = company_id
         else:
-            filters['company_id'] = args.get('company_id')
-        
+            filters['company_id'] = args.get('company_id') or get_api_key_company_id()
+
         # Get the filtered query using CarrierService
         query = CarrierService.list_carriers(filters)
 

@@ -3,6 +3,7 @@ from flask_restx import Resource
 from extensions import cache
 from extensions.error import ForbiddenException
 from system.common import permission_required,paginate
+from system.third_party.utils import get_api_key_company_id
 from warehouse.common import warehouse_required,add_warehouse_filter,check_warehouse_access
 
 from .schemas import (
@@ -61,6 +62,11 @@ class DNList(Resource):
         - `details`: A list of DN details, can be empty
         """
         data = api_ns.payload
+        # API Key 认证时自动注入 company_id（用于 goods_code 解析）
+        if not data.get('company_id'):
+            api_company_id = get_api_key_company_id()
+            if api_company_id:
+                data['company_id'] = api_company_id
         created_by = g.current_user.id
         new_dn = DNService.create_dn(data, created_by)
         return new_dn, 201

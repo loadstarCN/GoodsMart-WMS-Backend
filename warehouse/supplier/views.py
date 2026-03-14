@@ -1,6 +1,7 @@
 from flask import g
 from flask_restx import Resource, abort
 from system.common import paginate, permission_required
+from system.third_party.utils import get_api_key_company_id
 from .schemas import api_ns, supplier_model, supplier_input_model, supplier_pagination_parser, pagination_model
 from .services import SupplierService
 
@@ -28,8 +29,8 @@ class SupplierList(Resource):
             company_id = g.current_user.company_id
             filters['company_id'] = company_id
         else:
-            filters['company_id'] = args.get('company_id')
-        
+            filters['company_id'] = args.get('company_id') or get_api_key_company_id()
+
         # Get the filtered query using SupplierService
         query = SupplierService.list_suppliers(filters)
 

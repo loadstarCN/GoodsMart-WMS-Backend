@@ -3,6 +3,8 @@ from extensions.db import *
 from extensions.error import BadRequestException, NotFoundException
 from extensions.transaction import transactional
 from warehouse.inventory.services import InventoryService
+from warehouse.goods.services import GoodsService
+from system.webhook.services import emit as webhook_emit
 from .models import ASN, ASNDetail
 from dateutil.relativedelta import relativedelta
 from sqlalchemy import and_, func, case, extract
@@ -122,6 +124,8 @@ class ASNService:
             query = query.filter(ASN.status == filters['status'])
         if filters.get('tracking_number'):
             query = query.filter(ASN.tracking_number.ilike(f"%{filters['tracking_number']}%"))
+        if filters.get('order_number'):
+            query = query.filter(ASN.order_number.ilike(f"%{filters['order_number']}%"))
         if filters.get('supplier_id'):
             query = query.filter(ASN.supplier_id == filters['supplier_id'])
         if filters.get('carrier_id'):
@@ -187,6 +191,7 @@ class ASNService:
             asn_type=data.get('asn_type', 'inbound'), # 默认为 inbound
             status=data.get('status', 'pending'), # 默认为 pending
             expected_arrival_date=data.get('expected_arrival_date'),
+            order_number=data.get('order_number'),
             remark=data.get('remark'),
             created_by=created_by_id
         )
@@ -196,9 +201,19 @@ class ASNService:
         
         # 创建 ASN 明细（如果有）
         for detail in data.get('details', []):
+            goods_id = detail.get('goods_id')
+            # 支持通过 goods_code 解析 goods_id
+            if not goods_id and detail.get('goods_code'):
+                goods = GoodsService.get_goods_by_code(detail['goods_code'], data.get('company_id', 1))
+                if not goods:
+                    raise BadRequestException(f"Goods not found for code: {detail['goods_code']}", 16030)
+                goods_id = goods.id
+            if not goods_id:
+                raise BadRequestException("goods_id or goods_code is required for detail", 16031)
+
             new_detail = ASNDetail(
                 asn_id=new_asn.id,
-                goods_id=detail['goods_id'],
+                goods_id=goods_id,
                 quantity=detail['quantity'],
                 actual_quantity=detail.get('actual_quantity', 0),
                 sorted_quantity=detail.get('sorted_quantity', 0),
@@ -246,6 +261,7 @@ class ASNService:
         asn.asn_type = data.get('asn_type', asn.asn_type)
         asn.status = data.get('status', asn.status)
         asn.expected_arrival_date = data.get('expected_arrival_date', asn.expected_arrival_date)
+        asn.order_number = data.get('order_number', asn.order_number)
         asn.remark = data.get('remark', asn.remark)
         asn.is_active = data.get('is_active', asn.is_active)
 
@@ -324,9 +340,18 @@ class ASNService:
         if asn.status != 'pending':
             raise BadRequestException("Cannot add details to a non-pending ASN", 16003)
 
+        goods_id = data.get('goods_id')
+        if not goods_id and data.get('goods_code'):
+            goods = GoodsService.get_goods_by_code(data['goods_code'], data.get('company_id', 1))
+            if not goods:
+                raise BadRequestException(f"Goods not found for code: {data['goods_code']}", 16030)
+            goods_id = goods.id
+        if not goods_id:
+            raise BadRequestException("goods_id or goods_code is required", 16031)
+
         new_detail = ASNDetail(
             asn_id=asn_id,
-            goods_id=data['goods_id'],
+            goods_id=goods_id,
             quantity=data['quantity'],
             actual_quantity=data.get('actual_quantity', 0),
             sorted_quantity=data.get('sorted_quantity', 0),
@@ -399,8 +424,16 @@ class ASNService:
 
         # 处理更新和新增
         for item in details_data:
+            # 解析 goods_id（支持 goods_code）
+            if 'goods_id' not in item or not item.get('goods_id'):
+                if item.get('goods_code'):
+                    goods = GoodsService.get_goods_by_code(item['goods_code'], item.get('company_id', 1))
+                    if not goods:
+                        raise BadRequestException(f"Goods not found for code: {item['goods_code']}", 16030)
+                    item['goods_id'] = goods.id
+
             detail_id = item.get('id')
-            
+
             if detail_id and detail_id in existing_details:
                 # 更新现有记录
                 detail = existing_details[detail_id]
@@ -509,6 +542,12 @@ class ASNService:
         from warehouse.sorting.services import SortingTaskService
         SortingTaskService.create_sorting_task_from_asn(asn.id)
 
+        webhook_emit('asn.received', {
+            'asn_id': asn.id, 'status': 'received', 'order_number': getattr(asn, 'order_number', None),
+            'details': [{'goods_code': d.goods.code if d.goods else None,
+                         'quantity': d.quantity} for d in asn.details],
+        })
+
         return asn
 
     @staticmethod
@@ -532,9 +571,18 @@ class ASNService:
         # 更新库存信息
         for detail in asn.details:
             InventoryService.asn_completed(detail.goods_id, asn.warehouse_id, detail.quantity,detail.actual_quantity)
-    
+
+        webhook_emit('asn.completed', {
+            'asn_id': asn.id, 'status': 'completed', 'order_number': asn.order_number,
+            'details': [{'goods_code': d.goods.code if d.goods else None,
+                         'actual_quantity': d.actual_quantity,
+                         'quantity': d.quantity,
+                         'sorted_quantity': d.sorted_quantity,
+                         'damage_quantity': d.damage_quantity} for d in asn.details],
+        })
+
         return asn
-    
+
     @staticmethod
     @transactional
     def close_asn(asn_or_id: int | ASN):

@@ -6,6 +6,8 @@ from extensions.error import BadRequestException, NotFoundException
 from extensions.transaction import transactional
 from warehouse.inventory.services import InventoryService
 
+from warehouse.goods.services import GoodsService
+from system.webhook.services import emit as webhook_emit
 from .models import DN, DNDetail
 
 class DNService:
@@ -235,9 +237,19 @@ class DNService:
 
         # 创建 DN 明细（如果有）
         for detail in data.get('details', []):
+            goods_id = detail.get('goods_id')
+            # 支持通过 goods_code 解析 goods_id
+            if not goods_id and detail.get('goods_code'):
+                goods = GoodsService.get_goods_by_code(detail['goods_code'], data.get('company_id', 1))
+                if not goods:
+                    raise BadRequestException(f"Goods not found for code: {detail['goods_code']}", 16030)
+                goods_id = goods.id
+            if not goods_id:
+                raise BadRequestException("goods_id or goods_code is required for detail", 16031)
+
             new_detail = DNDetail(
                 dn_id=new_dn.id,
-                goods_id=detail['goods_id'],
+                goods_id=goods_id,
                 quantity=detail.get('quantity', 0),
                 picked_quantity=detail.get('picked_quantity', 0),
                 packed_quantity=detail.get('packed_quantity', 0),
@@ -365,9 +377,18 @@ class DNService:
         if dn.status != 'pending':
             raise BadRequestException("Cannot add details to a non-pending DN", 16003)
 
+        goods_id = data.get('goods_id')
+        if not goods_id and data.get('goods_code'):
+            goods = GoodsService.get_goods_by_code(data['goods_code'], data.get('company_id', 1))
+            if not goods:
+                raise BadRequestException(f"Goods not found for code: {data['goods_code']}", 16030)
+            goods_id = goods.id
+        if not goods_id:
+            raise BadRequestException("goods_id or goods_code is required", 16031)
+
         new_detail = DNDetail(
             dn_id=dn_id,
-            goods_id=data['goods_id'],
+            goods_id=goods_id,
             quantity=data.get('quantity', 0),
             picked_quantity=data.get('picked_quantity', 0),
             packed_quantity=data.get('packed_quantity', 0),
@@ -449,8 +470,18 @@ class DNService:
 
         # 处理更新和新增
         for item in details_data:
+            # 解析 goods_id（支持 goods_code）
+            goods_id = item.get('goods_id')
+            if not goods_id and item.get('goods_code'):
+                goods = GoodsService.get_goods_by_code(item['goods_code'], item.get('company_id', 1))
+                if not goods:
+                    raise BadRequestException(f"Goods not found for code: {item['goods_code']}", 16030)
+                goods_id = goods.id
+                item['goods_id'] = goods_id
+            if not goods_id:
+                raise BadRequestException("goods_id or goods_code is required", 16031)
+
             # 商品ID重复校验
-            goods_id = item['goods_id']
             if goods_id in processed_goods:
                 raise BadRequestException(f"Duplicate goods_id: {goods_id}", 16025)
             processed_goods.add(goods_id)
@@ -516,6 +547,10 @@ class DNService:
         # 创建拣货
         from warehouse.picking.services import PickingTaskService
         PickingTaskService.create_picking_task_from_dn(dn.id,dn.created_by)
+
+        webhook_emit('dn.in_progress', {
+            'dn_id': dn.id, 'status': 'in_progress', 'order_number': dn.order_number,
+        })
 
         return dn
     
@@ -584,7 +619,20 @@ class DNService:
 
         for detail in dn.details:
             InventoryService.dn_delivered(detail.goods_id,dn.warehouse_id,detail.delivered_quantity)
-           
+
+        # 获取 tracking_number
+        from warehouse.delivery.models import DeliveryTask
+        delivery_task = DeliveryTask.query.filter(
+            DeliveryTask.dn_id == dn.id,
+            DeliveryTask.is_active == True,
+        ).first()
+        tracking_number = delivery_task.tracking_number if delivery_task else None
+
+        webhook_emit('dn.delivered', {
+            'dn_id': dn.id, 'status': 'delivered', 'order_number': dn.order_number,
+            'tracking_number': tracking_number,
+        })
+
         return dn
 
     @staticmethod
@@ -603,6 +651,10 @@ class DNService:
 
         for detail in dn.details:
             InventoryService.dn_completed(detail.goods_id,dn.warehouse_id,detail.delivered_quantity)
+
+        webhook_emit('dn.completed', {
+            'dn_id': dn.id, 'status': 'completed', 'order_number': dn.order_number,
+        })
 
         return dn
     
