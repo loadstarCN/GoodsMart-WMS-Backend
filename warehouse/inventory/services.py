@@ -298,7 +298,7 @@ class InventoryService:
         inventory = InventoryService.get_inventory(goods_id, warehouse_id)
         if inventory.dn_stock < picked_quantity:
             raise BadRequestException("Not enough DN stock.", 15008)
-        inventory.dn_stock -= quantity
+        inventory.dn_stock -= picked_quantity
         inventory.picked_stock += picked_quantity
         inventory.total_stock = InventoryService._calculate_total_stock(inventory)
         # db.session.commit()
