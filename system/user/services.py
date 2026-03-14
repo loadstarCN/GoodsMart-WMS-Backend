@@ -23,11 +23,7 @@ class UserService:
         else:
             user = User.query.filter_by(user_name=account).first()
 
-        if not user:
-            raise NotFoundException("User not found", 13002)
-        
-        # 验证密码
-        if not user.check_password(password):
+        if not user or not user.check_password(password):
             raise UnauthorizedException("Invalid username or password", 11001)
 
         # 检查用户是否激活
@@ -49,7 +45,7 @@ class UserService:
         refresh_expires_in = current_app.config['JWT_REFRESH_TOKEN_EXPIRES']
 
         # 更新用户模型的refresh_token及有效期（需持久化存储）
-        user.refresh_token_expires = datetime.now() + refresh_expires_in
+        user.refresh_token_expires_at = datetime.now() + refresh_expires_in
         db.session.add(user)
         db.session.commit()
 
@@ -126,8 +122,8 @@ class UserService:
         """
         query = User.query.order_by(User.id.desc())
 
-        if filters.get('user_name'):
-            query = query.filter(User.username.ilike(f"%{filters['username']}%"))
+        if filters.get('username'):
+            query = query.filter(User.user_name.ilike(f"%{filters['username']}%"))
         if filters.get('email'):
             query = query.filter(User.email.ilike(f"%{filters['email']}%"))
 
@@ -198,7 +194,7 @@ class UserService:
     @staticmethod
     @transactional
     def change_password(user_id, old_password, new_password):
-        user = User.query.get_or_404(user_id)
+        user = get_object_or_404(User, user_id)
         
         # 验证旧密码
         if not user.check_password(old_password):
