@@ -387,7 +387,65 @@ sudo supervisorctl update
 
 提供 Dockerfile 和 docker-compose.yml 用于容器化部署完整系统。
 
+## Webhook 集成（Wholesale API 对接）
 
+WMS 支持通过 Webhook 向外部系统（如 Wholesale API）推送事件通知。
+
+### 数据库迁移
+
+首次部署或升级时，执行 `doc/migration-webhook-integration.sql` 完成数据库变更：
+
+```bash
+psql $SQLALCHEMY_DATABASE_URI -f doc/migration-webhook-integration.sql
+```
+
+该脚本会：
+- `asn` 表新增 `order_number` 字段（关联 Wholesale 到货单号）
+- `api_keys` 表新增 `company_id`、`webhook_url`、`webhook_secret` 字段
+- 创建 `webhook_events` 事件队列表
+
+### 配置 API Key
+
+为需要接收 Webhook 推送的外部系统配置对应的 API Key：
+
+```sql
+UPDATE api_keys
+SET company_id    = 1,
+    webhook_url   = 'https://your-system.example.com/api/webhook/wms',
+    webhook_secret = 'your-hmac-secret-here'
+WHERE key = 'your-api-key-here';
+```
+
+| 字段 | 说明 |
+|------|------|
+| `company_id` | 关联的公司 ID |
+| `webhook_url` | 接收事件推送的目标地址 |
+| `webhook_secret` | 用于签名验证的 HMAC 密钥 |
+
+### 定时推送任务
+
+Webhook 事件通过 `flask webhook push` 命令批量推送。建议使用 crontab 每分钟执行一次：
+
+```bash
+# 编辑 crontab
+crontab -e
+
+# 添加以下行（每分钟推送一次待发送事件）
+* * * * * cd /path/to/GoodsMart-WMS-Backend && flask webhook push >> /var/log/wms-webhook.log 2>&1
+```
+
+或使用 Supervisord 管理推送进程：
+
+```ini
+[program:wms-webhook]
+directory=/path/to/GoodsMart-WMS-Backend
+command=bash -c 'while true; do flask webhook push; sleep 60; done'
+autostart=true
+autorestart=true
+stderr_logfile=/var/log/wms-webhook.err.log
+stdout_logfile=/var/log/wms-webhook.out.log
+user=www-data
+```
 
 ## 错误码分类体系
 

@@ -389,6 +389,66 @@ Please refer to the README file of the https://github.com/loadstarCN/GoodsMart-W
 
 Dockerfile and docker-compose.yml are provided for containerized deployment of the complete system.
 
+## Webhook Integration (Wholesale API)
+
+WMS supports pushing event notifications to external systems (e.g., Wholesale API) via Webhook.
+
+### Database Migration
+
+On first deployment or upgrade, run `doc/migration-webhook-integration.sql` to apply the schema changes:
+
+```bash
+psql $SQLALCHEMY_DATABASE_URI -f doc/migration-webhook-integration.sql
+```
+
+This script will:
+- Add `order_number` column to the `asn` table (links to Wholesale order number)
+- Add `company_id`, `webhook_url`, and `webhook_secret` columns to `api_keys`
+- Create the `webhook_events` queue table
+
+### Configure API Key
+
+Set up the Webhook target for each external system's API Key:
+
+```sql
+UPDATE api_keys
+SET company_id     = 1,
+    webhook_url    = 'https://your-system.example.com/api/webhook/wms',
+    webhook_secret = 'your-hmac-secret-here'
+WHERE key = 'your-api-key-here';
+```
+
+| Field | Description |
+|-------|-------------|
+| `company_id` | Associated company ID |
+| `webhook_url` | Target URL to receive event pushes |
+| `webhook_secret` | HMAC secret key for signature verification |
+
+### Scheduled Push Task
+
+Webhook events are dispatched via the `flask webhook push` command. Use crontab to run it every minute:
+
+```bash
+# Edit crontab
+crontab -e
+
+# Add the following line (push pending events every minute)
+* * * * * cd /path/to/GoodsMart-WMS-Backend && flask webhook push >> /var/log/wms-webhook.log 2>&1
+```
+
+Or manage via Supervisord:
+
+```ini
+[program:wms-webhook]
+directory=/path/to/GoodsMart-WMS-Backend
+command=bash -c 'while true; do flask webhook push; sleep 60; done'
+autostart=true
+autorestart=true
+stderr_logfile=/var/log/wms-webhook.err.log
+stdout_logfile=/var/log/wms-webhook.out.log
+user=www-data
+```
+
 ## Error Code Classification System
 
 | Category | Error Code Range | HTTP Status Code | Description |

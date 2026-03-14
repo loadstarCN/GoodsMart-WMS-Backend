@@ -14,15 +14,7 @@ class APIKey(db.Model):
     __tablename__ = 'api_keys'
 
     __table_args__ = (
-        # 复合索引优化
-        db.Index('idx_api_key_system', 'key', 'system_name'),  # 高频查询组合
-        # 添加外键约束命名（可选优化）
-        db.ForeignKeyConstraint(
-            ['user_id'], ['users.id'],
-            name='fk_api_keys_user_id',
-            ondelete='CASCADE'
-        ),
-        
+        db.Index('idx_api_key_system', 'key', 'system_name'),
     )
 
     id = db.Column(db.Integer, primary_key=True)
