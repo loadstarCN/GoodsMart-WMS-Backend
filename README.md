@@ -29,10 +29,9 @@ This project is licensed under the **GNU Affero General Public License v3.0 (AGP
 - **Database**: PostgreSQL 13+
 - **ORM**: SQLAlchemy + Flask-SQLAlchemy
 - **Authentication & Authorization**: JWT + Flask-JWT-Extended
-- **Task Queue**: Celery + Redis
 - **API Documentation**: OpenAPI/Swagger
-- **Message Queue**: MQTT (IoT Device Integration)
 - **Caching**: Redis
+- **Scheduled Tasks**: Flask CLI + cron
 
 ## 📋 Prerequisites
 
@@ -88,16 +87,6 @@ JWT_SECRET_KEY=your_secure_random_jwt_secret_key_here
 # Redis Configuration
 REDIS_URL=redis://localhost:6379/0
 
-# Celery Configuration
-CELERY_BROKER_URL=redis://localhost:6379/1
-CELERY_RESULT_BACKEND=redis://localhost:6379/1
-
-# MQTT Configuration
-MQTT_BROKER_URL=your.mqtt.broker.url
-MQTT_BROKER_PORT=1883
-MQTT_USERNAME=your_mqtt_username
-MQTT_PASSWORD=your_mqtt_password
-
 # Client Configuration (points to frontend project address)
 CLIENT_BASE_URL=http://localhost:3000
 ```
@@ -125,13 +114,7 @@ python app.py
 
 The API service will run at http://localhost:5000.
 
-### 6. Start Celery Worker (Optional)
-
-```bash
-celery -A tasks.celery_worker.celery worker --loglevel=info
-```
-
-### 7. Deploy Client Project
+### 6. Deploy Client Project
 
 Please also deploy the https://github.com/loadstarCN/GoodsMart-WMS-Web frontend project for full functionality:
 
@@ -159,10 +142,11 @@ GoodsMart-WMS-Backend/
 │   └── env.py                # Alembic environment configuration
 ├── extensions/               # Flask extension initialization
 │   ├── __init__.py
-│   ├── celery.py             # Celery extension
 │   ├── db.py                 # SQLAlchemy database extension
 │   ├── jwt.py                # JWT extension
-│   └── mqtt.py               # MQTT extension
+│   ├── redis.py              # Redis extension
+│   ├── cache.py              # Cache extension
+│   └── oss.py                # Alibaba Cloud OSS extension
 ├── system/                   # System core modules
 │   ├── __init__.py
 │   ├── auth/                 # Authentication & authorization module
@@ -190,12 +174,11 @@ GoodsMart-WMS-Backend/
 │   │   ├── schemas.py
 │   │   └── utils.py
 │   └── ...                   # Other modules
-├── tasks/                    # Celery task module
+├── tasks/                    # Background task module
 │   ├── __init__.py
-│   ├── celery_worker.py      # Celery Worker
-│   ├── inventory_tasks.py    # Inventory-related tasks
-│   ├── order_tasks.py        # Order-related tasks
-│   └── notification_tasks.py # Notification-related tasks
+│   ├── commands.py           # Flask CLI commands (flask snapshot run)
+│   ├── snapshot.py           # Inventory snapshot task
+│   └── views.py              # Task trigger API endpoints
 ├── utils/                    # Utility functions
 │   ├── __init__.py
 │   ├── validators.py         # Data validators
@@ -305,34 +288,6 @@ pytest --cov=system tests/
 - Inventory counting
 - Transfer management
 
-## 🔌 MQTT Integration
-
-### Subscribe to Messages
-```python
-from extensions import mqtt_client
-
-def handle_sensor_data(topic, payload):
-    """Process sensor data"""
-    print(f"Received from {topic}: {payload}")
-    # Processing logic...
-
-# Subscribe to topic
-mqtt_client.subscribe('sensors/#', handle_sensor_data)
-```
-
-### Publish Messages
-```python
-from extensions import mqtt_client
-
-def control_device():
-    """Control device"""
-    success = mqtt_client.publish(
-        'devices/light/control',
-        {'action': 'on', 'duration': 30}
-    )
-    return success
-```
-
 ## 🚀 Deployment
 
 ### Complete System Deployment Requirements
@@ -343,7 +298,6 @@ To run the complete GoodsMart WMS system, you need to deploy simultaneously:
 2. **https://github.com/loadstarCN/GoodsMart-WMS-Web**
 3. **PostgreSQL Database**
 4. **Redis Server**
-5. **Optional**: MQTT Broker (for IoT device integration)
 
 ### Using Gunicorn (Production Environment)
 
@@ -446,6 +400,50 @@ autostart=true
 autorestart=true
 stderr_logfile=/var/log/wms-webhook.err.log
 stdout_logfile=/var/log/wms-webhook.out.log
+user=www-data
+```
+
+## Inventory Snapshot Scheduled Task
+
+WMS supports creating inventory snapshots across all warehouses via the `flask snapshot run` command. Snapshots are used for historical data queries, inventory change analysis, and reporting.
+
+### Trigger Methods
+
+**Via API (one-time manual trigger):**
+
+```http
+POST /tasks/task/inventory_snapshot
+Authorization: Bearer <token>
+```
+
+**Via command line:**
+
+```bash
+cd /path/to/GoodsMart-WMS-Backend && flask snapshot run
+```
+
+### Configure Scheduled Task (crontab)
+
+Run once daily, for example at 2 AM:
+
+```bash
+# Edit crontab
+crontab -e
+
+# Run inventory snapshot every day at 2 AM
+0 2 * * * cd /path/to/GoodsMart-WMS-Backend && flask snapshot run >> /var/log/wms-snapshot.log 2>&1
+```
+
+### Using Supervisord
+
+```ini
+[program:wms-snapshot]
+directory=/path/to/GoodsMart-WMS-Backend
+command=bash -c 'while true; do flask snapshot run; sleep 86400; done'
+autostart=true
+autorestart=true
+stderr_logfile=/var/log/wms-snapshot.err.log
+stdout_logfile=/var/log/wms-snapshot.out.log
 user=www-data
 ```
 

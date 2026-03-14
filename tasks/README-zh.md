@@ -1,48 +1,70 @@
-## 使用说明
+## 后台任务模块
 
-### 异步任务执行
-示例异步任务代码见 example.py 文件，任务函数应使用 @shared_task 装饰器进行标注。
+[English README](./README.md)
 
-系统将自动扫描并导入 tasks 目录下所有被 @task 装饰器修饰的函数。具体路径配置可参考 /config.py 文件。
+本模块包含所有需要在后台定时或按需执行的任务，通过 Flask CLI 命令触发，无需额外的任务队列服务。
 
-任务管理接口定义在 views.py 文件中。
+## 任务列表
 
-celery_worker.py 文件为独立运行的 Celery 示例脚本。
+| 命令 | 说明 | 建议频率 |
+|------|------|----------|
+| `flask snapshot run` | 为所有仓库创建库存快照 | 每天一次 |
 
-## Celery Worker启动说明
-### 启动方式
-#### 使用 Flask 上下文启动（推荐）
-在项目根目录下执行以下命令启动 Celery Worker，确保使用 Flask 上下文：
+## 库存快照任务
 
-#### Linux 系统
-```
-celery -A app.celery worker --loglevel=info
-```
+快照任务会遍历系统中的所有仓库，将当前库存状态完整记录一份，用于历史数据查询和分析。
 
-#### Windows 系统
-由于 Windows 系统默认不支持 Gevent 或 Eventlet，启动时需要安装 Eventlet：
-```
-pip install eventlet
-celery -A app.celery worker --loglevel=info  -P eventlet
+### 手动执行
+
+```bash
+cd /path/to/GoodsMart-WMS-Backend
+flask snapshot run
 ```
 
-### 独立启动（不使用 Flask 上下文）
-在无需 Flask 上下文的情况下，可以独立运行 Celery Worker。请参考 Celery_worker.py 文件中的示例代码。
+执行完成后会输出类似如下结果：
 
-#### Linux 系统
 ```
-celery -A tasks.celery_worker.celery worker --loglevel=info
+Snapshot completed in 0.35 seconds, 3 warehouses
 ```
 
-#### Windows 系统
-同样，Windows 系统下也需要安装 Eventlet：
-```
-pip install eventlet
-celery -A tasks.celery_worker.celery worker --loglevel=info  -P eventlet
+### 通过 API 触发
+
+```http
+POST /tasks/task/inventory_snapshot
+Authorization: Bearer <token>
 ```
 
-### Flower监控
-启动命令
+返回示例：
+
+```json
+{"message": "Snapshot completed in 0.35 seconds, 3 warehouses"}
 ```
-celery --broker=redis://username:password@host:port/database flower --basic-auth=username:password --port=5555
+
+### 定时调度（crontab）
+
+```bash
+# 每天凌晨 2 点执行
+0 2 * * * cd /path/to/GoodsMart-WMS-Backend && flask snapshot run >> /var/log/wms-snapshot.log 2>&1
 ```
+
+### 使用 Supervisord 管理
+
+```ini
+[program:wms-snapshot]
+directory=/path/to/GoodsMart-WMS-Backend
+command=bash -c 'while true; do flask snapshot run; sleep 86400; done'
+autostart=true
+autorestart=true
+stderr_logfile=/var/log/wms-snapshot.err.log
+stdout_logfile=/var/log/wms-snapshot.out.log
+user=www-data
+```
+
+## 新增任务
+
+如需添加新的定时任务：
+
+1. 在 `snapshot.py` 旁边新建任务文件（如 `cleanup.py`），编写普通 Python 函数
+2. 在 `commands.py` 中注册对应的 CLI 命令
+3. 在 `app.py` 的 `create_app()` 中通过 `app.cli.add_command()` 挂载
+4. 参照本文档在 README 中补充调度说明

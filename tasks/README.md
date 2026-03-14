@@ -1,49 +1,70 @@
-## Usage Instructions
+## Background Task Module
+
 [中文 README](./README-zh.md)
 
-### Asynchronous Task Execution
-Example asynchronous task code can be found in the example.py file. Task functions should be decorated with the `@shared_task` decorator.
+This module contains all tasks that need to run in the background on a schedule or on demand. Tasks are triggered via Flask CLI commands — no external task queue service required.
 
-The system will automatically scan and import all functions decorated with the `@task` decorator in the tasks directory. For specific path configuration, please refer to the `/config.py` file.
+## Task List
 
-Task management interfaces are defined in the views.py file.
+| Command | Description | Recommended Frequency |
+|---------|-------------|----------------------|
+| `flask snapshot run` | Create inventory snapshot for all warehouses | Daily |
 
-The celery_worker.py file contains a standalone Celery example script.
+## Inventory Snapshot Task
 
-## Celery Worker Startup Instructions
-### Startup Methods
-#### Using Flask Context (Recommended)
-Execute the following command in the project root directory to start the Celery Worker with Flask context:
+The snapshot task iterates through all warehouses and records the current inventory state in full, for historical queries and analysis.
 
-#### Linux Systems
-```
-celery -A app.celery worker --loglevel=info
-```
+### Manual Execution
 
-#### Windows Systems
-Since Windows systems do not natively support Gevent or Eventlet, you need to install Eventlet:
-```
-pip install eventlet
-celery -A app.celery worker --loglevel=info -P eventlet
+```bash
+cd /path/to/GoodsMart-WMS-Backend
+flask snapshot run
 ```
 
-### Standalone Startup (Without Flask Context)
-When Flask context is not required, you can run the Celery Worker independently. Please refer to the example code in the celery_worker.py file.
+Output example:
 
-#### Linux Systems
 ```
-celery -A tasks.celery_worker.celery worker --loglevel=info
+Snapshot completed in 0.35 seconds, 3 warehouses
 ```
 
-#### Windows Systems
-Similarly, Windows systems require Eventlet installation:
-```
-pip install eventlet
-celery -A tasks.celery_worker.celery worker --loglevel=info -P eventlet
+### Trigger via API
+
+```http
+POST /tasks/task/inventory_snapshot
+Authorization: Bearer <token>
 ```
 
-### Flower Monitoring
-Startup command:
+Response example:
+
+```json
+{"message": "Snapshot completed in 0.35 seconds, 3 warehouses"}
 ```
-celery --broker=redis://username:password@host:port/database flower --basic-auth=username:password --port=5555
+
+### Scheduled Execution (crontab)
+
+```bash
+# Run every day at 2 AM
+0 2 * * * cd /path/to/GoodsMart-WMS-Backend && flask snapshot run >> /var/log/wms-snapshot.log 2>&1
 ```
+
+### Using Supervisord
+
+```ini
+[program:wms-snapshot]
+directory=/path/to/GoodsMart-WMS-Backend
+command=bash -c 'while true; do flask snapshot run; sleep 86400; done'
+autostart=true
+autorestart=true
+stderr_logfile=/var/log/wms-snapshot.err.log
+stdout_logfile=/var/log/wms-snapshot.out.log
+user=www-data
+```
+
+## Adding New Tasks
+
+To add a new scheduled task:
+
+1. Create a new task file alongside `snapshot.py` (e.g., `cleanup.py`) with a plain Python function
+2. Register the corresponding CLI command in `commands.py`
+3. Mount it via `app.cli.add_command()` inside `create_app()` in `app.py`
+4. Document the scheduling instructions in the README
