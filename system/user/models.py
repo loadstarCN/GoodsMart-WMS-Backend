@@ -183,6 +183,13 @@ class User(db.Model):
         """缓存优化版权限检查"""
         return permission_name in {p.name for role in self.roles for p in role.permissions}
 
+    @property
+    def company_name(self):
+        """获取用户所属公司名称（仅 Staff 类型有值）"""
+        if hasattr(self, 'company') and self.company:
+            return self.company.name
+        return None
+
     def set_password(self, password):
         """设置用户密码"""
         self.password_hash = generate_password_hash(password)

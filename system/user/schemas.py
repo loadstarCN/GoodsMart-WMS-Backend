@@ -48,6 +48,7 @@ user_model = api_ns.model('User', {
     'updated_at': fields.DateTime(readOnly=True, description='User Updated Time'),
     'refresh_token_expires_at': fields.DateTime(description='Refresh Token Expires Time'),
     'type': fields.String(description='User Type'),
+    'company_name': fields.String(readOnly=True, description='Company Name'),
 })
 
 # -----------------------------
