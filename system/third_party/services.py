@@ -27,6 +27,8 @@ class APIKeyService:
             query = query.filter(APIKey.is_active == filters['is_active'])
         if filters.get('system_name'):
             query = query.filter(APIKey.system_name.ilike(f"%{filters['system_name']}%"))
+        if filters.get('company_id') is not None:
+            query = query.filter(APIKey.company_id == filters['company_id'])
 
         return query
 
@@ -50,8 +52,11 @@ class APIKeyService:
             user_id=data.get('user_id'),
             permissions=data.get('permissions', [])
         )
+        new_api_key.company_id = data.get('company_id')
+        new_api_key.is_active = data.get('is_active', True)
+        new_api_key.webhook_url = data.get('webhook_url')
+        new_api_key.webhook_secret = data.get('webhook_secret')
         db.session.add(new_api_key)
-        # db.session.commit()
         return new_api_key
 
     @staticmethod
@@ -65,8 +70,10 @@ class APIKeyService:
         api_key.system_name = data.get('system_name', api_key.system_name)
         api_key.permissions = data.get('permissions', api_key.permissions)
         api_key.user_id = data.get('user_id', api_key.user_id)
+        api_key.is_active = data.get('is_active', api_key.is_active)
+        api_key.webhook_url = data.get('webhook_url', api_key.webhook_url)
+        api_key.webhook_secret = data.get('webhook_secret', api_key.webhook_secret)
 
-        # db.session.commit()
         return api_key
 
     @staticmethod
@@ -77,4 +84,3 @@ class APIKeyService:
         """
         api_key = APIKeyService.get_api_key(api_key_id)
         db.session.delete(api_key)
-        # db.session.commit()

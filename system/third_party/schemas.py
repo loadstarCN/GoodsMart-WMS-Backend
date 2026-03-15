@@ -9,9 +9,12 @@ api_ns = Namespace('third_party', description='User related operations', authori
 # 创建 API Key 的请求模型（用于创建）
 # -----------------------------
 api_key_create_model = api_ns.model('APIKeyCreate', {
-    'user_id': fields.Integer(required=True, description='User ID'),
+    'user_id': fields.Integer(description='User ID'),
     'system_name': fields.String(required=True, description='Third-party system name'),
-    'permissions': fields.Raw(description='Permissions')
+    'permissions': fields.Raw(description='Permissions'),
+    'company_id': fields.Integer(description='Company ID'),
+    'webhook_url': fields.String(description='Webhook callback URL'),
+    'webhook_secret': fields.String(description='Webhook HMAC-SHA256 signing secret'),
 })
 
 # -----------------------------
@@ -30,7 +33,10 @@ api_key_model = api_ns.model('APIKey', {
     'system_name': fields.String(description='Third-party system name'),
     'is_active': fields.Boolean(description='Whether the API Key is active'),
     'permissions': fields.Raw(description='Permissions'),
-    'user_id': fields.Integer(description='User ID')
+    'user_id': fields.Integer(description='User ID'),
+    'company_id': fields.Integer(description='Company ID'),
+    'webhook_url': fields.String(description='Webhook callback URL'),
+    'webhook_secret': fields.String(description='Webhook HMAC-SHA256 signing secret'),
 })
 
 # -----------------------------
@@ -55,6 +61,7 @@ api_key_update_model = api_ns.model('APIKeyUpdate', api_key_update_fields)
 # 定义分页解析器
 # -----------------------------
 pagination_parser = pagination_parser.copy()
+pagination_parser.add_argument('company_id', type=int, location='args', help='Filter by company ID')
 
 # -----------------------------
 # 创建分页模型
