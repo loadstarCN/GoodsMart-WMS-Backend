@@ -80,6 +80,10 @@ def create_app():
     # 注册错误处理器
     error.register_error_handlers(app)
 
+    # 启动定时任务调度器（webhook 推送 + 库存快照）
+    from scheduler import init_scheduler
+    init_scheduler(app)
+
     return app
 
 app = create_app()
