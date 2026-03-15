@@ -1,4 +1,5 @@
 from sqlalchemy import func
+from sqlalchemy.orm import lazyload
 from extensions.db import *
 from extensions.error import BadRequestException, NotFoundException
 from extensions.transaction import transactional
@@ -14,6 +15,7 @@ class InventoryService:
         from extensions.error import NotFoundException
         inventory = (
             Inventory.query
+            .options(lazyload('*'))
             .filter_by(goods_id=goods_id, warehouse_id=warehouse_id)
             .with_for_update()
             .first()
