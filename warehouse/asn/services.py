@@ -193,7 +193,8 @@ class ASNService:
             expected_arrival_date=data.get('expected_arrival_date'),
             order_number=data.get('order_number'),
             remark=data.get('remark'),
-            created_by=created_by_id
+            created_by=created_by_id,
+            api_key_id=data.get('api_key_id'),
         )
         db.session.add(new_asn)
         db.session.flush()
@@ -546,7 +547,7 @@ class ASNService:
             'asn_id': asn.id, 'status': 'received', 'order_number': getattr(asn, 'order_number', None),
             'details': [{'goods_code': d.goods.code if d.goods else None,
                          'quantity': d.quantity} for d in asn.details],
-        })
+        }, api_key_id=asn.api_key_id)
 
         return asn
 
@@ -579,7 +580,7 @@ class ASNService:
                          'quantity': d.quantity,
                          'sorted_quantity': d.sorted_quantity,
                          'damage_quantity': d.damage_quantity} for d in asn.details],
-        })
+        }, api_key_id=asn.api_key_id)
 
         return asn
 

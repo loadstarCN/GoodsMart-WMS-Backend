@@ -230,7 +230,8 @@ class DNService:
             special_handling=data.get('special_handling'),
             remark=data.get('remark'),
             is_active=data.get('is_active', True),
-            created_by=created_by_id
+            created_by=created_by_id,
+            api_key_id=data.get('api_key_id'),
         )
         db.session.add(new_dn)
         db.session.flush()
@@ -550,7 +551,7 @@ class DNService:
 
         webhook_emit('dn.in_progress', {
             'dn_id': dn.id, 'status': 'in_progress', 'order_number': dn.order_number,
-        })
+        }, api_key_id=dn.api_key_id)
 
         return dn
     
@@ -631,7 +632,7 @@ class DNService:
         webhook_emit('dn.delivered', {
             'dn_id': dn.id, 'status': 'delivered', 'order_number': dn.order_number,
             'tracking_number': tracking_number,
-        })
+        }, api_key_id=dn.api_key_id)
 
         return dn
 
@@ -654,7 +655,7 @@ class DNService:
 
         webhook_emit('dn.completed', {
             'dn_id': dn.id, 'status': 'completed', 'order_number': dn.order_number,
-        })
+        }, api_key_id=dn.api_key_id)
 
         return dn
     

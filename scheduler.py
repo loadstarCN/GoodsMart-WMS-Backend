@@ -17,7 +17,7 @@ def init_scheduler(app):
     """初始化并启动定时任务调度器"""
     app.config['SCHEDULER_API_ENABLED'] = False
 
-    webhook_interval = int(os.getenv('WEBHOOK_PUSH_INTERVAL_MINUTES', '1'))
+    webhook_interval = int(os.getenv('WEBHOOK_PUSH_INTERVAL_MINUTES', '30'))
     snapshot_hour = int(os.getenv('SNAPSHOT_HOUR', '2'))
     snapshot_minute = int(os.getenv('SNAPSHOT_MINUTE', '0'))
 

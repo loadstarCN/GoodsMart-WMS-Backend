@@ -71,6 +71,9 @@ class ASNList(Resource):
         api_company_id = get_api_key_company_id()
         if api_company_id:
             data['company_id'] = api_company_id
+        # 记录创建来源 API Key（用于定向 Webhook 推送）
+        if g.current_system and g.current_system.get('api_key'):
+            data['api_key_id'] = g.current_system['api_key'].id
         created_by = g.current_user.id
         new_asn = ASNService.create_asn(data, created_by)
         return new_asn, 201

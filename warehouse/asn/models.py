@@ -87,9 +87,16 @@ class ASN(db.Model):
         nullable=False,
         info={'description': '创建人ID'}
     )
+    api_key_id = db.Column(
+        db.Integer,
+        db.ForeignKey('api_keys.id', ondelete='SET NULL'),
+        nullable=True,
+        index=True,
+        info={'description': '创建来源 API Key ID（用于定向 Webhook 推送）'}
+    )
     created_at = db.Column(
         db.DateTime,
-        default=db.func.now(),  
+        default=db.func.now(),
         info={'description': '创建时间'}
     )
     updated_at = db.Column(

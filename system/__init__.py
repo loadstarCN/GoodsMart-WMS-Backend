@@ -4,6 +4,7 @@ from .user.schemas import api_ns as user_ns
 from .logs.schemas import api_ns as logs_ns
 from .third_party.schemas import api_ns as third_party_ns
 from .limiter.schemas import api_ns as limiter_ns
+from .webhook.schemas import api_ns as webhook_ns
 
 blueprint = Blueprint('user_api', __name__)
 api = Api(
@@ -29,4 +30,5 @@ api.add_namespace(user_ns,path='/user')
 api.add_namespace(logs_ns,path='/logs')
 api.add_namespace(third_party_ns,path='/third-party')
 api.add_namespace(limiter_ns,path='/limiter')
+api.add_namespace(webhook_ns,path='/webhook')
 

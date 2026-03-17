@@ -13,35 +13,42 @@ from .models import WebhookEvent
 
 logger = logging.getLogger(__name__)
 
-# 重试间隔（秒）：1分钟、5分钟、30分钟、2小时、6小时
-RETRY_INTERVALS = [60, 300, 1800, 7200, 21600]
-MAX_ATTEMPTS = 5
+# 重试配置：每 30 分钟自动重试，最多 10 次，与 Wholesale 保持一致
+RETRY_INTERVAL_SECONDS = 1800  # 30 分钟
+MAX_ATTEMPTS = 10
 
 
-def emit(event_type, payload):
-    """创建 Webhook 事件记录
+def emit(event_type, payload, api_key_id=None):
+    """创建 Webhook 事件记录（定向推送）
 
-    为所有配置了 webhook_url 的活跃 APIKey 创建事件。
+    只为指定的 API Key 创建事件。如果未指定 api_key_id，则不推送
+    （WMS 内部手动创建的单据不触发 Webhook）。
 
     Args:
         event_type: 事件类型，如 'dn.delivered', 'asn.completed'
         payload: 事件数据（dict）
+        api_key_id: 目标 API Key ID（创建该单据的来源方）
     """
-    api_keys = APIKey.query.filter(
+    if not api_key_id:
+        return
+
+    api_key = APIKey.query.filter(
+        APIKey.id == api_key_id,
         APIKey.is_active == True,
         APIKey.webhook_url.isnot(None),
         APIKey.webhook_url != '',
-    ).all()
+    ).first()
 
-    for api_key in api_keys:
-        event = WebhookEvent(
-            api_key_id=api_key.id,
-            event_type=event_type,
-            payload=payload,
-            status='pending',
-        )
-        db.session.add(event)
+    if not api_key:
+        return
 
+    event = WebhookEvent(
+        api_key_id=api_key.id,
+        event_type=event_type,
+        payload=payload,
+        status='pending',
+    )
+    db.session.add(event)
     db.session.flush()
 
 
@@ -99,9 +106,8 @@ def _send_event(event):
         if event.attempts >= MAX_ATTEMPTS:
             event.status = 'failed'
         else:
-            # 指数退避
-            interval = RETRY_INTERVALS[min(event.attempts - 1, len(RETRY_INTERVALS) - 1)]
-            event.next_retry_at = datetime.now() + timedelta(seconds=interval)
+            # 固定 30 分钟间隔重试
+            event.next_retry_at = datetime.now() + timedelta(seconds=RETRY_INTERVAL_SECONDS)
 
         return False
 
