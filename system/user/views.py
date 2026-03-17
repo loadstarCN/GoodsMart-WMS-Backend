@@ -3,7 +3,7 @@ from flask_jwt_extended import get_current_user, jwt_required
 from flask_restx import Resource, abort
 from extensions.error import UnauthorizedException
 from system.common import paginate, permission_required
-from .schemas import api_ns, user_model, role_model, permission_model, user_input_model, role_input_model, permission_input_model, pagination_parser, user_pagination_model, role_pagination_model, permission_pagination_model, login_model,password_change_model
+from .schemas import api_ns, user_model, role_model, permission_model, user_input_model, role_input_model, permission_input_model, pagination_parser, user_pagination_model, role_pagination_model, permission_pagination_model, login_model, password_change_model, forgot_password_model, reset_password_model
 from .services import UserService, RoleService, PermissionService
 
 # ------------------------
@@ -76,6 +76,41 @@ class UserPassword(Resource):
         )
         return {"message": "Password updated successfully"}, 200
         
+
+@api_ns.route('/forgot-password')
+class ForgotPassword(Resource):
+
+    @api_ns.expect(forgot_password_model)
+    def post(self):
+        """发送密码重置验证码"""
+        email = api_ns.payload.get('email')
+        if not email:
+            return {"message": "Email is required"}, 400
+        try:
+            UserService.forgot_password(email)
+            return {"message": "Verification code sent"}, 200
+        except Exception as e:
+            return {"message": str(e)}, 400
+
+
+@api_ns.route('/reset-password')
+class ResetPassword(Resource):
+
+    @api_ns.expect(reset_password_model)
+    def post(self):
+        """验证码验证并重置密码"""
+        data = api_ns.payload
+        email = data.get('email')
+        code = data.get('code')
+        new_password = data.get('new_password')
+        if not all([email, code, new_password]):
+            return {"message": "All fields are required"}, 400
+        try:
+            UserService.reset_password(email, code, new_password)
+            return {"message": "Password reset successfully"}, 200
+        except Exception as e:
+            return {"message": str(e)}, 400
+
 
 @api_ns.doc(security="jsonWebToken")
 @api_ns.route('/users')
@@ -205,7 +240,7 @@ class RoleDetail(Resource):
 @api_ns.route('/permissions')
 class PermissionList(Resource):
 
-    @permission_required(["all_access", "permission_read"])
+    @permission_required(["all_access", "company_all_access", "permission_read"])
     @api_ns.expect(pagination_parser)
     @api_ns.marshal_with(permission_pagination_model)
     def get(self):

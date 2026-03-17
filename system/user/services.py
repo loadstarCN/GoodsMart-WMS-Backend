@@ -1,3 +1,4 @@
+import random
 from datetime import datetime, timedelta
 import re
 from flask import current_app
@@ -5,10 +6,13 @@ from flask_jwt_extended import create_access_token, create_refresh_token
 from flask_restx import abort
 from extensions.db import *
 from extensions.error import BadRequestException, NotFoundException, UnauthorizedException
+from extensions.redis import redis_client
 from extensions.transaction import transactional
 from .models import User, Role, Permission
 
 EMAIL_REGEX = r'^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$'
+RESET_CODE_PREFIX = 'pwd_reset:'
+RESET_CODE_TTL = 300  # 5 minutes
 
 class UserService:
 
@@ -203,6 +207,57 @@ class UserService:
         # 这里使用了 User 模型中的 set_password 方法来加密新密码
         user.set_password(new_password)
         # db.session.commit()
+
+    @staticmethod
+    def forgot_password(email: str):
+        """发送密码重置验证码到邮箱"""
+        user = User.query.filter_by(email=email).first()
+        if not user:
+            raise NotFoundException("User not found", 13002)
+        if not user.is_active:
+            raise BadRequestException("User is not active", 11006)
+
+        # 生成 6 位验证码
+        code = f'{random.randint(0, 999999):06d}'
+
+        # 存入 Redis，5 分钟过期
+        redis_client.setex(f'{RESET_CODE_PREFIX}{email}', RESET_CODE_TTL, code)
+
+        # 发送邮件
+        from system.settings.services import SettingsService
+        html = f"""
+        <div style="font-family: Arial, sans-serif; max-width: 480px; margin: 0 auto; padding: 30px;">
+            <h2 style="color: #4a6cf7; margin-bottom: 20px;">GoodsMart WMS</h2>
+            <p>You are resetting your password. Use the verification code below:</p>
+            <div style="background: #f5f7ff; border-radius: 8px; padding: 20px; text-align: center; margin: 20px 0;">
+                <span style="font-size: 32px; font-weight: bold; letter-spacing: 8px; color: #4a6cf7;">{code}</span>
+            </div>
+            <p style="color: #666;">This code expires in <strong>5 minutes</strong>.</p>
+            <p style="color: #666;">If you did not request this, please ignore this email.</p>
+            <hr style="border: none; border-top: 1px solid #eee; margin: 24px 0;">
+            <p style="color: #999; font-size: 12px;">GoodsMart Warehouse Management System</p>
+        </div>
+        """
+        SettingsService.send_email(email, 'Password Reset Code - GoodsMart WMS', html)
+
+    @staticmethod
+    @transactional
+    def reset_password(email: str, code: str, new_password: str):
+        """验证验证码并重置密码"""
+        stored_code = redis_client.get(f'{RESET_CODE_PREFIX}{email}')
+        if not stored_code:
+            raise BadRequestException("Verification code expired or not found", 10007)
+
+        if stored_code.decode('utf-8') != code:
+            raise BadRequestException("Invalid verification code", 10008)
+
+        user = User.query.filter_by(email=email).first()
+        if not user:
+            raise NotFoundException("User not found", 13002)
+
+        user.set_password(new_password)
+        # 清除已使用的验证码
+        redis_client.delete(f'{RESET_CODE_PREFIX}{email}')
 
 
 class RoleService:

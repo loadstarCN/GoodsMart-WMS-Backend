@@ -20,6 +20,16 @@ password_change_model = api_ns.model('PasswordChange', {
     'new_password': fields.String(required=True, description='New Password'),
 })
 
+forgot_password_model = api_ns.model('ForgotPassword', {
+    'email': fields.String(required=True, description='User Email'),
+})
+
+reset_password_model = api_ns.model('ResetPassword', {
+    'email': fields.String(required=True, description='User Email'),
+    'code': fields.String(required=True, description='Verification Code'),
+    'new_password': fields.String(required=True, description='New Password'),
+})
+
 # -----------------------------
 # 定义用于响应的简单用户模型（仅包含 id 和 user_name）
 # -----------------------------
