@@ -52,6 +52,7 @@ class CarrierService:
         """
         new_carrier = Carrier(
             name=data['name'],
+            code=data.get('code'),
             address=data.get('address'),
             phone=data.get('phone'),
             zip_code=data.get('zip_code'),
@@ -74,6 +75,7 @@ class CarrierService:
         carrier = CarrierService.get_carrier(carrier_id)
 
         carrier.name = data.get('name', carrier.name)
+        carrier.code = data.get('code', carrier.code)
         carrier.address = data.get('address', carrier.address)
         carrier.phone = data.get('phone', carrier.phone)
         carrier.zip_code = data.get('zip_code', carrier.zip_code)

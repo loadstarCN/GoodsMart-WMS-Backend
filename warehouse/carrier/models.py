@@ -24,9 +24,14 @@ class Carrier(db.Model):
 
     id = db.Column(db.Integer, primary_key=True)
     name = db.Column(
-        db.String(255), 
+        db.String(255),
         nullable=False,
         info={'description': '承运商名称（同公司下唯一）'}
+    )
+    code = db.Column(
+        db.String(30),
+        nullable=True,
+        info={'description': '承运商编码（如 yamato），用于跨系统匹配'}
     )
     address = db.Column(
         db.String(255), 

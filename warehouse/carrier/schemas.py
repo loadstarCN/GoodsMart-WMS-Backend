@@ -15,6 +15,7 @@ user_model = api_ns.model('User', original_user_model)
 carrier_simple_model = api_ns.model('CarrierSimple', {
     'id': fields.Integer(readOnly=True, description='Carrier ID'),
     'name': fields.String(required=True, description='Carrier Name'),
+    'code': fields.String(description='Carrier Code'),
 })
 
 
@@ -24,6 +25,7 @@ carrier_simple_model = api_ns.model('CarrierSimple', {
 carrier_fields = {
     'id': fields.Integer(readOnly=True, description='Carrier ID'),
     'name': fields.String(required=True, description='Carrier Name'),
+    'code': fields.String(description='Carrier Code (e.g. yamato)'),
     'address': fields.String(description='Carrier Address'),
     'zip_code': fields.String(description='Carrier Zip Code'),
     'phone': fields.String(description='Carrier Phone'),

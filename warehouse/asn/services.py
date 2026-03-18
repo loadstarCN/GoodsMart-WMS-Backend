@@ -183,6 +183,16 @@ class ASNService:
         if 'expected_arrival_date' in data and isinstance(data['expected_arrival_date'], str):
             data['expected_arrival_date'] = datetime.strptime(data['expected_arrival_date'], '%Y-%m-%d').date()
 
+        # 支持通过 carrier_code 解析 carrier_id（跨系统匹配）
+        if not data.get('carrier_id') and data.get('carrier_code'):
+            from warehouse.carrier.models import Carrier
+            carrier = Carrier.query.filter_by(
+                code=data['carrier_code'],
+                company_id=data.get('company_id', 1),
+            ).first()
+            if carrier:
+                data['carrier_id'] = carrier.id
+
         new_asn = ASN(
             supplier_id=data['supplier_id'],
             tracking_number=data.get('tracking_number'),
