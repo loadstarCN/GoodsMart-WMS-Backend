@@ -1,4 +1,4 @@
-from sqlalchemy import func
+from sqlalchemy import func, case
 from sqlalchemy.orm import lazyload
 from extensions.db import *
 from extensions.error import BadRequestException, NotFoundException
@@ -504,17 +504,29 @@ class InventoryService:
 
         from warehouse.dn.models import DN,DNDetail
 
-        # 计算 DN 库存
-        # 构建查询：求和 DN.quantity
-        total_quantity = db.session.query(func.coalesce(func.sum(DNDetail.quantity), 0)).\
+        # 计算 DN 预扣库存（dn_stock）
+        # dn_stock 代表「已被 DN 占用、但尚未实际拣出」的预扣量，必须涵盖所有仍持有
+        # 预扣的 DN，而不能只统计 pending：
+        #   - pending / in_progress：尚未拣货，按计划量(quantity)全额预扣
+        #   - picked / packed / delivered / completed：dn_picked 已按实际拣货量扣减过，
+        #     仅剩短拣未拣部分(quantity - picked_quantity)继续预扣，与增量扣减保持一致
+        #   - closed 及其他：预扣已释放，计 0
+        # 若此处只数 pending，DN 一旦进入 in_progress 就会在重聚合时被清掉预扣，
+        # 导致后续 picking_dn → dn_picked 时 dn_stock < picked_quantity 误报 15008。
+        reserved_expr = case(
+            (DN.status.in_(['pending', 'in_progress']), DNDetail.quantity),
+            (DN.status.in_(['picked', 'packed', 'delivered', 'completed']),
+                DNDetail.quantity - DNDetail.picked_quantity),
+            else_=0
+        )
+        total_quantity = db.session.query(func.coalesce(func.sum(reserved_expr), 0)).\
             join(DN, DNDetail.dn_id == DN.id).\
             filter(
                 DNDetail.goods_id == goods_id,
                 DN.warehouse_id == warehouse_id,
                 DN.is_active == True,
-                DN.status == 'pending'
             ).scalar()
-        
+
         inventory.dn_stock = total_quantity
 
         db.session.add(inventory)

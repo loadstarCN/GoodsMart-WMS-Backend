@@ -1,6 +1,7 @@
 from warehouse.inventory.services import InventoryService
 from .helpers import *
 from warehouse.picking.services import PickingTaskService
+from extensions.error import BadRequestException
 
 # ---------------------------------------------------------
 # 以下为测试视图层 (views.py) 逻辑的用例
@@ -490,3 +491,73 @@ def test_complete_task_transaction_rollback(client, monkeypatch):
         refreshed_task = get_picking_task_by_id(task.id)
         assert refreshed_task.status != "completed"
         assert refreshed_task.status == "in_progress"
+
+
+def test_create_batch_within_planned_succeeds(client):
+    """回归(Bug B)：累计已拣量不超过 DN 计划量时，create_batch 正常成功。"""
+    with client.application.app_context():
+        admin_user = get_operator_user()
+        task = get_picking_task()                       # dn3：goods_1 计划 40，已拣 10
+        PickingTaskService.process_task(task.id, admin_user.id)
+        planned_goods_id = task.dn.details[0].goods_id  # 计划内商品(goods_1)
+        location = get_location()
+
+        # 10 + 25 = 35 <= 40 → 允许
+        batch = PickingTaskService.create_batch(task.id, {
+            "details": [
+                {"location_id": location.id, "goods_id": planned_goods_id, "picked_quantity": 25},
+            ]
+        }, admin_user.id)
+        assert batch is not None
+
+
+def test_create_batch_rejects_overpick(client):
+    """
+    回归(Bug B)：同一计划商品的累计已拣量(现有 + 本次)超过 DN 计划量时必须拒绝(16029)。
+
+    这是「重复/超量提交」污染数据的根因防线：旧实现 create_batch 纯追加、无上限校验，
+    断网重试 / token 过期重登 / 连点都会不断累加 picked_quantity，最终撑大到计划量数倍，
+    并在 dn_picked 处误报 15008(DN库存不足)、使单据永久无法完成。
+    """
+    with client.application.app_context():
+        admin_user = get_operator_user()
+        task = get_picking_task()                       # goods_1 计划 40，已拣 10
+        PickingTaskService.process_task(task.id, admin_user.id)
+        planned_goods_id = task.dn.details[0].goods_id
+        location = get_location()
+
+        # 10 + 35 = 45 > 40 → 拒绝
+        with pytest.raises(BadRequestException, match="exceeds planned quantity"):
+            PickingTaskService.create_batch(task.id, {
+                "details": [
+                    {"location_id": location.id, "goods_id": planned_goods_id, "picked_quantity": 35},
+                ]
+            }, admin_user.id)
+
+
+def test_complete_task_rejects_overpicked_data(client):
+    """
+    回归(Bug B)：对已被重复提交污染(累计已拣 > 计划)的历史单据，
+    complete_task 给出明确的 16029，而非在 dn_picked 处误报 15008 或撞数据库约束。
+    """
+    with client.application.app_context():
+        admin_user = get_operator_user()
+        task = get_picking_task()                       # goods_1 计划 40，已拣 10
+        PickingTaskService.process_task(task.id, admin_user.id)
+        planned_goods_id = task.dn.details[0].goods_id
+        location = get_location()
+
+        # 绕过 create_batch 直接注入超量明细，模拟历史脏数据：goods_1 再 +35 → 累计 45 > 40
+        batch = PickingTaskService.create_batch(task.id, {"remark": "seed"}, admin_user.id)
+        db.session.add(PickingTaskDetail(
+            picking_task_id=task.id,
+            batch_id=batch.id,
+            location_id=location.id,
+            goods_id=planned_goods_id,
+            picked_quantity=35,
+            operator_id=admin_user.id,
+        ))
+        db.session.commit()
+
+        with pytest.raises(BadRequestException, match="exceeds planned quantity"):
+            PickingTaskService.complete_task(task.id, admin_user.id)

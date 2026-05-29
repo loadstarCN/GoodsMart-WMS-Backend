@@ -379,3 +379,36 @@ def test_check_stock_thresholds(client):
         status = InventoryService.check_stock_thresholds(goods_id, warehouse_id)
         assert status["is_below_low_threshold"] is False
         assert status["is_above_high_threshold"] is False
+
+
+def test_update_and_calculate_dn_stock_counts_in_progress(client):
+    """
+    回归(Bug A)：dn_stock 重聚合必须把 in_progress 的 DN 预扣计入。
+
+    旧实现只统计 status == 'pending'，导致 DN 一进入拣货(in_progress)，
+    后续任何重聚合(如别的 DN 增删改/关闭)都会把它的预扣清掉，
+    最终在 picking_dn → dn_picked 时 dn_stock < picked_quantity 误报 15008(DN库存不足)。
+    """
+    with client.application.app_context():
+        # 取一个处于 in_progress 的 DN，及其中一个商品
+        dn_ip = DN.query.filter_by(status='in_progress', is_active=True).first()
+        assert dn_ip is not None, "fixture 需包含 in_progress 的 DN"
+        gid = dn_ip.details[0].goods_id
+        wid = dn_ip.warehouse_id
+
+        def planned_sum(status):
+            total = 0
+            for d in DN.query.filter_by(warehouse_id=wid, is_active=True, status=status).all():
+                total += sum(det.quantity for det in d.details if det.goods_id == gid)
+            return total
+
+        pending_q = planned_sum('pending')
+        inprogress_q = planned_sum('in_progress')
+        assert inprogress_q > 0, "该商品需存在于 in_progress 的 DN 中才能验证此回归"
+
+        InventoryService.update_and_calculate_dn_stock(gid, wid)
+        inv = Inventory.query.filter_by(goods_id=gid, warehouse_id=wid).first()
+
+        # 关键：dn_stock 必须同时包含 pending 与 in_progress 的预扣，而不只是 pending
+        assert inv.dn_stock == pending_q + inprogress_q
+        assert inv.dn_stock > pending_q

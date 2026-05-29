@@ -216,6 +216,42 @@ class PickingTaskService:
         return task.batches  # 返回 relationship 列表
 
     @staticmethod
+    def _assert_within_planned(task: PickingTask, extra_by_goods: dict | None = None):
+        """
+        按商品维度校验拣货任务的累计已拣量不超过其 DN 的计划出库量。
+
+        累计量 = task_details 现有已拣量 + extra_by_goods 本次拟新增量。
+
+        create_batch 是纯追加操作，前端断网重试、token 过期重登、连点等都会重复
+        append picked_quantity，撑大 total_picked_quantity，并最终在 dn_picked 处
+        误报 15008（DN库存不足）、污染数据且使单据永久无法完成。此校验作为服务端
+        权威防线，与 DNDetail 上 `picked_quantity <= quantity` 的数据库约束对齐。
+        """
+        extra_by_goods = extra_by_goods or {}
+
+        planned = {}
+        for d in task.dn.details:
+            planned[d.goods_id] = planned.get(d.goods_id, 0) + (d.quantity or 0)
+
+        picked = {}
+        for td in task.task_details:
+            picked[td.goods_id] = picked.get(td.goods_id, 0) + (td.picked_quantity or 0)
+
+        for gid in set(picked) | set(extra_by_goods):
+            # 仅对 DN 计划明细内的商品做上限校验。计划外商品维持系统既有的宽容行为
+            #（_update_and_calculate_quantity 只按 DN 明细聚合，计划外拣货量本就被忽略），
+            # 本校验不扩大限制范围，只精准拦截「同一计划商品被重复/超量拣」。
+            if gid not in planned:
+                continue
+            total = picked.get(gid, 0) + extra_by_goods.get(gid, 0)
+            if total > planned[gid]:
+                raise BadRequestException(
+                    f"Picked quantity exceeds planned quantity for goods {gid}: "
+                    f"total {total} > planned {planned[gid]}.",
+                    16029
+                )
+
+    @staticmethod
     @transactional
     def create_batch(task_or_id: int | PickingTask, data: dict, operator_id: int) -> PickingBatch:
         """
@@ -259,7 +295,16 @@ class PickingTaskService:
         # 2. 强制校验类型（若存在且非列表则报错）
         if details_data is not None and not isinstance(details_data, list):
             raise BadRequestException("'details' must be a list (empty is allowed)", 16015)
-        
+
+        # 3. 权威校验：累计已拣量（现有 + 本次）不得超过 DN 计划量，
+        #    阻止重复 / 超量提交污染数据（见 _assert_within_planned）。
+        incoming_by_goods = {}
+        for item in details_data:
+            gid = item.get('goods_id')
+            if gid is not None:
+                incoming_by_goods[gid] = incoming_by_goods.get(gid, 0) + (item.get('picked_quantity', 0) or 0)
+        PickingTaskService._assert_within_planned(task, incoming_by_goods)
+
         for item in details_data:
             detail_obj = PickingTaskDetail(
                 picking_task_id=task.id,
@@ -384,7 +429,11 @@ class PickingTaskService:
         task = PickingTaskService._get_instance(task_or_id)
         if task.status != 'in_progress':
             raise BadRequestException("Cannot complete a non-in_progress Picking Task", 16008)
-        
+
+        # 防御性校验：累计已拣量不得超过 DN 计划量。对已被重复提交污染的历史单据
+        # 给出明确报错（16029），而非在 dn_picked 处误报 15008 或撞数据库约束。
+        PickingTaskService._assert_within_planned(task)
+
         task = PickingTaskService._update_task_status(task, 'completed', operator_id)
 
         for detail in task.task_details:
