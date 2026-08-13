@@ -1,3 +1,5 @@
+import hashlib
+
 from extensions.db import db
 
 class Recipient(db.Model):
@@ -5,7 +7,6 @@ class Recipient(db.Model):
     
     Attributes:
         name: 收件方名称
-        external_reference: 外部系统配送地址唯一标识（同一公司下唯一）
         country: 国家代码 (ISO 3166-1 alpha-2)
         is_active: 启用状态 (默认激活)
         company_id: 所属公司ID (外键不可删除)
@@ -17,11 +18,7 @@ class Recipient(db.Model):
         db.Index('idx_recipient_company_country', 'company_id', 'country'),  # 公司+国家组合查询
         db.Index('idx_recipient_geo', 'country', 'zip_code'),  # 地理维度查询加速
         
-        # Web 配送地址的稳定标识。同名收件人、同一人的多个地址必须允许并存。
-        db.UniqueConstraint(
-            'company_id', 'external_reference',
-            name='uq_company_recipient_external_reference',
-        ),
+        db.UniqueConstraint('company_id', 'name', name='uq_company_recipient'),
     )
 
     id = db.Column(db.Integer, primary_key=True)
@@ -29,11 +26,6 @@ class Recipient(db.Model):
         db.String(255), 
         nullable=False,
         info={'description': '收件方名称'}
-    )
-    external_reference = db.Column(
-        db.String(100),
-        nullable=True,
-        info={'description': '外部系统配送地址唯一标识'}
     )
     address = db.Column(
         db.String(255), 
@@ -109,4 +101,73 @@ class Recipient(db.Model):
         lazy='joined',
         info={'description': '所属公司对象'}
     )
+
+    external_mapping = db.relationship(
+        'RecipientExternalMapping',
+        back_populates='recipient',
+        uselist=False,
+        cascade='all, delete-orphan',
+        lazy='joined',
+    )
+
+    @property
+    def display_name(self):
+        return (
+            self.external_mapping.display_name
+            if self.external_mapping else self.name
+        )
+
+    @property
+    def external_reference(self):
+        return (
+            self.external_mapping.external_reference
+            if self.external_mapping else None
+        )
+
+    @property
+    def display_email(self):
+        return (
+            self.external_mapping.email
+            if self.external_mapping else self.email
+        )
+
+    @staticmethod
+    def integration_storage_name(display_name, external_reference):
+        """生成不暴露给 API/UI 的稳定技术名，绕开历史姓名唯一约束。"""
+        suffix = hashlib.sha256(
+            str(external_reference).encode('utf-8')
+        ).hexdigest()[:16]
+        prefix = str(display_name or 'Recipient')[:230]
+        return f'{prefix} [ext:{suffix}]'
+
+
+class RecipientExternalMapping(db.Model):
+    """外部配送地址与历史 Recipient 的一对一映射。"""
+    __tablename__ = 'recipient_external_mappings'
+    __table_args__ = (
+        db.UniqueConstraint(
+            'company_id', 'external_reference',
+            name='uq_recipient_external_mapping_company_reference',
+        ),
+        db.UniqueConstraint(
+            'recipient_id', name='uq_recipient_external_mapping_recipient'
+        ),
+    )
+
+    id = db.Column(db.Integer, primary_key=True)
+    company_id = db.Column(db.Integer, nullable=False, index=True)
+    external_reference = db.Column(db.String(100), nullable=False)
+    recipient_id = db.Column(
+        db.Integer,
+        db.ForeignKey('recipients.id', ondelete='CASCADE'),
+        nullable=False,
+    )
+    display_name = db.Column(db.String(255), nullable=False)
+    email = db.Column(db.String(255))
+    created_at = db.Column(db.DateTime, default=db.func.now())
+    updated_at = db.Column(
+        db.DateTime, default=db.func.now(), onupdate=db.func.now()
+    )
+
+    recipient = db.relationship('Recipient', back_populates='external_mapping')
 

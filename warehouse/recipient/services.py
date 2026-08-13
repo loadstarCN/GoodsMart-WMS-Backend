@@ -1,6 +1,6 @@
 from extensions.db import db, get_object_or_404
 from extensions.transaction import transactional
-from .models import Recipient
+from .models import Recipient, RecipientExternalMapping
 
 class RecipientService:
 
@@ -22,14 +22,24 @@ class RecipientService:
         """
         query = Recipient.query.order_by(Recipient.id.desc())
 
+        if any(filters.get(key) for key in (
+            'external_reference', 'name', 'email', 'keyword'
+        )):
+            query = query.outerjoin(RecipientExternalMapping)
+
         if filters.get('company_id'):
             query = query.filter(Recipient.company_id == filters['company_id'])
         if filters.get('external_reference'):
             query = query.filter(
-                Recipient.external_reference == filters['external_reference']
+                RecipientExternalMapping.external_reference
+                == filters['external_reference']
             )
         if filters.get('name'):
-            query = query.filter(Recipient.name.ilike(f"%{filters['name']}%"))
+            value = f"%{filters['name']}%"
+            query = query.filter(db.or_(
+                RecipientExternalMapping.display_name.ilike(value),
+                Recipient.name.ilike(value),
+            ))
         if filters.get('address'):
             query = query.filter(Recipient.address.ilike(f"%{filters['address']}%"))
         if filters.get('zip_code'):
@@ -37,13 +47,18 @@ class RecipientService:
         if filters.get('phone'):
             query = query.filter(Recipient.phone.ilike(f"%{filters['phone']}%"))
         if filters.get('email'):
-            query = query.filter(Recipient.email.ilike(f"%{filters['email']}%"))
+            value = f"%{filters['email']}%"
+            query = query.filter(db.or_(
+                RecipientExternalMapping.email.ilike(value),
+                Recipient.email.ilike(value),
+            ))
         if filters.get('country'):
             query = query.filter(Recipient.country.ilike(f"%{filters['country']}%"))
         if filters.get('keyword'):
             keyword = f"%{filters['keyword']}%"
             query = query.filter(db.or_(
                 Recipient.name.ilike(keyword),
+                RecipientExternalMapping.display_name.ilike(keyword),
                 Recipient.address.ilike(keyword),
                 Recipient.phone.ilike(keyword),
                 Recipient.contact.ilike(keyword),
@@ -82,13 +97,17 @@ class RecipientService:
         """
         创建新 Recipient
         """
+        external_reference = data.get('external_reference')
         new_recipient = Recipient(
-            name=data['name'],
-            external_reference=data.get('external_reference'),
+            name=(
+                Recipient.integration_storage_name(
+                    data['name'], external_reference
+                ) if external_reference else data['name']
+            ),
             address=data.get('address'),
             zip_code=data.get('zip_code'),
             phone=data.get('phone'),
-            email=data.get('email'),
+            email=None if external_reference else data.get('email'),
             contact=data.get('contact'),
             country=data['country'],
             is_active=data.get('is_active', True),
@@ -96,7 +115,15 @@ class RecipientService:
             company_id=data['company_id']
         )
         db.session.add(new_recipient)
-        # db.session.commit()
+        db.session.flush()
+        if external_reference:
+            db.session.add(RecipientExternalMapping(
+                company_id=data['company_id'],
+                external_reference=str(external_reference),
+                recipient_id=new_recipient.id,
+                display_name=data['name'],
+                email=data.get('email'),
+            ))
         return new_recipient
 
     @staticmethod
@@ -108,14 +135,32 @@ class RecipientService:
         """
         recipient = RecipientService.get_recipient(recipient_id, company_id)
 
-        recipient.name = data.get('name', recipient.name)
-        recipient.external_reference = data.get(
-            'external_reference', recipient.external_reference
-        )
+        external_reference = data.get('external_reference')
+        mapping = recipient.external_mapping
+        if external_reference and mapping is None:
+            mapping = RecipientExternalMapping(
+                company_id=recipient.company_id,
+                external_reference=str(external_reference),
+                recipient_id=recipient.id,
+                display_name=data.get('name', recipient.name),
+                email=data.get('email'),
+            )
+            db.session.add(mapping)
+            recipient.external_mapping = mapping
+        elif mapping is not None:
+            if external_reference:
+                mapping.external_reference = str(external_reference)
+            mapping.display_name = data.get('name', mapping.display_name)
+            if 'email' in data:
+                mapping.email = data['email']
+
+        if mapping is None:
+            recipient.name = data.get('name', recipient.name)
         recipient.address = data.get('address', recipient.address)
         recipient.zip_code = data.get('zip_code', recipient.zip_code)
         recipient.phone = data.get('phone', recipient.phone)
-        recipient.email = data.get('email', recipient.email)
+        if mapping is None:
+            recipient.email = data.get('email', recipient.email)
         recipient.contact = data.get('contact', recipient.contact)
         recipient.country = data.get('country', recipient.country)
         recipient.is_active = data.get('is_active', recipient.is_active)

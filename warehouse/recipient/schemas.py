@@ -16,7 +16,7 @@ user_model = api_ns.model('User', original_user_model)
 
 recipient_base_model = api_ns.model('RecipientBase', {
     'id': fields.Integer(readOnly=True, description='Recipient ID'),
-    'name': fields.String(required=True, description='Recipient Name'),
+    'name': fields.String(required=True, attribute='display_name', description='Recipient Name'),
 })
 
 # -----------------------------
@@ -24,12 +24,12 @@ recipient_base_model = api_ns.model('RecipientBase', {
 # -----------------------------
 recipient_fields = {
     'id': fields.Integer(readOnly=True, description='Recipient ID'),
-    'name': fields.String(required=True, description='Recipient Name'),
+    'name': fields.String(required=True, attribute='display_name', description='Recipient Name'),
     'external_reference': fields.String(description='External delivery address ID'),
     'address': fields.String(description='Recipient Address'),
     'zip_code': fields.String(description='Recipient Zip Code'),
     'phone': fields.String(description='Recipient Phone'),
-    'email': fields.String(description='Recipient Email'),
+    'email': fields.String(attribute='display_email', description='Recipient Email'),
     'contact': fields.String(description='Contact Person'),
     'country': fields.String(required=True, description='Country Code (e.g., cn, jp)'),
     'is_active': fields.Boolean(description='Is the recipient active?'),
