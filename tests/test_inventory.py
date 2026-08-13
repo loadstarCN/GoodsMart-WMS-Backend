@@ -223,6 +223,21 @@ def test_inventory_service_picking_completed(client):
         assert inventory.picked_stock == initial_picked_stock + 2
 
 
+def test_partial_pick_releases_unpicked_dn_reservation(client):
+    """A short pick moves the real quantity and releases the remaining reservation."""
+    with client.application.app_context():
+        inventory = get_inventory()
+        inventory.dn_stock = 2
+        initial_picked_stock = inventory.picked_stock
+
+        InventoryService.dn_picked(
+            inventory.goods_id, inventory.warehouse_id, quantity=2, picked_quantity=1
+        )
+
+        assert inventory.dn_stock == 0
+        assert inventory.picked_stock == initial_picked_stock + 1
+
+
 def test_inventory_service_packing_completed(client):
     """
     测试包装完成：picked_stock 减少，packed_stock 增加
@@ -412,3 +427,33 @@ def test_update_and_calculate_dn_stock_counts_in_progress(client):
         # 关键：dn_stock 必须同时包含 pending 与 in_progress 的预扣，而不只是 pending
         assert inv.dn_stock == pending_q + inprogress_q
         assert inv.dn_stock > pending_q
+
+
+def test_dn_stock_recalculation_releases_short_pick_difference(client):
+    """Completed picking must not re-reserve the quantity that was not found."""
+    with client.application.app_context():
+        dn = DN.query.filter_by(status='in_progress', is_active=True).first()
+        detail = dn.details[0]
+        detail.quantity = 2
+        detail.picked_quantity = 1
+        dn.status = 'picked'
+
+        # Isolate this goods/warehouse from other active reservations.
+        for other in DN.query.filter(
+            DN.id != dn.id,
+            DN.warehouse_id == dn.warehouse_id,
+            DN.is_active.is_(True),
+        ).all():
+            for other_detail in other.details:
+                if other_detail.goods_id == detail.goods_id:
+                    other.is_active = False
+                    break
+        db.session.flush()
+
+        InventoryService.update_and_calculate_dn_stock(
+            detail.goods_id, dn.warehouse_id
+        )
+        inventory = Inventory.query.filter_by(
+            goods_id=detail.goods_id, warehouse_id=dn.warehouse_id
+        ).first()
+        assert inventory.dn_stock == 0

@@ -19,4 +19,5 @@ jobs:
             cd /var/www/api_wms
             git pull origin main
             pip install -r requirements.txt -q
+            FLASK_ENV=production FLASK_APP=app:create_app flask db upgrade
             pm2 restart wms-api

@@ -3,6 +3,8 @@ from extensions.error import BadRequestException, NotFoundException
 from warehouse.dn.models import DN
 from warehouse.dn.services import DNService
 from warehouse.inventory.services import InventoryService
+from warehouse.goods.models import GoodsLocation
+from warehouse.location.models import Location
 from warehouse.removal.services import RemovalService
 from .models import PickingTask, PickingTaskDetail, PickingTaskStatusLog,PickingBatch
 from extensions.transaction import transactional
@@ -252,6 +254,59 @@ class PickingTaskService:
                 )
 
     @staticmethod
+    def _assert_location_stock(task: PickingTask, details_data: list):
+        """Validate that every picked unit exists in the selected warehouse bin."""
+        requested = {}
+        for item in details_data:
+            goods_id = item.get('goods_id')
+            location_id = item.get('location_id')
+            quantity = item.get('picked_quantity', 0) or 0
+            if quantity <= 0:
+                continue
+            if goods_id is None or location_id is None:
+                raise BadRequestException(
+                    "goods_id and location_id are required for picked items", 16034
+                )
+            key = (goods_id, location_id)
+            requested[key] = requested.get(key, 0) + quantity
+
+        for (goods_id, location_id), quantity in requested.items():
+            stock = (
+                GoodsLocation.query
+                .join(Location, GoodsLocation.location_id == Location.id)
+                .filter(
+                    GoodsLocation.goods_id == goods_id,
+                    GoodsLocation.location_id == location_id,
+                    Location.warehouse_id == task.dn.warehouse_id,
+                )
+                .with_for_update()
+                .first()
+            )
+            if stock is None:
+                raise BadRequestException(
+                    f"Goods {goods_id} has no stock in location {location_id}.", 16035
+                )
+
+            already_reserved = (
+                db.session.query(func.coalesce(func.sum(PickingTaskDetail.picked_quantity), 0))
+                .join(PickingTask)
+                .filter(
+                    PickingTaskDetail.goods_id == goods_id,
+                    PickingTaskDetail.location_id == location_id,
+                    PickingTask.status == 'in_progress',
+                    PickingTask.is_active.is_(True),
+                )
+                .scalar()
+            )
+            available = max((stock.quantity or 0) - (already_reserved or 0), 0)
+            if quantity > available:
+                raise BadRequestException(
+                    f"Insufficient stock in location {location_id} for goods {goods_id}: "
+                    f"requested {quantity}, available {available}.",
+                    16036,
+                )
+
+    @staticmethod
     @transactional
     def create_batch(task_or_id: int | PickingTask, data: dict, operator_id: int) -> PickingBatch:
         """
@@ -304,6 +359,7 @@ class PickingTaskService:
             if gid is not None:
                 incoming_by_goods[gid] = incoming_by_goods.get(gid, 0) + (item.get('picked_quantity', 0) or 0)
         PickingTaskService._assert_within_planned(task, incoming_by_goods)
+        PickingTaskService._assert_location_stock(task, details_data)
 
         for item in details_data:
             detail_obj = PickingTaskDetail(

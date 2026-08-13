@@ -1,10 +1,11 @@
-from extensions.db import *
+from extensions.db import db
 
 class Recipient(db.Model):
     """收件人信息表
     
     Attributes:
-        name: 收件方名称 (同一公司下唯一)
+        name: 收件方名称
+        external_reference: 外部系统配送地址唯一标识（同一公司下唯一）
         country: 国家代码 (ISO 3166-1 alpha-2)
         is_active: 启用状态 (默认激活)
         company_id: 所属公司ID (外键不可删除)
@@ -16,15 +17,23 @@ class Recipient(db.Model):
         db.Index('idx_recipient_company_country', 'company_id', 'country'),  # 公司+国家组合查询
         db.Index('idx_recipient_geo', 'country', 'zip_code'),  # 地理维度查询加速
         
-        # 数据完整性约束
-        db.UniqueConstraint('company_id', 'name', name='uq_company_recipient'),  # 同一公司下名称唯一
+        # Web 配送地址的稳定标识。同名收件人、同一人的多个地址必须允许并存。
+        db.UniqueConstraint(
+            'company_id', 'external_reference',
+            name='uq_company_recipient_external_reference',
+        ),
     )
 
     id = db.Column(db.Integer, primary_key=True)
     name = db.Column(
         db.String(255), 
         nullable=False,
-        info={'description': '收件方名称（同公司下唯一）'}
+        info={'description': '收件方名称'}
+    )
+    external_reference = db.Column(
+        db.String(100),
+        nullable=True,
+        info={'description': '外部系统配送地址唯一标识'}
     )
     address = db.Column(
         db.String(255), 
@@ -44,7 +53,6 @@ class Recipient(db.Model):
     email = db.Column(
         db.String(255), 
         nullable=True,
-        unique=True,
         info={'description': '联系邮箱'}
     )
     contact = db.Column(
@@ -102,4 +110,3 @@ class Recipient(db.Model):
         info={'description': '所属公司对象'}
     )
 
-   

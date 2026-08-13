@@ -312,7 +312,12 @@ class InventoryService:
         inventory = InventoryService._get_for_update(goods_id, warehouse_id)
         if inventory.dn_stock < picked_quantity:
             raise BadRequestException("Not enough DN stock.", 15008)
-        inventory.dn_stock -= picked_quantity
+        # Release this DN's full reservation when picking closes. Only the
+        # physically picked amount moves to picked_stock; any short quantity
+        # becomes available to other DNs again.
+        if inventory.dn_stock < quantity:
+            raise BadRequestException("Not enough DN stock.", 15008)
+        inventory.dn_stock -= quantity
         inventory.picked_stock += picked_quantity
         inventory.total_stock = InventoryService._calculate_total_stock(inventory)
         # db.session.commit()
@@ -508,15 +513,13 @@ class InventoryService:
         # dn_stock 代表「已被 DN 占用、但尚未实际拣出」的预扣量，必须涵盖所有仍持有
         # 预扣的 DN，而不能只统计 pending：
         #   - pending / in_progress：尚未拣货，按计划量(quantity)全额预扣
-        #   - picked / packed / delivered / completed：dn_picked 已按实际拣货量扣减过，
-        #     仅剩短拣未拣部分(quantity - picked_quantity)继续预扣，与增量扣减保持一致
+        #   - picked / packed / delivered / completed：拣货已结束，实际拣出的数量已转入
+        #     picked_stock，短拣差额必须释放，不再继续预扣
         #   - closed 及其他：预扣已释放，计 0
         # 若此处只数 pending，DN 一旦进入 in_progress 就会在重聚合时被清掉预扣，
         # 导致后续 picking_dn → dn_picked 时 dn_stock < picked_quantity 误报 15008。
         reserved_expr = case(
             (DN.status.in_(['pending', 'in_progress']), DNDetail.quantity),
-            (DN.status.in_(['picked', 'packed', 'delivered', 'completed']),
-                DNDetail.quantity - DNDetail.picked_quantity),
             else_=0
         )
         total_quantity = db.session.query(func.coalesce(func.sum(reserved_expr), 0)).\

@@ -535,6 +535,32 @@ def test_create_batch_rejects_overpick(client):
             }, admin_user.id)
 
 
+def test_create_batch_rejects_quantity_above_location_stock(client):
+    """Picking is capped by physical stock in the selected warehouse location."""
+    with client.application.app_context():
+        admin_user = get_operator_user()
+        task = get_picking_task()
+        PickingTaskService.process_task(task.id, admin_user.id)
+        goods_id = task.dn.details[0].goods_id
+        location = get_location()
+        stock = GoodsLocation.query.filter_by(
+            goods_id=goods_id, location_id=location.id
+        ).first()
+        stock.quantity = 1
+        # Isolate this stock boundary from the seeded historical picking details.
+        PickingTaskDetail.query.filter_by(picking_task_id=task.id).delete()
+        db.session.flush()
+
+        with pytest.raises(BadRequestException, match="Insufficient stock in location"):
+            PickingTaskService.create_batch(task.id, {
+                'details': [{
+                    'location_id': location.id,
+                    'goods_id': goods_id,
+                    'picked_quantity': 2,
+                }],
+            }, admin_user.id)
+
+
 def test_complete_task_rejects_overpicked_data(client):
     """
     回归(Bug B)：对已被重复提交污染(累计已拣 > 计划)的历史单据，

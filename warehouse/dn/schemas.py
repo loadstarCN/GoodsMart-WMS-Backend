@@ -137,6 +137,9 @@ dn_model = api_ns.model('DN', asn_full_fields)
 # 5) DN 输入基础模型
 # 生成 DN 输入模型：复制后删除不允许用户输入的字段
 dn_input_fields = generate_input_fields(dn_fields)
+dn_input_fields['carrier_code'] = fields.String(
+    description='Carrier code used by external integrations (e.g. yamato)'
+)
 dn_input_base_model = api_ns.model('DNInputBase', dn_input_fields)
 
 # 6) DN 输入模型（可包含明细输入）

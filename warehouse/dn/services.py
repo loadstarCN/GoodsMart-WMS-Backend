@@ -16,6 +16,29 @@ class DNService:
     related to DN and DNDetail.
     """
 
+    @staticmethod
+    def _assert_new_dn_stock_available(warehouse_id: int, details: list):
+        """Prevent a new DN from reserving more stock than is available."""
+        requested_by_goods = {}
+        for detail in details:
+            goods_id = detail['goods_id']
+            quantity = detail['quantity']
+            requested_by_goods[goods_id] = requested_by_goods.get(goods_id, 0) + quantity
+
+        for goods_id, quantity in requested_by_goods.items():
+            inventory = InventoryService._get_for_update(goods_id, warehouse_id)
+            available = (
+                inventory.onhand_stock
+                - inventory.locked_stock
+                - inventory.dn_stock
+            )
+            if quantity > available:
+                raise BadRequestException(
+                    f"Insufficient available stock for goods {goods_id}: "
+                    f"requested {quantity}, available {max(available, 0)}.",
+                    16032,
+                )
+
     # ------------------------------------
     # DN Services 私有方法
     # ------------------------------------
@@ -216,6 +239,60 @@ class DNService:
         if 'expected_shipping_date' in data and isinstance(data['expected_shipping_date'], str):
             data['expected_shipping_date'] = datetime.strptime(data['expected_shipping_date'], '%Y-%m-%d').date()
             
+        # 跨系统可直接传承运商 code，避免 Wholesale 依赖 WMS 内部自增 ID。
+        if not data.get('carrier_id') and data.get('carrier_code'):
+            from warehouse.carrier.models import Carrier
+            carrier_code = data['carrier_code'].strip().lower()
+            carrier_aliases = {
+                'yamato': ('yamato', 'ヤマト'),
+                'sagawa': ('sagawa', '佐川'),
+                'sf': ('sf', 'sf-express', '順豊'),
+                'ems': ('ems',),
+                'dhl': ('dhl',),
+            }
+            carrier = Carrier.query.filter(
+                Carrier.company_id == data.get('company_id', 1),
+                Carrier.is_active.is_(True),
+                db.or_(
+                    func.lower(Carrier.code) == carrier_code,
+                    *[
+                        Carrier.name.ilike(f'%{alias}%')
+                        for alias in carrier_aliases.get(carrier_code, (carrier_code,))
+                    ],
+                ),
+            ).order_by(Carrier.id.asc()).first()
+            if carrier:
+                data['carrier_id'] = carrier.id
+
+        resolved_details = []
+        for detail in data.get('details', []):
+            goods_id = detail.get('goods_id')
+            if not goods_id and detail.get('goods_code'):
+                goods = GoodsService.get_goods_by_code(
+                    detail['goods_code'], data.get('company_id', 1)
+                )
+                if not goods:
+                    raise BadRequestException(
+                        f"Goods not found for code: {detail['goods_code']}", 16030
+                    )
+                goods_id = goods.id
+            if not goods_id:
+                raise BadRequestException(
+                    "goods_id or goods_code is required for detail", 16031
+                )
+
+            quantity = detail.get('quantity', 0)
+            if quantity <= 0:
+                raise BadRequestException("DN detail quantity must be positive", 16033)
+            resolved_details.append({**detail, 'goods_id': goods_id, 'quantity': quantity})
+
+        # Pending/in-progress DNs reserve on-hand stock. Reject over-reservation
+        # here so an impossible integration payload never reaches picking.
+        if data.get('status', 'pending') in ('pending', 'in_progress'):
+            DNService._assert_new_dn_stock_available(
+                data['warehouse_id'], resolved_details
+            )
+
         new_dn = DN(
             recipient_id=data['recipient_id'],
             shipping_address=data['shipping_address'],
@@ -237,21 +314,11 @@ class DNService:
         db.session.flush()
 
         # 创建 DN 明细（如果有）
-        for detail in data.get('details', []):
-            goods_id = detail.get('goods_id')
-            # 支持通过 goods_code 解析 goods_id
-            if not goods_id and detail.get('goods_code'):
-                goods = GoodsService.get_goods_by_code(detail['goods_code'], data.get('company_id', 1))
-                if not goods:
-                    raise BadRequestException(f"Goods not found for code: {detail['goods_code']}", 16030)
-                goods_id = goods.id
-            if not goods_id:
-                raise BadRequestException("goods_id or goods_code is required for detail", 16031)
-
+        for detail in resolved_details:
             new_detail = DNDetail(
                 dn_id=new_dn.id,
-                goods_id=goods_id,
-                quantity=detail.get('quantity', 0),
+                goods_id=detail['goods_id'],
+                quantity=detail['quantity'],
                 picked_quantity=detail.get('picked_quantity', 0),
                 packed_quantity=detail.get('packed_quantity', 0),
                 delivered_quantity=detail.get('delivered_quantity', 0),                
@@ -542,6 +609,20 @@ class DNService:
         dn = DNService._get_instance(dn_or_id)
         if dn.status != 'pending':
             raise BadRequestException("Cannot mark a DN as 'in progress' that is not in 'pending' status.", 16000)
+
+        # Revalidate just before work starts. Stock may have changed since the
+        # DN was created, especially for old integrations that over-reserved.
+        for detail in dn.details:
+            inventory = InventoryService._get_for_update(
+                detail.goods_id, dn.warehouse_id
+            )
+            physical_available = inventory.onhand_stock - inventory.locked_stock
+            if detail.quantity > physical_available:
+                raise BadRequestException(
+                    f"Insufficient physical stock for goods {detail.goods_id}: "
+                    f"requested {detail.quantity}, available {max(physical_available, 0)}.",
+                    16037,
+                )
         
         dn = DNService._update_dn_status(dn, "in_progress")
 
@@ -632,6 +713,15 @@ class DNService:
         webhook_emit('dn.delivered', {
             'dn_id': dn.id, 'status': 'delivered', 'order_number': dn.order_number,
             'tracking_number': tracking_number,
+            'details': [
+                {
+                    'goods_code': detail.goods.code,
+                    'planned_quantity': detail.quantity,
+                    'picked_quantity': detail.picked_quantity,
+                    'delivered_quantity': detail.delivered_quantity,
+                }
+                for detail in dn.details
+            ],
         }, api_key_id=dn.api_key_id)
 
         return dn
@@ -655,6 +745,15 @@ class DNService:
 
         webhook_emit('dn.completed', {
             'dn_id': dn.id, 'status': 'completed', 'order_number': dn.order_number,
+            'details': [
+                {
+                    'goods_code': detail.goods.code,
+                    'planned_quantity': detail.quantity,
+                    'picked_quantity': detail.picked_quantity,
+                    'delivered_quantity': detail.delivered_quantity,
+                }
+                for detail in dn.details
+            ],
         }, api_key_id=dn.api_key_id)
 
         return dn

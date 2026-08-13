@@ -1,4 +1,4 @@
-from extensions.db import *
+from extensions.db import db, get_object_or_404
 from extensions.transaction import transactional
 from .models import Recipient
 
@@ -24,6 +24,10 @@ class RecipientService:
 
         if filters.get('company_id'):
             query = query.filter(Recipient.company_id == filters['company_id'])
+        if filters.get('external_reference'):
+            query = query.filter(
+                Recipient.external_reference == filters['external_reference']
+            )
         if filters.get('name'):
             query = query.filter(Recipient.name.ilike(f"%{filters['name']}%"))
         if filters.get('address'):
@@ -36,21 +40,40 @@ class RecipientService:
             query = query.filter(Recipient.email.ilike(f"%{filters['email']}%"))
         if filters.get('country'):
             query = query.filter(Recipient.country.ilike(f"%{filters['country']}%"))
+        if filters.get('keyword'):
+            keyword = f"%{filters['keyword']}%"
+            query = query.filter(db.or_(
+                Recipient.name.ilike(keyword),
+                Recipient.address.ilike(keyword),
+                Recipient.phone.ilike(keyword),
+                Recipient.contact.ilike(keyword),
+            ))
         
-        if 'is_active' not in filters or filters['is_active'] is None:            
-            query = query.filter(Recipient.is_active == True)
-        else:
+        if (('is_active' not in filters or filters['is_active'] is None)
+                and not filters.get('external_reference')):
+            query = query.filter(Recipient.is_active.is_(True))
+        elif filters.get('is_active') is not None:
             # 否则按用户传入的值进行过滤
             query = query.filter(Recipient.is_active == filters['is_active'])
         
         return query
 
     @staticmethod
-    def get_recipient(recipient_id: int) -> Recipient:
+    def get_recipient(recipient_id: int, company_id: int | None = None) -> Recipient:
         """
         根据 ID 获取单个 Recipient，不存在时抛出 404
         """
-        recipient = get_object_or_404(Recipient, recipient_id)
+        if company_id is None:
+            recipient = get_object_or_404(Recipient, recipient_id)
+        else:
+            recipient = Recipient.query.filter_by(
+                id=recipient_id, company_id=company_id
+            ).first()
+            if recipient is None:
+                from extensions.error import NotFoundException
+                raise NotFoundException(
+                    f'Recipient with id {recipient_id} not found', 13001
+                )
         return recipient
 
     @staticmethod
@@ -61,6 +84,7 @@ class RecipientService:
         """
         new_recipient = Recipient(
             name=data['name'],
+            external_reference=data.get('external_reference'),
             address=data.get('address'),
             zip_code=data.get('zip_code'),
             phone=data.get('phone'),
@@ -77,13 +101,17 @@ class RecipientService:
 
     @staticmethod
     @transactional
-    def update_recipient(recipient_id: int, data: dict) -> Recipient:
+    def update_recipient(recipient_id: int, data: dict,
+                         company_id: int | None = None) -> Recipient:
         """
         更新 Recipient 信息
         """
-        recipient = RecipientService.get_recipient(recipient_id)
+        recipient = RecipientService.get_recipient(recipient_id, company_id)
 
         recipient.name = data.get('name', recipient.name)
+        recipient.external_reference = data.get(
+            'external_reference', recipient.external_reference
+        )
         recipient.address = data.get('address', recipient.address)
         recipient.zip_code = data.get('zip_code', recipient.zip_code)
         recipient.phone = data.get('phone', recipient.phone)
@@ -98,10 +126,10 @@ class RecipientService:
 
     @staticmethod
     @transactional
-    def delete_recipient(recipient_id: int):
+    def delete_recipient(recipient_id: int, company_id: int | None = None):
         """
         删除 Recipient
         """
-        recipient = RecipientService.get_recipient(recipient_id)
+        recipient = RecipientService.get_recipient(recipient_id, company_id)
         db.session.delete(recipient)
         # db.session.commit()

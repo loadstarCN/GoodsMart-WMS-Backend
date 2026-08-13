@@ -25,6 +25,7 @@ recipient_base_model = api_ns.model('RecipientBase', {
 recipient_fields = {
     'id': fields.Integer(readOnly=True, description='Recipient ID'),
     'name': fields.String(required=True, description='Recipient Name'),
+    'external_reference': fields.String(description='External delivery address ID'),
     'address': fields.String(description='Recipient Address'),
     'zip_code': fields.String(description='Recipient Zip Code'),
     'phone': fields.String(description='Recipient Phone'),
@@ -51,12 +52,14 @@ recipient_input_model = api_ns.model('RecipientInput', recipient_input_fields)
 # -----------------------------
 recipient_pagination_parser = pagination_parser.copy()
 recipient_pagination_parser.add_argument('name', type=str, help='Filter by Recipient Name', location='args')
+recipient_pagination_parser.add_argument('external_reference', type=str, help='Filter by exact external delivery address ID', location='args')
 recipient_pagination_parser.add_argument('address', type=str, help='Filter by Recipient Address', location='args')
 recipient_pagination_parser.add_argument('zip_code', type=str, help='Filter by Recipient Zip Code', location='args')
 recipient_pagination_parser.add_argument('phone', type=str, help='Filter by Recipient Phone', location='args')
 recipient_pagination_parser.add_argument('email', type=str, help='Filter by Recipient Email', location='args')
 recipient_pagination_parser.add_argument('contact', type=str, help='Filter by Contact Person', location='args')
 recipient_pagination_parser.add_argument('country', type=str, help='Filter by Country Code', location='args')
+recipient_pagination_parser.add_argument('keyword', type=str, help='Search name, address, phone or contact', location='args')
 recipient_pagination_parser.add_argument('is_active', type=inputs.boolean, help='Filter by Active Status', location='args')
 recipient_pagination_parser.add_argument('company_id', type=int, help='Filter by Company ID', location='args')
 

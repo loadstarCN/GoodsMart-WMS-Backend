@@ -1,9 +1,19 @@
 from flask import g
-from flask_restx import Resource, abort
+from flask_restx import Resource
 from system.common import paginate, permission_required
 from system.third_party.utils import get_api_key_company_id
 from .schemas import api_ns, recipient_model, recipient_input_model, recipient_pagination_parser, pagination_model
 from .services import RecipientService
+
+
+def _request_company_id():
+    """返回 API Key 或公司员工允许访问的公司范围。"""
+    api_company_id = get_api_key_company_id()
+    if api_company_id:
+        return api_company_id
+    if g.current_user.type == 'staff':
+        return g.current_user.company_id
+    return None
 
 @api_ns.doc(security="jsonWebToken")
 @api_ns.route('/')
@@ -22,12 +32,14 @@ class RecipientList(Resource):
         filters = {
             'is_active': args.get('is_active'),
             'name': args.get('name'),
+            'external_reference': args.get('external_reference'),
             'address': args.get('address'),
             'zip_code': args.get('zip_code'),
             'phone': args.get('phone'),
             'email': args.get('email'),
             'contact': args.get('contact'),
-            'country': args.get('country')
+            'country': args.get('country'),
+            'keyword': args.get('keyword'),
         }
 
         # Check user type and get the company_id if user type is 'staff'
@@ -68,7 +80,9 @@ class RecipientDetail(Resource):
     @api_ns.marshal_with(recipient_model)
     def get(self, recipient_id):
         """Get recipient details"""
-        recipient = RecipientService.get_recipient(recipient_id)
+        recipient = RecipientService.get_recipient(
+            recipient_id, _request_company_id()
+        )
         return recipient
 
     @permission_required(["all_access", "company_all_access", "recipient_edit"])
@@ -78,13 +92,15 @@ class RecipientDetail(Resource):
         """Update recipient details"""
         data = api_ns.payload
 
-        updated_recipient = RecipientService.update_recipient(recipient_id, data)
+        updated_recipient = RecipientService.update_recipient(
+            recipient_id, data, _request_company_id()
+        )
 
         return updated_recipient
 
     @permission_required(["all_access", "company_all_access", "recipient_delete"])
     def delete(self, recipient_id):
         """Delete a recipient"""
-        RecipientService.delete_recipient(recipient_id)
+        RecipientService.delete_recipient(recipient_id, _request_company_id())
 
         return {"message": "Recipient deleted successfully"}, 200

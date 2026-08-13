@@ -48,6 +48,79 @@ def test_create_dn(client, access_token):
     assert len(data['details']) == 1
 
 
+def test_create_dn_rejects_quantity_above_available_stock(client):
+    """An integration cannot create a DN that makes available stock negative."""
+    with client.application.app_context():
+        warehouse = Warehouse.query.first()
+        recipient = Recipient.query.first()
+        goods = Goods.query.first()
+        inventory = Inventory.query.filter_by(
+            goods_id=goods.id, warehouse_id=warehouse.id
+        ).first()
+        inventory.onhand_stock = 1
+        inventory.locked_stock = 0
+        inventory.dn_stock = 0
+        db.session.commit()
+
+        with pytest.raises(BadRequestException, match="Insufficient available stock"):
+            DNService.create_dn({
+                'recipient_id': recipient.id,
+                'warehouse_id': warehouse.id,
+                'shipping_address': 'test',
+                'expected_shipping_date': '2026-08-13',
+                'dn_type': 'shipping',
+                'details': [{'goods_id': goods.id, 'quantity': 2}],
+            }, created_by_id=get_operator_user().id)
+
+
+def test_create_dn_resolves_legacy_carrier_name_from_code(client):
+    """carrier_code works with existing rows whose code column was never backfilled."""
+    with client.application.app_context():
+        warehouse = Warehouse.query.first()
+        recipient = Recipient.query.first()
+        goods = Goods.query.first()
+        carrier = Carrier.query.first()
+        carrier.name = 'ヤマト'
+        carrier.code = None
+        inventory = Inventory.query.filter_by(
+            goods_id=goods.id, warehouse_id=warehouse.id
+        ).first()
+        inventory.onhand_stock = 10
+        inventory.locked_stock = 0
+        inventory.dn_stock = 0
+        db.session.commit()
+
+        dn = DNService.create_dn({
+            'recipient_id': recipient.id,
+            'warehouse_id': warehouse.id,
+            'company_id': carrier.company_id,
+            'shipping_address': 'test',
+            'expected_shipping_date': '2026-08-13',
+            'carrier_code': 'yamato',
+            'dn_type': 'shipping',
+            'details': [{'goods_id': goods.id, 'quantity': 1}],
+        }, created_by_id=get_operator_user().id)
+
+        assert dn.carrier_id == carrier.id
+
+
+def test_progress_dn_rejects_when_physical_stock_is_insufficient(client):
+    """A legacy oversized DN cannot enter picking even if it already exists."""
+    with client.application.app_context():
+        dn = get_dn()
+        detail = dn.details[0]
+        inventory = Inventory.query.filter_by(
+            goods_id=detail.goods_id, warehouse_id=dn.warehouse_id
+        ).first()
+        inventory.onhand_stock = max(detail.quantity - 1, 0)
+        inventory.locked_stock = 0
+        dn.status = 'pending'
+        db.session.commit()
+
+        with pytest.raises(BadRequestException, match="Insufficient physical stock"):
+            DNService.progress_dn(dn.id)
+
+
 def test_get_dns(client, access_token):
     """
     测试获取 DN 列表 (GET /dn/)
