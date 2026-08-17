@@ -10,6 +10,7 @@ from .models import PickingTask, PickingTaskDetail, PickingTaskStatusLog,Picking
 from extensions.transaction import transactional
 from dateutil.relativedelta import relativedelta
 from sqlalchemy import and_, func, case, extract
+from sqlalchemy.orm import lazyload
 from datetime import datetime, timedelta
 
 from datetime import datetime
@@ -271,15 +272,21 @@ class PickingTaskService:
             requested[key] = requested.get(key, 0) + quantity
 
         for (goods_id, location_id), quantity in requested.items():
+            # lazyload('*') 抑制模型上 lazy='joined' 的级联 eager join：
+            # 带 LEFT OUTER JOIN 的 SELECT ... FOR UPDATE 在 PostgreSQL 上直接报
+            # FeatureNotSupported（FOR UPDATE cannot be applied to the nullable
+            # side of an outer join）。of=GoodsLocation 使锁只落在库存行上，
+            # 不连带锁 join 进来的 locations 行。
             stock = (
                 GoodsLocation.query
+                .options(lazyload('*'))
                 .join(Location, GoodsLocation.location_id == Location.id)
                 .filter(
                     GoodsLocation.goods_id == goods_id,
                     GoodsLocation.location_id == location_id,
                     Location.warehouse_id == task.dn.warehouse_id,
                 )
-                .with_for_update()
+                .with_for_update(of=GoodsLocation)
                 .first()
             )
             if stock is None:

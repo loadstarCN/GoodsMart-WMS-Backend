@@ -587,3 +587,49 @@ def test_complete_task_rejects_overpicked_data(client):
 
         with pytest.raises(BadRequestException, match="exceeds planned quantity"):
             PickingTaskService.complete_task(task.id, admin_user.id)
+
+
+def test_location_stock_lock_query_has_no_outer_join(client):
+    """
+    回归：_assert_location_stock 的 SELECT ... FOR UPDATE 行锁查询不得携带
+    eager join（lazy='joined'）产生的 LEFT OUTER JOIN。
+
+    PostgreSQL 对 outer join 的可空侧加 FOR UPDATE 会抛
+    FeatureNotSupported("FOR UPDATE cannot be applied to the nullable side
+    of an outer join")，导致保存拣货批次直接 500。SQLite 会忽略 FOR UPDATE
+    子句、无法复现该报错，故通过捕获实际下发的 SQL 来断言查询形态。
+    """
+    from sqlalchemy import event
+
+    with client.application.app_context():
+        admin_user = get_operator_user()
+        task = get_picking_task()
+        PickingTaskService.process_task(task.id, admin_user.id)
+        planned_goods_id = task.dn.details[0].goods_id
+        location = get_location()
+
+        captured = []
+
+        def _capture(conn, cursor, statement, parameters, context, executemany):
+            captured.append(statement)
+
+        event.listen(db.engine, "before_cursor_execute", _capture)
+        try:
+            PickingTaskService.create_batch(task.id, {
+                "details": [
+                    {"location_id": location.id, "goods_id": planned_goods_id, "picked_quantity": 1},
+                ]
+            }, admin_user.id)
+        finally:
+            event.remove(db.engine, "before_cursor_execute", _capture)
+
+        lock_lookups = [
+            s for s in captured
+            if s.lstrip().upper().startswith("SELECT") and "FROM goods_locations" in s
+        ]
+        assert lock_lookups, "expected _assert_location_stock to query goods_locations"
+        for statement in lock_lookups:
+            assert "LEFT OUTER JOIN" not in statement.upper(), (
+                "goods_locations 行锁查询携带了 eager join 的 LEFT OUTER JOIN，"
+                "会在 PostgreSQL 上触发 FeatureNotSupported：\n" + statement
+            )
