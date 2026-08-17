@@ -589,7 +589,12 @@ class ASNService:
                          'actual_quantity': d.actual_quantity,
                          'quantity': d.quantity,
                          'sorted_quantity': d.sorted_quantity,
-                         'damage_quantity': d.damage_quantity} for d in asn.details],
+                         'damage_quantity': d.damage_quantity,
+                         # weight/volume 为该明细行的合计值（kg / m³），
+                         # 入库分拣时在 WMS 称量录入，是重量数据的唯一来源，
+                         # 由订阅方（Wholesale）换算回填其商品主数据
+                         'weight': d.weight,
+                         'volume': d.volume} for d in asn.details],
         }, api_key_id=asn.api_key_id)
 
         return asn

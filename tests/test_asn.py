@@ -388,3 +388,45 @@ def test_asn_service_update_asn_detail_invalid_detail(client):
             ASNService.update_asn_detail(asn.id, -999, {"quantity": 999})
         assert "not found" in str(excinfo.value).lower()
         assert excinfo.value.biz_code == 13001
+
+def test_complete_asn_webhook_payload_includes_weight_and_volume(client):
+    """
+    回归：asn.completed 的 webhook 明细必须携带分拣称量的 weight/volume（行合计，kg/m³）。
+
+    重量数据只在 WMS 入库分拣时产生，Wholesale（mart）侧依赖该回传换算并回填
+    其商品主数据（克/单件），否则出库单运费只能走默认兜底。
+    """
+    with client.application.app_context():
+        from system.third_party.models import APIKey
+        from system.webhook.models import WebhookEvent
+
+        api_key = APIKey(
+            key='wh-test-weight-payload',
+            system_name='mart_webhook_test',
+            permissions=['all_access'],
+        )
+        api_key.webhook_url = 'http://127.0.0.1:9/webhook'  # emit 只落库，不实际发送
+        db.session.add(api_key)
+        db.session.commit()
+
+        asn = get_asn()
+        asn.status = 'received'
+        asn.api_key_id = api_key.id
+        detail = asn.details[0]
+        detail.weight = 0.3
+        detail.volume = 0.002
+        db.session.commit()
+        goods_code = detail.goods.code
+
+        ASNService.complete_asn(asn.id)
+
+        event = WebhookEvent.query.filter_by(
+            api_key_id=api_key.id, event_type='asn.completed'
+        ).first()
+        assert event is not None, "asn.completed 事件未落库"
+
+        payload_detail = next(
+            d for d in event.payload['details'] if d['goods_code'] == goods_code
+        )
+        assert payload_detail['weight'] == 0.3
+        assert payload_detail['volume'] == 0.002
