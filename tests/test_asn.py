@@ -430,3 +430,53 @@ def test_complete_asn_webhook_payload_includes_weight_and_volume(client):
         )
         assert payload_detail['weight'] == 0.3
         assert payload_detail['volume'] == 0.002
+
+
+def test_complete_asn_webhook_payload_includes_goods_spec(client):
+    """
+    asn.completed 明细附带商品主数据的单件规格（重量 kg / 尺寸 mm）。
+
+    分拣站把称重、测量结果写在商品主数据上而不是 ASN 明细上，
+    只回传明细的 weight 会让实测值永远到不了 Wholesale。
+    goods.weight 是 Numeric，必须转成 float 才能落进 JSON payload。
+    """
+    with client.application.app_context():
+        from decimal import Decimal
+        from system.third_party.models import APIKey
+        from system.webhook.models import WebhookEvent
+
+        api_key = APIKey(
+            key='wh-test-goods-spec-payload',
+            system_name='mart_webhook_spec_test',
+            permissions=['all_access'],
+        )
+        api_key.webhook_url = 'http://127.0.0.1:9/webhook'  # emit 只落库，不实际发送
+        db.session.add(api_key)
+        db.session.commit()
+
+        asn = get_asn()
+        asn.status = 'received'
+        asn.api_key_id = api_key.id
+        goods = asn.details[0].goods
+        goods.weight = Decimal('0.125')
+        goods.length = 150
+        goods.width = 100
+        goods.height = 40
+        db.session.commit()
+        goods_code = goods.code
+
+        ASNService.complete_asn(asn.id)
+
+        event = WebhookEvent.query.filter_by(
+            api_key_id=api_key.id, event_type='asn.completed'
+        ).first()
+        assert event is not None, "asn.completed 事件未落库"
+
+        payload_detail = next(
+            d for d in event.payload['details'] if d['goods_code'] == goods_code
+        )
+        assert payload_detail['goods_weight_kg'] == 0.125
+        assert isinstance(payload_detail['goods_weight_kg'], float)
+        assert payload_detail['goods_length_mm'] == 150
+        assert payload_detail['goods_width_mm'] == 100
+        assert payload_detail['goods_height_mm'] == 40

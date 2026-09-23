@@ -28,7 +28,25 @@ class ASNService:
         if isinstance(asn_or_id, int):
             return ASNService.get_asn(asn_or_id)
         return asn_or_id
-    
+
+    @staticmethod
+    def _goods_spec_payload(goods) -> dict:
+        """asn.completed 明细附带的商品主数据规格（单件）
+
+        分拣站（Station）在完成分拣任务之前把称重/测量结果写进商品主数据，
+        所以这里读到的就是本次入库刚测出的值。单位写进字段名，避免订阅方误读：
+        重量 kg（Numeric → float，否则 JSON 序列化失败），尺寸 mm。
+        未测量的为 None。
+        """
+        if goods is None:
+            return {}
+        return {
+            'goods_weight_kg': float(goods.weight) if goods.weight is not None else None,
+            'goods_length_mm': goods.length,
+            'goods_width_mm': goods.width,
+            'goods_height_mm': goods.height,
+        }
+
     @staticmethod
     @transactional
     def _update_asn_status(asn: ASN, new_status: str) -> ASN:
@@ -594,7 +612,8 @@ class ASNService:
                          # 入库分拣时在 WMS 称量录入，是重量数据的唯一来源，
                          # 由订阅方（Wholesale）换算回填其商品主数据
                          'weight': d.weight,
-                         'volume': d.volume} for d in asn.details],
+                         'volume': d.volume,
+                         **ASNService._goods_spec_payload(d.goods)} for d in asn.details],
         }, api_key_id=asn.api_key_id)
 
         return asn
