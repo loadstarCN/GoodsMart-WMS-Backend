@@ -40,6 +40,9 @@ class Config:
     # Flask-Limiter 开关（登录 / 找回密码等端点的限流）
     RATELIMIT_ENABLED = os.getenv('RATELIMIT_ENABLED', 'True') == 'True'
     RATELIMIT_HEADERS_ENABLED = True
+    # Redis 不可用时限流退回进程内存计数并吞掉存储错误，避免登录等接口因 Redis 故障 500
+    RATELIMIT_IN_MEMORY_FALLBACK_ENABLED = True
+    RATELIMIT_SWALLOW_ERRORS = True
     # 调度器（webhook 推送 + 库存快照）只应在 WSGI 服务进程里启动；CLI / 迁移脚本请设为 False
     SCHEDULER_ENABLED = os.getenv('SCHEDULER_ENABLED', 'True') == 'True'
     # 加密敏感系统设置（SMTP 密码等）的 Fernet 密钥；不设则退回数据库内自动生成的密钥（仅混淆）

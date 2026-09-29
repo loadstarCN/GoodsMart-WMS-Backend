@@ -38,6 +38,11 @@ def _refresh_ttl_seconds():
     return int(current_app.config['JWT_REFRESH_TOKEN_EXPIRES'].total_seconds())
 
 
+def _log_redis_error(action, exc):
+    # Redis 不可用时吊销功能降级（fail-open），业务请求本身不因此失败；必须留下明显日志
+    current_app.logger.error(f'[jwt] Redis unavailable, {action} skipped: {exc}')
+
+
 def revoke_token(jti, exp=None):
     """吊销单个 token。exp 为该 token 的过期时间戳，用来决定 Redis 记录保留多久。"""
     if not jti:
@@ -45,12 +50,18 @@ def revoke_token(jti, exp=None):
     ttl = int(exp - time.time()) if exp else _refresh_ttl_seconds()
     if ttl <= 0:
         return
-    _redis().setex(f'{BLOCKLIST_PREFIX}{jti}', ttl, '1')
+    try:
+        _redis().setex(f'{BLOCKLIST_PREFIX}{jti}', ttl, '1')
+    except Exception as exc:
+        _log_redis_error(f'revoke token {jti}', exc)
 
 
 def revoke_all_user_tokens(user_id):
     """吊销某用户当前已签发的全部 token（改密 / 重置密码 / 停用账号时调用）。"""
-    _redis().setex(f'{USER_CUTOFF_PREFIX}{user_id}', _refresh_ttl_seconds(), str(int(time.time())))
+    try:
+        _redis().setex(f'{USER_CUTOFF_PREFIX}{user_id}', _refresh_ttl_seconds(), str(int(time.time())))
+    except Exception as exc:
+        _log_redis_error(f'revoke tokens of user {user_id}', exc)
 
 
 def load_active_user(identity):
@@ -96,13 +107,17 @@ def register_jwt_callbacks(manager):
 
     @manager.token_in_blocklist_loader
     def token_revoked_callback(_jwt_header, jwt_data):
-        r = _redis()
-        jti = jwt_data.get('jti')
-        if jti and r.exists(f'{BLOCKLIST_PREFIX}{jti}'):
-            return True
-        cutoff = r.get(f'{USER_CUTOFF_PREFIX}{jwt_data.get("sub")}')
-        if cutoff:
-            cutoff = int(cutoff.decode() if isinstance(cutoff, bytes) else cutoff)
-            if int(jwt_data.get('iat', 0)) < cutoff:
+        try:
+            r = _redis()
+            jti = jwt_data.get('jti')
+            if jti and r.exists(f'{BLOCKLIST_PREFIX}{jti}'):
                 return True
+            cutoff = r.get(f'{USER_CUTOFF_PREFIX}{jwt_data.get("sub")}')
+            if cutoff:
+                cutoff = int(cutoff.decode() if isinstance(cutoff, bytes) else cutoff)
+                if int(jwt_data.get('iat', 0)) < cutoff:
+                    return True
+        except Exception as exc:
+            # Redis 故障不应让全站 401/500；此时吊销检查降级为不生效，靠 token 自身过期兜底
+            _log_redis_error('revocation check', exc)
         return False
