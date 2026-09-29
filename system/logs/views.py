@@ -1,9 +1,11 @@
-from flask_restx import Resource, abort, marshal_with
+from flask_restx import Resource, marshal_with
 from system.common import permission_required, paginate
-from .models import ActivityLog
 from .schemas import api_ns, log_model, pagination_parser, pagination_model
 from .services import LogService
 
+
+# 审计日志只读：不提供创建 / 修改 / 删除接口，避免日志被伪造或篡改。
+# 写入只发生在 system/logs/utils.py 的请求钩子里。
 
 @api_ns.doc(security="jsonWebToken")
 @api_ns.route('/')
@@ -11,7 +13,7 @@ class UserLogs(Resource):
 
     @permission_required(["all_access", "logs_read"])
     @api_ns.expect(pagination_parser)
-    @api_ns.marshal_with(pagination_model, mask='*,items{id,actor,endpoint,method,status_code,ip_address,created_at}')
+    @api_ns.marshal_with(pagination_model, mask='*,items{id,actor,endpoint,method,status_code,ip_address,processing_time,created_at}')
     def get(self):
         """获取用户日志（分页）"""
         args = pagination_parser.parse_args()
@@ -34,19 +36,6 @@ class UserLogs(Resource):
         return paginate(query, page, per_page)
 
 
-    @permission_required(["all_access", "logs_create"])
-    @api_ns.expect(log_model)
-    @marshal_with(log_model)
-    def post(self):
-        """创建用户日志"""
-        data = api_ns.payload
-
-        # 使用 LogService 创建日志
-        new_log = LogService.create_log(data)
-        
-        return new_log, 201
-
-
 @api_ns.doc(security="jsonWebToken")
 @api_ns.route('/<int:log_id>')
 class UserLog(Resource):
@@ -57,20 +46,3 @@ class UserLog(Resource):
         """获取单个用户日志"""
         log = LogService.get_log(log_id)
         return log
-
-
-    @permission_required(["all_access", "logs_edit"])
-    @api_ns.expect(log_model)
-    @marshal_with(log_model)
-    def put(self, log_id):
-        """更新单个用户日志"""
-        data = api_ns.payload
-        updated_log = LogService.update_log(log_id, data)
-        return updated_log
-
-
-    @permission_required(["all_access", "logs_delete"])
-    def delete(self, log_id):
-        """删除用户日志"""
-        LogService.delete_log(log_id)
-        return {"message": "Log deleted successfully"}, 200

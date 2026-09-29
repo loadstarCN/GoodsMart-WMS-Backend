@@ -60,6 +60,8 @@ company_input_model = api_ns.model('CompanyInput', company_input_fields)
 # -----------------------------
 pagination_parser = pagination_parser.copy()
 pagination_parser.add_argument('is_active', type=inputs.boolean, help='Is the company active?', location='args')
+pagination_parser.add_argument('name', type=str, help='Filter by company name', location='args')
+pagination_parser.add_argument('keyword', type=str, help='Search by company name', location='args')
 pagination_parser.add_argument('expired_at_start', type=inputs.date_from_iso8601, help='Expiration timestamp', location='args')
 pagination_parser.add_argument('expired_at_end', type=inputs.date_from_iso8601, help='Expiration timestamp', location='args')
 

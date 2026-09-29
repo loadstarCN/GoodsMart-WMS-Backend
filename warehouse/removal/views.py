@@ -1,17 +1,22 @@
 from flask import  g
-from flask_restx import Resource,abort
+from flask_restx import Resource
 from extensions.error import ForbiddenException, NotFoundException
 from system.common import permission_required,paginate
-from warehouse.common import warehouse_required,add_warehouse_filter,check_goods_access, check_location_access
+from warehouse.common import (
+    require_actor_user_id,
+    warehouse_required, add_warehouse_filter, check_goods_access, check_location_access, get_warehouse_owned,
+    require_bulk_list,
+)
+from .models import RemovalRecord
 from .schemas import (
     api_ns,
     removal_record_model,
-    removal_record_input_model,        
-    removal_pagination_parser,         
+    removal_record_input_model,
+    removal_pagination_parser,
     removal_pagination_model
 )
-from warehouse.goods.services import GoodsLocationService, GoodsService
-from .services import RemovalService  
+from warehouse.goods.services import GoodsLocationService
+from .services import RemovalService
 
 @api_ns.doc(security="jsonWebToken")
 @api_ns.route('/')
@@ -32,13 +37,13 @@ class RemovalRecordList(Resource):
             'goods_id': args.get('goods_id'),
             'location_id': args.get('location_id'),
             'operator_id': args.get('operator_id'),
-            'removal_time': args.get('removal_time'),
-            'location_code': args.get('location_code'),  
-            'goods_code': args.get('goods_code'),        
-            'keyword': args.get('keyword'),              
-            'warehouse_id': args.get('warehouse_id')     
+            'start_time': args.get('start_time'),
+            'end_time': args.get('end_time'),
+            'location_code': args.get('location_code'),
+            'goods_code': args.get('goods_code'),
+            'keyword': args.get('keyword'),
         }
-        filters = add_warehouse_filter(filters)  
+        filters = add_warehouse_filter(filters)
 
         query = RemovalService.list_removal_records(filters)
         return paginate(query, page, per_page)
@@ -50,14 +55,14 @@ class RemovalRecordList(Resource):
     def post(self):
         """创建新的下架记录"""
         data = api_ns.payload
-        created_by = g.current_user.id
+        created_by = require_actor_user_id()
 
         # 需要判断商品和库位是否存在，以及是否是在允许的仓库中
         goods_id = data.get('goods_id')
-        location_id = data.get('location_id')        
+        location_id = data.get('location_id')
         if not GoodsLocationService.is_goods_in_location(goods_id, location_id):
             raise NotFoundException("Goods not found in the specified location", 13003)
-       
+
         # 验证员工用户对指定商品的访问权限
         if not check_goods_access(goods_id):
             raise ForbiddenException("You do not have access to this Goods", 12001)
@@ -74,11 +79,11 @@ class RemovalRecordList(Resource):
 class RemovalRecordDetail(Resource):
 
     @permission_required(["all_access","company_all_access","removal_read"])
+    @warehouse_required()
     @api_ns.marshal_with(removal_record_model)
     def get(self, record_id):
-        """获取下架记录详情"""
-        record = RemovalService.get_removal_record(record_id)
-        return record
+        """获取下架记录详情（记录所在库位的仓库必须在可访问范围内）"""
+        return get_warehouse_owned(RemovalRecord, record_id, warehouse_attr='location.warehouse_id', what='Removal record')
 
 @api_ns.doc(security="jsonWebToken")
 @api_ns.route('/bulk')
@@ -94,7 +99,8 @@ class RemovalRecordBulk(Resource):
         预期接收一个列表，每个元素是 removal_record_input_model 定义的 JSON 对象
         """
         data_list = api_ns.payload  # payload 应该是一个列表
-        created_by = g.current_user.id
+        created_by = require_actor_user_id()
+        require_bulk_list(data_list, 'records')
 
         # 对每条记录进行基础验证，例如判断商品是否在指定库位中存在及权限验证
         for data in data_list:

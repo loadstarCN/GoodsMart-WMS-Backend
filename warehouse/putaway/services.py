@@ -1,8 +1,8 @@
 from sqlalchemy import or_
 from extensions.db import *
 from extensions.transaction import transactional
+from warehouse.common import require_positive_int, require_bulk_list, require_fields, lock_goods_location
 from warehouse.goods.models import Goods, GoodsLocation
-from warehouse.goods.services import GoodsLocationService
 from warehouse.inventory.services import InventoryService
 from warehouse.location.models import Location
 from .models import PutawayRecord
@@ -18,7 +18,7 @@ class PutawayService:
     def list_putaway_records(filters: dict):
         """
         根据过滤条件，返回 PutawayRecord 的查询对象，并按 id 降序排序。
-        
+
         :param filters: dict，包含可能的过滤字段
         :return: 已排序并过滤后的 SQLAlchemy Query 对象
         """
@@ -38,14 +38,14 @@ class PutawayService:
 
         # 针对 Goods 相关的过滤，先统一 join 一次
         if any(key in filters for key in ['goods_code', 'keyword']):
-            query = query.join(Goods, PutawayRecord.goods_id == Goods.id)   
+            query = query.join(Goods, PutawayRecord.goods_id == Goods.id)
 
-        if filters.get('goods_code'):                            
+        if filters.get('goods_code'):
             query = query.filter(Goods.code.ilike(f"%{filters['goods_code']}%"))
 
         # 针对 Location 相关的过滤，先统一 join 一次
         if any(key in filters for key in ['location_code', 'warehouse_id','warehouse_ids','keyword']):
-            query = query.join(Location, PutawayRecord.location_id == Location.id)        
+            query = query.join(Location, PutawayRecord.location_id == Location.id)
 
         if filters.get('location_code'):
             query = query.filter(Location.code.ilike(f"%{filters['location_code']}%"))
@@ -67,7 +67,7 @@ class PutawayService:
         if filters.get('warehouse_id'):
             query = query.filter(Location.warehouse_id == filters['warehouse_id'])
         if filters.get('warehouse_ids'):
-            query = query.filter(Location.warehouse_id.in_(filters['warehouse_ids']))       
+            query = query.filter(Location.warehouse_id.in_(filters['warehouse_ids']))
 
         return query
 
@@ -76,38 +76,45 @@ class PutawayService:
     def create_putaway_record(data: dict, created_by_id: int) -> PutawayRecord:
         """
         创建一条新的上架记录
-        
-        :param data: dict，包含 goods_id, location_id, quantity, operator_id, remark 等字段
+
+        :param data: dict，包含 goods_id, location_id, quantity, remark 等字段
         :return: 新创建的 PutawayRecord 实例
         """
+        require_fields(data, 'goods_id', 'location_id', 'quantity')
+        goods_id = data['goods_id']
+        location_id = data['location_id']
+        quantity = require_positive_int(data['quantity'], 'quantity')
+        get_object_or_404(Goods, goods_id)
+        location = get_object_or_404(Location, location_id)
+
         new_record = PutawayRecord(
-            goods_id=data['goods_id'],
-            location_id=data['location_id'],
-            quantity=data['quantity'],
+            goods_id=goods_id,
+            location_id=location_id,
+            quantity=quantity,
             remark=data.get('remark', ''),
             operator_id=created_by_id
         )
         db.session.add(new_record)
         db.session.flush()
 
-        goods_location_record = GoodsLocationService.get_goods_location_record(new_record.goods_id, new_record.location_id)
+        # 读改写商品库位记录全程持锁（SELECT ... FOR UPDATE）
+        goods_location_record = lock_goods_location(goods_id, location_id)
         if goods_location_record is None:
             # 创建新的库存信息
-            data = {
-                'goods_id': new_record.goods_id,
-                'location_id': new_record.location_id,
-                'quantity': new_record.quantity
-            }
-            goods_location_record = GoodsLocationService.create_goods_location(data)
+            goods_location_record = GoodsLocation(
+                goods_id=goods_id,
+                location_id=location_id,
+                quantity=quantity,
+            )
         else:
             # 更新库存信息
-            goods_location_record.quantity += new_record.quantity
-        
+            goods_location_record.quantity += quantity
+
         db.session.add(goods_location_record)
         db.session.flush()
 
         #更新库存信息
-        InventoryService.putaway_completed(new_record.goods_id, new_record.location.warehouse_id,new_record.quantity)
+        InventoryService.putaway_completed(goods_id, location.warehouse_id, quantity)
 
         # db.session.commit()
         return new_record
@@ -128,11 +135,12 @@ class PutawayService:
         :param created_by_id: 创建者的用户ID
         :return: 创建成功的 PutawayRecord 实例列表
         """
+        require_bulk_list(data_list, 'records')
         new_records = []
         for data in data_list:
             new_record = PutawayService.create_putaway_record(data, created_by_id)
             new_records.append(new_record)
             db.session.flush()
-        
+
         # 装饰器 transactional 会在函数退出后自动提交事务
         return new_records

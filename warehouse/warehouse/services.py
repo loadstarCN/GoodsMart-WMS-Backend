@@ -1,6 +1,7 @@
 from extensions.db import *
 from extensions.error import BadRequestException
 from extensions.transaction import transactional
+from warehouse.staff.models import Staff
 from warehouse.staff.services import StaffService
 from .models import Warehouse
 
@@ -86,35 +87,33 @@ class WarehouseService:
     @transactional
     def update_warehouse(warehouse_id: int, data: dict) -> Warehouse:
         """
-        更新 Warehouse 信息
+        更新 Warehouse 信息（company_id 不可变；manager 归属按仓库自己的公司校验）
         """
-        manager_id = data.get('manager_id')
+        warehouse = WarehouseService.get_warehouse(warehouse_id)
+
         manager = None
-        if manager_id:
-            manager = StaffService.get_staff(manager_id)
-            # 检查manager是否属于同一公司
-            if manager.company_id != data['company_id']:
+        new_manager_id = data.get('manager_id')
+        if new_manager_id:
+            manager = StaffService.get_staff(new_manager_id)
+            # manager 必须与仓库同公司（以仓库落库的 company_id 为准，而非客户端传的值）
+            if manager.company_id != warehouse.company_id:
                 raise BadRequestException("Manager does not belong to the same company", 16027)
 
-        old_manager = None
-        warehouse = WarehouseService.get_warehouse(warehouse_id)
-        if warehouse.manager:
-            old_manager = warehouse.manager
-        if manager_id and old_manager and old_manager.id != manager_id:
-            # 如果旧的管理员存在且与新的管理员不同，则从旧的管理员中删除该仓库
-            if manager.type == 'Staff':
-                if warehouse in old_manager.warehouses:
-                    # 从旧的管理员中删除该仓库
-                    old_manager.warehouses.remove(warehouse)
-                    db.session.add(old_manager)
-                    db.session.flush()  # 确保新对象的 ID 被分配
-            
+        # 换管理员（含显式置空）时，把仓库从旧管理员的管辖列表里摘掉
+        old_manager_id = warehouse.manager_id
+        if 'manager_id' in data and old_manager_id and old_manager_id != new_manager_id:
+            old_manager = db.session.get(Staff, old_manager_id)
+            if old_manager is not None and warehouse in old_manager.warehouses:
+                old_manager.warehouses.remove(warehouse)
+                db.session.add(old_manager)
+
         warehouse.name = data.get('name', warehouse.name)
         warehouse.address = data.get('address', warehouse.address)
         warehouse.phone = data.get('phone', warehouse.phone)
         warehouse.zip_code = data.get('zip_code', warehouse.zip_code)
         warehouse.default_currency = data.get('default_currency', warehouse.default_currency)
-        warehouse.manager_id = data.get('manager_id', warehouse.manager_id)
+        if 'manager_id' in data:
+            warehouse.manager_id = new_manager_id
         warehouse.is_active = data.get('is_active', warehouse.is_active)
 
         db.session.add(warehouse)

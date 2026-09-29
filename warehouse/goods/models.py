@@ -140,7 +140,7 @@ class Goods(db.Model):
     created_by = db.Column(
         db.Integer,
         db.ForeignKey('users.id', ondelete='SET NULL'),
-        nullable=False,
+        nullable=True,  # 与 ondelete='SET NULL' 一致：创建人被删除后置空
         info={'description': '创建人ID'}
     )
     created_at = db.Column(

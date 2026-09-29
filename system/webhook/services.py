@@ -74,24 +74,40 @@ def _send_event(event):
         return False
 
     payload_bytes = json.dumps(event.payload, ensure_ascii=False).encode('utf-8')
+    timestamp = str(int(datetime.now().timestamp()))
 
     headers = {
         'Content-Type': 'application/json',
         'X-Webhook-Event': event.event_type,
+        # 事件 ID + 时间戳：接收方据此做幂等与防重放（同一事件重试时 ID 不变）
+        'X-Webhook-Id': str(event.id),
+        'X-Webhook-Timestamp': timestamp,
+        'X-Webhook-Attempt': str(event.attempts + 1),
     }
 
-    # HMAC 签名
+    # HMAC 签名：V1 只签正文（兼容已接入方）；V2 把事件 ID 与时间戳一起签，防重放
     if api_key.webhook_secret:
         signature = _sign_payload(payload_bytes, api_key.webhook_secret)
         headers['X-Webhook-Signature'] = f'sha256={signature}'
+        signed_v2 = f'{event.id}.{timestamp}.'.encode('utf-8') + payload_bytes
+        headers['X-Webhook-Signature-V2'] = f'sha256={_sign_payload(signed_v2, api_key.webhook_secret)}'
+    else:
+        logger.warning(f'Webhook event {event.id}: api_key {api_key.id} has no webhook_secret, payload sent unsigned')
 
     try:
+        # 发送前再校验一次 URL（防止配置后 DNS 改指内网），且不跟随重定向
+        from .utils import validate_webhook_url
+        validate_webhook_url(api_key.webhook_url)
+
         resp = requests.post(
             api_key.webhook_url,
             data=payload_bytes,
             headers=headers,
             timeout=10,
+            allow_redirects=False,
         )
+        if 300 <= resp.status_code < 400:
+            raise requests.HTTPError(f'Redirect ({resp.status_code}) is not allowed', response=resp)
         resp.raise_for_status()
 
         event.status = 'sent'
@@ -101,7 +117,9 @@ def _send_event(event):
 
     except Exception as e:
         event.attempts += 1
-        event.last_error = str(e)[:500]
+        # 错误信息不带目标 URL / 响应体，避免被用作内网探测的回显
+        status = getattr(getattr(e, 'response', None), 'status_code', None)
+        event.last_error = (f'{type(e).__name__}' + (f' (HTTP {status})' if status else ''))[:500]
 
         if event.attempts >= MAX_ATTEMPTS:
             event.status = 'failed'
@@ -134,13 +152,20 @@ def push_pending_events():
     sent = 0
     failed = 0
 
+    # 逐条提交：一条的状态更新失败不会让整批已推送的事件回滚后被重复推送
     for event in events:
-        if _send_event(event):
+        ok = _send_event(event)
+        try:
+            db.session.commit()
+        except Exception as e:
+            db.session.rollback()
+            logger.error(f'Webhook event {event.id}: failed to persist status: {e}')
+            failed += 1
+            continue
+        if ok:
             sent += 1
         else:
             failed += 1
-
-    db.session.commit()
 
     if sent or failed:
         logger.info(f'Webhook push: {sent} sent, {failed} failed')

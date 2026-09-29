@@ -1,14 +1,19 @@
+from datetime import datetime, timedelta
+from dateutil.relativedelta import relativedelta
+from sqlalchemy import and_, func, case, extract
+from sqlalchemy.orm import joinedload, selectinload
 from extensions.db import *
 from extensions.error import BadRequestException, NotFoundException
 from extensions.transaction import transactional
+from warehouse.common import require_non_negative_int, require_fields
 from warehouse.asn.models import ASN
-from .models import SortingTask, SortingTaskDetail, SortingTaskStatusLog, SortingBatch
-from datetime import datetime, timedelta
 from warehouse.asn.services import ASNService
-from dateutil.relativedelta import relativedelta
-from sqlalchemy import and_, func, case, extract
+from .models import SortingTask, SortingTaskDetail, SortingTaskStatusLog, SortingBatch
 
 class SortingTaskService:
+
+    # 分拣累计量（合格 + 损坏）允许超出 ASN 计划量的容差（件）。默认 0：不允许多分拣。
+    OVERAGE_TOLERANCE = 0
 
     # ------------------------------------------------------------------------------------
     # SortingTaskService 私有方法
@@ -24,7 +29,80 @@ class SortingTaskService:
         if isinstance(task_or_id, int):
             return SortingTaskService.get_task(task_or_id)
         return task_or_id
-    
+
+    @staticmethod
+    def _parse_datetime(value):
+        """operation_time：接受 None / datetime / ISO8601 字符串"""
+        if value is None or isinstance(value, datetime):
+            return value
+        if isinstance(value, str):
+            try:
+                return datetime.fromisoformat(value)
+            except ValueError:
+                pass
+        raise BadRequestException("operation_time must be an ISO8601 datetime", 14021)
+
+    @staticmethod
+    def _detail_quantities(item: dict) -> tuple:
+        """从明细项里取出并校验 (goods_id, sorted_quantity, damage_quantity)"""
+        require_fields(item, 'goods_id')
+        goods_id = item['goods_id']
+        sorted_quantity = require_non_negative_int(item.get('sorted_quantity'), 'sorted_quantity')
+        damage_quantity = require_non_negative_int(item.get('damage_quantity'), 'damage_quantity')
+        return goods_id, sorted_quantity, damage_quantity
+
+    @staticmethod
+    def _assert_batch_in_task(task: SortingTask, batch_id) -> SortingBatch:
+        """明细挂靠的批次必须属于同一个任务"""
+        require_fields({'batch_id': batch_id}, 'batch_id')
+        batch = db.session.get(SortingBatch, batch_id)
+        if not batch or batch.sorting_task_id != task.id:
+            raise BadRequestException(f"Batch (id={batch_id}) does not belong to Sorting Task (id={task.id})", 16058)
+        return batch
+
+    @staticmethod
+    def _assert_within_planned(task: SortingTask, incoming_by_goods: dict | None = None,
+                               exclude_detail_id: int | None = None):
+        """
+        按商品维度校验分拣累计量（合格 + 损坏）不超过 ASN 计划量。
+
+        累计量 = 该 ASN 所有启用分拣任务的现有明细量 + incoming_by_goods 本次拟新增量
+        （exclude_detail_id 用于更新明细时把自身旧值排除）。
+
+        create_batch 是纯追加操作，前端断网重试、连点都会重复 append，撑大
+        sorted_quantity 并在 asn_completed 处虚增 sorted_stock。此校验作为服务端
+        权威防线，同时拒绝 ASN 明细里没有的商品。
+        """
+        incoming_by_goods = incoming_by_goods or {}
+        asn = task.asn
+
+        planned = {}
+        for d in asn.details:
+            planned[d.goods_id] = planned.get(d.goods_id, 0) + (d.quantity or 0)
+
+        query = (
+            db.session.query(
+                SortingTaskDetail.goods_id,
+                func.coalesce(func.sum(SortingTaskDetail.sorted_quantity + SortingTaskDetail.damage_quantity), 0),
+            )
+            .join(SortingTask, SortingTaskDetail.sorting_task_id == SortingTask.id)
+            .filter(SortingTask.asn_id == asn.id, SortingTask.is_active == True)
+        )
+        if exclude_detail_id is not None:
+            query = query.filter(SortingTaskDetail.id != exclude_detail_id)
+        existing = dict(query.group_by(SortingTaskDetail.goods_id).all())
+
+        for gid in set(existing) | set(incoming_by_goods):
+            if gid not in planned:
+                raise BadRequestException(f"Goods {gid} is not part of ASN {asn.id}", 16057)
+            total = existing.get(gid, 0) + incoming_by_goods.get(gid, 0)
+            if total > planned[gid] + SortingTaskService.OVERAGE_TOLERANCE:
+                raise BadRequestException(
+                    f"Sorted quantity exceeds planned quantity for goods {gid}: "
+                    f"total {total} > planned {planned[gid]}.",
+                    16062
+                )
+
     # 状态更新 & 状态日志
     @staticmethod
     @transactional
@@ -59,7 +137,7 @@ class SortingTaskService:
 
         # db.session.commit()
         return task
-    
+
     # ------------------------------------------------------------------------------------
     # SortingTaskService 公共方法
     # ------------------------------------------------------------------------------------
@@ -70,7 +148,15 @@ class SortingTaskService:
         """
         根据过滤条件，返回 SortingTask 的查询对象。
         """
-        query = SortingTask.query.order_by(SortingTask.id.desc())
+        # 列表 schema 逐行汇总 task_details 与 asn.details，预加载避免 N+1
+        query = (
+            SortingTask.query
+            .options(
+                selectinload(SortingTask.task_details),
+                joinedload(SortingTask.asn).selectinload(ASN.details),
+            )
+            .order_by(SortingTask.id.desc())
+        )
 
         if filters.get('asn_id'):
             query = query.filter(SortingTask.asn_id == filters['asn_id'])
@@ -106,10 +192,10 @@ class SortingTaskService:
         if filters.get('warehouse_id'):
             query = query.filter(ASN.warehouse_id == filters['warehouse_id'])
         if filters.get('warehouse_ids'):
-            query = query.filter(ASN.warehouse_id.in_(filters['warehouse_ids'])) 
+            query = query.filter(ASN.warehouse_id.in_(filters['warehouse_ids']))
 
         return query
-    
+
     @staticmethod
     def get_task(task_id: int) -> SortingTask:
         """
@@ -121,43 +207,51 @@ class SortingTaskService:
     @transactional
     def create_task(data: dict, created_by_id: int) -> SortingTask:
         """
-        创建新的 Sorting Task
+        创建新的 Sorting Task。只接受 asn_id；status 固定 pending、is_active 固定 True。
         """
+        require_fields(data, 'asn_id')
+        asn_id = data['asn_id']
+        ASNService.get_asn(asn_id)  # 不存在 404
+
         new_task = SortingTask(
-            asn_id=data['asn_id'],
-            status=data.get('status', 'pending'),
-            is_active=data.get('is_active', True),
+            asn_id=asn_id,
+            status='pending',
+            is_active=True,
             created_by=created_by_id
         )
         db.session.add(new_task)
+        db.session.flush()
         # db.session.commit()
         return new_task
 
-    
+
     @staticmethod
     @transactional
-    def update_task(task_id: int, data: dict) -> SortingTask:
+    def update_task(task_or_id: int | SortingTask, data: dict) -> SortingTask:
         """
-        更新指定 SortingTask（仅当其 status 为 pending 时）
+        更新指定 SortingTask（仅当其 status 为 pending 时）。
+        只允许改 asn_id；status / is_active 只能经 process / complete 或 ASN cancel 变更。
         """
-        task = SortingTaskService.get_task(task_id)
+        task = SortingTaskService._get_instance(task_or_id)
         if task.status != 'pending':
             raise BadRequestException("Cannot update a non-pending Sorting Task", 16001)
 
-        task.asn_id = data.get('asn_id', task.asn_id)
-        task.status = data.get('status', task.status)
-        task.is_active = data.get('is_active', task.is_active)
+        if data.get('asn_id'):
+            ASNService.get_asn(data['asn_id'])  # 不存在 404
+            task.asn_id = data['asn_id']
 
+        db.session.add(task)
+        db.session.flush()
         # db.session.commit()
         return task
 
     @staticmethod
     @transactional
-    def delete_task(task_id: int):
+    def delete_task(task_or_id: int | SortingTask):
         """
         删除指定 SortingTask（仅当其 status 为 pending 时）
         """
-        task = SortingTaskService.get_task(task_id)
+        task = SortingTaskService._get_instance(task_or_id)
         if task.status != 'pending':
             raise BadRequestException("Cannot delete a non-pending Sorting Task", 16002)
 
@@ -168,11 +262,11 @@ class SortingTaskService:
     # TaskDetail 相关
     # ------------------------------------------------------------------------------------
     @staticmethod
-    def list_task_details(task_id: int):
+    def list_task_details(task_or_id: int | SortingTask):
         """
         获取指定 SortingTask 下所有的 SortingTaskDetail
         """
-        task = SortingTaskService.get_task(task_id)
+        task = SortingTaskService._get_instance(task_or_id)
         return task.task_details
 
     @staticmethod
@@ -187,62 +281,81 @@ class SortingTaskService:
 
     @staticmethod
     @transactional
-    def create_task_detail(task_id: int, data: dict, created_by_id: int) -> SortingTaskDetail:
+    def create_task_detail(task_id: int | SortingTask, data: dict, created_by_id: int) -> SortingTaskDetail:
         """
         创建新的 SortingTaskDetail（仅当所属的 SortingTask 为 in_progress）。
-        
-        注意：此时需要在 data 中包含 batch_id 才能正确关联到 SortingBatch
+
+        注意：此时需要在 data 中包含 batch_id 才能正确关联到 SortingBatch，
+        且 goods 必须在 ASN 明细内、累计量不得超过计划量。
         """
-        task = SortingTaskService.get_task(task_id)
+        task = SortingTaskService._get_instance(task_id)
         if task.status != 'in_progress':
             raise BadRequestException("Cannot create Sorting Task Detail in a non-in-progress Sorting Task", 16009)
 
+        batch = SortingTaskService._assert_batch_in_task(task, data.get('batch_id'))
+        goods_id, sorted_quantity, damage_quantity = SortingTaskService._detail_quantities(data)
+        SortingTaskService._assert_within_planned(task, {goods_id: sorted_quantity + damage_quantity})
+
         new_detail = SortingTaskDetail(
-            sorting_task_id=task_id,
-            batch_id=data['batch_id'],               # 必填字段，关联分拣批次
-            goods_id=data['goods_id'],
-            sorted_quantity=data.get('sorted_quantity', 0),
-            damage_quantity=data.get('damage_quantity', 0),
+            sorting_task_id=task.id,
+            batch_id=batch.id,               # 必填字段，关联分拣批次
+            goods_id=goods_id,
+            sorted_quantity=sorted_quantity,
+            damage_quantity=damage_quantity,
             operator_id=created_by_id
         )
         db.session.add(new_detail)
+        db.session.flush()
         # db.session.commit()
         return new_detail
 
-    
+
     @staticmethod
     @transactional
-    def update_task_detail(task_id: int, detail_id: int, data: dict) -> SortingTaskDetail:
+    def update_task_detail(task_or_id: int | SortingTask, detail_id: int, data: dict) -> SortingTaskDetail:
         """
         更新指定 SortingTaskDetail（仅当所属的 SortingTask 为 in_progress）。
         """
-        task = SortingTaskService.get_task(task_id)
+        task = SortingTaskService._get_instance(task_or_id)
         if task.status != 'in_progress':
             raise BadRequestException("Cannot update Sorting Task Detail in a non-in-progress Sorting Task", 16010)
 
-        detail = SortingTaskService.get_task_detail(task_id, detail_id)
+        detail = SortingTaskService.get_task_detail(task.id, detail_id)
 
-        # 如果要更新 batch_id，请确保传入
+        # 如果要更新 batch_id，必须仍是本任务的批次
         if 'batch_id' in data:
-            detail.batch_id = data['batch_id']
-        detail.goods_id = data.get('goods_id', detail.goods_id)
-        detail.sorted_quantity = data.get('sorted_quantity', detail.sorted_quantity)
-        detail.damage_quantity = data.get('damage_quantity', detail.damage_quantity)
+            detail.batch_id = SortingTaskService._assert_batch_in_task(task, data['batch_id']).id
+
+        merged = {
+            'goods_id': data.get('goods_id', detail.goods_id),
+            'sorted_quantity': data.get('sorted_quantity', detail.sorted_quantity),
+            'damage_quantity': data.get('damage_quantity', detail.damage_quantity),
+        }
+        goods_id, sorted_quantity, damage_quantity = SortingTaskService._detail_quantities(merged)
+        SortingTaskService._assert_within_planned(
+            task, {goods_id: sorted_quantity + damage_quantity}, exclude_detail_id=detail.id
+        )
+
+        detail.goods_id = goods_id
+        detail.sorted_quantity = sorted_quantity
+        detail.damage_quantity = damage_quantity
+        db.session.add(detail)
+        db.session.flush()
 
         # db.session.commit()
         return detail
 
     @staticmethod
     @transactional
-    def delete_task_detail(task_id: int, detail_id: int):
+    def delete_task_detail(task_or_id: int | SortingTask, detail_id: int):
         """
         删除指定的 SortingTaskDetail（仅当所属的 SortingTask 状态为 in_progress）。
         """
-        task = SortingTaskService.get_task(task_id)
+        task = SortingTaskService._get_instance(task_or_id)
         if task.status != 'in_progress':
             raise BadRequestException("Cannot delete Sorting Task Detail in a non-in-progress Sorting Task",16011)
 
-        detail = SortingTaskService.get_task_detail(task_id, detail_id)
+        detail = SortingTaskService.get_task_detail(task.id, detail_id)
         db.session.delete(detail)
         # db.session.commit()
 
@@ -250,14 +363,13 @@ class SortingTaskService:
     # Sorting Batch 相关 (增删改查)
     # -------------------------------------------------------------------------
     @staticmethod
-    def list_batches(task_id: int):
+    def list_batches(task_or_id: int | SortingTask):
         """
         获取指定 SortingTask 下所有的 SortingBatch
-        因为 sorting_task.batches 是 lazy='dynamic', 需要 .all() 来获取列表
         """
-        task = SortingTaskService.get_task(task_id)
+        task = SortingTaskService._get_instance(task_or_id)
         return task.batches  # 返回列表
-    
+
     @staticmethod
     def get_batch(task_id: int, batch_id: int) -> SortingBatch:
         """
@@ -267,7 +379,7 @@ class SortingTaskService:
         if batch.sorting_task_id != task_id:
             raise NotFoundException(f"Batch (id={batch_id}) not found in Task (id={task_id}).", 13001)
         return batch
-    
+
     @staticmethod
     @transactional
     def create_batch(task_or_id: int | SortingTask, data: dict, operator_id: int):
@@ -277,7 +389,7 @@ class SortingTaskService:
         2) 创建批次并批量添加 SortingTaskDetail
 
         统一规则： 仅当 SortingTask.status == 'in_progress' 才允许操作。
-        
+
         data 示例:
             {
                 "operation_time": "2025-02-01T08:00:00",  # 可选
@@ -293,7 +405,8 @@ class SortingTaskService:
                 ]
             }
         如果 data 内部没有 "details" 或其为空数组，表示仅创建批次。
-        返回: (batch, [list_of_details]) 
+        明细里的 goods 必须在 ASN 明细内，且累计（合格 + 损坏）不得超过 ASN 计划量。
+        返回: batch
         """
 
         task = SortingTaskService._get_instance(task_or_id)
@@ -301,63 +414,59 @@ class SortingTaskService:
         if task.status != 'in_progress':
             raise BadRequestException("Cannot create a batch or details in a non-in-progress Sorting Task", 16012)
 
-        op_time = data.get('operation_time')
-        if isinstance(op_time, str):
-            # 如果确认是 ISO8601
-            op_time = datetime.fromisoformat(op_time)
-            # 否则使用 datetime.strptime(op_time, '%Y-%m-%dT%H:%M:%S') 等
+        # 强制校验类型（若存在且非列表则报错）
+        details_data = data.get("details") or []
+        if not isinstance(details_data, list):
+            raise BadRequestException("'details' must be a list (empty is allowed)", 16015)
+
+        # 先做权威校验：累计分拣量（现有 + 本次）不得超过 ASN 计划量，阻止重复 / 超量提交
+        parsed_details = [SortingTaskService._detail_quantities(item) for item in details_data]
+        incoming_by_goods = {}
+        for goods_id, sorted_quantity, damage_quantity in parsed_details:
+            incoming_by_goods[goods_id] = incoming_by_goods.get(goods_id, 0) + sorted_quantity + damage_quantity
+        SortingTaskService._assert_within_planned(task, incoming_by_goods)
 
         # 1) 创建批次
         new_batch = SortingBatch(
             sorting_task_id=task.id,
             operator_id=operator_id,
-            operation_time=op_time or datetime.now(),
+            operation_time=SortingTaskService._parse_datetime(data.get('operation_time')) or datetime.now(),
             remark=data.get('remark', '')
         )
         db.session.add(new_batch)
         db.session.flush()  # 为了获取新批次的 ID
 
         # 2) 如果有 details，就批量创建 detail
-        details_data = data.get("details", [])
-        # 2. 强制校验类型（若存在且非列表则报错）
-        if details_data is not None and not isinstance(details_data, list):
-            raise BadRequestException("'details' must be a list (empty is allowed)", 16015)
-
-        for item in details_data:
+        for goods_id, sorted_quantity, damage_quantity in parsed_details:
             detail_obj = SortingTaskDetail(
                 sorting_task_id=task.id,
-                batch_id=new_batch.id,  
-                goods_id=item['goods_id'],
-                sorted_quantity=item.get('sorted_quantity', 0),
-                damage_quantity=item.get('damage_quantity', 0),
+                batch_id=new_batch.id,
+                goods_id=goods_id,
+                sorted_quantity=sorted_quantity,
+                damage_quantity=damage_quantity,
                 operator_id=operator_id
             )
             db.session.add(detail_obj)
+        db.session.flush()
 
-        # 3) 一次性提交
         # db.session.commit()
-
-        # 返回批次对象和所创建的明细列表
         return new_batch
-
-
-    
 
     @staticmethod
     @transactional
-    def update_batch(task_id: int, batch_id: int, data: dict) -> SortingBatch:
+    def update_batch(task_or_id: int | SortingTask, batch_id: int, data: dict) -> SortingBatch:
         """
         更新已有 SortingBatch
         - 仅当 SortingTask 处于 in_progress 时允许更新
         """
-        task = SortingTaskService.get_task(task_id)
+        task = SortingTaskService._get_instance(task_or_id)
         if task.status != 'in_progress':
             raise BadRequestException("Cannot update a batch in a non-in-progress Sorting Task", 16013)
 
-        batch = SortingTaskService.get_batch(task_id, batch_id)
+        batch = SortingTaskService.get_batch(task.id, batch_id)
 
         if 'operation_time' in data:
-            batch.operation_time = data['operation_time']
+            batch.operation_time = SortingTaskService._parse_datetime(data['operation_time']) or batch.operation_time
         if 'remark' in data:
             batch.remark = data['remark']
 
@@ -366,21 +475,21 @@ class SortingTaskService:
 
     @staticmethod
     @transactional
-    def delete_batch(task_id: int, batch_id: int):
+    def delete_batch(task_or_id: int | SortingTask, batch_id: int):
         """
         删除指定的 SortingBatch
         - 仅当 SortingTask 处于 in_progress 时允许删除
-        - 若已产生明细（SortingTaskDetail），可视业务决定是否禁止删除或自动删除
+        - 批次下的 SortingTaskDetail 随之级联删除
         """
-        task = SortingTaskService.get_task(task_id)
+        task = SortingTaskService._get_instance(task_or_id)
         if task.status != 'in_progress':
             raise BadRequestException("Cannot delete a batch in a non-in-progress Sorting Task", 16014)
 
-        batch = SortingTaskService.get_batch(task_id, batch_id)
+        batch = SortingTaskService.get_batch(task.id, batch_id)
         db.session.delete(batch)
         # db.session.commit()
 
-   
+
     @staticmethod
     @transactional
     def process_task(task_or_id: int | SortingTask, operator_id: int) -> SortingTask:
@@ -391,7 +500,7 @@ class SortingTaskService:
 
         if task.status != 'pending':
             raise BadRequestException("Cannot process a non-pending Sorting Task", 16007)
-        
+
         task = SortingTaskService._update_task_status(task, 'in_progress', operator_id)
         return task
 
@@ -400,17 +509,20 @@ class SortingTaskService:
     @transactional
     def complete_task(task_or_id: int | SortingTask, operator_id: int) -> SortingTask:
         """
-        更新 SortingTask 的状态为 completed
+        更新 SortingTask 的状态为 completed，并完成其 ASN。
+        完成前再验一次累计分拣量不超过 ASN 计划量。
         """
         task = SortingTaskService._get_instance(task_or_id)
         if task.status != 'in_progress':
             raise BadRequestException("Cannot complete a non-in_progress Sorting Task", 16008)
 
+        SortingTaskService._assert_within_planned(task)
+
         task = SortingTaskService._update_task_status(task, 'completed', operator_id)
 
         # 更新 ASN Detail 的数量字段
         ASNService.complete_asn(task.asn)
-                    
+
         return task
 
     @staticmethod
@@ -432,7 +544,7 @@ class SortingTaskService:
         db.session.add(sorting_task)
         # db.session.commit()
         return sorting_task
-    
+
     @staticmethod
     def get_sorting_monthly_stats(months=6, filters=None):
         """获取最近N个月各状态Sorting统计（支持仓库过滤）
@@ -480,7 +592,7 @@ class SortingTaskService:
             if filters.get('warehouse_id'):
                 query = query.filter(ASN.warehouse_id == filters['warehouse_id'])
             if filters.get('warehouse_ids'):
-                query = query.filter(ASN.warehouse_id.in_(filters['warehouse_ids'])) 
+                query = query.filter(ASN.warehouse_id.in_(filters['warehouse_ids']))
 
         # 分组和排序保持不变
         query = query.group_by('year', 'month').order_by('year', 'month')
@@ -555,7 +667,7 @@ class SortingTaskService:
             if filters.get('warehouse_id'):
                 query = query.filter(ASN.warehouse_id == filters['warehouse_id'])
             if filters.get('warehouse_ids'):
-                query = query.filter(ASN.warehouse_id.in_(filters['warehouse_ids'])) 
+                query = query.filter(ASN.warehouse_id.in_(filters['warehouse_ids']))
 
         # 执行查询（建议添加缓存机制）
         raw_data = {

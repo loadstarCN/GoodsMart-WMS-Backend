@@ -1,9 +1,7 @@
 from sqlalchemy import func
 from extensions.db import *
 from extensions.transaction import transactional
-from warehouse.goods.models import Goods
 from warehouse.goods.services import GoodsLocationService
-from warehouse.warehouse.models import Warehouse
 from .models import InventorySnapshot
 
 class InventorySnapshotService:

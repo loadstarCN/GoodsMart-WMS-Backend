@@ -6,7 +6,7 @@ from warehouse.warehouse.services import WarehouseService
 def run_inventory_snapshot():
     """为所有仓库创建库存快照"""
     start_time = time.time()
-    warehouses = WarehouseService.list_warehouses({})
+    warehouses = WarehouseService.list_warehouses({}).all()
     for warehouse in warehouses:
         InventorySnapshotService.create_snapshot(warehouse.id)
     duration = time.time() - start_time

@@ -11,7 +11,13 @@ def filter_none(data):
     return data
 
 def generate_input_fields(model):
-    return {key: field for key, field in model.items() if not getattr(field, 'readOnly', False)}
+    """从输出模型生成输入模型：剔除只读字段。
+    flask-restx 把 readOnly=True 存成 field.readonly（小写），两种写法都要识别。
+    """
+    return {
+        key: field for key, field in model.items()
+        if not (getattr(field, 'readonly', False) or getattr(field, 'readOnly', False))
+    }
 
 def parse_date(date_str):
     if not date_str or not date_str.strip():

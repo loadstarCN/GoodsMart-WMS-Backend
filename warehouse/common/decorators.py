@@ -4,8 +4,9 @@ from flask_restx import abort
 
 from extensions import db
 from extensions.error import BadRequestException, ForbiddenException, UnauthorizedException
-from warehouse.warehouse.models import Warehouse
-from warehouse.staff.models import Staff
+
+# 注意：Warehouse / Staff 模型在函数内延迟导入。各业务模块的 views 会 `from warehouse.common import ...`，
+# 若这里在模块顶层导入业务模型，会经由 warehouse/<模块>/__init__.py → views 反向引用 warehouse.common 形成循环导入。
 
 def extract_warehouse_id():
     """
@@ -19,8 +20,12 @@ def extract_warehouse_id():
 
     if not warehouse_id:
         return  # 如果 warehouse_id 为空，则不做任何处理
-    warehouse_id = int(warehouse_id)
+    try:
+        warehouse_id = int(warehouse_id)
+    except (TypeError, ValueError):
+        raise BadRequestException("Invalid warehouse ID", 14009)
     # 验证 warehouse 是否存在且处于激活状态
+    from warehouse.warehouse.models import Warehouse
     warehouse = db.session.get(Warehouse, warehouse_id)
     if not warehouse:
         raise BadRequestException("Invalid warehouse ID", 14009)
@@ -68,8 +73,9 @@ def _enforce_warehouse_requirement(force_warehouse=False):
     if force_warehouse and not getattr(g, "warehouse_id", None):
         raise BadRequestException("User must provide a valid warehouse_id when force_warehouse is True", 14003)
 
-    if not hasattr(g, "current_user") or not g.current_user:
-        raise UnauthorizedException("No current user found", 11004)
+    if not g.get("current_user"):
+        _enforce_api_key_warehouse_access()
+        return
 
     user = g.current_user
     user_roles = [getattr(role, "name", role) for role in getattr(user, "roles", [])]
@@ -84,6 +90,7 @@ def _enforce_warehouse_requirement(force_warehouse=False):
 
     # 对于 staff 用户，加载其可访问仓库
     if user.type == "staff":
+        from warehouse.staff.models import Staff
         staff = db.session.get(Staff, user.id)
         if not staff:
             raise ForbiddenException("Current user is not a staff member", 12005)
@@ -113,6 +120,28 @@ def _enforce_warehouse_requirement(force_warehouse=False):
         raise ForbiddenException("Unsupported user type", 12005)
 
 
+def _enforce_api_key_warehouse_access():
+    """
+    未绑定用户的 API Key：
+    - 绑定了公司 → 可访问仓库 = 该公司全部启用仓库；提供了 warehouse_id 时必须在其中
+    - 未绑定公司（超级密钥）→ 不受限
+    - 既无用户也无 API Key → 401
+    """
+    if not getattr(g, "current_system", None):
+        raise UnauthorizedException("No current user found", 11004)
+
+    api_company_id = getattr(g, "api_key_company_id", None)
+    if not api_company_id:
+        return
+
+    from warehouse.company.models import Company
+    company = db.session.get(Company, api_company_id)
+    warehouses = company.warehouses if company else []
+    g.accessible_warehouses = [w for w in warehouses if w.is_active]
+    if getattr(g, "warehouse_id", None) and g.warehouse not in g.accessible_warehouses:
+        raise ForbiddenException("Warehouse ID is not accessible to this API key", 12001)
+
+
 def _enforce_staff_warehouse_access():
     """
     进一步确保：
@@ -120,8 +149,8 @@ def _enforce_staff_warehouse_access():
     - 对于 staff 用户，必须确保已加载 g.accessible_warehouses，并且若提供了 warehouse_id，
       则该仓库必须在 g.accessible_warehouses 内。
     """
-    if not hasattr(g, "current_user") or not g.current_user:
-        raise UnauthorizedException("No current user found", 11004)
+    if not g.get("current_user"):
+        return  # API Key 路径已在 _enforce_api_key_warehouse_access 处理
 
     user = g.current_user
     # 对于普通用户，不作检查

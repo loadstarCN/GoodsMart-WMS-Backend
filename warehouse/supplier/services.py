@@ -80,7 +80,7 @@ class SupplierService:
         supplier.email = data.get('email', supplier.email)
         supplier.contact = data.get('contact', supplier.contact)
         supplier.is_active = data.get('is_active', supplier.is_active)
-        supplier.company_id = data.get('company_id', supplier.company_id)
+        # company_id 不可通过更新修改（归属固定）
 
         # db.session.commit()
         return supplier

@@ -1,7 +1,9 @@
-from flask import g
-from flask_jwt_extended import get_current_user, jwt_required
+from flask import g, request
+from flask_jwt_extended import decode_token, get_current_user, get_jwt, jwt_required
 from flask_restx import Resource, abort
 from extensions.error import UnauthorizedException
+from extensions.jwt import revoke_token
+from extensions.limiter import limiter
 from system.common import paginate, permission_required
 from .schemas import api_ns, user_model, role_model, permission_model, user_input_model, role_input_model, permission_input_model, pagination_parser, user_pagination_model, role_pagination_model, permission_pagination_model, login_model, password_change_model, forgot_password_model, reset_password_model
 from .services import UserService, RoleService, PermissionService
@@ -11,21 +13,11 @@ from .services import UserService, RoleService, PermissionService
 # ------------------------
 
 
-@api_ns.doc(security="jsonWebToken")
-@api_ns.route('/test')
-class Test(Resource):
-    
-    @permission_required(["all_access","user_read"])
-    def get(self):
-        _user = g.get('current_user')
-        if _user:
-            return {"id": _user.id, "name": _user.user_name}, 200
-        return {"message": "No user found"}, 404
-    
 @api_ns.route('/login')
 class UserLogin(Resource):
 
     @api_ns.expect(login_model)
+    @limiter.limit("30 per minute")  # 按客户端 IP；同一出口 NAT 的仓库有多台 PDA，不能太紧
     def post(self):
         """用户登录"""
         data = api_ns.payload
@@ -43,13 +35,37 @@ class TokenRefresh(Resource):
 
         @jwt_required(refresh=True)
         def post(self):
-            """刷新令牌"""
+            """刷新令牌（refresh_token 轮换后旧的立即作废）"""
             current_user = get_current_user()
             if not current_user:
                 raise UnauthorizedException("Token is invalid", 11002)
-            
+
+            claims = get_jwt()
             result = UserService.refresh_token(current_user)
+            if 'refresh_token' in result:
+                revoke_token(claims.get('jti'), claims.get('exp'))
             return result, 200
+
+
+@api_ns.doc(security="jsonWebToken")
+@api_ns.route('/logout')
+class UserLogout(Resource):
+
+    @jwt_required(verify_type=False)
+    def post(self):
+        """登出：吊销当前 token；请求体可附带 refresh_token 一并吊销"""
+        claims = get_jwt()
+        revoke_token(claims.get('jti'), claims.get('exp'))
+
+        body = request.get_json(silent=True) or {}
+        refresh_token = body.get('refresh_token')
+        if refresh_token:
+            try:
+                decoded = decode_token(refresh_token)
+                revoke_token(decoded.get('jti'), decoded.get('exp'))
+            except Exception:
+                pass  # 无效的 refresh_token 无需处理
+        return {"message": "Logged out"}, 200
 
 
 @api_ns.doc(security="jsonWebToken")
@@ -75,28 +91,30 @@ class UserPassword(Resource):
             new_password=new_password
         )
         return {"message": "Password updated successfully"}, 200
-        
+
 
 @api_ns.route('/forgot-password')
 class ForgotPassword(Resource):
 
     @api_ns.expect(forgot_password_model)
+    @limiter.limit("5 per minute;30 per hour")
     def post(self):
-        """发送密码重置验证码"""
-        email = api_ns.payload.get('email')
+        """发送密码重置验证码（无论邮箱是否存在都返回同样的结果）"""
+        email = (api_ns.payload or {}).get('email')
         if not email:
             return {"message": "Email is required"}, 400
         try:
             UserService.forgot_password(email)
-            return {"message": "Verification code sent"}, 200
         except Exception as e:
-            return {"message": str(e)}, 400
+            api_ns.logger.error(f"forgot_password failed for {email}: {e}")
+        return {"message": "If the email exists, a verification code has been sent"}, 200
 
 
 @api_ns.route('/reset-password')
 class ResetPassword(Resource):
 
     @api_ns.expect(reset_password_model)
+    @limiter.limit("10 per minute")
     def post(self):
         """验证码验证并重置密码"""
         data = api_ns.payload
@@ -105,11 +123,8 @@ class ResetPassword(Resource):
         new_password = data.get('new_password')
         if not all([email, code, new_password]):
             return {"message": "All fields are required"}, 400
-        try:
-            UserService.reset_password(email, code, new_password)
-            return {"message": "Password reset successfully"}, 200
-        except Exception as e:
-            return {"message": str(e)}, 400
+        UserService.reset_password(email, code, new_password)
+        return {"message": "Password reset successfully"}, 200
 
 
 @api_ns.doc(security="jsonWebToken")
@@ -127,7 +142,10 @@ class UserList(Resource):
 
         filters = {
             'username': args.get('username'),
-            'email': args.get('email')
+            'email': args.get('email'),
+            'keyword': args.get('keyword'),
+            'is_active': args.get('is_active'),
+            'type': args.get('type'),
         }
 
         query = UserService.list_users(filters)
@@ -158,15 +176,17 @@ class UserDetail(Resource):
     @api_ns.expect(user_input_model)
     @api_ns.marshal_with(user_model)
     def put(self, user_id):
-        """更新用户信息"""
+        """更新用户信息（含启用/停用）"""
         data = api_ns.payload
-        updated_user = UserService.update_user(user_id, data)        
+        actor = g.get('current_user')
+        updated_user = UserService.update_user(user_id, data, actor_id=actor.id if actor else None)
         return updated_user
 
     @permission_required(["all_access", "user_delete"])
     def delete(self, user_id):
         """删除用户"""
-        UserService.delete_user(user_id)
+        actor = g.get('current_user')
+        UserService.delete_user(user_id, actor_id=actor.id if actor else None)
         return {"message": "User deleted successfully"}, 200
 
 
@@ -178,7 +198,7 @@ class UserDetail(Resource):
 @api_ns.route('/roles')
 class RoleList(Resource):
 
-    @permission_required(["all_access", "role_read"])
+    @permission_required(["all_access", "company_all_access", "role_read"])
     @api_ns.expect(pagination_parser)
     @api_ns.marshal_with(role_pagination_model)
     def get(self):
@@ -189,6 +209,7 @@ class RoleList(Resource):
 
         filters = {
             'name': args.get('name'),
+            'keyword': args.get('keyword'),
             'is_active': args.get('is_active')
         }
 
@@ -209,7 +230,7 @@ class RoleList(Resource):
 @api_ns.route('/roles/<int:role_id>')
 class RoleDetail(Resource):
 
-    @permission_required(["all_access", "role_read"])
+    @permission_required(["all_access", "company_all_access", "role_read"])
     @api_ns.marshal_with(role_model)
     def get(self, role_id):
         """获取角色详情"""
@@ -251,7 +272,7 @@ class PermissionList(Resource):
 
         filters = {
             'name': args.get('name'),
-            'is_active': args.get('is_active')
+            'keyword': args.get('keyword'),
         }
 
         query = PermissionService.list_permissions(filters)

@@ -69,6 +69,9 @@ cycle_count_task_detail_model = api_ns.model('CycleCountTaskDetail', cycle_count
 
 # 生成 Cycle Count Task Detail 输入模型：复制后删除不允许输入的字段
 cycle_count_task_detail_input_fields = generate_input_fields(cycle_count_task_detail_fields)
+# task_id 来自路径；status / operator_id / completed_at / system_quantity 只由盘点流程写入
+for key in ['task_id', 'status', 'operator_id', 'completed_at', 'system_quantity']:
+    cycle_count_task_detail_input_fields.pop(key, None)
 cycle_count_task_detail_input_model = api_ns.model('CycleCountTaskDetailInput', cycle_count_task_detail_input_fields)
 
 # ------------------------------------------------------------------------------
@@ -125,6 +128,9 @@ cycle_count_task_base_model = api_ns.model('CycleCountTaskBase', cycle_count_tas
 
 # 生成 Cycle Count Task 输入模型：复制后删除不允许用户输入的字段
 cycle_count_task_input_fields = generate_input_fields(cycle_count_task_base_fields)
+# 状态 / 审计字段只由 process / complete 流程写入，不接受客户端输入
+for key in ['status', 'is_active', 'created_by', 'started_at', 'completed_at']:
+    cycle_count_task_input_fields.pop(key, None)
 cycle_count_task_input_model = api_ns.model('CycleCountTaskInput', cycle_count_task_input_fields)
 # 添加task_details字段
 cycle_count_task_input_model['task_details'] = fields.List(

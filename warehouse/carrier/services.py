@@ -82,7 +82,7 @@ class CarrierService:
         carrier.email = data.get('email', carrier.email)
         carrier.contact = data.get('contact', carrier.contact)
         carrier.is_active = data.get('is_active', carrier.is_active)
-        carrier.company_id = data.get('company_id', carrier.company_id)
+        # company_id 不可通过更新修改（归属固定）
 
         # db.session.commit()
         return carrier

@@ -1,4 +1,5 @@
 from flask import g
+from warehouse.common import require_actor_user_id
 from flask_restx import Resource, abort
 from extensions.error import ForbiddenException
 from system.common import paginate, permission_required
@@ -44,7 +45,7 @@ class DepartmentList(Resource):
     def post(self):
         """Create a new department"""
         data = api_ns.payload
-        created_by = g.current_user.id
+        created_by = require_actor_user_id()
         # Check if the user is a staff member and restrict access to their company
         if g.current_user.type == 'staff':
             company_id = g.current_user.company_id

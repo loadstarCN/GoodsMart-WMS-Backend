@@ -111,19 +111,26 @@ ASN（Advanced Shipping Notice，高级送货通知）模块用于管理入库�
    - 所有商品的 `actual_quantity` 必须等于 `quantity`。
    - 完成后，ASN 被标记为 `closed`，并且无法再更改。
 
+### **取消（`PUT /asn/<id>/cancel/`）**
+
+- `pending`：等同 `close`，单据关闭并重算 `asn_stock`。
+- `received` 且分拣任务尚无任何批次 / 明细：回滚 `asn_received` 的签收库存（`received_stock`），停用分拣任务并关闭单据。
+- `completed` / `closed`，或分拣已有进度：返回 409（业务码 16059 / 16060）。
+
 ---
 
 ## 更新机制
 
 ### **ASN 更新**
-- 字段如 `tracking_number`、`carrier_id` 和 `remark` 可以在 ASN 状态为 `closed` 前更新。
-- 收货后需要更新 `actual_arrival_date`。
-- 状态只能向前转换（`pending` → `received` → `closed`），不可回退。
+- 只接受 `supplier_id`、`tracking_number`、`carrier_id`、`asn_type`、`expected_arrival_date`、`order_number`、`remark`（及 `details`）。
+- `status`、`is_active`、`created_by`、`*_at` 只能经 `receive` / `close` / `cancel` 等动作端点变更，请求体里传了也会被忽略。
+- `supplier_id` / `carrier_id` 必须与单据仓库同属一家公司；`goods_code` / `carrier_code` 只在单据仓库所属公司内解析。
+- 状态只能向前转换（`pending` → `received` → `completed`），不可回退。
 
 ### **ASNDetail 更新**
-- 收货时更新 `actual_quantity`。
-- 分拣时更新 `sorted_quantity` 和 `damage_quantity`。
-- 如果父 ASN 状态为 `closed`，则限制更新。
+- 只接受 `goods_id` / `goods_code`、`quantity`（正整数）、`weight`、`volume`、`remark`；商品必须属于单据仓库所在公司。
+- `actual_quantity`、`sorted_quantity`、`damage_quantity` 是分拣完成时按分拣明细聚合得出的过程量，不接受客户端输入。
+- 如果父 ASN 状态不是 `pending`，则不允许更新。
 
 ---
 

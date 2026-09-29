@@ -1,8 +1,10 @@
 from flask import g
-from flask_restx import Resource,abort
-from extensions.error import ForbiddenException
+from flask_restx import Resource
+from extensions.error import BadRequestException
 from system.common import permission_required,paginate
-from warehouse.common import warehouse_required,add_warehouse_filter,check_warehouse_access
+from warehouse.common import warehouse_required,add_warehouse_filter,get_warehouse_owned,require_positive_int, require_actor_user_id
+from warehouse.dn.models import DN
+from .models import DeliveryTask
 from .schemas import (
     api_ns,
     delivery_task_model,
@@ -14,6 +16,11 @@ from .schemas import (
     delivery_monthly_stats_parser
 )
 from .services import DeliveryTaskService
+
+
+def _owned_task(task_id: int) -> DeliveryTask:
+    """按 id 取发货任务并经其 DN 校验仓库归属（须在 @warehouse_required() 之后调用）"""
+    return get_warehouse_owned(DeliveryTask, task_id, warehouse_attr='dn.warehouse_id', what='Delivery Task')
 
 
 @api_ns.doc(security="jsonWebToken")
@@ -53,14 +60,18 @@ class DeliveryTaskList(Resource):
         return paginate(query, page, per_page)
 
     @permission_required(["all_access","company_all_access","delivery_edit"])
+    @warehouse_required()
     @api_ns.expect(delivery_task_input_model)
     @api_ns.marshal_with(delivery_task_model)
     def post(self):
         """
-        Create a new Delivery
+        Create a new Delivery (the DN must be accessible; status is always pending)
         """
         data = api_ns.payload
-        created_by = g.current_user.id
+        if not isinstance(data, dict):
+            raise BadRequestException("Request body must be a JSON object", 16015)
+        get_warehouse_owned(DN, require_positive_int(data.get('dn_id'), 'dn_id', 16044), what='DN')
+        created_by = require_actor_user_id()
         new_delivery = DeliveryTaskService.create_task(data, created_by)
         return new_delivery, 201
 
@@ -76,37 +87,37 @@ class DeliveryTaskDetailView(Resource):
         """
         Get details of a specific Delivery
         """
-        task = DeliveryTaskService.get_task(task_id)
-        if not check_warehouse_access(task.dn.warehouse_id):
-            raise ForbiddenException("You do not have access to this Delivery Task", 12001)
-        
-        return task, 200
+        return _owned_task(task_id), 200
 
     @permission_required(["all_access","company_all_access","delivery_edit"])
+    @warehouse_required()
     @api_ns.expect(delivery_task_input_model)
     @api_ns.marshal_with(delivery_task_model)
     def put(self, task_id):
         """
-        Update a specific Delivery
+        Update a specific Delivery (dn_id / status / is_active are not editable)
         """
+        task = _owned_task(task_id)
         data = api_ns.payload
-        updated_delivery = DeliveryTaskService.update_task(task_id, data)
+        updated_delivery = DeliveryTaskService.update_task(task.id, data)
 
         return updated_delivery
 
     @permission_required(["all_access","company_all_access","delivery_delete"])
+    @warehouse_required()
     def delete(self, task_id):
         """
         Delete a specific Delivery
         """
-        DeliveryTaskService.delete_task(task_id)
+        task = _owned_task(task_id)
+        DeliveryTaskService.delete_task(task.id)
         return {"message": "Delivery deleted successfully"}, 200
 
 
 @api_ns.doc(security="jsonWebToken")
 @api_ns.route('/<int:task_id>/process/')
 class DeliveryTaskProcess(Resource):
-    
+
     @permission_required(["all_access","company_all_access","delivery_edit"])
     @warehouse_required()
     @api_ns.marshal_with(delivery_task_model)
@@ -114,20 +125,17 @@ class DeliveryTaskProcess(Resource):
         """
         Process a specific Delivery (set status to shipping)
         """
-        operator_id = g.current_user.id
-        task = DeliveryTaskService.get_task(task_id)
-        if not check_warehouse_access(task.dn.warehouse_id):
-            raise ForbiddenException("You do not have access to this Delivery Task", 12001)
+        operator_id = require_actor_user_id()
+        task = _owned_task(task_id)
+        updated_delivery = DeliveryTaskService.process_task(task, operator_id)
 
-        updated_delivery = DeliveryTaskService.process_task(task_id,operator_id)
-        
         return updated_delivery
 
 
 @api_ns.doc(security="jsonWebToken")
 @api_ns.route('/<int:task_id>/complete/')
 class DeliveryTaskComplete(Resource):
-    
+
     @permission_required(["all_access","company_all_access","delivery_edit"])
     @warehouse_required()
     @api_ns.expect(delivery_task_complete_input_model)
@@ -137,20 +145,17 @@ class DeliveryTaskComplete(Resource):
         Complete a specific Delivery (set status to completed)
         """
         data = api_ns.payload
-        operator_id = g.current_user.id
-        task = DeliveryTaskService.get_task(task_id)
-        if not check_warehouse_access(task.dn.warehouse_id):
-            raise ForbiddenException("You do not have access to this Delivery Task", 12001)
-        
-        updated_delivery = DeliveryTaskService.complete_task(task_id,data=data,operator_id=operator_id)
-        
+        operator_id = require_actor_user_id()
+        task = _owned_task(task_id)
+        updated_delivery = DeliveryTaskService.complete_task(task, data=data, operator_id=operator_id)
+
         return updated_delivery
 
 
 @api_ns.doc(security="jsonWebToken")
 @api_ns.route('/<int:task_id>/sign/')
 class DeliveryTaskSign(Resource):
-    
+
     @permission_required(["all_access","company_all_access","delivery_edit"])
     @warehouse_required()
     @api_ns.expect(delivery_task_signed_input_model)
@@ -160,24 +165,21 @@ class DeliveryTaskSign(Resource):
         Sign a specific Delivery (set status to signed)
         """
         data = api_ns.payload
-        operator_id = g.current_user.id
-        task = DeliveryTaskService.get_task(task_id)
-        if not check_warehouse_access(task.dn.warehouse_id):
-            raise ForbiddenException("You do not have access to this Delivery Task", 12001)
-        
-        updated_delivery = DeliveryTaskService.sign_task(task_id,data=data,operator_id=operator_id)
-        
+        operator_id = require_actor_user_id()
+        task = _owned_task(task_id)
+        updated_delivery = DeliveryTaskService.sign_task(task, data=data, operator_id=operator_id)
+
         return updated_delivery
-    
+
 
 
 @api_ns.doc(security="jsonWebToken")
 @api_ns.route('/monthly-stats')
 class DeliveryMonthlyStats(Resource):
     """
-    Get monthly Sorting statistics
+    Get monthly Delivery statistics
     """
-    @permission_required(["all_access","company_all_access","sorting_read"])
+    @permission_required(["all_access","company_all_access","delivery_read"])
     @warehouse_required()
     @api_ns.expect(delivery_monthly_stats_parser)
     def get(self):
@@ -193,19 +195,18 @@ class DeliveryMonthlyStats(Resource):
         filters = add_warehouse_filter(filters)
         stats = DeliveryTaskService.get_delivery_monthly_stats(months=months,filters=filters)
         return stats, 200
-    
+
 @api_ns.doc(security="jsonWebToken")
 @api_ns.route('/status-overview-stats')
-class PickingStatusOverviewStats(Resource):
+class DeliveryStatusOverviewStats(Resource):
     """
-    Get Sorting status overview statistics
+    Get Delivery status overview statistics
     """
-    @permission_required(["all_access","company_all_access","sorting_read"])
+    @permission_required(["all_access","company_all_access","delivery_read"])
     @warehouse_required()
     def get(self):
         # 解析请求参数
-        # 解析请求参数
-        args = delivery_monthly_stats_parser.parse_args()
+        delivery_monthly_stats_parser.parse_args()
 
         # 将筛选参数打包到 dict 中
         filters = {}

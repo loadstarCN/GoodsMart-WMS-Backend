@@ -57,13 +57,54 @@ def test_update_delivery_task(client, access_token):
         headers={'Authorization': f'Bearer {access_token}'},
         json={
             "tracking_number": "DT-UPDATED",
-            "status": "in_progress"
+            "status": "signed",
+            "is_active": False,
+            "dn_id": 2,
         }
     )
     assert response.status_code == 200
     data = response.get_json()
     assert data['tracking_number'] == "DT-UPDATED"
-    assert data['status'] == "in_progress"
+    # B-12 / B-40：status / is_active / dn_id 不能经 PUT 改
+    assert data['status'] == "pending"
+    assert data['is_active'] is True
+    assert data['dn_id'] == task.dn_id
+
+
+@pytest.mark.parametrize('body', [
+    {"dn_id": 1, "recipient_id": 1, "shipping_address": "x"},                       # 缺 expected_shipping_date
+    {"recipient_id": 1, "shipping_address": "x", "expected_shipping_date": "2026-01-01"},  # 缺 dn_id
+    {"dn_id": 1, "recipient_id": 1, "shipping_address": "x",
+     "expected_shipping_date": "2026-01-01", "transportation_mode": "teleport"},     # 枚举非法
+    {"dn_id": 1, "recipient_id": 1, "shipping_address": "x",
+     "expected_shipping_date": "2026-01-01", "shipping_cost": -1},                  # 运费为负
+    {"dn_id": 1, "recipient_id": 1, "shipping_address": "x",
+     "expected_shipping_date": "2026-01-01", "actual_shipping_date": "2025-12-31"}, # 实际早于计划（撞 CHECK 约束）
+    {"dn_id": 1, "recipient_id": 1, "shipping_address": "x", "expected_shipping_date": "01/01/2026"},  # 日期格式
+])
+def test_create_delivery_invalid_body_returns_400(client, access_token, body):
+    """B-18：缺字段 / 枚举非法 / 数值非法 → 400 而非 500"""
+    response = client.post('/delivery/', headers={'Authorization': f'Bearer {access_token}'}, json=body)
+    assert response.status_code == 400, response.get_json()
+
+
+def test_create_delivery_rejects_recipient_of_other_company(client, access_token):
+    """B-04：收货人 / 承运商必须与 DN 仓库同公司 → 403"""
+    with client.application.app_context():
+        admin = get_admin_user()
+        company_b = Company.query.filter_by(name='Company B').first()
+        recipient_b = Recipient(name='R-B-DELIVERY', address='b', zip_code='1', phone='1', email='rbd@b.com',
+                                contact='c', country='us', created_by=admin.id, company_id=company_b.id)
+        db.session.add(recipient_b)
+        db.session.commit()
+        recipient_b_id = recipient_b.id
+
+    response = client.post('/delivery/', headers={'Authorization': f'Bearer {access_token}'}, json={
+        "dn_id": 1, "recipient_id": recipient_b_id, "shipping_address": "x",
+        "expected_shipping_date": "2026-01-01",
+    })
+    assert response.status_code == 403
+    assert response.get_json()['code'] == 12001
 
 
 def test_delete_delivery_task(client, access_token):
@@ -125,12 +166,18 @@ def test_delivery_task_service_update_delivery(client):
         task = get_delivery_task()
         user = get_operator_user()
 
+        original_dn_id = task.dn_id
         updated_data = {
             "status": "completed",
+            "dn_id": original_dn_id + 1,
+            "remark": "service updated",
         }
         updated_task = DeliveryTaskService.update_task(task.id, updated_data)
         assert updated_task is not None
-        assert updated_task.status == "completed"
+        # B-12 / B-40：status 只经流程端点变更，dn_id 不可改
+        assert updated_task.status == "pending"
+        assert updated_task.dn_id == original_dn_id
+        assert updated_task.remark == "service updated"
 
 
 def test_create_task_with_invalid_data(client):
@@ -151,9 +198,10 @@ def test_create_task_with_invalid_data(client):
             "status": "pending",
         }
 
-        # 预期会抛出错误，任务无法创建
-        with pytest.raises(KeyError):
+        # B-18：缺必填字段 → 400（BadRequestException），而不是 KeyError 变 500
+        with pytest.raises(BadRequestException) as excinfo:
             DeliveryTaskService.create_task(invalid_data,user.id)
+        assert excinfo.value.biz_code == 40000
 
 
 def test_update_delivery_with_invalid_status(client):

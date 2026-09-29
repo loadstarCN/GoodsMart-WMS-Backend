@@ -1,7 +1,21 @@
+from flask import current_app
 from extensions.db import *
+from extensions.redis import redis_client
 from extensions.transaction import transactional
 from .models import IPBlacklist, IPWhitelist
 from datetime import datetime
+
+
+def _sync_redis(set_name: str, ip_address: str, add: bool):
+    """黑白名单的生效判断在 Redis（check_ip），增删条目时同步写入，否则要重启服务才生效"""
+    try:
+        if add:
+            redis_client.sadd(set_name, ip_address)
+        else:
+            redis_client.srem(set_name, ip_address)
+    except Exception as e:
+        current_app.logger.error(f"Failed to sync IP {set_name} to Redis: {e}")
+
 
 class LimiterService:
 
@@ -36,7 +50,7 @@ class LimiterService:
 
         new_blacklist_item = IPBlacklist(ip_address=ip_address, reason=reason, timestamp=datetime.now())
         db.session.add(new_blacklist_item)
-        # db.session.commit()
+        _sync_redis('blacklist', ip_address, add=True)
 
         return new_blacklist_item
 
@@ -47,8 +61,8 @@ class LimiterService:
         删除黑名单条目
         """
         blacklist_item = LimiterService.get_blacklist_item(blacklist_id)
+        _sync_redis('blacklist', blacklist_item.ip_address, add=False)
         db.session.delete(blacklist_item)
-        # db.session.commit()
 
     @staticmethod
     def list_whitelist(filters: dict):
@@ -81,7 +95,7 @@ class LimiterService:
 
         new_whitelist_item = IPWhitelist(ip_address=ip_address, reason=reason, timestamp=datetime.now())
         db.session.add(new_whitelist_item)
-        # db.session.commit()
+        _sync_redis('whitelist', ip_address, add=True)
 
         return new_whitelist_item
 
@@ -92,5 +106,5 @@ class LimiterService:
         删除白名单条目
         """
         whitelist_item = LimiterService.get_whitelist_item(whitelist_id)
+        _sync_redis('whitelist', whitelist_item.ip_address, add=False)
         db.session.delete(whitelist_item)
-        # db.session.commit()

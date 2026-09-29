@@ -19,5 +19,7 @@ jobs:
             cd /var/www/api_wms
             git pull origin main
             pip install -r requirements.txt -q
-            FLASK_ENV=production FLASK_APP=app:create_app flask db upgrade
+            # 迁移 / 种子脚本只需要应用上下文，不要在这些一次性进程里启动调度器
+            FLASK_ENV=production SCHEDULER_ENABLED=False FLASK_APP=app:create_app flask db upgrade
+            FLASK_ENV=production SCHEDULER_ENABLED=False python seed_permissions.py
             pm2 restart wms-api

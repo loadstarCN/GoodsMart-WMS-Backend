@@ -102,46 +102,70 @@ def test_get_goods_locations(client, access_token):
     assert len(data['items']) > 0
 
 
-def test_create_goods_location(client, access_token):
+def test_get_goods_location_detail(client, access_token):
+    with client.application.app_context():
+        goods_location = get_goods_location()
+        response = client.get(f'/goods/locations/{goods_location.id}', headers={
+            'Authorization': f'Bearer {access_token}'
+        })
+        assert response.status_code == 200
+        data = response.get_json()
+        assert data['id'] == goods_location.id
+        assert data['quantity'] == goods_location.quantity
+
+
+def test_goods_location_write_endpoints_removed(client, access_token):
+    """B-07：库位库存只能经上架/移库/下架/调整流程变更，直写端点一律 405"""
     with client.application.app_context():
         goods = get_goods()
         location = get_location_by_id(2)
-        response = client.post('/goods/locations/', headers={
-            'Authorization': f'Bearer {access_token}'
-        }, json={
-            'goods_id': goods.id,
-            'location_id': location.id,
-            'quantity': 50
-        })
-        assert response.status_code == 201
-        data = response.get_json()
-        assert data['goods_id'] == goods.id
-        assert data['quantity'] == 50
-
-
-def test_update_goods_location(client, access_token):
-    with client.application.app_context():
         goods_location = get_goods_location()
-        response = client.put(f'/goods/locations/{goods_location.id}', headers={
-            'Authorization': f'Bearer {access_token}'
-        }, json={
-            'quantity': 200
+        original_quantity = goods_location.quantity
+        headers = {'Authorization': f'Bearer {access_token}'}
+
+        response = client.post('/goods/locations/', headers=headers, json={
+            'goods_id': goods.id, 'location_id': location.id, 'quantity': 50
         })
-        assert response.status_code == 200
-        data = response.get_json()
-        assert data['quantity'] == 200
+        assert response.status_code == 405
+
+        response = client.put(f'/goods/locations/{goods_location.id}', headers=headers, json={'quantity': 200})
+        assert response.status_code == 405
+
+        response = client.delete(f'/goods/locations/{goods_location.id}', headers=headers)
+        assert response.status_code == 405
+
+        db.session.expire_all()
+        assert get_goods_location_by_id(goods_location.id).quantity == original_quantity
 
 
-def test_delete_goods_location(client, access_token):
+def test_update_goods_cannot_change_company(client, access_token):
+    """update 忽略 company_id（归属固定）"""
     with client.application.app_context():
-        goods_location = get_goods_location()
-        response = client.delete(f'/goods/locations/{goods_location.id}', headers={
+        goods = get_goods()
+        original_company_id = goods.company_id
+        response = client.put(f'/goods/{goods.id}', headers={
             'Authorization': f'Bearer {access_token}'
-        })
+        }, json={'name': 'Still mine', 'company_id': 2})
         assert response.status_code == 200
-        data = response.get_json()
-        assert data['message'] == 'GoodsLocation deleted successfully'
+        assert response.get_json()['company_id'] == original_company_id
 
-        # Ensure the goods location is deleted
-        deleted_goods_location = get_goods_location_by_id(goods_location.id)
-        assert deleted_goods_location is None
+
+def test_bulk_upload_missing_price_and_bad_number(client, access_token):
+    """B-18：CSV 缺 price 列 → 正常导入（price 为空）；价格非数字 → 400"""
+    import io
+    headers = {'Authorization': f'Bearer {access_token}'}
+
+    csv_ok = "code,name\nB001,Bulk One\n"
+    response = client.post('/goods/bulk_upload', headers=headers, data={
+        'file': (io.BytesIO(csv_ok.encode('utf-8')), 'goods.csv'),
+        'company_id': '1',
+    }, content_type='multipart/form-data')
+    assert response.status_code == 200, response.get_json()
+
+    csv_bad = "code,name,price\nB002,Bulk Two,abc\n"
+    response = client.post('/goods/bulk_upload', headers=headers, data={
+        'file': (io.BytesIO(csv_bad.encode('utf-8')), 'goods.csv'),
+        'company_id': '1',
+    }, content_type='multipart/form-data')
+    assert response.status_code == 400
+    assert response.get_json()['code'] == 10012

@@ -67,7 +67,7 @@ class DepartmentService:
         department.name = data.get('name', department.name)
         department.description = data.get('description', department.description)
         department.is_active = data.get('is_active', department.is_active)
-        department.company_id = data.get('company_id', department.company_id)
+        # company_id 不允许通过更新接口迁移部门到其它公司
 
         # db.session.commit()
         return department

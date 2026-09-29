@@ -23,6 +23,7 @@ class Staff(User):
         db.Index('idx_staff_company', 'company_id'),  # 公司查询加速
         db.Index('idx_staff_employee', 'employee_number'),  # 工号快速检索
         db.UniqueConstraint('company_id', 'employee_number', name='uq_company_empno'),  # 公司级唯一
+        db.UniqueConstraint('company_id', 'phone', name='uq_staff_company_phone'),  # 手机号公司内唯一（跨公司不互斥、不可枚举）
     )
 
     id = db.Column(
@@ -64,8 +65,7 @@ class Staff(User):
     phone = db.Column(
         db.String(20),
         nullable=True,
-        unique=True,  # 唯一约束
-        info={'description': '手机号码（唯一）'}
+        info={'description': '手机号码（公司内唯一，见 uq_staff_company_phone）'}
     )
     openid = db.Column(
         db.String(100),

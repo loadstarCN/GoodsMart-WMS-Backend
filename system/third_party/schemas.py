@@ -1,4 +1,4 @@
-from flask_restx import Namespace, fields
+from flask_restx import Namespace, fields, inputs
 from extensions import authorizations
 from system.common import pagination_parser, create_pagination_model
 
@@ -6,62 +6,46 @@ from system.common import pagination_parser, create_pagination_model
 api_ns = Namespace('third_party', description='User related operations', authorizations=authorizations)
 
 # -----------------------------
-# 创建 API Key 的请求模型（用于创建）
+# 创建 / 更新 API Key 的请求模型
 # -----------------------------
 api_key_create_model = api_ns.model('APIKeyCreate', {
     'user_id': fields.Integer(description='User ID'),
     'system_name': fields.String(required=True, description='Third-party system name'),
-    'permissions': fields.Raw(description='Permissions'),
-    'company_id': fields.Integer(description='Company ID'),
-    'webhook_url': fields.String(description='Webhook callback URL'),
-    'webhook_secret': fields.String(description='Webhook HMAC-SHA256 signing secret'),
+    'permissions': fields.List(fields.String, description='Permission names'),
+    'company_id': fields.Integer(description='Company ID (super admin only; others are forced to their own company)'),
+    'is_active': fields.Boolean(description='Whether the API Key is active'),
+    'webhook_url': fields.String(description='Webhook callback URL (https only in production)'),
+    'webhook_secret': fields.String(description='Webhook HMAC-SHA256 signing secret (write-only; empty keeps current)'),
 })
 
 # -----------------------------
-# 登录模型
-# -----------------------------
-api_key_login_model = api_ns.model('APIKeyLogin', {
-    'api_key': fields.String(required=True, description='API Key')
-})
-
-# -----------------------------
-# API Key 的响应模型（输出模型）
+# API Key 的响应模型（不含明文 key 与 webhook_secret）
 # -----------------------------
 api_key_model = api_ns.model('APIKey', {
     'id': fields.Integer(readonly=True, description='API Key ID'),
-    'key': fields.String(description='API Key'),
+    'key_prefix': fields.String(readonly=True, description='First 8 characters of the key'),
     'system_name': fields.String(description='Third-party system name'),
     'is_active': fields.Boolean(description='Whether the API Key is active'),
     'permissions': fields.Raw(description='Permissions'),
     'user_id': fields.Integer(description='User ID'),
     'company_id': fields.Integer(description='Company ID'),
     'webhook_url': fields.String(description='Webhook callback URL'),
-    'webhook_secret': fields.String(description='Webhook HMAC-SHA256 signing secret'),
+    'has_webhook_secret': fields.Boolean(readonly=True, description='Whether a webhook secret is configured'),
 })
 
-# -----------------------------
-# 生成 APIKey 输入模型：
-# 从输出模型复制后删除只读或自动生成的字段
-# -----------------------------
-api_key_input_fields = api_key_model.copy()
-for key in ['id', 'key']:
-    api_key_input_fields.pop(key, None)
-api_key_input_model = api_ns.model('APIKeyInput', api_key_input_fields)
-
-# -----------------------------
-# 生成 APIKey 更新模型：
-# 从输出模型复制后删除不允许更新的字段（例如：id、key、user_id）
-# -----------------------------
-api_key_update_fields = api_key_model.copy()
-for key in ['id', 'key', 'user_id']:
-    api_key_update_fields.pop(key, None)
-api_key_update_model = api_ns.model('APIKeyUpdate', api_key_update_fields)
+# 创建响应：额外返回一次明文 key
+api_key_created_model = api_ns.inherit('APIKeyCreated', api_key_model, {
+    'key': fields.String(attribute='plain_key', readonly=True, description='Plain API key — shown only once'),
+})
 
 # -----------------------------
 # 定义分页解析器
 # -----------------------------
 pagination_parser = pagination_parser.copy()
 pagination_parser.add_argument('company_id', type=int, location='args', help='Filter by company ID')
+pagination_parser.add_argument('is_active', type=inputs.boolean, location='args', help='Filter by active status')
+pagination_parser.add_argument('system_name', type=str, location='args', help='Filter by system name')
+pagination_parser.add_argument('keyword', type=str, location='args', help='Search in system name / key prefix')
 
 # -----------------------------
 # 创建分页模型

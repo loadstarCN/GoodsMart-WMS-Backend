@@ -68,8 +68,21 @@ def test_delete_whitelist(client, access_token):
         assert response.get_json()['message'] == "Whitelist entry deleted"
 
 def test_limiter(client, access_token):
-    time.sleep(3)  # 等待 3 秒
     """Test Limiter - Rate Limiting"""
+    # 测试配置默认关闭限流（避免登录等用例互相干扰）。关闭时 init_app 不会注册请求钩子，
+    # 所以这里在本测试的 app 上打开配置并重新初始化（此时该 app 尚未处理过请求）
+    from extensions import limiter
+    app = client.application
+    app.config['RATELIMIT_ENABLED'] = True
+    limiter.init_app(app)
+    try:
+        _run_limiter_scenario(client, access_token)
+    finally:
+        limiter.enabled = False
+
+
+def _run_limiter_scenario(client, access_token):
+    time.sleep(3)  # 等待 3 秒
     # 第一次请求
     response = client.get('/ip-lists/test', headers={
         'Authorization': f'Bearer {access_token}',

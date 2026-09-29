@@ -43,6 +43,12 @@ class NotFoundException(APIException):
     def __init__(self, message, biz_code=43000, field=None):
         super().__init__(message, biz_code, 404, field)
 
+# 409 Conflict
+class ConflictException(APIException):
+    """409 错误（资源仍被引用 / 状态冲突）"""
+    def __init__(self, message, biz_code=44000, field=None):
+        super().__init__(message, biz_code, 409, field)
+
 # 500 Internal Server Error
 class InternalServerError(APIException):
     """500 错误"""
@@ -82,13 +88,13 @@ def register_error_handlers(app):
             "message": error.description
         }, error.code
     
-    # 处理ValueError
+    # 处理ValueError（生产环境不回显异常原文，避免泄露内部信息）
     @app.errorhandler(ValueError)
     def handle_value_error(error):
         response = {
             "status": "error",
             "code": 40000,
-            "message": str(error)
+            "message": str(error) if app.config.get('FLASK_ENV') == 'development' else "Invalid value"
         }
         
         if app.config.get('FLASK_ENV') == 'development':

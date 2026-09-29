@@ -8,7 +8,9 @@ from flask_jwt_extended import JWTManager, create_access_token
 import uuid
 # 扩展和系统工具
 from extensions import db, error, redis_client, limiter
+from extensions.jwt import register_jwt_callbacks
 from system.third_party.models import APIKey
+from system.third_party.utils import hash_api_key
 from system.user.models import Permission, User, Role
 from system.logs.models import ActivityLog
 from system.limiter.models import IPBlacklist, IPWhitelist
@@ -79,6 +81,9 @@ sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 # 导入配置类
 from config import TestingConfig
 
+# 测试用 API Key 明文（helpers 里以哈希落库）
+TEST_API_KEY_PLAIN = 'test-plain-api-key-0000000000000000000000000000'
+
 def setup_app():
     app = Flask(__name__)
     config = TestingConfig()
@@ -93,18 +98,8 @@ def setup_app():
     redis_client.init_app(app)
     limiter.init_app(app)
 
-    # 注册 JWT 回调
-    @jwt.user_identity_loader
-    def user_identity_lookup(user):
-        """定义如何将用户对象序列化到 JWT 中"""
-        return str(user.id)  # 强制转换为字符串
-
-    @jwt.user_lookup_loader
-    def user_lookup_callback(_jwt_header, jwt_data):
-        """根据 JWT 数据加载用户"""
-        identity = jwt_data.get("sub")
-        if identity:
-            return db.session.get(User, identity)
+    # 注册 JWT 回调（与生产 app.py 共用同一套：含停用用户拒绝、token 吊销）
+    register_jwt_callbacks(jwt)
     # 注册 JWT and API Key 验证逻辑
     app.before_request(validate_jwt_and_api_key)
 
@@ -766,9 +761,10 @@ def init_test_data(app):
         db.session.commit()
 
 
-        # Add test API keys
-        db.session.add(APIKey(key=str(uuid.uuid4()), system_name="System1", user_id=admin_user.id))
-        db.session.add(APIKey(key=str(uuid.uuid4()), system_name="System2", user_id=admin_user.id))
+        # Add test API keys（落库的是哈希；明文 TEST_API_KEY_PLAIN 供需要 X-API-KEY 的测试使用）
+        db.session.add(APIKey(key=hash_api_key(TEST_API_KEY_PLAIN), key_prefix=TEST_API_KEY_PLAIN[:8],
+                              system_name="System1", user_id=admin_user.id, permissions=['all_access']))
+        db.session.add(APIKey(key=hash_api_key(str(uuid.uuid4())), system_name="System2", user_id=admin_user.id))
         db.session.commit()
 
 

@@ -1,8 +1,9 @@
 from flask import g
 from flask_restx import Resource
-from extensions.error import ForbiddenException
-from warehouse.common import warehouse_required,add_warehouse_filter,check_warehouse_access
+from warehouse.common import warehouse_required, add_warehouse_filter, get_warehouse_owned, require_fields, require_actor_user_id
+from warehouse.asn.models import ASN
 
+from .models import SortingTask
 from .schemas import (
     api_ns,
     sorting_task_model,
@@ -18,6 +19,17 @@ from .schemas import (
 from .services import SortingTaskService
 from system.common import permission_required
 from system.common import paginate
+
+
+def _owned_task(task_id: int) -> SortingTask:
+    """按 id 取分拣任务并校验其 ASN 所在仓库在调用方可访问范围内（须在 @warehouse_required() 之后调用）"""
+    return get_warehouse_owned(SortingTask, task_id, warehouse_attr='asn.warehouse_id', what='Sorting Task')
+
+
+def _owned_asn(asn_id) -> ASN:
+    """body 里引用的 ASN 也必须在调用方可访问范围内"""
+    require_fields({'asn_id': asn_id}, 'asn_id')
+    return get_warehouse_owned(ASN, asn_id, what='ASN')
 
 
 @api_ns.doc(security="jsonWebToken")
@@ -49,14 +61,16 @@ class SortingTaskList(Resource):
         return paginate(query, page, per_page),200
 
     @permission_required(["all_access","company_all_access","sorting_edit"])
+    @warehouse_required()
     @api_ns.expect(sorting_task_input_model)
     @api_ns.marshal_with(sorting_task_model)
     def post(self):
         """
-        Create a new Sorting Task
+        Create a new Sorting Task (status / is_active are ignored)
         """
         data = api_ns.payload
-        created_by = g.current_user.id
+        _owned_asn(data.get('asn_id'))
+        created_by = require_actor_user_id()
         new_task = SortingTaskService.create_task(data, created_by)
         return new_task, 201
 
@@ -72,65 +86,60 @@ class SortingTaskDetailView(Resource):
         """
         Get details of a specific Sorting Task
         """
-        task = SortingTaskService.get_task(task_id)
-        if not check_warehouse_access(task.asn.warehouse_id):
-            raise ForbiddenException("You do not have access to this Sorting Task", 12001)
-        return task, 200
+        return _owned_task(task_id), 200
 
     @permission_required(["all_access","company_all_access","sorting_edit"])
+    @warehouse_required()
     @api_ns.expect(sorting_task_input_model)
     @api_ns.marshal_with(sorting_task_model)
     def put(self, task_id):
         """
-        Update a specific Sorting Task
+        Update a specific Sorting Task (only asn_id; status / is_active are ignored)
         """
+        task = _owned_task(task_id)
         data = api_ns.payload
-        updated_task = SortingTaskService.update_task(task_id, data)
+        if data.get('asn_id'):
+            _owned_asn(data['asn_id'])
+        updated_task = SortingTaskService.update_task(task, data)
         return updated_task
 
     @permission_required(["all_access","company_all_access","sorting_delete"])
+    @warehouse_required()
     def delete(self, task_id):
         """
         Delete a specific Sorting Task
         """
-        SortingTaskService.delete_task(task_id)
+        SortingTaskService.delete_task(_owned_task(task_id))
         return {"message": "Sorting Task deleted successfully"}, 200
 
 @api_ns.doc(security="jsonWebToken")
 @api_ns.route('/<int:task_id>/process/')
 class SortingTaskProcess(Resource):
-    
+
     @permission_required(["all_access","company_all_access","sorting_edit"])
     @warehouse_required()
     @api_ns.marshal_with(sorting_task_model)
     def put(self, task_id):
         """
-        Update a specific Sorting Task
+        Start a specific Sorting Task (pending -> in_progress)
         """
-        operator_id = g.current_user.id
-        updated_task = SortingTaskService.get_task(task_id)
-        if not check_warehouse_access(updated_task.asn.warehouse_id):
-            raise ForbiddenException("You do not have access to this Sorting Task", 12001)
-        updated_task = SortingTaskService.process_task(updated_task, operator_id)
+        operator_id = require_actor_user_id()
+        updated_task = SortingTaskService.process_task(_owned_task(task_id), operator_id)
         return updated_task
-    
+
 @api_ns.doc(security="jsonWebToken")
 @api_ns.route('/<int:task_id>/complete/')
 class SortingTaskComplete(Resource):
-    
+
     @permission_required(["all_access","company_all_access","sorting_edit"])
     @warehouse_required()
     @api_ns.marshal_with(sorting_task_model)
     def put(self, task_id):
         """
-        Update a specific Sorting Task
+        Complete a specific Sorting Task (in_progress -> completed) and its ASN
         """
-        operator_id = g.current_user.id
-        updated_task = SortingTaskService.get_task(task_id)
-        if not check_warehouse_access(updated_task.asn.warehouse_id):
-            raise ForbiddenException("You do not have access to this Sorting Task", 12001)
-        
-        updated_task = SortingTaskService.complete_task(updated_task, operator_id)
+        operator_id = require_actor_user_id()
+        updated_task = SortingTaskService.complete_task(_owned_task(task_id), operator_id)
         return updated_task
 
 
@@ -140,23 +149,27 @@ class SortingTaskComplete(Resource):
 class SortingTaskDetailList(Resource):
 
     @permission_required(["all_access","company_all_access","sorting_read"])
+    @warehouse_required()
     @api_ns.marshal_list_with(sorting_task_detail_model)
     def get(self, task_id):
         """
         Get all Sorting Task Details for a specific task
         """
-        return SortingTaskService.list_task_details(task_id)
+        return SortingTaskService.list_task_details(_owned_task(task_id))
 
     @permission_required(["all_access","company_all_access","sorting_edit"])
+    @warehouse_required()
     @api_ns.expect(sorting_task_detail_input_model)
     @api_ns.marshal_with(sorting_task_detail_model)
     def post(self, task_id):
         """
         Create a new Sorting Task Detail under a specific Sorting Task
+        (goods must be part of the ASN; cumulative quantity must not exceed the plan)
         """
-        created_by = g.current_user.id
+        task = _owned_task(task_id)
+        created_by = require_actor_user_id()
         data = api_ns.payload
-        new_detail = SortingTaskService.create_task_detail(task_id, data, created_by)
+        new_detail = SortingTaskService.create_task_detail(task, data, created_by)
         return new_detail, 201
 
 
@@ -165,30 +178,36 @@ class SortingTaskDetailList(Resource):
 class SortingTaskDetailItem(Resource):
 
     @permission_required(["all_access","company_all_access","sorting_read"])
+    @warehouse_required()
     @api_ns.marshal_with(sorting_task_detail_model)
     def get(self, task_id, detail_id):
         """
         Get a specific Sorting Task Detail under a specific Sorting Task
         """
-        return SortingTaskService.get_task_detail(task_id, detail_id)
+        task = _owned_task(task_id)
+        return SortingTaskService.get_task_detail(task.id, detail_id)
 
     @permission_required(["all_access","company_all_access","sorting_edit"])
+    @warehouse_required()
     @api_ns.expect(sorting_task_detail_input_model)
     @api_ns.marshal_with(sorting_task_detail_model)
     def put(self, task_id, detail_id):
         """
         Update a specific Sorting Task Detail
         """
+        task = _owned_task(task_id)
         data = api_ns.payload
-        updated_detail = SortingTaskService.update_task_detail(task_id, detail_id, data)
+        updated_detail = SortingTaskService.update_task_detail(task, detail_id, data)
         return updated_detail
 
     @permission_required(["all_access","company_all_access","sorting_delete"])
+    @warehouse_required()
     def delete(self, task_id, detail_id):
         """
         Delete a specific Sorting Task Detail
         """
-        SortingTaskService.delete_task_detail(task_id, detail_id)
+        task = _owned_task(task_id)
+        SortingTaskService.delete_task_detail(task, detail_id)
 
         return {"message": "Sorting Task Detail deleted successfully"}, 200
 
@@ -200,12 +219,13 @@ class SortingBatchList(Resource):
     """
 
     @permission_required(["all_access","company_all_access","sorting_read"])
+    @warehouse_required()
     @api_ns.marshal_list_with(sorting_batch_model)
     def get(self, task_id):
         """
         列出指定 SortingTask 下所有的 SortingBatch
         """
-        return SortingTaskService.list_batches(task_id)
+        return SortingTaskService.list_batches(_owned_task(task_id))
 
     @permission_required(["all_access","company_all_access","sorting_edit"])
     @warehouse_required()
@@ -216,16 +236,13 @@ class SortingBatchList(Resource):
         创建新的 SortingBatch
         - 如果传入 data['details']，则同时批量创建 SortingTaskDetail
         - 要求对应的 SortingTask 必须是 in_progress 状态
+        - 明细商品必须在 ASN 明细内，累计分拣量不得超过 ASN 计划量
         """
         data = api_ns.payload or {}
-        operator_id = g.current_user.id
+        operator_id = require_actor_user_id()
 
-
-        task = SortingTaskService.get_task(task_id)
-        if not check_warehouse_access(task.asn.warehouse_id):
-            raise ForbiddenException("You do not have access to this Sorting Task", 12001)
-
-        new_batch = SortingTaskService.create_batch(task_id, data, operator_id)
+        task = _owned_task(task_id)
+        new_batch = SortingTaskService.create_batch(task, data, operator_id)
 
         return new_batch, 201
 
@@ -238,14 +255,17 @@ class SortingBatchItem(Resource):
     """
 
     @permission_required(["all_access","company_all_access","sorting_read"])
+    @warehouse_required()
     @api_ns.marshal_with(sorting_batch_model)
     def get(self, task_id, batch_id):
         """
         获取单个 SortingBatch
         """
-        return SortingTaskService.get_batch(task_id, batch_id)
+        task = _owned_task(task_id)
+        return SortingTaskService.get_batch(task.id, batch_id)
 
     @permission_required(["all_access","company_all_access","sorting_edit"])
+    @warehouse_required()
     @api_ns.expect(sorting_batch_input_model)
     @api_ns.marshal_with(sorting_batch_model)
     def put(self, task_id, batch_id):
@@ -253,20 +273,23 @@ class SortingBatchItem(Resource):
         更新 SortingBatch
         - 要求对应的 SortingTask 必须是 in_progress 状态
         """
+        task = _owned_task(task_id)
         data = api_ns.payload or {}
-        updated_batch = SortingTaskService.update_batch(task_id, batch_id, data)
+        updated_batch = SortingTaskService.update_batch(task, batch_id, data)
         return updated_batch
 
     @permission_required(["all_access","company_all_access","sorting_delete"])
+    @warehouse_required()
     def delete(self, task_id, batch_id):
         """
         删除 SortingBatch
         - 要求对应的 SortingTask 必须是 in_progress 状态
-        - 若下方已有 SortingTaskDetail，可根据业务要求自动级联删除或禁止删除
+        - 批次下的 SortingTaskDetail 随之级联删除
         """
-        SortingTaskService.delete_batch(task_id, batch_id)
+        task = _owned_task(task_id)
+        SortingTaskService.delete_batch(task, batch_id)
         return {"message": "Sorting Batch deleted successfully"}, 200
-    
+
 
 @api_ns.doc(security="jsonWebToken")
 @api_ns.route('/monthly-stats')
@@ -291,7 +314,7 @@ class SortingMonthlyStats(Resource):
         filters = add_warehouse_filter(filters)
         stats = SortingTaskService.get_sorting_monthly_stats(months=months,filters=filters)
         return stats, 200
-    
+
 @api_ns.doc(security="jsonWebToken")
 @api_ns.route('/status-overview-stats')
 class SortingStatusOverviewStats(Resource):
@@ -301,7 +324,6 @@ class SortingStatusOverviewStats(Resource):
     @permission_required(["all_access","company_all_access","sorting_read"])
     @warehouse_required()
     def get(self):
-        # 解析请求参数
         # 解析请求参数
         args = sorting_monthly_stats_parser.parse_args()
 

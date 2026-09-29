@@ -17,7 +17,7 @@ payment_model = api_ns.model('Payment', {
     'id': fields.Integer(readOnly=True, description='Payment ID'),
     'delivery_id': fields.Integer(required=True, description='ID of the associated delivery'),
     'amount': fields.Float(required=True, description='Payment amount'),
-    'currency': fields.String(required=True, description='Currency code (ISO 4217 standard)', default='USD'),
+    'currency': fields.String(required=True, description='Currency code (ISO 4217 standard)', default='JPY'),
     'payment_method': fields.String(
         required=True, 
         description='Payment method', 
@@ -45,6 +45,9 @@ payment_model = api_ns.model('Payment', {
 # PaymentInput 模型：从输出模型复制后删除只读及关联字段
 # -------------------------------------------------------------------
 payment_input_fields = generate_input_fields(payment_model)
+# 状态由 process / cancel 动作推进、创建人取自登录身份，都不接受客户端输入
+for key in ['status', 'created_by']:
+    payment_input_fields.pop(key, None)
 payment_input_model = api_ns.model('PaymentInput', payment_input_fields)
 
 # -------------------------------------------------------------------

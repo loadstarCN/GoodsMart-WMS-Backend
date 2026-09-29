@@ -1,11 +1,23 @@
 from extensions.db import *
-from extensions.error import BadRequestException, NotFoundException
+from extensions.error import BadRequestException, ForbiddenException, NotFoundException
 from extensions.transaction import transactional
+from warehouse.carrier.models import Carrier
+from warehouse.delivery.models import DeliveryTask
+from warehouse.dn.models import DN
 from warehouse.inventory.services import InventoryService
+from warehouse.warehouse.models import Warehouse
 from .models import Payment
 from datetime import datetime
 
 class PaymentService:
+
+    @staticmethod
+    def get_payment_company_id(payment: Payment):
+        """支付记录的归属公司 = 发货单所在仓库的公司（Payment 本身没有 company_id 列）"""
+        delivery = payment.delivery
+        dn = delivery.dn if delivery else None
+        warehouse = dn.warehouse if dn else None
+        return warehouse.company_id if warehouse else None
 
     @staticmethod
     def list_payments(filters: dict):
@@ -23,7 +35,7 @@ class PaymentService:
             query = query.filter(Payment.carrier_id == filters['carrier_id'])
         if filters.get('status'):
             query = query.filter(Payment.status == filters['status'])
-        
+
         # 如果 filters 中没有 is_active 或其值为 None，则只返回 is_active=True
         if 'is_active' not in filters or filters['is_active'] is None:
             query = query.filter(Payment.is_active == True)
@@ -31,6 +43,14 @@ class PaymentService:
             # 否则按用户传入的值进行过滤
             query = query.filter(Payment.is_active == filters['is_active'])
 
+        # 公司隔离：沿 delivery → dn → warehouse 找到归属公司
+        if filters.get('company_id'):
+            query = (
+                query.join(DeliveryTask, Payment.delivery_id == DeliveryTask.id)
+                     .join(DN, DeliveryTask.dn_id == DN.id)
+                     .join(Warehouse, DN.warehouse_id == Warehouse.id)
+                     .filter(Warehouse.company_id == filters['company_id'])
+            )
 
         return query
 
@@ -44,21 +64,31 @@ class PaymentService:
 
     @staticmethod
     @transactional
-    def create_payment(data: dict, created_by_id: int) -> Payment:
+    def create_payment(data: dict, created_by_id: int, actor_company_id: int | None = None) -> Payment:
         """
-        创建新的 Payment。
+        创建新的 Payment（状态固定 pending）。
 
         :param data: 包含请求中的支付数据
         :param created_by_id: 创建者用户 ID
+        :param actor_company_id: 调用方公司（平台管理员为 None）；发货单与承运商都必须属于该公司
         :return: 新创建的 Payment 对象
         """
+        delivery = get_object_or_404(DeliveryTask, data.get('delivery_id'))
+        carrier = get_object_or_404(Carrier, data.get('carrier_id'))
+
+        delivery_company_id = delivery.dn.warehouse.company_id if delivery.dn and delivery.dn.warehouse else None
+        if actor_company_id is not None and delivery_company_id != actor_company_id:
+            raise ForbiddenException("Permission denied: delivery belongs to another company", 12001)
+        if carrier.company_id != delivery_company_id:
+            raise BadRequestException("Carrier does not belong to the same company as the delivery", 16027)
+
         new_payment = Payment(
-            delivery_id=data['delivery_id'],
+            delivery_id=delivery.id,
             amount=data['amount'],
             currency=data.get('currency', 'JPY'),
             payment_method=data['payment_method'],
-            status=data['status'],
-            carrier_id=data['carrier_id'],
+            status='pending',
+            carrier_id=carrier.id,
             payment_time=data.get('payment_time'),
             remark=data.get('remark'),
             is_active=data.get('is_active', True),

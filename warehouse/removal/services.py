@@ -1,10 +1,9 @@
-from flask_restx import abort
 from sqlalchemy import or_
 from extensions.db import *
 from extensions.error import BadRequestException, NotFoundException
 from extensions.transaction import transactional
+from warehouse.common import require_positive_int, require_bulk_list, require_fields, lock_goods_location
 from warehouse.goods.models import Goods
-from warehouse.goods.services import GoodsLocationService
 from warehouse.inventory.services import InventoryService
 from warehouse.location.models import Location
 from .models import RemovalRecord
@@ -81,40 +80,46 @@ class RemovalService:
         """
         创建一条新的下架记录
 
-        :param data: dict，包含 goods_id, location_id, quantity, operator_id, reason, remark 等字段
+        :param data: dict，包含 goods_id, location_id, quantity, reason, remark 等字段
         :return: 新创建的 RemovalRecord 实例
         """
-        goods_id=data['goods_id']
-        location_id=data['location_id']
-        quantity=data['quantity']
+        require_fields(data, 'goods_id', 'location_id', 'quantity', 'reason')
+        goods_id = data['goods_id']
+        location_id = data['location_id']
+        quantity = require_positive_int(data['quantity'], 'quantity')
+        reason = data['reason']
+        location = get_object_or_404(Location, location_id)
 
-        # 先去获取商品库位GoodsLocation信息，如果找不到到会抛出404错误，捕获这个错误，并更新库存信息，同时还需要判断库存是否足够
-        goods_location_record = GoodsLocationService.get_goods_location_record(goods_id, location_id)
+        # 持锁读取商品库位记录：找不到 404，库存不足 400，读改写期间其它事务不能插进来
+        goods_location_record = lock_goods_location(goods_id, location_id)
         if goods_location_record is None:
             raise NotFoundException("GoodsLocation not found", 13004)
-        
+        if goods_location_record.quantity < quantity:
+            raise BadRequestException("Stock is not enough", 15001)
+
         new_record = RemovalRecord(
             goods_id=goods_id,
             location_id=location_id,
             quantity=quantity,
-            reason=data['reason'],
+            reason=reason,
             remark=data.get('remark', ''),
             operator_id=created_by_id
         )
         db.session.add(new_record)
         db.session.flush()
-        
-        goods_location_record.quantity -= new_record.quantity
-        if goods_location_record.quantity < 0:
-            raise BadRequestException("Stock is not enough", 15001)
-        elif goods_location_record.quantity == 0:           
+
+        goods_location_record.quantity -= quantity
+        if goods_location_record.quantity == 0:
             db.session.delete(goods_location_record)
         else:
             db.session.add(goods_location_record)
         db.session.flush()
 
-        #更新库存信息
-        InventoryService.removal_completed(new_record.goods_id, new_record.location.warehouse_id, new_record.quantity)
+        #更新库存信息：拣货下架的货走 picked_stock（由拣货流程记账），其它原因的下架进入待上架区
+        if reason == 'picking':
+            InventoryService.picking_removed(goods_id, location.warehouse_id, quantity)
+        else:
+            InventoryService.removal_completed(goods_id, location.warehouse_id, quantity)
 
         # db.session.commit()
         return new_record
@@ -137,6 +142,7 @@ class RemovalService:
         :param created_by_id: 创建者的用户ID
         :return: 创建成功的 RemovalRecord 实例列表
         """
+        require_bulk_list(data_list, 'records')
         new_records = []
         for data in data_list:
             new_record = RemovalService.create_removal_record(data, created_by_id)

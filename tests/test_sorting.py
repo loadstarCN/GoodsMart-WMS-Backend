@@ -1,4 +1,4 @@
-from extensions.error import NotFoundException
+from extensions.error import BadRequestException, NotFoundException
 from .helpers import *
 from warehouse.sorting.services import SortingTaskService
 
@@ -71,15 +71,15 @@ def test_update_sorting_task(client, access_token):
         f'/sorting/{task_id}',
         headers={'Authorization': f'Bearer {access_token}'},
         json={
-            "status": "pending",  # 仍为 pending，因此允许更新
+            "status": "completed",
             "is_active": False
         }
     )
     assert response.status_code == 200
     data = response.get_json()
-    # 验证更新后的关键字段
+    # status / is_active 只能经 process / complete 动作端点变更，PUT 里传了也被忽略（B-12）
     assert data['status'] == "pending"
-    assert data['is_active'] is False
+    assert data['is_active'] is True
 
 
 def test_delete_sorting_task(client, access_token):
@@ -326,12 +326,12 @@ def test_sorting_task_service_update_task(client):
         assert task is not None
 
         updated_task = SortingTaskService.update_task(task.id, {
-            "status": "pending",  # 允许更新
+            "status": "completed",
             "is_active": False
         })
-        # 验证更新后的关键字段
+        # 过程字段不接受客户端输入（B-12）
         assert updated_task.status == "pending"
-        assert updated_task.is_active is False
+        assert updated_task.is_active is True
 
 
 def test_sorting_task_service_delete_task(client):
@@ -418,14 +418,21 @@ def test_sorting_task_service_update_task_detail(client):
             created_by_id=user.id
         )
 
-        # 更新
+        # 更新（ASN 明细计划量 1000，累计 900 + 99 未超量）
         updated_detail = SortingTaskService.update_task_detail(
             new_task.id,
             detail_obj.id,
-            {"sorted_quantity": 999, "damage_quantity": 99}
+            {"sorted_quantity": 900, "damage_quantity": 99}
         )
-        assert updated_detail.sorted_quantity == 999
+        assert updated_detail.sorted_quantity == 900
         assert updated_detail.damage_quantity == 99
+
+        # 超过 ASN 计划量则拒绝（B-13）
+        with pytest.raises(BadRequestException) as excinfo:
+            SortingTaskService.update_task_detail(
+                new_task.id, detail_obj.id, {"sorted_quantity": 1000, "damage_quantity": 1}
+            )
+        assert excinfo.value.biz_code == 16062
 
 
 def test_sorting_task_service_delete_task_detail(client):

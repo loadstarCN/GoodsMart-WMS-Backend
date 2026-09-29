@@ -1,19 +1,13 @@
 from flask import g
 from flask_restx import Resource
+from extensions.error import BadRequestException
 from system.common import paginate, permission_required
-from system.third_party.utils import get_api_key_company_id
+from system.common.permissions import get_actor_company_id
+from warehouse.common import get_company_owned, require_actor_user_id
+from .models import Recipient
 from .schemas import api_ns, recipient_model, recipient_input_model, recipient_pagination_parser, pagination_model
 from .services import RecipientService
 
-
-def _request_company_id():
-    """返回 API Key 或公司员工允许访问的公司范围。"""
-    api_company_id = get_api_key_company_id()
-    if api_company_id:
-        return api_company_id
-    if g.current_user.type == 'staff':
-        return g.current_user.company_id
-    return None
 
 @api_ns.doc(security="jsonWebToken")
 @api_ns.route('/')
@@ -40,14 +34,9 @@ class RecipientList(Resource):
             'contact': args.get('contact'),
             'country': args.get('country'),
             'keyword': args.get('keyword'),
+            # 员工 / 公司级 API Key 只能看本公司；平台管理员可按参数筛选
+            'company_id': get_actor_company_id() or args.get('company_id'),
         }
-
-        # Check user type and get the company_id if user type is 'staff'
-        if g.current_user.type == 'staff':
-            company_id = g.current_user.company_id
-            filters['company_id'] = company_id
-        else:
-            filters['company_id'] = get_api_key_company_id() or args.get('company_id')
 
         # Get the filtered query using RecipientService
         query = RecipientService.list_recipients(filters)
@@ -60,15 +49,19 @@ class RecipientList(Resource):
     def post(self):
         """Create a new recipient"""
         data = api_ns.payload
-        # API Key 认证时强制注入 company_id（防止跨公司操作）
-        api_company_id = get_api_key_company_id()
-        if api_company_id:
-            data['company_id'] = api_company_id
-        created_by = g.current_user.id
+
+        # 非平台管理员强制落在自己公司，不接受请求体里的 company_id
+        actor_company_id = get_actor_company_id()
+        if actor_company_id is not None:
+            data['company_id'] = actor_company_id
+        elif not data.get('company_id'):
+            raise BadRequestException("company_id is required", 14015)
+
+        created_by = require_actor_user_id()
 
         # Create the new recipient using RecipientService
         new_recipient = RecipientService.create_recipient(data, created_by)
-        
+
         return new_recipient, 201
 
 
@@ -80,10 +73,7 @@ class RecipientDetail(Resource):
     @api_ns.marshal_with(recipient_model)
     def get(self, recipient_id):
         """Get recipient details"""
-        recipient = RecipientService.get_recipient(
-            recipient_id, _request_company_id()
-        )
-        return recipient
+        return get_company_owned(Recipient, recipient_id)
 
     @permission_required(["all_access", "company_all_access", "recipient_edit"])
     @api_ns.expect(recipient_input_model)
@@ -91,16 +81,18 @@ class RecipientDetail(Resource):
     def put(self, recipient_id):
         """Update recipient details"""
         data = api_ns.payload
+        get_company_owned(Recipient, recipient_id)
+        # 归属公司不允许通过更新接口迁移
+        data.pop('company_id', None)
 
-        updated_recipient = RecipientService.update_recipient(
-            recipient_id, data, _request_company_id()
-        )
+        updated_recipient = RecipientService.update_recipient(recipient_id, data)
 
         return updated_recipient
 
     @permission_required(["all_access", "company_all_access", "recipient_delete"])
     def delete(self, recipient_id):
         """Delete a recipient"""
-        RecipientService.delete_recipient(recipient_id, _request_company_id())
+        get_company_owned(Recipient, recipient_id)
+        RecipientService.delete_recipient(recipient_id)
 
         return {"message": "Recipient deleted successfully"}, 200

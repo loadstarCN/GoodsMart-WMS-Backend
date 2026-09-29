@@ -1,14 +1,77 @@
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 from dateutil.relativedelta import relativedelta
 from sqlalchemy import and_, func, case, extract
 from extensions.db import *
-from extensions.error import BadRequestException, NotFoundException
+from extensions.error import (
+    BadRequestException, ConflictException, ForbiddenException, NotFoundException,
+)
 from extensions.transaction import transactional
+from warehouse.common import require_positive_int, require_bulk_list, require_fields
 from warehouse.inventory.services import InventoryService
 
 from warehouse.goods.services import GoodsService
 from system.webhook.services import emit as webhook_emit
 from .models import DN, DNDetail
+
+
+# ------------------------------------
+# 出库线共用的请求体处理（picking / packing / delivery 也从这里引用）。
+# 数量 / 列表 / 必填校验用 warehouse.common 的共享实现；这里只放白名单裁剪与日期解析。
+# ------------------------------------
+
+def pick_fields(data: dict, allowed) -> dict:
+    """白名单裁剪：status / is_active / created_by / *_quantity / *_at 等只能由流程端点改。"""
+    if not isinstance(data, dict):
+        raise BadRequestException("Request body must be a JSON object", 16015)
+    return {k: data[k] for k in allowed if k in data}
+
+
+def parse_date_value(value, field: str):
+    """'YYYY-MM-DD' 字符串或 date；格式不对 → 400"""
+    if value is None or isinstance(value, date):
+        return value
+    if isinstance(value, str):
+        try:
+            return datetime.strptime(value.strip(), '%Y-%m-%d').date()
+        except ValueError:
+            pass
+    raise BadRequestException(f"{field} must be a date in YYYY-MM-DD format", 16050)
+
+
+def parse_datetime_value(value, field: str):
+    """ISO 8601 / 'YYYY-MM-DD HH:MM:SS' 字符串或 datetime；格式不对 → 400"""
+    if value is None or isinstance(value, datetime):
+        return value
+    if isinstance(value, str):
+        try:
+            return datetime.fromisoformat(value.strip().replace('Z', '+00:00'))
+        except ValueError:
+            pass
+    raise BadRequestException(f"{field} must be an ISO 8601 datetime", 16050)
+
+
+def resolve_company_id(data: dict, warehouse) -> int:
+    """按 goods_code / carrier_code 查主数据时使用的公司 = 单据仓库所属公司。
+
+    仓库归属已由视图层 require_warehouse_scope 保证（员工 / 绑定公司的 API Key 都只能
+    选自家仓库），所以不必再看 Staff.company_id 或 g.api_key_company_id；
+    请求体显式给了 company_id 且与仓库公司不一致 → 403。绝不回落到 1。
+    """
+    company_id = warehouse.company_id
+    if data.get('company_id') is not None and data['company_id'] != company_id:
+        raise ForbiddenException("Permission denied: company_id does not match the warehouse", 12001)
+    return company_id
+
+
+# 请求体白名单：状态 / 审计 / 统计数量字段一律不接受客户端赋值
+DN_CREATE_FIELDS = (
+    'recipient_id', 'shipping_address', 'expected_shipping_date', 'warehouse_id',
+    'carrier_id', 'carrier_code', 'dn_type', 'order_number', 'transportation_mode',
+    'packaging_info', 'special_handling', 'remark',
+)
+DN_UPDATE_FIELDS = tuple(f for f in DN_CREATE_FIELDS if f != 'warehouse_id')
+DN_DETAIL_FIELDS = ('goods_id', 'goods_code', 'quantity', 'remark')
+
 
 class DNService:
     """
@@ -16,21 +79,37 @@ class DNService:
     related to DN and DNDetail.
     """
 
-    @staticmethod
-    def _assert_new_dn_stock_available(warehouse_id: int, details: list):
-        """Prevent a new DN from reserving more stock than is available."""
-        requested_by_goods = {}
-        for detail in details:
-            goods_id = detail['goods_id']
-            quantity = detail['quantity']
-            requested_by_goods[goods_id] = requested_by_goods.get(goods_id, 0) + quantity
+    # ------------------------------------
+    # DN Services 私有方法
+    # ------------------------------------
 
+    @staticmethod
+    def _own_reserved_by_goods(dn: DN | None) -> dict:
+        """本 DN 当前已计入 Inventory.dn_stock 的预占量（按商品聚合）。
+        新单 / 已关闭 / 已停用的 DN 没有预占，返回空。"""
+        if dn is None or not dn.is_active or dn.status not in ('pending', 'in_progress'):
+            return {}
+        reserved = {}
+        for detail in dn.details:
+            reserved[detail.goods_id] = reserved.get(detail.goods_id, 0) + (detail.quantity or 0)
+        return reserved
+
+    @staticmethod
+    def _assert_dn_stock_available(warehouse_id: int, requested_by_goods: dict, dn: DN | None = None):
+        """校验各商品「本 DN 变更后的计划总量」不超过可用量。
+
+        可用量 = onhand - locked - dn_stock + 本 DN 自身已预占量：dn_stock 已经包含了
+        本 DN 现有明细，改量 / 加行 / 同步时必须把自己排除，否则会把自己算成别人的预占。
+        create / create_detail / update_detail / sync 四处复用。
+        """
+        own = DNService._own_reserved_by_goods(dn)
         for goods_id, quantity in requested_by_goods.items():
             inventory = InventoryService._get_for_update(goods_id, warehouse_id)
             available = (
                 inventory.onhand_stock
                 - inventory.locked_stock
                 - inventory.dn_stock
+                + own.get(goods_id, 0)
             )
             if quantity > available:
                 raise BadRequestException(
@@ -39,10 +118,82 @@ class DNService:
                     16032,
                 )
 
-    # ------------------------------------
-    # DN Services 私有方法
-    # ------------------------------------
+    @staticmethod
+    def assert_company_master_data(company_id: int, recipient_id=None, carrier_id=None, goods_ids=()):
+        """收货人 / 承运商 / 商品必须属于单据所在公司；不存在 400，跨公司 403。"""
+        from warehouse.recipient.models import Recipient
+        from warehouse.carrier.models import Carrier
+        from warehouse.goods.models import Goods
 
+        if recipient_id is not None:
+            recipient = db.session.get(Recipient, recipient_id)
+            if not recipient:
+                raise BadRequestException(f"Recipient {recipient_id} not found", 16045)
+            if recipient.company_id != company_id:
+                raise ForbiddenException("Permission denied: recipient belongs to another company", 12001)
+
+        if carrier_id is not None:
+            carrier = db.session.get(Carrier, carrier_id)
+            if not carrier:
+                raise BadRequestException(f"Carrier {carrier_id} not found", 16045)
+            if carrier.company_id != company_id:
+                raise ForbiddenException("Permission denied: carrier belongs to another company", 12001)
+
+        goods_ids = set(goods_ids)
+        if goods_ids:
+            rows = db.session.query(Goods.id, Goods.company_id).filter(Goods.id.in_(goods_ids)).all()
+            found = {gid: cid for gid, cid in rows}
+            missing = goods_ids - set(found)
+            if missing:
+                raise BadRequestException(f"Goods not found: {sorted(missing)}", 16045)
+            foreign = [gid for gid, cid in found.items() if cid != company_id]
+            if foreign:
+                raise ForbiddenException("Permission denied: goods belongs to another company", 12001)
+
+    @staticmethod
+    def _resolve_carrier_by_code(company_id: int, carrier_code: str):
+        """跨系统可直接传承运商 code，避免 Wholesale 依赖 WMS 内部自增 ID。"""
+        from warehouse.carrier.models import Carrier
+        carrier_code = carrier_code.strip().lower()
+        carrier_aliases = {
+            'yamato': ('yamato', 'ヤマト'),
+            'sagawa': ('sagawa', '佐川'),
+            'sf': ('sf', 'sf-express', '順豊'),
+            'ems': ('ems',),
+            'dhl': ('dhl',),
+        }
+        return Carrier.query.filter(
+            Carrier.company_id == company_id,
+            Carrier.is_active.is_(True),
+            db.or_(
+                func.lower(Carrier.code) == carrier_code,
+                *[
+                    Carrier.name.ilike(f'%{alias}%')
+                    for alias in carrier_aliases.get(carrier_code, (carrier_code,))
+                ],
+            ),
+        ).order_by(Carrier.id.asc()).first()
+
+    @staticmethod
+    def _resolve_goods_id(item: dict, company_id: int) -> int:
+        """明细里 goods_id / goods_code 二选一；按公司查 code。"""
+        goods_id = item.get('goods_id')
+        if goods_id is None and item.get('goods_code'):
+            goods = GoodsService.get_goods_by_code(item['goods_code'], company_id)
+            if not goods:
+                raise BadRequestException(f"Goods not found for code: {item['goods_code']}", 16030)
+            return goods.id
+        if goods_id is None:
+            raise BadRequestException("goods_id or goods_code is required for detail", 16031)
+        return require_positive_int(goods_id, 'goods_id', 16031)
+
+    @staticmethod
+    def _validate_dn_enums(payload: dict):
+        if payload.get('dn_type') is not None and payload['dn_type'] not in DN.DN_TYPES:
+            raise BadRequestException(f"Invalid dn_type: {payload['dn_type']}", 16047)
+        mode = payload.get('transportation_mode')
+        if mode is not None and mode not in DN.DN_TRANSPORTATION_MODES:
+            raise BadRequestException(f"Invalid transportation_mode: {mode}", 16048)
 
     @staticmethod
     def _get_instance(dn_or_id: int | DN) -> DN:
@@ -54,7 +205,7 @@ class DNService:
         if isinstance(dn_or_id, int):
             return DNService.get_dn(dn_or_id)
         return dn_or_id
-    
+
     @staticmethod
     @transactional
     def _update_dn_status(dn: DN, new_status: str) -> DN:
@@ -81,7 +232,7 @@ class DNService:
         db.session.flush()
         # db.session.commit()
         return dn
-    
+
     @staticmethod
     @transactional
     def _update_and_calculate_quantity(dn_or_id: int | DN):
@@ -89,6 +240,7 @@ class DNService:
         更新 DNDetail 的已拣选、已打包和已发货数量。
         参数可以是 DN 的 ID（int）或 DN 实例。
         如果找不到 DN，则抛出 NotFound 异常。
+        已拣 / 已打包量各用一次按商品聚合的查询算出，不再逐明细查两次。
         """
         from warehouse.picking.models import PickingTask, PickingTaskDetail
         from warehouse.packing.models import PackingTask, PackingTaskDetail
@@ -108,39 +260,44 @@ class DNService:
             is not None
         )
 
+        # 1. 已拣选数量（来自已完成的 PickingTask，按商品聚合）
+        picked_by_goods = dict(
+            db.session.query(
+                PickingTaskDetail.goods_id,
+                func.coalesce(func.sum(PickingTaskDetail.picked_quantity), 0),
+            )
+            .join(PickingTask, PickingTaskDetail.picking_task_id == PickingTask.id)
+            .filter(
+                PickingTask.dn_id == dn.id,
+                PickingTask.is_active == True,
+                PickingTask.status == 'completed',
+            )
+            .group_by(PickingTaskDetail.goods_id)
+            .all()
+        )
+
+        # 2. 已打包数量（来自已完成的 PackingTask，按商品聚合）
+        packed_by_goods = dict(
+            db.session.query(
+                PackingTaskDetail.goods_id,
+                func.coalesce(func.sum(PackingTaskDetail.packed_quantity), 0),
+            )
+            .join(PackingTask, PackingTaskDetail.packing_task_id == PackingTask.id)
+            .filter(
+                PackingTask.dn_id == dn.id,
+                PackingTask.is_active == True,
+                PackingTask.status == 'completed',
+            )
+            .group_by(PackingTaskDetail.goods_id)
+            .all()
+        )
+
         for dn_detail in dn.details:
-            goods_id = dn_detail.goods_id
-
-            # 1. 计算已拣选数量（来自 PickingTaskDetail）
-            picked_query = (
-                db.session.query(PickingTaskDetail.picked_quantity)
-                .join(PickingTask)
-                .filter(
-                    PickingTask.dn_id == dn.id,
-                    PickingTaskDetail.goods_id == goods_id,
-                    PickingTask.is_active == True,
-                    PickingTask.status == 'completed'
-                )
-            )
-            picked_quantity = sum(result[0] for result in picked_query.all())
-
-            # 2. 计算已打包数量（来自 PackingTaskDetail）
-            packed_query = (
-                db.session.query(PackingTaskDetail.packed_quantity)
-                .join(PackingTask)
-                .filter(
-                    PackingTask.dn_id == dn.id,
-                    PackingTaskDetail.goods_id == goods_id,
-                    PackingTask.is_active == True,
-                    PackingTask.status == 'completed'
-                )
-            )
-            packed_quantity = sum(result[0] for result in packed_query.all())
-
-            # 3. 计算已发货数量（如果存在已完成的 DeliveryTask，则等于已打包数量）
+            picked_quantity = int(picked_by_goods.get(dn_detail.goods_id, 0) or 0)
+            packed_quantity = int(packed_by_goods.get(dn_detail.goods_id, 0) or 0)
+            # 3. 已发货数量（如果存在已完成的 DeliveryTask，则等于已打包数量）
             delivered_quantity = packed_quantity if has_completed_delivery else 0
 
-            # 更新 DNDetail 的统计值
             dn_detail.picked_quantity = picked_quantity
             dn_detail.packed_quantity = packed_quantity
             dn_detail.delivered_quantity = delivered_quantity
@@ -150,7 +307,7 @@ class DNService:
         # db.session.commit()
 
         return dn
-    
+
     # ------------------------------------
     # DN Services 共有方法
     # ------------------------------------
@@ -213,116 +370,100 @@ class DNService:
         if filters.get('warehouse_id'):
             query = query.filter(DN.warehouse_id == filters['warehouse_id'])
         if filters.get('warehouse_ids'):
-            query = query.filter(DN.warehouse_id.in_(filters['warehouse_ids'])) 
+            query = query.filter(DN.warehouse_id.in_(filters['warehouse_ids']))
 
         return query
-    
+
     @staticmethod
     def get_dn(dn_id: int) -> DN:
         """
         根据 ID 获取单个 DN，如不存在则抛出 404
         """
         return get_object_or_404(DN, dn_id)
-    
+
     @staticmethod
     @transactional
     def create_dn(data: dict, created_by_id: int) -> DN:
         """
-        创建一个新的 DN 以及可选的明细。
+        创建一个新的 DN 及其明细（details 必填且非空）。
+
+        只接受白名单字段；status 固定 pending、is_active 固定 True，
+        picked/packed/delivered_quantity 由流程计算，客户端传入一律忽略。
+        收货人 / 承运商 / 商品必须与仓库属于同一公司。
 
         :param data: DN 数据（可包含 details）
         :param created_by_id: 当前用户 ID
         :return: 新创建的 DN 对象
         """
+        from warehouse.warehouse.models import Warehouse
 
-        # 假设 data['expected_shipping_date'] = "2025-01-01"
-        if 'expected_shipping_date' in data and isinstance(data['expected_shipping_date'], str):
-            data['expected_shipping_date'] = datetime.strptime(data['expected_shipping_date'], '%Y-%m-%d').date()
-            
-        # 跨系统可直接传承运商 code，避免 Wholesale 依赖 WMS 内部自增 ID。
-        if not data.get('carrier_id') and data.get('carrier_code'):
-            from warehouse.carrier.models import Carrier
-            carrier_code = data['carrier_code'].strip().lower()
-            carrier_aliases = {
-                'yamato': ('yamato', 'ヤマト'),
-                'sagawa': ('sagawa', '佐川'),
-                'sf': ('sf', 'sf-express', '順豊'),
-                'ems': ('ems',),
-                'dhl': ('dhl',),
-            }
-            carrier = Carrier.query.filter(
-                Carrier.company_id == data.get('company_id', 1),
-                Carrier.is_active.is_(True),
-                db.or_(
-                    func.lower(Carrier.code) == carrier_code,
-                    *[
-                        Carrier.name.ilike(f'%{alias}%')
-                        for alias in carrier_aliases.get(carrier_code, (carrier_code,))
-                    ],
-                ),
-            ).order_by(Carrier.id.asc()).first()
+        payload = pick_fields(data, DN_CREATE_FIELDS)
+        require_fields(payload, 'recipient_id', 'shipping_address', 'expected_shipping_date', 'warehouse_id')
+        details_data = require_bulk_list(data.get('details'), 'details')
+
+        warehouse_id = require_positive_int(payload['warehouse_id'], 'warehouse_id', 16044)
+        warehouse = db.session.get(Warehouse, warehouse_id)
+        if not warehouse:
+            raise BadRequestException(f"Warehouse {warehouse_id} not found", 16045)
+
+        company_id = resolve_company_id(data, warehouse)
+
+        payload['expected_shipping_date'] = parse_date_value(payload['expected_shipping_date'], 'expected_shipping_date')
+        DNService._validate_dn_enums(payload)
+
+        if not payload.get('carrier_id') and payload.get('carrier_code'):
+            carrier = DNService._resolve_carrier_by_code(company_id, payload['carrier_code'])
             if carrier:
-                data['carrier_id'] = carrier.id
+                payload['carrier_id'] = carrier.id
 
         resolved_details = []
-        for detail in data.get('details', []):
-            goods_id = detail.get('goods_id')
-            if not goods_id and detail.get('goods_code'):
-                goods = GoodsService.get_goods_by_code(
-                    detail['goods_code'], data.get('company_id', 1)
-                )
-                if not goods:
-                    raise BadRequestException(
-                        f"Goods not found for code: {detail['goods_code']}", 16030
-                    )
-                goods_id = goods.id
-            if not goods_id:
-                raise BadRequestException(
-                    "goods_id or goods_code is required for detail", 16031
-                )
+        requested_by_goods = {}
+        for item in details_data:
+            item = pick_fields(item, DN_DETAIL_FIELDS)
+            goods_id = DNService._resolve_goods_id(item, company_id)
+            if goods_id in requested_by_goods:
+                raise BadRequestException(f"Duplicate goods_id: {goods_id}", 16025)
+            quantity = require_positive_int(item.get('quantity'), 'quantity')
+            requested_by_goods[goods_id] = quantity
+            resolved_details.append({'goods_id': goods_id, 'quantity': quantity, 'remark': item.get('remark', '')})
 
-            quantity = detail.get('quantity', 0)
-            if quantity <= 0:
-                raise BadRequestException("DN detail quantity must be positive", 16033)
-            resolved_details.append({**detail, 'goods_id': goods_id, 'quantity': quantity})
+        DNService.assert_company_master_data(
+            company_id,
+            recipient_id=payload['recipient_id'],
+            carrier_id=payload.get('carrier_id'),
+            goods_ids=requested_by_goods.keys(),
+        )
 
-        # Pending/in-progress DNs reserve on-hand stock. Reject over-reservation
-        # here so an impossible integration payload never reaches picking.
-        if data.get('status', 'pending') in ('pending', 'in_progress'):
-            DNService._assert_new_dn_stock_available(
-                data['warehouse_id'], resolved_details
-            )
+        # 新单一律 pending 并预占库存：这里拒绝超额预占，
+        # 让不可能完成的集成报文根本进不了拣货。
+        DNService._assert_dn_stock_available(warehouse_id, requested_by_goods)
 
         new_dn = DN(
-            recipient_id=data['recipient_id'],
-            shipping_address=data['shipping_address'],
-            expected_shipping_date=data['expected_shipping_date'],
-            warehouse_id=data['warehouse_id'],
-            carrier_id=data.get('carrier_id'),
-            dn_type=data.get('dn_type', 'shipping'),  # 默认 shipping
-            status=data.get('status', 'pending'),      # 默认 pending
-            order_number=data.get('order_number'),
-            transportation_mode=data.get('transportation_mode'),
-            packaging_info=data.get('packaging_info'),
-            special_handling=data.get('special_handling'),
-            remark=data.get('remark'),
-            is_active=data.get('is_active', True),
+            recipient_id=payload['recipient_id'],
+            shipping_address=payload['shipping_address'],
+            expected_shipping_date=payload['expected_shipping_date'],
+            warehouse_id=warehouse_id,
+            carrier_id=payload.get('carrier_id'),
+            dn_type=payload.get('dn_type') or 'shipping',  # 默认 shipping
+            status='pending',
+            order_number=payload.get('order_number'),
+            transportation_mode=payload.get('transportation_mode'),
+            packaging_info=payload.get('packaging_info'),
+            special_handling=payload.get('special_handling'),
+            remark=payload.get('remark'),
+            is_active=True,
             created_by=created_by_id,
             api_key_id=data.get('api_key_id'),
         )
         db.session.add(new_dn)
         db.session.flush()
 
-        # 创建 DN 明细（如果有）
         for detail in resolved_details:
             new_detail = DNDetail(
                 dn_id=new_dn.id,
                 goods_id=detail['goods_id'],
                 quantity=detail['quantity'],
-                picked_quantity=detail.get('picked_quantity', 0),
-                packed_quantity=detail.get('packed_quantity', 0),
-                delivered_quantity=detail.get('delivered_quantity', 0),                
-                remark=detail.get('remark', ''),
+                remark=detail['remark'],
                 created_by=created_by_id
             )
             db.session.add(new_detail)
@@ -332,15 +473,14 @@ class DNService:
 
         # db.session.commit()
 
-        
-
         return new_dn
 
     @staticmethod
     @transactional
     def update_dn(dn_or_id: int | DN, data: dict) -> DN:
         """
-        更新指定的 DN 记录（仅当其状态为 pending 时允许更新，或按实际业务修改）。
+        更新指定的 DN 记录（仅当其状态为 pending 时允许更新）。
+        只接受白名单字段：status / is_active / created_by / *_at 由流程端点变更，客户端传入忽略。
 
         :param dn_id: 待更新的 DN ID
         :param data: 要更新的字段
@@ -351,29 +491,41 @@ class DNService:
         dn = DNService._get_instance(dn_or_id)
         if dn.status != 'pending':
             raise BadRequestException("Cannot update a non-pending DN", 16001)
-        
-        # 假设 data['expected_shipping_date'] = "2025-01-01"
-        if 'expected_shipping_date' in data and isinstance(data['expected_shipping_date'], str):
-            data['expected_shipping_date'] = datetime.strptime(data['expected_shipping_date'], '%Y-%m-%d').date()
-        
-        dn.recipient_id = data.get('recipient_id', dn.recipient_id)
-        dn.shipping_address = data.get('shipping_address', dn.shipping_address)
-        dn.expected_shipping_date = data.get('expected_shipping_date', dn.expected_shipping_date)
-        dn.carrier_id = data.get('carrier_id', dn.carrier_id)
-        dn.dn_type = data.get('dn_type', dn.dn_type)
-        dn.status = data.get('status', dn.status)
-        dn.order_number = data.get('order_number', dn.order_number)
-        dn.transportation_mode = data.get('transportation_mode', dn.transportation_mode)
-        dn.packaging_info = data.get('packaging_info', dn.packaging_info)
-        dn.special_handling = data.get('special_handling', dn.special_handling)
-        dn.remark = data.get('remark', dn.remark)
-        dn.is_active = data.get('is_active', dn.is_active)
+
+        payload = pick_fields(data, DN_UPDATE_FIELDS)
+        company_id = dn.warehouse.company_id
+
+        if 'expected_shipping_date' in payload:
+            payload['expected_shipping_date'] = parse_date_value(payload['expected_shipping_date'], 'expected_shipping_date')
+        DNService._validate_dn_enums(payload)
+
+        if not payload.get('carrier_id') and payload.get('carrier_code'):
+            carrier = DNService._resolve_carrier_by_code(company_id, payload['carrier_code'])
+            if carrier:
+                payload['carrier_id'] = carrier.id
+
+        DNService.assert_company_master_data(
+            company_id,
+            recipient_id=payload.get('recipient_id'),
+            carrier_id=payload.get('carrier_id'),
+        )
+
+        # NOT NULL 字段：传 None 视为不改
+        for field in ('recipient_id', 'shipping_address', 'expected_shipping_date', 'dn_type'):
+            if payload.get(field) is not None:
+                setattr(dn, field, payload[field])
+        # 可空字段：显式传 None 允许清空
+        for field in ('carrier_id', 'order_number', 'transportation_mode',
+                      'packaging_info', 'special_handling', 'remark'):
+            if field in payload:
+                setattr(dn, field, payload[field])
 
         db.session.add(dn)
         db.session.flush()
 
         if 'details' in data:
-            DNService.sync_dn_details(dn, data.get('details', []), dn.created_by)  # 更新明细
+            details_data = require_bulk_list(data.get('details'), 'details')
+            DNService.sync_dn_details(dn, details_data, dn.created_by)  # 更新明细
 
         # db.session.commit()
         return dn
@@ -415,7 +567,7 @@ class DNService:
 
         # db.session.commit()
         return dn
-   
+
 
     @staticmethod
     def list_dn_details(dn_id: int):
@@ -424,7 +576,7 @@ class DNService:
         """
         dn = DNService.get_dn(dn_id)  # 若不存在会 404
         return dn.details
-    
+
     @staticmethod
     def get_dn_detail(dn_id: int, detail_id: int) -> DNDetail:
         """
@@ -440,28 +592,28 @@ class DNService:
     def create_dn_detail(dn_id: int, data: dict, created_by_id: int) -> DNDetail:
         """
         在指定 DN 下创建一条 DNDetail（仅当 DN 状态为 pending 时）。
+        同一商品在一张 DN 上只能有一行；数量不得超过排除本单预占后的可用量。
         """
         dn = DNService.get_dn(dn_id)
         if dn.status != 'pending':
             raise BadRequestException("Cannot add details to a non-pending DN", 16003)
 
-        goods_id = data.get('goods_id')
-        if not goods_id and data.get('goods_code'):
-            goods = GoodsService.get_goods_by_code(data['goods_code'], data.get('company_id', 1))
-            if not goods:
-                raise BadRequestException(f"Goods not found for code: {data['goods_code']}", 16030)
-            goods_id = goods.id
-        if not goods_id:
-            raise BadRequestException("goods_id or goods_code is required", 16031)
+        item = pick_fields(data, DN_DETAIL_FIELDS)
+        company_id = dn.warehouse.company_id
+        goods_id = DNService._resolve_goods_id(item, company_id)
+        quantity = require_positive_int(item.get('quantity'), 'quantity')
+
+        if any(d.goods_id == goods_id for d in dn.details):
+            raise BadRequestException(f"Duplicate goods_id: {goods_id}", 16025)
+
+        DNService.assert_company_master_data(company_id, goods_ids=[goods_id])
+        DNService._assert_dn_stock_available(dn.warehouse_id, {goods_id: quantity}, dn)
 
         new_detail = DNDetail(
             dn_id=dn_id,
             goods_id=goods_id,
-            quantity=data.get('quantity', 0),
-            picked_quantity=data.get('picked_quantity', 0),
-            packed_quantity=data.get('packed_quantity', 0),
-            delivered_quantity=data.get('delivered_quantity', 0),
-            remark=data.get('remark', ''),
+            quantity=quantity,
+            remark=item.get('remark', ''),
             created_by=created_by_id
         )
         db.session.add(new_detail)
@@ -477,28 +629,51 @@ class DNService:
     def update_dn_detail(dn_id: int, detail_id: int, update_data: dict) -> DNDetail:
         """
         更新指定 DNDetail（仅当所属的 DN 状态为 pending 时）。
+        只接受 goods_id / goods_code / quantity / remark；picked/packed/delivered_quantity 忽略。
         """
         dn = DNService.get_dn(dn_id)
         if dn.status != 'pending':
             raise BadRequestException("Cannot update details in a non-pending DN", 16004)
 
         detail = DNService.get_dn_detail(dn_id, detail_id)
+        item = pick_fields(update_data, DN_DETAIL_FIELDS)
+        company_id = dn.warehouse.company_id
 
-        detail.goods_id = update_data.get('goods_id', detail.goods_id)
-        detail.quantity = update_data.get('quantity', detail.quantity)
-        detail.picked_quantity = update_data.get('picked_quantity', detail.picked_quantity)
-        detail.packed_quantity = update_data.get('packed_quantity', detail.packed_quantity)
-        detail.delivered_quantity = update_data.get('delivered_quantity', detail.delivered_quantity)
-        detail.remark = update_data.get('remark', detail.remark)
+        goods_id = detail.goods_id
+        if item.get('goods_id') is not None or item.get('goods_code'):
+            goods_id = DNService._resolve_goods_id(item, company_id)
+        quantity = detail.quantity
+        if 'quantity' in item:
+            quantity = require_positive_int(item.get('quantity'), 'quantity')
+
+        if goods_id != detail.goods_id:
+            if any(d.goods_id == goods_id for d in dn.details if d.id != detail.id):
+                raise BadRequestException(f"Duplicate goods_id: {goods_id}", 16025)
+            DNService.assert_company_master_data(company_id, goods_ids=[goods_id])
+
+        # 本 DN 变更后该商品的计划总量（同商品其它行 + 本行新量）
+        other_total = sum(
+            (d.quantity or 0) for d in dn.details
+            if d.id != detail.id and d.goods_id == goods_id
+        )
+        DNService._assert_dn_stock_available(dn.warehouse_id, {goods_id: other_total + quantity}, dn)
+
+        old_goods_id = detail.goods_id
+        detail.goods_id = goods_id
+        detail.quantity = quantity
+        if 'remark' in item:
+            detail.remark = item['remark']
 
         db.session.add(detail)
         db.session.flush()
         InventoryService.update_and_calculate_dn_stock(detail.goods_id,dn.warehouse_id)
+        if old_goods_id != detail.goods_id:
+            InventoryService.update_and_calculate_dn_stock(old_goods_id, dn.warehouse_id)
 
         # db.session.commit()
         return detail
 
-   
+
     @staticmethod
     @transactional
     def delete_dn_detail(dn_id: int, detail_id: int):
@@ -526,42 +701,43 @@ class DNService:
         1. 传入id存在则更新记录
         2. 没有id则创建新记录
         3. 原detail不在新数据中的自动删除
+        每个商品变更后的计划量都要通过「排除本单预占后的可用量」校验。
         """
         dn = DNService._get_instance(dn_or_id)
-        
+
         if dn.status != 'pending':
             raise BadRequestException("Cannot sync details in non-pending DN", 16006)
 
+        details_data = require_bulk_list(details_data, 'details', allow_empty=True)
+        company_id = dn.warehouse.company_id
         existing_details = {d.id: d for d in dn.details}
-        new_detail_ids = set()
-        processed_goods = set()  # 用于校验商品重复
+        touched_goods_ids = {d.goods_id for d in dn.details}
 
-        # 处理更新和新增
-        for item in details_data:
-            # 解析 goods_id（支持 goods_code）
-            goods_id = item.get('goods_id')
-            if not goods_id and item.get('goods_code'):
-                goods = GoodsService.get_goods_by_code(item['goods_code'], item.get('company_id', 1))
-                if not goods:
-                    raise BadRequestException(f"Goods not found for code: {item['goods_code']}", 16030)
-                goods_id = goods.id
-                item['goods_id'] = goods_id
-            if not goods_id:
-                raise BadRequestException("goods_id or goods_code is required", 16031)
-
+        # 先解析并校验全部明细，再落库
+        resolved = []
+        requested_by_goods = {}
+        for raw in details_data:
+            item = pick_fields(raw, DN_DETAIL_FIELDS + ('id',))
+            goods_id = DNService._resolve_goods_id(item, company_id)
             # 商品ID重复校验
-            if goods_id in processed_goods:
+            if goods_id in requested_by_goods:
                 raise BadRequestException(f"Duplicate goods_id: {goods_id}", 16025)
-            processed_goods.add(goods_id)
+            quantity = require_positive_int(item.get('quantity'), 'quantity')
+            requested_by_goods[goods_id] = quantity
+            resolved.append((item.get('id'), goods_id, quantity, item.get('remark', '')))
 
-            # 处理明细ID
-            if 'id' in item and item['id'] in existing_details:
+        DNService.assert_company_master_data(company_id, goods_ids=requested_by_goods.keys())
+        DNService._assert_dn_stock_available(dn.warehouse_id, requested_by_goods, dn)
+
+        new_detail_ids = set()
+        for detail_id, goods_id, quantity, remark in resolved:
+            touched_goods_ids.add(goods_id)
+            if detail_id in existing_details:
                 # 更新现有记录
-                detail = existing_details[item['id']]
-                detail.quantity = item['quantity']
-                detail.picked_quantity = item.get('picked_quantity', 0)
-                detail.packed_quantity = item.get('packed_quantity', 0)
-                detail.remark = item.get('remark', '')
+                detail = existing_details[detail_id]
+                detail.goods_id = goods_id
+                detail.quantity = quantity
+                detail.remark = remark
                 db.session.add(detail)
                 new_detail_ids.add(detail.id)
             else:
@@ -569,33 +745,24 @@ class DNService:
                 new_detail = DNDetail(
                     dn_id=dn.id,
                     goods_id=goods_id,
-                    quantity=item['quantity'],
-                    picked_quantity=item.get('picked_quantity', 0),
-                    packed_quantity=item.get('packed_quantity', 0),
-                    remark=item.get('remark', ''),
+                    quantity=quantity,
+                    remark=remark,
                     created_by=created_by
                 )
                 db.session.add(new_detail)
+                db.session.flush()
                 new_detail_ids.add(new_detail.id)
 
         # 删除不存在于新数据中的记录
-        deleted_goods_ids = set()
-        for detail_id in existing_details:
+        for detail_id, detail in existing_details.items():
             if detail_id not in new_detail_ids:
-                detail = existing_details[detail_id]
-                deleted_goods_ids.add(detail.goods_id)
                 db.session.delete(detail)
-        
+
         db.session.flush()
         db.session.expire(dn, ['details'])
-        # 更新后的明细列表
-        latest_details = dn.details
 
-        for detail in latest_details:
-            InventoryService.update_and_calculate_dn_stock(detail.goods_id,dn.warehouse_id)
-        
-        # 更新被删除明细的库存状态
-        for goods_id in deleted_goods_ids:
+        # 涉及到的商品（新增 / 更新 / 删除 / 换货前后）统一重算预占
+        for goods_id in touched_goods_ids:
             InventoryService.update_and_calculate_dn_stock(goods_id, dn.warehouse_id)
 
         return dn.details
@@ -623,7 +790,7 @@ class DNService:
                     f"requested {detail.quantity}, available {max(physical_available, 0)}.",
                     16037,
                 )
-        
+
         dn = DNService._update_dn_status(dn, "in_progress")
 
         # 创建拣货
@@ -635,9 +802,9 @@ class DNService:
         }, api_key_id=dn.api_key_id)
 
         return dn
-    
-    
-    
+
+
+
     @staticmethod
     @transactional
     def picking_dn(dn_or_id:int | DN) -> DN:
@@ -647,22 +814,22 @@ class DNService:
         dn = DNService._get_instance(dn_or_id)
         if dn.status != 'in_progress':
             raise BadRequestException("Cannot pick a DN that is not in 'in_progress' status.", 16000)
-        
+
         dn = DNService._update_dn_status(dn, "picked")
         DNService._update_and_calculate_quantity(dn_or_id)
 
-        for detail in dn.details:            
+        for detail in dn.details:
             # 更新库存信息
             InventoryService.dn_picked(detail.goods_id,dn.warehouse_id,detail.quantity,detail.picked_quantity)
 
         # 创建打包任务
         from warehouse.packing.services import PackingTaskService
         PackingTaskService.create_packing_task_from_dn(dn.id,dn.created_by)
-        
+
         return dn
 
-    
-    
+
+
     @staticmethod
     @transactional
     def packing_dn(dn_or_id:int | DN) -> DN:
@@ -672,8 +839,8 @@ class DNService:
         dn = DNService._get_instance(dn_or_id)
         if dn.status != 'picked':
             raise BadRequestException("Cannot pack a DN that is not in 'picked' status.", 16000)
-        
-        dn = DNService._update_dn_status(dn, "packed")        
+
+        dn = DNService._update_dn_status(dn, "packed")
         DNService._update_and_calculate_quantity(dn_or_id)
 
         for detail in dn.details:
@@ -695,7 +862,7 @@ class DNService:
         dn = DNService._get_instance(dn_or_id)
         if dn.status != 'packed':
             raise BadRequestException("Cannot ship a DN that is not in 'packed' status.", 16000)
-        
+
         dn = DNService._update_dn_status(dn, "delivered")
         DNService._update_and_calculate_quantity(dn_or_id)
 
@@ -736,7 +903,7 @@ class DNService:
         dn = DNService._get_instance(dn_or_id)
         if dn.status != 'delivered':
             raise BadRequestException("Cannot complete a DN that is not in 'delivered' status.", 16000)
-      
+
         dn = DNService._update_dn_status(dn, "completed")
         DNService._update_and_calculate_quantity(dn_or_id)
 
@@ -757,7 +924,7 @@ class DNService:
         }, api_key_id=dn.api_key_id)
 
         return dn
-    
+
     @staticmethod
     @transactional
     def close_dn(dn_or_id: int | DN):
@@ -771,14 +938,50 @@ class DNService:
         # 判断是否为pending状态
         if dn.status != 'pending':
             raise BadRequestException("Cannot close a DN that is not in 'pending' status.", 16022)
-        
+
         dn = DNService._update_dn_status(dn, "closed")
 
         for detail in dn.details:
             InventoryService.update_and_calculate_dn_stock(detail.goods_id,dn.warehouse_id)
-    
+
         return dn
-    
+
+    @staticmethod
+    @transactional
+    def cancel_dn(dn_or_id: int | DN) -> DN:
+        """
+        取消 DN 并释放 dn_stock 预占：
+        - pending：等同 close
+        - in_progress：拣货任务尚无任何批次 / 明细时允许取消，拣货任务一并停用
+        - 其它状态：拣货已经发生，409
+        """
+        dn = DNService._get_instance(dn_or_id)
+        if dn.status == 'pending':
+            return DNService.close_dn(dn)
+        if dn.status != 'in_progress':
+            raise ConflictException(f"Cannot cancel a DN in '{dn.status}' status.", 16052)
+
+        from warehouse.picking.models import PickingTask
+        tasks = PickingTask.query.filter(
+            PickingTask.dn_id == dn.id,
+            PickingTask.is_active.is_(True),
+        ).all()
+        for task in tasks:
+            if task.status == 'completed' or task.batches or task.task_details:
+                raise ConflictException(
+                    "Cannot cancel a DN whose picking has already started.", 16053
+                )
+
+        for task in tasks:
+            task.is_active = False
+            db.session.add(task)
+
+        dn = DNService._update_dn_status(dn, "closed")
+        for detail in dn.details:
+            InventoryService.update_and_calculate_dn_stock(detail.goods_id, dn.warehouse_id)
+
+        return dn
+
     @staticmethod
     def get_dn_monthly_stats(months=6, filters=None):
         """获取最近N个月各状态ASN统计（支持仓库过滤）
@@ -838,7 +1041,7 @@ class DNService:
             if filters.get('warehouse_id'):
                 query = query.filter(DN.warehouse_id == filters['warehouse_id'])
             if filters.get('warehouse_ids'):
-                query = query.filter(DN.warehouse_id.in_(filters['warehouse_ids'])) 
+                query = query.filter(DN.warehouse_id.in_(filters['warehouse_ids']))
 
         # 分组和排序保持不变
         query = query.group_by('year', 'month').order_by('year', 'month')
@@ -918,7 +1121,7 @@ class DNService:
             if filters.get('warehouse_id'):
                 query = query.filter(DN.warehouse_id == filters['warehouse_id'])
             if filters.get('warehouse_ids'):
-                query = query.filter(DN.warehouse_id.in_(filters['warehouse_ids'])) 
+                query = query.filter(DN.warehouse_id.in_(filters['warehouse_ids']))
 
         # 执行查询（建议添加缓存机制）
         raw_data = {

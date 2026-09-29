@@ -50,6 +50,10 @@ PERMISSIONS = [
     # 系统 - 任务
     ("tasks_execute", "执行后台任务"),
 
+    # 系统 - Webhook 推送日志
+    ("webhook_read", "查看 Webhook 推送日志"),
+    ("webhook_edit", "手动重试 Webhook 推送"),
+
     # 仓库 - 公司
     ("company_read", "查看公司列表和详情"),
     ("company_edit", "创建或编辑公司"),
@@ -108,6 +112,8 @@ PERMISSIONS = [
 
     # 仓库 - 库存
     ("inventory_read", "查看库存列表和详情"),
+    ("inventory_edit", "创建或编辑库存记录"),
+    ("inventory_delete", "删除库存记录"),
 
     # 仓库 - 上架
     ("putaway_read", "查看上架任务列表和详情"),
@@ -149,6 +155,7 @@ PERMISSIONS = [
     # 仓库 - 库存调整
     ("adjustment_read", "查看库存调整列表和详情"),
     ("adjustment_edit", "创建或编辑库存调整"),
+    ("adjustment_approve", "审批库存调整"),
     ("adjustment_delete", "删除库存调整"),
 
     # 仓库 - 盘点

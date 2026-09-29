@@ -2,10 +2,11 @@ from werkzeug.exceptions import NotFound
 from extensions.db import *
 from extensions.error import BadRequestException, NotFoundException
 from extensions.transaction import transactional
+from warehouse.common import require_bulk_list, require_fields, require_non_negative_int
 from warehouse.goods.models import Goods
 from .models import (
-    CycleCountTask, 
-    CycleCountTaskDetail, 
+    CycleCountTask,
+    CycleCountTaskDetail,
     CycleCountTaskStatusLog
 )
 from warehouse.goods.services import GoodsLocationService, GoodsService
@@ -76,14 +77,15 @@ class CycleCountTaskService:
     @transactional
     def create_task(data: dict, created_by_id: int) -> CycleCountTask:
         """
-        创建新的 Cycle Count Task（仅创建主任务，不带明细）。
+        创建新的 Cycle Count Task。status / is_active / created_by 不接受客户端输入：
+        新任务固定 pending + 启用，状态只能经 process / complete 推进。
         """
         new_task = CycleCountTask(
-            task_name=data['task_name'],
+            task_name=data.get('task_name'),
             warehouse_id=data['warehouse_id'],
             scheduled_date=data.get('scheduled_date'),
-            status=data.get('status', 'pending'),
-            is_active=data.get('is_active', True),
+            status='pending',
+            is_active=True,
             created_by=created_by_id
         )
 
@@ -117,10 +119,9 @@ class CycleCountTaskService:
         if task.status != 'pending':
             raise BadRequestException("Cannot update a non-pending CycleCountTask", 16001)
 
+        # 白名单：只允许改任务名和计划时间；status / is_active / created_by 忽略
         task.task_name = data.get('task_name', task.task_name)
         task.scheduled_date = data.get('scheduled_date', task.scheduled_date)
-        task.status = data.get('status', task.status)
-        task.is_active = data.get('is_active', task.is_active)
 
         # db.session.commit()
         return task
@@ -220,15 +221,14 @@ class CycleCountTaskService:
 
         detail = CycleCountTaskService.get_task_detail(task_id, detail_id)
 
-        # 获取库存数据，计算差额
-        # goods_in_location_count = GoodsLocationService.get_quantity(detail.goods_id, detail.location_id)
-
+        # 白名单：goods_id / location_id / actual_quantity；
+        # status 与 operator_id 只由 complete / batch_save 流程写入，不接受客户端输入
         detail.goods_id = data.get('goods_id', detail.goods_id)
         detail.location_id = data.get('location_id', detail.location_id)
-        detail.actual_quantity = data.get('actual_quantity', detail.actual_quantity)
-        # detail.difference = detail.actual_quantity - detail.system_quantity
-        detail.operator_id = data.get('operator_id', detail.operator_id)
-        detail.status = data.get('status', detail.status)
+        if 'actual_quantity' in data:
+            detail.actual_quantity = require_non_negative_int(data['actual_quantity'], 'actual_quantity')
+            if detail.system_quantity is not None:
+                detail.difference = detail.actual_quantity - detail.system_quantity
 
         # db.session.commit()
         return detail
@@ -379,10 +379,12 @@ class CycleCountTaskService:
         if task.status != 'in_progress':
             raise BadRequestException("Cannot update details in a non-in_progress CycleCountTask", 16010)
         
-        for detail_data in details:
+        for detail_data in require_bulk_list(details, 'details'):
+            require_fields(detail_data, 'id')
             detail = CycleCountTaskService.get_task_detail(task_id, detail_data['id'])
             detail.system_quantity = detail.system_quantity or 0  # 将 None 转为 0
-            detail.actual_quantity = int(detail_data.get('actual_quantity', 0))  # 默认值为 0
+            # 负数 / 小数 / bool / 非数字 → 400（共享校验）
+            detail.actual_quantity = require_non_negative_int(detail_data.get('actual_quantity'), 'actual_quantity')
             detail.operator_id = operator_id
             detail.difference = detail.actual_quantity - detail.system_quantity
 

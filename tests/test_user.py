@@ -109,11 +109,25 @@ def test_create_user(client, access_token):
         'user_name': 'test_user',
         'email': 'test_user@example.com',
         'password': 'test_password',
-        'roles': ['user'],
+        'roles': ['warehouse_operator'],
         'is_active': True
     })
     assert response.status_code == 201
     assert response.get_json()['user_name'] == 'test_user'
+    assert response.get_json()['roles'] == ['warehouse_operator']
+
+def test_create_user_with_unknown_role_is_rejected(client, access_token):
+    # 不存在的角色名以前会被静默忽略，现在明确报错
+    response = client.post('/user/users', headers={
+        'Authorization': f'Bearer {access_token}'
+    }, json={
+        'user_name': 'test_user2',
+        'email': 'test_user2@example.com',
+        'password': 'test_password',
+        'roles': ['no_such_role'],
+    })
+    assert response.status_code == 400
+    assert response.get_json()['code'] == 14014
 
 def test_get_roles(client, access_token):
     response = client.get('/user/roles', headers={
@@ -173,13 +187,18 @@ def test_update_role(client, access_token):
         assert response.get_json()['name'] == 'updated_admin_role'
 
 def test_delete_role(client, access_token):
+    headers = {'Authorization': f'Bearer {access_token}'}
+    # 使用中的角色不能删（admin 角色挂在 admin 用户上）
     with client.application.app_context():
-        role = get_admin_role()
-        response = client.delete(f'/user/roles/{role.id}', headers={
-            'Authorization': f'Bearer {access_token}'
-        })
-        assert response.status_code == 200
-        assert response.get_json()['message'] == 'Role deleted successfully'
+        in_use_id = get_admin_role().id
+    assert client.delete(f'/user/roles/{in_use_id}', headers=headers).status_code == 409
+
+    # 未被使用的角色可以删
+    created = client.post('/user/roles', headers=headers, json={'name': 'temp_role', 'description': 'tmp'})
+    assert created.status_code == 201
+    response = client.delete(f"/user/roles/{created.get_json()['id']}", headers=headers)
+    assert response.status_code == 200
+    assert response.get_json()['message'] == 'Role deleted successfully'
         
 # 只有admin用户才能创建，修改，删除用户和角色
 def test_create_user_unauthorized(client, access_operator_token):

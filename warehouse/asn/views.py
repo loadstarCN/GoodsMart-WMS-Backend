@@ -1,11 +1,13 @@
 from flask import g
-from werkzeug.exceptions import NotFound
-from flask_restx import Resource,abort
+from flask_restx import Resource
 from extensions import cache
-from extensions.error import ForbiddenException
 from system.common import permission_required,paginate
 from system.third_party.utils import get_api_key_company_id
-from warehouse.common import warehouse_required,check_warehouse_access,add_warehouse_filter
+from warehouse.common import (
+    require_actor_user_id,
+    warehouse_required, add_warehouse_filter, require_warehouse_scope, get_warehouse_owned, require_fields,
+)
+from .models import ASN
 from .schemas import (
     api_ns,
     asn_model,
@@ -18,6 +20,11 @@ from .schemas import (
     asn_monthly_stats_parser
 )
 from .services import ASNService
+
+
+def _owned_asn(asn_id: int) -> ASN:
+    """按 id 取 ASN 并校验其仓库在调用方可访问范围内（须在 @warehouse_required() 之后调用）"""
+    return get_warehouse_owned(ASN, asn_id, what='ASN')
 
 
 @api_ns.doc(security="jsonWebToken")
@@ -41,8 +48,9 @@ class ASNList(Resource):
             'asn_type': args.get('asn_type'),
             'status': args.get('status'),
             'tracking_number': args.get('tracking_number'),
+            'order_number': args.get('order_number'),
             'supplier_id': args.get('supplier_id'),
-            'carrier_id': args.get('carrier_id'),            
+            'carrier_id': args.get('carrier_id'),
             'expected_arrival_date': args.get('expected_arrival_date'),
             'created_by': args.get('created_by'),
             'is_active': args.get('is_active'),
@@ -54,27 +62,32 @@ class ASNList(Resource):
         return paginate(query, page, per_page), 200
 
     @permission_required(["all_access","company_all_access","asn_edit"])
+    @warehouse_required()
     @api_ns.expect(asn_input_model)
     @api_ns.marshal_with(asn_model)
     def post(self):
         """
         Create a new ASN
+        - `warehouse_id`: Required, must be accessible to the caller
         - `asn_type`: Defaults to `inbound` if not provided by the frontend
         - `expected_arrival_date`: Can be null
-        - `status`: Defaults to `pending` if not provided by the frontend
         - `remark`: Can be null
         - `details`: A list of ASN details, can be empty
+        - `status` / `is_active` and per-detail process quantities are ignored
         """
 
         data = api_ns.payload
+        require_fields(data, 'warehouse_id')
+        require_warehouse_scope(data['warehouse_id'], 'warehouse')
+
         # API Key 认证时强制注入 company_id（防止跨公司操作）
         api_company_id = get_api_key_company_id()
         if api_company_id:
             data['company_id'] = api_company_id
-        # 记录创建来源 API Key（用于定向 Webhook 推送）
-        if g.current_system and g.current_system.get('api_key'):
-            data['api_key_id'] = g.current_system['api_key'].id
-        created_by = g.current_user.id
+        # 记录创建来源 API Key（用于定向 Webhook 推送）；JWT 路径下不允许客户端自带
+        api_key = g.current_system.get('api_key') if g.current_system else None
+        data['api_key_id'] = api_key.id if api_key else None
+        created_by = require_actor_user_id()
         new_asn = ASNService.create_asn(data, created_by)
         return new_asn, 201
 
@@ -90,29 +103,30 @@ class ASNDetailView(Resource):
         """
         Get details of a specific ASN
         """
-        asn = ASNService.get_asn(asn_id)
-        if not check_warehouse_access(asn.warehouse_id):
-            raise ForbiddenException("You do not have access to this ASN", 12001)
-        return asn, 200
+        return _owned_asn(asn_id), 200
 
     @permission_required(["all_access","company_all_access","asn_edit"])
+    @warehouse_required()
     @api_ns.expect(asn_input_base_model)
     @api_ns.marshal_with(asn_model)
     def put(self, asn_id):
         """
-        Update a specific ASN
+        Update a specific ASN (status / is_active are ignored; use the action endpoints)
         """
+        asn = _owned_asn(asn_id)
         data = api_ns.payload
-        updated_asn = ASNService.update_asn(asn_id, data)
+        updated_asn = ASNService.update_asn(asn, data)
         return updated_asn, 200
 
     @permission_required(["all_access","company_all_access","asn_delete"])
+    @warehouse_required()
     def delete(self, asn_id):
         """
         Delete a specific ASN
         """
-        ASNService.delete_asn(asn_id)
-        
+        asn = _owned_asn(asn_id)
+        ASNService.delete_asn(asn)
+
         return {"message": "ASN deleted successfully"}, 200
 
 
@@ -131,13 +145,9 @@ class ASNReceiveResource(Resource):
         """
         Mark a specific ASN as 'received'.
         - Returns 404 if ASN not found.
-        """ 
-        updated_asn = ASNService.get_asn(asn_id)
-        if not check_warehouse_access(updated_asn.warehouse_id):
-            raise ForbiddenException("You do not have access to this ASN", 12001) 
-        
-        updated_asn = ASNService.receive_asn(updated_asn)
-        
+        """
+        updated_asn = ASNService.receive_asn(_owned_asn(asn_id))
+
         return updated_asn, 200
 
 
@@ -156,12 +166,29 @@ class ASNCloseResource(Resource):
         """
         Mark a specific ASN as 'closed'.
         - Returns 404 if ASN not found.
-        """ 
-        updated_asn = ASNService.get_asn(asn_id)
-        if not check_warehouse_access(updated_asn.warehouse_id):
-            raise ForbiddenException("You do not have access to this ASN", 12001)
-        updated_asn = ASNService.close_asn(updated_asn)
-        
+        """
+        updated_asn = ASNService.close_asn(_owned_asn(asn_id))
+
+        return updated_asn, 200
+
+
+@api_ns.doc(security="jsonWebToken")
+@api_ns.route('/<int:asn_id>/cancel/')
+class ASNCancelResource(Resource):
+    """
+    取消 ASN：pending 直接关闭；received 且分拣尚未开始时回滚签收库存并关闭；其它状态 409。
+    """
+
+    @permission_required(["all_access","company_all_access","asn_edit"])
+    @warehouse_required()
+    @api_ns.marshal_with(asn_model)
+    def put(self, asn_id):
+        """
+        Cancel a specific ASN and release its inventory reservation.
+        - Returns 404 if ASN not found, 409 if it can no longer be cancelled.
+        """
+        updated_asn = ASNService.cancel_asn(_owned_asn(asn_id))
+
         return updated_asn, 200
 
 
@@ -173,23 +200,26 @@ class ASNDetailList(Resource):
     """
 
     @permission_required(["all_access","company_all_access","asn_read"])
+    @warehouse_required()
     @api_ns.marshal_list_with(asn_detail_model)
     def get(self, asn_id):
         """
         Get all ASNDetails for a specific ASN
         """
-        return ASNService.list_asn_details(asn_id), 200
+        return ASNService.list_asn_details(_owned_asn(asn_id)), 200
 
     @permission_required(["all_access","company_all_access","asn_edit"])
+    @warehouse_required()
     @api_ns.expect(asn_detail_input_model)
     @api_ns.marshal_with(asn_detail_model)
     def post(self, asn_id):
         """
-        Create a new ASNDetail under a specific ASN
+        Create a new ASNDetail under a specific ASN (goods must belong to the same company)
         """
+        asn = _owned_asn(asn_id)
         data = api_ns.payload
-        new_detail = ASNService.create_asn_detail(asn_id, data, g.current_user.id)
-        
+        new_detail = ASNService.create_asn_detail(asn, data, require_actor_user_id())
+
         return new_detail, 201
 
 
@@ -201,33 +231,39 @@ class ASNDetailItem(Resource):
     """
 
     @permission_required(["all_access","company_all_access","asn_read"])
+    @warehouse_required()
     @api_ns.marshal_with(asn_detail_model)
     def get(self, asn_id, detail_id):
         """
         Get a specific ASNDetail under a specific ASN
         """
-        detail = ASNService.get_asn_detail(asn_id, detail_id)
+        asn = _owned_asn(asn_id)
+        detail = ASNService.get_asn_detail(asn.id, detail_id)
         return detail
 
     @permission_required(["all_access","company_all_access","asn_edit"])
+    @warehouse_required()
     @api_ns.expect(asn_detail_input_model)
     @api_ns.marshal_with(asn_detail_model)
     def put(self, asn_id, detail_id):
         """
-        Update a specific ASNDetail
+        Update a specific ASNDetail (process quantities are ignored)
         """
+        asn = _owned_asn(asn_id)
         data = api_ns.payload
-        updated_detail = ASNService.update_asn_detail(asn_id, detail_id, data)
+        updated_detail = ASNService.update_asn_detail(asn, detail_id, data)
 
         return updated_detail, 200
 
     @permission_required(["all_access","company_all_access","asn_delete"])
+    @warehouse_required()
     def delete(self, asn_id, detail_id):
         """
         Delete a specific ASNDetail
         """
-        ASNService.delete_asn_detail(asn_id, detail_id)
-        
+        asn = _owned_asn(asn_id)
+        ASNService.delete_asn_detail(asn, detail_id)
+
         return {"message": "ASNDetail deleted successfully"}, 200
 
 
@@ -257,7 +293,7 @@ class ASNMonthlyStats(Resource):
         filters = add_warehouse_filter(filters)
         stats = ASNService.get_asn_monthly_stats(months,filters=filters)
         return stats, 200
-    
+
 @api_ns.doc(security="jsonWebToken")
 @api_ns.route('/status-overview-stats')
 class ASNStatusOverviewStats(Resource):

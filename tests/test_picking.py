@@ -72,15 +72,36 @@ def test_update_picking_task(client, access_token):
         f'/picking/{task_id}',
         headers={'Authorization': f'Bearer {access_token}'},
         json={
-            "status": "pending",
-            "is_active": False
+            "status": "completed",
+            "is_active": False,
+            "dn_id": 2,
         }
     )
     assert response.status_code == 200
     data = response.get_json()
-    # 检查更新后的关键字段
+    # B-12：status / is_active / dn_id 都不能经 PUT 改，状态只经 process / complete 流转
     assert data['status'] == "pending"
-    assert data['is_active'] is False
+    assert data['is_active'] is True
+    assert data['dn_id'] == task.dn_id
+
+
+def test_create_picking_task_requires_dn_id(client, access_token):
+    """B-18：缺 dn_id → 400；DN 不存在 → 404"""
+    headers = {'Authorization': f'Bearer {access_token}'}
+    assert client.post('/picking/', headers=headers, json={"status": "pending"}).status_code == 400
+    assert client.post('/picking/', headers=headers, json={"dn_id": "abc"}).status_code == 400
+    assert client.post('/picking/', headers=headers, json={"dn_id": True}).status_code == 400
+    assert client.post('/picking/', headers=headers, json={"dn_id": 99999}).status_code == 404
+
+
+def test_post_picking_detail_endpoint_removed(client, access_token):
+    """B-35：明细只能经批次创建，POST /picking/<id>/details/ 已下线（原来必 500）。"""
+    with client.application.app_context():
+        task_id = get_picking_task().id
+    response = client.post(f'/picking/{task_id}/details/',
+                           headers={'Authorization': f'Bearer {access_token}'},
+                           json={"goods_id": 1, "location_id": 1, "picked_quantity": 1})
+    assert response.status_code == 405
 
 
 def test_delete_picking_task(client, access_token):
@@ -147,12 +168,12 @@ def test_picking_task_service_update_task(client):
         assert task is not None
 
         updated_task = PickingTaskService.update_task(task.id, {
-            "status": "pending",  # 允许更新
+            "status": "completed",
             "is_active": False
         })
-        # 检查更新后的关键字段
+        # B-12：status / is_active 不接受客户端赋值
         assert updated_task.status == "pending"
-        assert updated_task.is_active is False
+        assert updated_task.is_active is True
 
 
 def test_picking_task_service_delete_task(client):
@@ -401,6 +422,7 @@ def test_picking_task_complete_sets_completed_at(client, access_token):
         task = get_picking_task_by_status("pending")
         # 先从 pending => in_progress
         PickingTaskService.process_task(task.id, admin_user.id)
+        _drop_off_plan_details(task)
         task_id = task.id
         response = client.put(
             f'/picking/{task_id}/complete/',
@@ -426,6 +448,18 @@ def get_inventory_for(goods_id, warehouse_id):
     from warehouse.inventory.models import Inventory
     return Inventory.query.filter_by(goods_id=goods_id, warehouse_id=warehouse_id).first()
 
+
+def _drop_off_plan_details(task):
+    """种子拣货任务带了一条不在 DN 明细内的 goods_2 明细；complete 现在会拒绝计划外商品（16042），
+    正常完成流程的用例先把它清掉。"""
+    planned = {d.goods_id for d in task.dn.details}
+    for detail in list(task.task_details):
+        if detail.goods_id not in planned:
+            db.session.delete(detail)
+    db.session.commit()
+    db.session.expire(task, ['task_details'])
+
+
 def test_complete_task_success(client):
     """
     测试 complete_task 正常完成流程：
@@ -440,10 +474,11 @@ def test_complete_task_success(client):
         assert task is not None
 
         dn = task.dn
-        dn.status == "in_progress"
+        assert dn.status == "in_progress"
 
         # 将任务状态设置为 in_progress
         PickingTaskService.process_task(task.id, admin_user.id)
+        _drop_off_plan_details(task)
 
         # 确保 task_details 存在，便于后续验证库存更新
         assert len(task.task_details) > 0
@@ -477,6 +512,7 @@ def test_complete_task_transaction_rollback(client, monkeypatch):
 
         # 将任务状态设置为 in_progress
         PickingTaskService.process_task(task.id, admin_user.id)
+        _drop_off_plan_details(task)
 
         # 模拟 InventoryService.picking_completed 抛出异常
         def fake_picking_completed(goods_id, warehouse_id, quantity, commit=True):
@@ -587,6 +623,184 @@ def test_complete_task_rejects_overpicked_data(client):
 
         with pytest.raises(BadRequestException, match="exceeds planned quantity"):
             PickingTaskService.complete_task(task.id, admin_user.id)
+
+
+def test_update_task_detail_rejects_location_or_goods_change(client, access_token):
+    """B-14：拣货明细 PUT 不能改 location_id / goods_id（否则可以挪到别仓库位，complete 时跨仓扣库存）。"""
+    with client.application.app_context():
+        admin_user = get_operator_user()
+        task = get_picking_task()
+        PickingTaskService.process_task(task.id, admin_user.id)
+        detail = task.task_details[0]
+        other_location = Location.query.filter(Location.id != detail.location_id).first()
+        task_id, detail_id = task.id, detail.id
+        original_location_id, original_goods_id = detail.location_id, detail.goods_id
+        other_goods_id = 2 if original_goods_id != 2 else 1
+
+    headers = {'Authorization': f'Bearer {access_token}'}
+    response = client.put(f'/picking/{task_id}/details/{detail_id}', headers=headers,
+                          json={"location_id": other_location.id})
+    assert response.status_code == 400
+    assert response.get_json()['code'] == 16049
+
+    response = client.put(f'/picking/{task_id}/details/{detail_id}', headers=headers,
+                          json={"goods_id": other_goods_id})
+    assert response.status_code == 400
+    assert response.get_json()['code'] == 16049
+
+    # 回传未变化的 location_id / goods_id（前端整对象回传）是允许的
+    response = client.put(f'/picking/{task_id}/details/{detail_id}', headers=headers,
+                          json={"location_id": original_location_id, "goods_id": original_goods_id})
+    assert response.status_code == 200
+
+    with client.application.app_context():
+        refreshed = get_picking_task_detail_by_id(detail_id)
+        assert refreshed.location_id == original_location_id
+        assert refreshed.goods_id == original_goods_id
+
+
+def test_update_task_detail_quantity_is_bounded(client):
+    """B-14：明细改量要过计划量上限与库位库存校验，且必须是正整数。"""
+    with client.application.app_context():
+        admin_user = get_operator_user()
+        task = get_picking_task()                       # goods_1 计划 40，已拣 10
+        PickingTaskService.process_task(task.id, admin_user.id)
+        planned_goods_id = task.dn.details[0].goods_id
+        detail = next(d for d in task.task_details if d.goods_id == planned_goods_id)
+
+        # 10 → 40：恰好等于计划量，允许
+        PickingTaskService.update_task_detail(task.id, detail.id, {"picked_quantity": 40})
+        assert detail.picked_quantity == 40
+
+        # 41 > 计划 40 → 16029
+        with pytest.raises(BadRequestException) as excinfo:
+            PickingTaskService.update_task_detail(task.id, detail.id, {"picked_quantity": 41})
+        assert excinfo.value.biz_code == 16029
+
+        # 库位库存 1，改到 2 → 16036
+        PickingTaskService.update_task_detail(task.id, detail.id, {"picked_quantity": 1})
+        stock = GoodsLocation.query.filter_by(goods_id=detail.goods_id, location_id=detail.location_id).first()
+        stock.quantity = 1
+        db.session.flush()
+        with pytest.raises(BadRequestException) as excinfo:
+            PickingTaskService.update_task_detail(task.id, detail.id, {"picked_quantity": 2})
+        assert excinfo.value.biz_code == 16036
+
+        for bad in (0, -3, "five", 1.5, True):
+            with pytest.raises(BadRequestException) as excinfo:
+                PickingTaskService.update_task_detail(task.id, detail.id, {"picked_quantity": bad})
+            assert excinfo.value.biz_code == 16033
+
+
+def test_complete_task_rejects_location_in_other_warehouse(client):
+    """B-14：complete 前复核全部明细的库位必须属于 DN 仓库。"""
+    with client.application.app_context():
+        admin_user = get_operator_user()
+        task = get_picking_task()
+        PickingTaskService.process_task(task.id, admin_user.id)
+        _drop_off_plan_details(task)
+        other_warehouse = Warehouse.query.filter(Warehouse.id != task.dn.warehouse_id).first()
+        foreign_location = Location(warehouse_id=other_warehouse.id, code='FOREIGN', description='x',
+                                    location_type='standard', created_by=admin_user.id)
+        db.session.add(foreign_location)
+        db.session.flush()
+        db.session.add(GoodsLocation(goods_id=task.dn.details[0].goods_id,
+                                     location_id=foreign_location.id, quantity=100))
+        # 直接把一条明细挪到别仓库位，模拟被绕过校验的历史脏数据
+        detail = task.task_details[0]
+        detail.location_id = foreign_location.id
+        db.session.commit()
+
+        with pytest.raises(BadRequestException) as excinfo:
+            PickingTaskService.complete_task(task.id, admin_user.id)
+        assert excinfo.value.biz_code == 16054
+        assert get_picking_task_by_id(task.id).status == 'in_progress'
+
+
+def test_picking_rejects_goods_not_in_dn(client, access_token):
+    """
+    拣货明细的商品必须在 DN 明细内（16042）：批次创建 / 明细改量当场拒绝，
+    complete 前对全部明细再验一次（种子任务自带一条计划外 goods_2 明细，正好当脏数据）。
+    拣货下架走 picking_removed 不进 sorted_stock，计划外商品一旦下架会从 total_stock 里消失。
+    """
+    with client.application.app_context():
+        admin_user = get_operator_user()
+        task = get_picking_task()                       # dn3 只有 goods_1
+        PickingTaskService.process_task(task.id, admin_user.id)
+        planned = {d.goods_id for d in task.dn.details}
+        off_plan_detail = next(d for d in task.task_details if d.goods_id not in planned)
+        off_plan_goods_id = off_plan_detail.goods_id
+        location = get_location()
+        task_id, off_plan_detail_id, location_id = task.id, off_plan_detail.id, location.id
+
+        # 批次创建：计划外商品 → 16042
+        with pytest.raises(BadRequestException) as excinfo:
+            PickingTaskService.create_batch(task.id, {"details": [
+                {"location_id": location.id, "goods_id": off_plan_goods_id, "picked_quantity": 1},
+            ]}, admin_user.id)
+        assert excinfo.value.biz_code == 16042
+
+        # complete：历史脏数据（计划外明细）→ 16042，任务保持 in_progress
+        with pytest.raises(BadRequestException) as excinfo:
+            PickingTaskService.complete_task(task.id, admin_user.id)
+        assert excinfo.value.biz_code == 16042
+        assert get_picking_task_by_id(task.id).status == 'in_progress'
+
+    # 明细改量：计划外明细 → 16042（走 API）
+    response = client.put(f'/picking/{task_id}/details/{off_plan_detail_id}',
+                          headers={'Authorization': f'Bearer {access_token}'},
+                          json={"picked_quantity": 1})
+    assert response.status_code == 400
+    assert response.get_json()['code'] == 16042
+
+    # 批次创建走 API 同样 16042
+    response = client.post(f'/picking/{task_id}/batches/',
+                           headers={'Authorization': f'Bearer {access_token}'},
+                           json={"details": [{"location_id": location_id, "goods_id": off_plan_goods_id,
+                                              "picked_quantity": 1}]})
+    assert response.status_code == 400
+    assert response.get_json()['code'] == 16042
+
+
+def test_create_batch_rejects_location_in_other_warehouse(client):
+    with client.application.app_context():
+        admin_user = get_operator_user()
+        task = get_picking_task()
+        PickingTaskService.process_task(task.id, admin_user.id)
+        other_warehouse = Warehouse.query.filter(Warehouse.id != task.dn.warehouse_id).first()
+        foreign_location = Location(warehouse_id=other_warehouse.id, code='FOREIGN2', description='x',
+                                    location_type='standard', created_by=admin_user.id)
+        db.session.add(foreign_location)
+        db.session.commit()
+
+        with pytest.raises(BadRequestException) as excinfo:
+            PickingTaskService.create_batch(task.id, {"details": [
+                {"location_id": foreign_location.id, "goods_id": task.dn.details[0].goods_id, "picked_quantity": 1},
+            ]}, admin_user.id)
+        assert excinfo.value.biz_code == 16054
+
+
+@pytest.mark.parametrize('body', [
+    {"details": {"goods_id": 1}},                                                     # details 不是 list
+    {"details": ["x"]},                                                               # 元素不是对象
+    {"details": [{"location_id": 1, "goods_id": 1}]},                                 # 缺 picked_quantity
+    {"details": [{"location_id": 1, "goods_id": 1, "picked_quantity": 0}]},           # 非正数
+    {"details": [{"location_id": 1, "goods_id": 1, "picked_quantity": "two"}]},       # 非整数
+    {"details": [{"location_id": 1, "goods_id": 1, "picked_quantity": True}]},        # bool 不是数量
+    {"details": [{"goods_id": 1, "picked_quantity": 1}]},                             # 缺 location_id
+    {"details": [{"location_id": 1, "picked_quantity": 1}]},                          # 缺 goods_id
+    {"operation_time": "yesterday"},                                                  # 时间格式非法
+])
+def test_create_batch_invalid_body_returns_400(client, access_token, body):
+    """B-18：批次明细缺字段 / 非正数 / 类型不对 → 400 而非 500"""
+    with client.application.app_context():
+        admin_user = get_operator_user()
+        task = get_picking_task()
+        PickingTaskService.process_task(task.id, admin_user.id)
+        task_id = task.id
+    response = client.post(f'/picking/{task_id}/batches/',
+                           headers={'Authorization': f'Bearer {access_token}'}, json=body)
+    assert response.status_code == 400, response.get_json()
 
 
 def test_location_stock_lock_query_has_no_outer_join(client):

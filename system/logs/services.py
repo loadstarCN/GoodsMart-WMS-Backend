@@ -26,13 +26,12 @@ class LogService:
             query = query.filter(ActivityLog.ip_address == filters['ip_address'])
         if filters.get('created_at'):
             query = query.filter(ActivityLog.created_at >= filters['created_at'])
+        # keyword 只搜 actor / endpoint，不搜请求响应正文（避免逐字盲猜正文中的凭证）
         if filters.get('keyword'):
             keyword = f"%{filters['keyword']}%"
             query = query.filter(
                 (ActivityLog.actor.ilike(keyword)) |
-                (ActivityLog.endpoint.ilike(keyword)) |
-                (ActivityLog.request_data.ilike(keyword)) |
-                (ActivityLog.response_data.ilike(keyword))
+                (ActivityLog.endpoint.ilike(keyword))
             )
 
         return query

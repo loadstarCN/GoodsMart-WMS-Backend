@@ -36,9 +36,10 @@ goods_base_model = api_ns.model('GoodsBase', {
     'description': fields.String(description='Goods Description'),
     'unit': fields.String(description='Unit of Measurement', default='pcs'),
     'weight': fields.Float(description='Weight in kilograms'),
-    'length': fields.Float(description='Length in centimeters'),
-    'width': fields.Float(description='Width in centimeters'),
-    'height': fields.Float(description='Height in centimeters'),
+    # 与模型一致：尺寸为整数毫米（webhook 里也按 *_mm 输出）
+    'length': fields.Integer(description='Length in millimeters'),
+    'width': fields.Integer(description='Width in millimeters'),
+    'height': fields.Integer(description='Height in millimeters'),
     'manufacturer': fields.String(description='Manufacturer Information'),
     'brand': fields.String(description='Brand Information'),
     'image_url': fields.String(description='Goods Image URL'),
@@ -86,10 +87,6 @@ goods_location_model = api_ns.inherit('GoodsLocation', goods_location_base_model
     'location': fields.Nested(location_simple_model, readonly=True, description='Location Details')
 })
 
-
-# 使用删除字段的方法构建 GoodsLocation 输入模型
-location_input_fields = generate_input_fields(goods_location_base_model)
-goods_location_input_model = api_ns.model('GoodsLocationInput', location_input_fields)
 
 # -----------------------------
 # Goods 总模型（包含 locations 嵌套字段）

@@ -33,11 +33,11 @@ sorting_task_status_log_model = api_ns.model('SortingTaskStatusLog', {
 # ---------------------------------------------------------------------------------
 sorting_task_detail_for_batch_model = api_ns.model('SortingTaskDetailForBatch', {
     'id': fields.Integer(readOnly=True, description='Sorting Task Detail ID'),
-    'goods_id': fields.Integer(required=True, description='Associated ASN Detail ID'),
-    'sorted_quantity': fields.Integer(description='Quantity sorted in this task'),
-    'damage_quantity': fields.Integer(description='Quantity damaged in this task'),
-    'sorting_time': fields.DateTime(description='Time of sorting operation'),
-    'operator_id': fields.Integer(description='Operator performing the sorting'),
+    'goods_id': fields.Integer(required=True, description='Associated Goods ID (must be part of the ASN)'),
+    'sorted_quantity': fields.Integer(description='Quantity sorted in this task (non-negative integer)'),
+    'damage_quantity': fields.Integer(description='Quantity damaged in this task (non-negative integer)'),
+    'sorting_time': fields.DateTime(readOnly=True, description='Time of sorting operation'),
+    'operator_id': fields.Integer(readOnly=True, description='Operator performing the sorting'),
     'goods': fields.Nested(goods_model, readOnly=True, description='Goods details'),
     'operator': fields.Nested(user_model, readOnly=True, description='Operator details'),
 })
@@ -48,8 +48,8 @@ sorting_task_detail_for_batch_model = api_ns.model('SortingTaskDetailForBatch', 
 # ---------------------------------------------------------------------------------
 sorting_batch_model = api_ns.model('SortingBatch', {
     'id': fields.Integer(readOnly=True, description='Sorting Batch ID'),
-    'sorting_task_id': fields.Integer(required=True, description='Associated Sorting Task ID'),
-    'operator_id': fields.Integer(description='Operator who performed the sorting batch'),
+    'sorting_task_id': fields.Integer(readOnly=True, description='Associated Sorting Task ID'),
+    'operator_id': fields.Integer(readOnly=True, description='Operator who performed the sorting batch'),
     'operation_time': fields.DateTime(description='Time of the sorting batch'),
     'remark': fields.String(description='Remark for the sorting batch'),
     'operator': fields.Nested(user_model, readOnly=True, description='Operator details'),
@@ -71,16 +71,17 @@ sorting_task_detail_model = api_ns.inherit('SortingTaskDetail', sorting_task_det
 # ---------------------------------------------------------------------------------
 # 5. SortingTask 基础信息输出模型
 # ---------------------------------------------------------------------------------
+# status / is_active / started_at / completed_at 只能经 process / complete 动作端点变更，不接受客户端输入
 sorting_task_base_model = api_ns.model('SortingTaskBase', {
     'id': fields.Integer(readOnly=True, description='Sorting Task ID'),
     'asn_id': fields.Integer(required=True, description='Associated ASN ID'),
-    'status': fields.String(description='Sorting Task Status', enum=SortingTask.SORTING_TASK_STATUSES),
-    'is_active': fields.Boolean(description='Is the task active?'),
-    'created_by': fields.Integer(description='User who created the task'),
+    'status': fields.String(readOnly=True, description='Sorting Task Status', enum=SortingTask.SORTING_TASK_STATUSES),
+    'is_active': fields.Boolean(readOnly=True, description='Is the task active?'),
+    'created_by': fields.Integer(readOnly=True, description='User who created the task'),
     'created_at': fields.DateTime(readOnly=True, description='Task creation time'),
     'updated_at': fields.DateTime(readOnly=True, description='Last update time'),
-    'started_at': fields.DateTime(description='The time the task started'),
-    'completed_at': fields.DateTime(description='The time the task was completed'),
+    'started_at': fields.DateTime(readOnly=True, description='The time the task started'),
+    'completed_at': fields.DateTime(readOnly=True, description='The time the task was completed'),
     'creator': fields.Nested(user_model, readOnly=True, description='Creator details'),
     'detail_count': fields.Integer(
         readOnly=True,

@@ -4,7 +4,6 @@ from sqlalchemy import or_,func
 from collections import defaultdict
 from extensions.db import get_object_or_404
 from extensions.transaction import transactional
-from warehouse.inventory.models import Inventory
 from warehouse.location.models import Location
 from .models import Goods, GoodsLocation
 
@@ -96,14 +95,8 @@ class GoodsService:
                 )
             )
 
-        # 使用 Inventory 模型中的 warehouse_id 进行过滤
-        # if filters.get('warehouse_id'):
-        #     query = query.join(Inventory, Goods.id == Inventory.goods_id) \
-        #                 .filter(Inventory.warehouse_id == filters['warehouse_id'])
-            
-        # if filters.get('warehouse_ids'):
-        #     query = query.join(Inventory, Goods.id == Inventory.goods_id) \
-        #                 .filter(Inventory.warehouse_id.in_(filters['warehouse_ids'])).distinct(Goods.id)
+        # 商品是公司级主数据，不按仓库过滤：新建但尚无库存的商品也要能被查到（上架前先建档）。
+        # 租户隔离由上面的 company_id 过滤保证；filters 里的 warehouse_id(s) 在这里被有意忽略。
 
         return query
 

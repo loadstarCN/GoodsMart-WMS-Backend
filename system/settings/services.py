@@ -5,12 +5,14 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 
 from cryptography.fernet import Fernet
+from flask import current_app
 
 from extensions import db
 from .models import SystemSetting
 
-# 用于加密敏感配置（如 SMTP 密码）的密钥
-# 首次部署时自动生成并存入 system_settings 表
+# 用于加密敏感配置（如 SMTP 密码）的密钥。
+# 优先取环境变量 SETTINGS_ENCRYPTION_KEY（推荐：密钥不与密文同库）；
+# 未配置时退回到 system_settings 表里自动生成的密钥（仅相当于混淆，会打日志提醒）。
 _fernet = None
 
 SMTP_KEYS = ['smtp_host', 'smtp_port', 'smtp_username', 'smtp_password', 'smtp_sender', 'smtp_use_tls']
@@ -22,7 +24,15 @@ def _get_fernet():
     if _fernet:
         return _fernet
 
-    setting = SystemSetting.query.get('_encryption_key')
+    env_key = current_app.config.get('SETTINGS_ENCRYPTION_KEY')
+    if env_key:
+        _fernet = Fernet(env_key.encode() if isinstance(env_key, str) else env_key)
+        return _fernet
+
+    current_app.logger.warning(
+        'SETTINGS_ENCRYPTION_KEY is not set; secret settings are encrypted with a key stored in the same database'
+    )
+    setting = db.session.get(SystemSetting, '_encryption_key')
     if not setting:
         key = Fernet.generate_key().decode()
         setting = SystemSetting(key='_encryption_key', value=key, is_secret=True)

@@ -3,12 +3,13 @@ from sqlalchemy.dialects.postgresql import JSON
 
 class APIKey(db.Model):
     """API密钥管理表
-    
+
     Attributes:
-        key: 密钥值 (全局唯一加密存储)
+        key: 密钥的 SHA-256 哈希（明文只在创建时返回一次）
+        key_prefix: 明文前 8 位，用于列表展示与识别
         system_name: 归属系统名称 (业务维度标识)
         is_active: 激活状态 (默认启用)
-        permissions: 权限配置 (结构化JSON存储)
+        permissions: 权限配置 (权限名列表)
         user_id: 关联用户ID (允许空值)
     """
     __tablename__ = 'api_keys'
@@ -19,13 +20,18 @@ class APIKey(db.Model):
 
     id = db.Column(db.Integer, primary_key=True)
     key = db.Column(
-        db.String(128), 
+        db.String(128),
         unique=True,
         nullable=False,
-        info={'description': 'API密钥（SHA256加密存储）'}
+        info={'description': 'API密钥（SHA256 哈希存储）'}
+    )
+    key_prefix = db.Column(
+        db.String(16),
+        nullable=True,
+        info={'description': '明文密钥前缀（仅用于展示）'}
     )
     system_name = db.Column(
-        db.String(255), 
+        db.String(255),
         nullable=False,
         info={'description': '归属系统标识（字母数字组合）'}
     )
@@ -41,7 +47,7 @@ class APIKey(db.Model):
         default=list,
         info={'description': 'JSON格式权限配置'}
     )
-    
+
     user_id = db.Column(
         db.Integer,
         db.ForeignKey('users.id', ondelete='CASCADE'),  # 用户删除级联
@@ -69,9 +75,9 @@ class APIKey(db.Model):
 
     # 关系加载策略优化
     user = db.relationship(
-        'User', 
+        'User',
         backref=db.backref(
-            'api_keys', 
+            'api_keys',
             lazy='dynamic',  # 动态加载防止内存膨胀
             order_by='desc(APIKey.id)'
         ),
@@ -79,18 +85,20 @@ class APIKey(db.Model):
         info={'description': '关联用户对象'}
     )
 
-    
+    # 创建时临时挂载的明文 key（不落库，只在创建响应里返回一次）
+    plain_key = None
 
-
-    def __init__(self, key, system_name, user_id=None, permissions=None):
+    def __init__(self, key, system_name, user_id=None, permissions=None, key_prefix=None):
         self.key = key
+        self.key_prefix = key_prefix
         self.system_name = system_name
         self.user_id = user_id
-        self.permissions = permissions or []  # 如果未提供，则默认为空字典
-    
+        self.permissions = permissions or []
+
     def has_permission(self, permission):
-        """Check if the specified module has the action permission"""     
-        return permission in self.permissions
-        
-        
-        
+        """Check if the specified module has the action permission"""
+        return permission in (self.permissions or [])
+
+    @property
+    def has_webhook_secret(self):
+        return bool(self.webhook_secret)

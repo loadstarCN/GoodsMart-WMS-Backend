@@ -19,19 +19,21 @@ user_model = api_ns.model('User', original_user_model)
 # ASNDetail 模型定义
 # -----------------------------
 # 定义 ASNDetail 的完整字段字典
+# asn_id / created_by 由路径与登录身份决定；actual / sorted / damage_quantity 是分拣完成时
+# 聚合出的过程量，都不接受客户端输入（readOnly 会被 generate_input_fields 剔除）。
 asn_detail_fields = {
     'id': fields.Integer(readOnly=True, description='ASN Detail ID'),
-    'asn_id': fields.Integer(required=True, description='Associated ASN ID'),
-    'goods_id': fields.Integer(required=True, description='Associated Goods ID'),
+    'asn_id': fields.Integer(readOnly=True, description='Associated ASN ID'),
+    'goods_id': fields.Integer(description='Associated Goods ID (or provide goods_code)'),
     'goods_code': fields.String(description='Goods code (alternative to goods_id)'),
-    'quantity': fields.Integer(description='Expected quantity of goods'),
-    'actual_quantity': fields.Integer(description='Actual quantity received'),
-    'sorted_quantity': fields.Integer(description='Quantity sorted'),
-    'damage_quantity': fields.Integer(description='Quantity damaged'),
+    'quantity': fields.Integer(description='Expected quantity of goods (positive integer)'),
+    'actual_quantity': fields.Integer(readOnly=True, description='Actual quantity received'),
+    'sorted_quantity': fields.Integer(readOnly=True, description='Quantity sorted'),
+    'damage_quantity': fields.Integer(readOnly=True, description='Quantity damaged'),
     'weight': fields.Float(description='Weight of goods (kg)'),
     'volume': fields.Float(description='Volume of goods (m³)'),
     'remark': fields.String(description='Remark for the ASN detail'),
-    'created_by': fields.Integer(description='User who created the ASN detail'),
+    'created_by': fields.Integer(readOnly=True, description='User who created the ASN detail'),
     'create_time': fields.DateTime(readOnly=True, description='Creation time'),
     'update_time': fields.DateTime(readOnly=True, description='Last updated time'),
     'goods': fields.Nested(goods_model, readOnly=True, description='Details of the associated goods'),
@@ -49,18 +51,19 @@ asn_detail_input_model = api_ns.model('ASNDetailInput', asn_detail_input_fields)
 # ASN 模型定义
 # -----------------------------
 # 定义 ASN 的完整字段字典
+# status / is_active / created_by 只能经 receive / close / cancel 等动作端点变更，不接受客户端输入
 asn_fields = {
     'id': fields.Integer(readOnly=True, description='ASN ID'),
     'supplier_id': fields.Integer(required=True, description='Associated Supplier ID'),
     'tracking_number': fields.String(description='Tracking number of the shipment'),
     'carrier_id': fields.Integer(description='Associated Carrier ID'),
-    'asn_type': fields.String(required=True, description='Type of ASN', enum=ASN.ASN_TYPES),
-    'status': fields.String(description='Status of the ASN', enum=ASN.ASN_STATUSES),
+    'asn_type': fields.String(description='Type of ASN (defaults to inbound)', enum=ASN.ASN_TYPES),
+    'status': fields.String(readOnly=True, description='Status of the ASN', enum=ASN.ASN_STATUSES),
     'expected_arrival_date': fields.Date(description='Expected arrival date'),
     'order_number': fields.String(description='Associated external order number'),
     'remark': fields.String(description='Remark for the ASN'),
-    'is_active': fields.Boolean(description='Is the ASN active?'),
-    'created_by': fields.Integer(description='User who created the ASN'),
+    'is_active': fields.Boolean(readOnly=True, description='Is the ASN active?'),
+    'created_by': fields.Integer(readOnly=True, description='User who created the ASN'),
     'created_at': fields.DateTime(readOnly=True, description='Creation time'),
     'updated_at': fields.DateTime(readOnly=True, description='Last updated time'),
     'received_at': fields.DateTime(readOnly=True, description='Received time'),

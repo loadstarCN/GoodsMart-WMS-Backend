@@ -1,14 +1,16 @@
-from flask_restx import abort
+from sqlalchemy import or_
+from sqlalchemy.orm import aliased
 from extensions.db import *
 from extensions.error import BadRequestException, NotFoundException
 from extensions.transaction import transactional
-from warehouse.goods.models import Goods
-from warehouse.goods.services import GoodsLocationService
+from warehouse.common import (
+    require_same_warehouse, require_positive_int, require_bulk_list, require_fields, lock_goods_location,
+)
+from warehouse.goods.models import Goods, GoodsLocation
 from warehouse.inventory.services import InventoryService
 from warehouse.location.models import Location
-from sqlalchemy import or_
-from sqlalchemy.orm import aliased
 from .models import TransferRecord
+
 
 class TransferService:
     """
@@ -20,7 +22,7 @@ class TransferService:
     def list_transfer_records(filters: dict):
         """
         根据过滤条件，返回 TransferRecord 的查询对象，并按 id 降序排序。
-        
+
         :param filters: dict，包含可能的过滤字段
         :return: 已排序并过滤后的 SQLAlchemy Query 对象
         """
@@ -90,24 +92,36 @@ class TransferService:
     @transactional
     def create_transfer_record(data: dict, created_by_id: int) -> TransferRecord:
         """
-        创建一条新的移库记录
-        
-        :param data: dict，包含 goods_id, from_location_id, to_location_id, quantity, operator_id, remark 等字段
+        创建一条新的移库记录（先减来源库位、后加目标库位，同一事务内两条库位记录都持锁）
+
+        :param data: dict，包含 goods_id, from_location_id, to_location_id, quantity, remark 等字段
         :return: 新创建的 TransferRecord 实例
         """
-        goods_id=data['goods_id']
-        from_location_id=data['from_location_id']
-        to_location_id=data['to_location_id']
-        quantity=data['quantity']
-        
-        # 先去获取商品库位GoodsLocation信息，如果找不到会抛出404错误，捕获这个错误，并创建新的库存信息
-        from_goods_location_record = GoodsLocationService.get_goods_location_record(goods_id, from_location_id)
-        to_goods_location_record = GoodsLocationService.get_goods_location_record(goods_id, to_location_id)
+        require_fields(data, 'goods_id', 'from_location_id', 'to_location_id', 'quantity')
+        goods_id = data['goods_id']
+        from_location_id = data['from_location_id']
+        to_location_id = data['to_location_id']
+        quantity = require_positive_int(data['quantity'], 'quantity')
+        if from_location_id == to_location_id:
+            raise BadRequestException("The from_location_id and to_location_id cannot be the same", 14006)
+
+        from_location = get_object_or_404(Location, from_location_id)
+        to_location = get_object_or_404(Location, to_location_id)
+        # 移库只在同一仓库内进行，跨仓库会让 Inventory 记账落到错误的仓库
+        require_same_warehouse(from_location.warehouse_id, to_location.warehouse_id, 'to_location')
+
+        # 按库位 id 顺序加锁，避免 A→B 与 B→A 并发时互相等待形成死锁
+        locked = {}
+        for location_id in sorted({from_location_id, to_location_id}):
+            locked[location_id] = lock_goods_location(goods_id, location_id)
+        from_goods_location_record = locked[from_location_id]
+        to_goods_location_record = locked[to_location_id]
+
         if from_goods_location_record is None:
             raise NotFoundException("Goods not found in the specified from_location", 14003)
-        if from_goods_location_record.quantity < data['quantity']:
+        if from_goods_location_record.quantity < quantity:
             raise BadRequestException("Insufficient inventory in the specified location", 15001)
-        
+
         new_record = TransferRecord(
             goods_id=goods_id,
             from_location_id=from_location_id,
@@ -118,30 +132,29 @@ class TransferService:
         )
         db.session.add(new_record)
         db.session.flush()
-        
+
         from_goods_location_record.quantity -= quantity
         if from_goods_location_record.quantity == 0:
             db.session.delete(from_goods_location_record)
         else:
             db.session.add(from_goods_location_record)
-        
+
 
         if to_goods_location_record is None:
             # 创建新的库存信息
-            data = {
-                'goods_id': new_record.goods_id,
-                'location_id': new_record.to_location_id,
-                'quantity': new_record.quantity
-            }
-            to_goods_location_record = GoodsLocationService.create_goods_location(data)
+            to_goods_location_record = GoodsLocation(
+                goods_id=goods_id,
+                location_id=to_location_id,
+                quantity=quantity,
+            )
         else:
-            to_goods_location_record.quantity += new_record.quantity
+            to_goods_location_record.quantity += quantity
 
-        db.session.add(to_goods_location_record)        
-        db.session.flush()   
+        db.session.add(to_goods_location_record)
+        db.session.flush()
 
         #更新库存信息
-        InventoryService.update_and_calculate_stock(new_record.goods_id, new_record.to_location.warehouse_id)
+        InventoryService.update_and_calculate_stock(goods_id, to_location.warehouse_id)
         # db.session.commit()
         return new_record
 
@@ -149,7 +162,7 @@ class TransferService:
     def get_transfer_record(record_id: int) -> TransferRecord:
         """
         根据 record_id 获取单个 TransferRecord，不存在时抛出 404
-        
+
         :param record_id: TransferRecord 的 ID
         :return: TransferRecord 实例
         :raises NotFound: 如果 record_id 不存在
@@ -161,16 +174,17 @@ class TransferService:
     def bulk_create_transfer_records(data_list: list, created_by_id: int) -> list:
         """
         批量创建移库记录
-        
+
         :param data_list: list，每个元素为 dict，包含 goods_id, from_location_id, to_location_id, quantity, remark 等字段
         :param created_by_id: 创建者的用户ID
         :return: 创建成功的 TransferRecord 实例列表
         """
+        require_bulk_list(data_list, 'records')
         new_records = []
         for data in data_list:
             new_record = TransferService.create_transfer_record(data, created_by_id)
             new_records.append(new_record)
             db.session.flush()
 
-        
+
         return new_records

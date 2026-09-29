@@ -1,4 +1,4 @@
-from flask_restx import Namespace, fields
+from flask_restx import Namespace, fields, inputs
 from extensions import authorizations
 from system.common import generate_input_fields, pagination_parser, create_pagination_model
 
@@ -65,8 +65,8 @@ user_model = api_ns.model('User', {
 # 生成 User 输入模型：从 User 输出模型复制后删除只读字段，并添加 password 字段
 # -----------------------------
 user_input_fields = generate_input_fields(user_model)
-# 添加输入时需要的额外字段
-user_input_fields['password'] = fields.String(required=True, description='User Password')
+# 添加输入时需要的额外字段（创建时必填，更新时留空表示不修改）
+user_input_fields['password'] = fields.String(description='User Password')
 user_input_model = api_ns.model('UserInput', user_input_fields)
 
 # -----------------------------
@@ -96,9 +96,6 @@ permission_model = api_ns.model('Permission', {
     'id': fields.Integer(readOnly=True, description='Permission ID'),
     'name': fields.String(required=True, description='Permission Name'),
     'description': fields.String(description='Permission Description'),
-    'is_active': fields.Boolean(description='Is the permission active?'),
-    'created_at': fields.DateTime(readOnly=True, description='Creation timestamp'),
-    'updated_at': fields.DateTime(readOnly=True, description='Last updated timestamp'),
 })
 
 # -----------------------------
@@ -108,9 +105,15 @@ permission_input_fields = generate_input_fields(permission_model)
 permission_input_model = api_ns.model('PermissionInput', permission_input_fields)
 
 # -----------------------------
-# 定义请求参数解析器（分页相关）
+# 定义请求参数解析器（分页 + 过滤）
 # -----------------------------
 pagination_parser = pagination_parser.copy()
+pagination_parser.add_argument('keyword', type=str, location='args', help='Search by name / email')
+pagination_parser.add_argument('is_active', type=inputs.boolean, location='args', help='Filter by active status')
+pagination_parser.add_argument('username', type=str, location='args', help='Filter users by user name')
+pagination_parser.add_argument('email', type=str, location='args', help='Filter users by email')
+pagination_parser.add_argument('name', type=str, location='args', help='Filter roles / permissions by name')
+pagination_parser.add_argument('type', type=str, location='args', help='Filter users by type (user / staff)')
 
 # 创建分页模型
 user_pagination_model = create_pagination_model(api_ns, user_model)

@@ -1,17 +1,55 @@
-from datetime import datetime
 from extensions.db import *
 from extensions.error import BadRequestException
 from extensions.transaction import transactional
 from warehouse.dn.models import DN, DNDetail
 from warehouse.goods.models import Goods
-from warehouse.dn.services import DNService
-from warehouse.inventory.services import InventoryService  
+from warehouse.common import require_positive_int, require_fields
+from warehouse.dn.services import (
+    DNService, pick_fields, parse_date_value, parse_datetime_value,
+)
 from dateutil.relativedelta import relativedelta
 from sqlalchemy import and_, func, case, extract
 from datetime import datetime, timedelta
 from .models import DeliveryTask, DeliveryTaskStatusLog
 
+# 请求体白名单：dn_id 只在创建时接受；status / is_active / created_by / *_at 只经流程端点变更
+DELIVERY_UPDATE_FIELDS = (
+    'recipient_id', 'shipping_address', 'expected_shipping_date', 'actual_shipping_date',
+    'transportation_mode', 'carrier_id', 'tracking_number', 'shipping_cost', 'currency',
+    'order_number', 'remark',
+)
+DELIVERY_CREATE_FIELDS = ('dn_id',) + DELIVERY_UPDATE_FIELDS
+
+
 class DeliveryTaskService:
+
+    @staticmethod
+    def _normalize_payload(payload: dict, dn: DN):
+        """日期 / 枚举 / 运费统一校验并转换；收货人、承运商必须与 DN 仓库同公司。"""
+        for field in ('expected_shipping_date', 'actual_shipping_date'):
+            if field in payload:
+                payload[field] = parse_date_value(payload[field], field)
+        mode = payload.get('transportation_mode')
+        if mode is not None and mode not in DeliveryTask.DELIVERY_TASK_TRANSPORTATION_MODES:
+            raise BadRequestException(f"Invalid transportation_mode: {mode}", 16048)
+        cost = payload.get('shipping_cost')
+        if cost is not None:
+            if isinstance(cost, bool) or not isinstance(cost, (int, float)) or cost < 0:
+                raise BadRequestException("shipping_cost must be a non-negative number", 16033)
+        DNService.assert_company_master_data(
+            dn.warehouse.company_id,
+            recipient_id=payload.get('recipient_id'),
+            carrier_id=payload.get('carrier_id'),
+        )
+        return payload
+
+    @staticmethod
+    def _assert_shipping_dates(expected, actual):
+        """与表上 chk_shipping_date 约束对齐：实际发货日不得早于计划发货日（否则 500）"""
+        if expected is not None and actual is not None and actual < expected:
+            raise BadRequestException(
+                "actual_shipping_date must not be earlier than expected_shipping_date", 16061
+            )
 
     @staticmethod
     def _get_instance(task_or_id: int | DeliveryTask) -> DeliveryTask:
@@ -92,27 +130,32 @@ class DeliveryTaskService:
     @transactional
     def create_task(data: dict, created_by_id: int) -> DeliveryTask:
         """
-        创建新的 DeliveryTask
+        创建新的 DeliveryTask。只接受白名单字段；status 固定 pending、is_active 固定 True。
+        缺 dn_id / recipient_id / shipping_address / expected_shipping_date → 400。
         """
-        # 若传入的 expected_shipping_date/actual_shipping_date 是字符串, 在此转换
-        if 'expected_shipping_date' in data and isinstance(data['expected_shipping_date'], str):
-            data['expected_shipping_date'] = datetime.strptime(data['expected_shipping_date'], '%Y-%m-%d').date()
-        if 'actual_shipping_date' in data and isinstance(data['actual_shipping_date'], str):
-            data['actual_shipping_date'] = datetime.strptime(data['actual_shipping_date'], '%Y-%m-%d').date()
+        payload = pick_fields(data, DELIVERY_CREATE_FIELDS)
+        require_fields(payload, 'dn_id', 'recipient_id', 'shipping_address', 'expected_shipping_date')
+        dn_id = require_positive_int(payload['dn_id'], 'dn_id', 16044)
+        dn = get_object_or_404(DN, dn_id)
+        payload = DeliveryTaskService._normalize_payload(payload, dn)
+        DeliveryTaskService._assert_shipping_dates(
+            payload['expected_shipping_date'], payload.get('actual_shipping_date')
+        )
 
         new_delivery = DeliveryTask(
-            dn_id=data['dn_id'],
-            recipient_id=data['recipient_id'],
-            shipping_address=data['shipping_address'],
-            expected_shipping_date=data['expected_shipping_date'],
-            actual_shipping_date=data.get('actual_shipping_date'),
-            transportation_mode=data.get('transportation_mode'),
-            carrier_id=data.get('carrier_id'),
-            tracking_number=data.get('tracking_number'),
-            shipping_cost=data.get('shipping_cost', 0.0),
-            order_number=data.get('order_number'),
-            status=data.get('status', 'pending'),
-            remark=data.get('remark'),
+            dn_id=dn_id,
+            recipient_id=payload['recipient_id'],
+            shipping_address=payload['shipping_address'],
+            expected_shipping_date=payload['expected_shipping_date'],
+            actual_shipping_date=payload.get('actual_shipping_date'),
+            transportation_mode=payload.get('transportation_mode'),
+            carrier_id=payload.get('carrier_id'),
+            tracking_number=payload.get('tracking_number'),
+            shipping_cost=payload.get('shipping_cost', 0.0),
+            currency=payload.get('currency') or 'JPY',
+            order_number=payload.get('order_number'),
+            status='pending',
+            remark=payload.get('remark'),
             created_by=created_by_id
         )
         db.session.add(new_delivery)
@@ -130,34 +173,31 @@ class DeliveryTaskService:
     @transactional
     def update_task(delivery_id: int, data: dict) -> DeliveryTask:
         """
-        更新指定 DeliveryTask（若要跟 Sorting 的逻辑一致，可限制仅在某些状态下可改）
+        更新指定 DeliveryTask（completed / signed 后不可改）。
+        只接受白名单字段：dn_id 不可改；status / is_active / created_by / *_at
+        只经 process / complete / sign 流转，客户端传入一律忽略。
         """
         delivery = DeliveryTaskService.get_task(delivery_id)
 
-        # 如果你想严格限制只能在 'pending' 或 'in_progress' 状态下才可编辑，可自行加判断：
         if delivery.status in ('completed', 'signed'):
            raise BadRequestException("Cannot update a completed or signed Delivery", 16023)
 
-        # 字段转换
-        if 'expected_shipping_date' in data and isinstance(data['expected_shipping_date'], str):
-            data['expected_shipping_date'] = datetime.strptime(data['expected_shipping_date'], '%Y-%m-%d').date()
-        if 'actual_shipping_date' in data and isinstance(data['actual_shipping_date'], str):
-            data['actual_shipping_date'] = datetime.strptime(data['actual_shipping_date'], '%Y-%m-%d').date()
+        payload = pick_fields(data, DELIVERY_UPDATE_FIELDS)
+        payload = DeliveryTaskService._normalize_payload(payload, delivery.dn)
+        DeliveryTaskService._assert_shipping_dates(
+            payload.get('expected_shipping_date', delivery.expected_shipping_date),
+            payload.get('actual_shipping_date', delivery.actual_shipping_date),
+        )
 
-        # 更新字段
-        delivery.dn_id = data.get('dn_id', delivery.dn_id)
-        delivery.recipient_id = data.get('recipient_id', delivery.recipient_id)
-        delivery.shipping_address = data.get('shipping_address', delivery.shipping_address)
-        delivery.expected_shipping_date = data.get('expected_shipping_date', delivery.expected_shipping_date)
-        delivery.actual_shipping_date = data.get('actual_shipping_date', delivery.actual_shipping_date)
-        delivery.transportation_mode = data.get('transportation_mode', delivery.transportation_mode)
-        delivery.carrier_id = data.get('carrier_id', delivery.carrier_id)
-        delivery.tracking_number = data.get('tracking_number', delivery.tracking_number)
-        delivery.shipping_cost = data.get('shipping_cost', delivery.shipping_cost)
-        delivery.order_number = data.get('order_number', delivery.order_number)
-        delivery.status = data.get('status', delivery.status)
-        delivery.remark = data.get('remark', delivery.remark)
-        delivery.is_active = data.get('is_active', delivery.is_active)
+        # NOT NULL 字段：传 None 视为不改
+        for field in ('recipient_id', 'shipping_address', 'expected_shipping_date'):
+            if payload.get(field) is not None:
+                setattr(delivery, field, payload[field])
+        # 可空字段：显式传 None 允许清空
+        for field in ('actual_shipping_date', 'transportation_mode', 'carrier_id', 'tracking_number',
+                      'shipping_cost', 'currency', 'order_number', 'remark'):
+            if field in payload:
+                setattr(delivery, field, payload[field])
 
         # db.session.commit()
         return delivery
@@ -247,16 +287,20 @@ class DeliveryTaskService:
         task = DeliveryTaskService._get_instance(task_or_id)
         if task.status != 'in_progress':
             raise BadRequestException("Cannot complete a non-in-progress Delivery", 16008)
-        
+
+        payload = pick_fields(data or {}, (
+            'transportation_mode', 'carrier_id', 'tracking_number', 'shipping_cost', 'currency', 'remark',
+        ))
+        payload = DeliveryTaskService._normalize_payload(payload, task.dn)
+        DeliveryTaskService._assert_shipping_dates(task.expected_shipping_date, datetime.now().date())
+
         task = DeliveryTaskService._update_task_status(task, 'completed', operator_id)
 
         # 更新字段
         task.actual_shipping_date = datetime.now().date()  # 获取当前日期
-        task.transportation_mode = data.get('transportation_mode', task.transportation_mode)
-        task.carrier_id = data.get('carrier_id', task.carrier_id)
-        task.tracking_number = data.get('tracking_number', task.tracking_number)
-        task.shipping_cost = data.get('shipping_cost', task.shipping_cost)
-        task.remark = data.get('remark', task.remark)
+        for field in ('transportation_mode', 'carrier_id', 'tracking_number', 'shipping_cost', 'currency', 'remark'):
+            if field in payload:
+                setattr(task, field, payload[field])
 
         # 若有需要在此更新库存或者做别的业务处理
         DNService.delivery_dn(task.dn_id)
@@ -278,13 +322,13 @@ class DeliveryTaskService:
         if task.status != 'completed':
             raise BadRequestException("Cannot sign a non-completed Delivery", 16024)
         
+        signed_at = parse_datetime_value((data or {}).get('signed_at'), 'signed_at')
+
         task = DeliveryTaskService._update_task_status(task, 'signed', operator_id)
 
-        # 更新字段
-        if 'signed_at' in data and isinstance(data['signed_at'], str):
-            data['signed_at'] = data['signed_at']
-
-        task.signed_at = data.get('signed_at', task.signed_at)
+        # 客户端给了签收时间就用它，否则用状态流转时刻
+        if signed_at is not None:
+            task.signed_at = signed_at
         # db.session.commit()
         
         DNService.complete_dn(task.dn)

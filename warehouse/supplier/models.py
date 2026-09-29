@@ -20,6 +20,7 @@ class Supplier(db.Model):
         
         # 数据完整性约束
         db.UniqueConstraint('company_id', 'name', name='uq_company_supplier'),  # 同一公司下名称唯一
+        db.UniqueConstraint('company_id', 'email', name='uq_company_supplier_email'),  # 邮箱按公司唯一（跨公司可重复）
     )
 
     id = db.Column(db.Integer, primary_key=True)
@@ -44,10 +45,9 @@ class Supplier(db.Model):
         info={'description': '联系电话'}
     )
     email = db.Column(
-        db.String(255), 
+        db.String(255),
         nullable=True,
-        unique=True,
-        info={'description': '联系邮箱'}
+        info={'description': '联系邮箱（同公司下唯一）'}
     )
     contact = db.Column(
         db.String(255), 

@@ -1,20 +1,23 @@
 from flask import g
-from flask_restx import Resource,abort
+from flask_restx import Resource
 from extensions.error import ForbiddenException
 from system.common import permission_required
-from warehouse.common import warehouse_required,add_warehouse_filter,check_goods_access, check_location_access
+from warehouse.common import (
+    require_actor_user_id,
+    warehouse_required, add_warehouse_filter, check_goods_access, check_location_access, get_warehouse_owned,
+    require_bulk_list,
+)
 
+from .models import PutawayRecord
 from .schemas import (
-    api_ns, 
-    putaway_record_model, 
-    putaway_record_input_model, 
+    api_ns,
+    putaway_record_model,
+    putaway_record_input_model,
     putaway_pagination_parser,
     putaway_pagination_model
 )
 from system.common import paginate
 from .services import PutawayService
-from warehouse.goods.services import GoodsService
-from warehouse.location.models import Location
 
 @api_ns.doc(security="jsonWebToken")
 @api_ns.route('/')
@@ -53,7 +56,7 @@ class PutawayRecordList(Resource):
     def post(self):
         """创建新上架记录"""
         data = api_ns.payload
-        created_by = g.current_user.id
+        created_by = require_actor_user_id()
 
         # 需要判断商品和库位是否存在，以及是否是在允许的仓库中
         goods_id = data.get('goods_id')
@@ -62,11 +65,11 @@ class PutawayRecordList(Resource):
         # 验证员工用户对指定商品的访问权限
         if not check_goods_access(goods_id):
             raise ForbiddenException("You do not have access to this Goods", 12001)
-        
+
         # 验证员工用户对指定库位的访问权限
         if not check_location_access(location_id):
             raise ForbiddenException("You do not have access to this Location", 12001)
-    
+
         new_record = PutawayService.create_putaway_record(data,created_by)
         return new_record, 201
 
@@ -76,17 +79,17 @@ class PutawayRecordList(Resource):
 class PutawayRecordDetail(Resource):
 
     @permission_required(["all_access","company_all_access","putaway_read"])
+    @warehouse_required()
     @api_ns.marshal_with(putaway_record_model)
     def get(self, record_id):
-        """获取上架记录详情"""
-        record = PutawayService.get_putaway_record(record_id)
-        return record
+        """获取上架记录详情（记录所在库位的仓库必须在可访问范围内）"""
+        return get_warehouse_owned(PutawayRecord, record_id, warehouse_attr='location.warehouse_id', what='Putaway record')
 
 
 @api_ns.doc(security="jsonWebToken")
 @api_ns.route('/bulk')
 class PutawayRecordBulk(Resource):
-    
+
     @permission_required(["all_access","company_all_access","putaway_edit"])
     @warehouse_required()
     @api_ns.expect([putaway_record_input_model])
@@ -97,7 +100,8 @@ class PutawayRecordBulk(Resource):
         预期接收一个列表，每个元素是 putaway_record_input_model 定义的 JSON 对象
         """
         data_list = api_ns.payload  # 预期 payload 是一个列表
-        created_by = g.current_user.id
+        created_by = require_actor_user_id()
+        require_bulk_list(data_list, 'records')
 
         # 验证每个记录的商品和库位访问权限
         for data in data_list:

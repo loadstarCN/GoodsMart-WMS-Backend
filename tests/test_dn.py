@@ -1,4 +1,4 @@
-from extensions.error import BadRequestException, NotFoundException
+from extensions.error import BadRequestException, ForbiddenException, NotFoundException
 from warehouse.dn.services import DNService
 
 from warehouse.inventory.services import InventoryService
@@ -169,17 +169,112 @@ def test_update_dn(client, access_token):
         json={
             'shipping_address': '999 Updated Street',
             'status': 'picked',
+            'is_active': False,
+            'created_by': 999,
             'remark': 'Updated DN remark'
         }
     )
-    # 如果 DN 原本是 pending，更新为 picking 应该没问题
-    # 若非 pending，需要根据视图层的逻辑返回 400
-    # 这里假设能成功更新
+    # B-12：status / is_active / created_by 只能经流程端点变更，PUT 里的值被忽略
     assert response.status_code == 200
     data = response.get_json()
     assert data['shipping_address'] == '999 Updated Street'
-    assert data['status'] == 'picked'
+    assert data['status'] == 'pending'
+    assert data['is_active'] is True
+    assert data['created_by'] != 999
     assert data['remark'] == 'Updated DN remark'
+
+
+def test_update_dn_status_closed_is_ignored(client, access_token):
+    """B-12：PUT /dn/<id> {"status": "closed"} 不能绕过状态机关闭单据、释放预占。"""
+    with client.application.app_context():
+        dn = get_dn()
+        dn_id = dn.id
+        goods_id = dn.details[0].goods_id
+        reserved_before = get_inventory_by_goods_id_and_warehouse_id(goods_id, dn.warehouse_id).dn_stock
+
+    response = client.put(
+        f'/dn/{dn_id}',
+        headers={'Authorization': f'Bearer {access_token}'},
+        json={'status': 'closed'}
+    )
+    assert response.status_code == 200
+    assert response.get_json()['status'] == 'pending'
+
+    with client.application.app_context():
+        dn = get_dn_by_id(dn_id)
+        assert dn.status == 'pending'
+        assert dn.closed_at is None
+        assert get_inventory_by_goods_id_and_warehouse_id(goods_id, dn.warehouse_id).dn_stock == reserved_before
+
+
+def test_create_dn_ignores_status_and_quantity_fields(client, access_token):
+    """B-12：创建时传入的 status / is_active / picked_quantity 等一律忽略。"""
+    with client.application.app_context():
+        warehouse = Warehouse.query.first()
+        recipient = Recipient.query.first()
+        goods = Goods.query.filter_by(code='G002').first()
+
+    response = client.post(
+        '/dn/',
+        headers={'Authorization': f'Bearer {access_token}'},
+        json={
+            'recipient_id': recipient.id,
+            'warehouse_id': warehouse.id,
+            'shipping_address': 'x',
+            'expected_shipping_date': '2026-01-01',
+            'status': 'completed',
+            'is_active': False,
+            'details': [{'goods_id': goods.id, 'quantity': 3,
+                         'picked_quantity': 3, 'packed_quantity': 3, 'delivered_quantity': 3}],
+        }
+    )
+    assert response.status_code == 201
+    data = response.get_json()
+    assert data['status'] == 'pending'
+    assert data['is_active'] is True
+    assert data['details'][0]['picked_quantity'] == 0
+    assert data['details'][0]['packed_quantity'] == 0
+    assert data['details'][0]['delivered_quantity'] == 0
+
+
+@pytest.mark.parametrize('body', [
+    {'recipient_id': 1, 'warehouse_id': 1, 'shipping_address': 'x'},            # 缺 expected_shipping_date / details
+    {'recipient_id': 1, 'warehouse_id': 1, 'shipping_address': 'x',
+     'expected_shipping_date': '2026-01-01', 'details': {'goods_id': 1}},        # details 不是 list
+    {'recipient_id': 1, 'warehouse_id': 1, 'shipping_address': 'x',
+     'expected_shipping_date': '2026-01-01', 'details': []},                     # details 为空
+    {'recipient_id': 1, 'warehouse_id': 1, 'shipping_address': 'x',
+     'expected_shipping_date': '2026-01-01', 'details': [{'goods_id': 1, 'quantity': 0}]},   # 数量非正
+    {'recipient_id': 1, 'warehouse_id': 1, 'shipping_address': 'x',
+     'expected_shipping_date': '2026-01-01', 'details': [{'goods_id': 1, 'quantity': 'five'}]}, # 数量非整数
+    {'recipient_id': 1, 'warehouse_id': 1, 'shipping_address': 'x',
+     'expected_shipping_date': '2026-01-01', 'details': [{'goods_id': 1, 'quantity': 1.5}]},   # 数量非整数
+    {'recipient_id': 1, 'warehouse_id': 1, 'shipping_address': 'x',
+     'expected_shipping_date': '2026-01-01', 'details': [{'goods_id': 1, 'quantity': True}]},  # bool 不是数量
+    {'recipient_id': 1, 'warehouse_id': 1, 'shipping_address': 'x',
+     'expected_shipping_date': '2026-01-01', 'details': [{'quantity': 5}]},      # 缺 goods_id
+    {'recipient_id': 1, 'warehouse_id': 1, 'shipping_address': 'x',
+     'expected_shipping_date': '2026-01-01', 'dn_type': 'bogus',
+     'details': [{'goods_id': 1, 'quantity': 1}]},                              # 枚举非法
+    {'recipient_id': 1, 'warehouse_id': 1, 'shipping_address': 'x',
+     'expected_shipping_date': 'not-a-date', 'details': [{'goods_id': 1, 'quantity': 1}]},   # 日期非法
+])
+def test_create_dn_invalid_body_returns_400(client, access_token, body):
+    """B-18：缺字段 / 类型不对 / 非正数 → 400 而非 500"""
+    response = client.post('/dn/', headers={'Authorization': f'Bearer {access_token}'}, json=body)
+    assert response.status_code == 400, response.get_json()
+
+
+def test_create_dn_rejects_duplicate_goods(client, access_token):
+    with client.application.app_context():
+        goods = Goods.query.first()
+    response = client.post('/dn/', headers={'Authorization': f'Bearer {access_token}'}, json={
+        'recipient_id': 1, 'warehouse_id': 1, 'shipping_address': 'x',
+        'expected_shipping_date': '2026-01-01',
+        'details': [{'goods_id': goods.id, 'quantity': 1}, {'goods_id': goods.id, 'quantity': 1}],
+    })
+    assert response.status_code == 400
+    assert response.get_json()['code'] == 16025
 
 
 def test_create_dn_detail(client, access_token):
@@ -188,7 +283,8 @@ def test_create_dn_detail(client, access_token):
     """
     with client.application.app_context():
         dn = DN.query.first()
-        goods = Goods.query.first()
+        # 同一商品在一张 DN 上只能有一行，种子 DN 已含 G001，这里用 G002
+        goods = Goods.query.filter_by(code='G002').first()
         assert dn is not None
         assert goods is not None
 
@@ -206,6 +302,44 @@ def test_create_dn_detail(client, access_token):
     assert response.status_code == 201
     data = response.get_json()
     assert data['quantity'] == 5
+    assert data['picked_quantity'] == 0  # B-12：统计字段不接受客户端赋值
+
+
+def test_create_dn_detail_rejects_duplicate_goods_and_bad_quantity(client, access_token):
+    with client.application.app_context():
+        dn = DN.query.first()
+        existing_goods_id = dn.details[0].goods_id
+        other_goods = Goods.query.filter_by(code='G002').first()
+    headers = {'Authorization': f'Bearer {access_token}'}
+
+    response = client.post(f'/dn/{dn.id}/details/', headers=headers,
+                           json={'goods_id': existing_goods_id, 'quantity': 1})
+    assert response.status_code == 400
+    assert response.get_json()['code'] == 16025
+
+    for bad_quantity in (0, -1, 'five', 1.5, True, None):
+        response = client.post(f'/dn/{dn.id}/details/', headers=headers,
+                               json={'goods_id': other_goods.id, 'quantity': bad_quantity})
+        assert response.status_code == 400
+        assert response.get_json()['code'] == 16033
+
+
+def test_create_dn_detail_rejects_quantity_above_available(client, access_token):
+    """B-15：新增明细不得超过（排除本单预占后的）可用量。"""
+    with client.application.app_context():
+        dn = DN.query.first()
+        goods = Goods.query.filter_by(code='G002').first()
+        inventory = get_inventory_by_goods_id_and_warehouse_id(goods.id, dn.warehouse_id)
+        inventory.onhand_stock = 10
+        inventory.locked_stock = 0
+        inventory.dn_stock = 0
+        dn_id, goods_id = dn.id, goods.id
+        db.session.commit()
+
+    response = client.post(f'/dn/{dn_id}/details/', headers={'Authorization': f'Bearer {access_token}'},
+                           json={'goods_id': goods_id, 'quantity': 11})
+    assert response.status_code == 400
+    assert response.get_json()['code'] == 16032
 
 
 def test_get_dn_details_list(client, access_token):
@@ -233,9 +367,14 @@ def test_update_dn_detail(client, access_token):
         dn = DN.query.first()
         detail = DNDetail.query.filter_by(dn_id=dn.id).first()
         assert detail is not None
+        # 种子库存不够 99，先把在库量抬高；本用例只验证字段更新
+        inventory = get_inventory_by_goods_id_and_warehouse_id(detail.goods_id, dn.warehouse_id)
+        inventory.onhand_stock = 1000
+        dn_id, detail_id = dn.id, detail.id
+        db.session.commit()
 
     response = client.put(
-        f'/dn/{dn.id}/details/{detail.id}',
+        f'/dn/{dn_id}/details/{detail_id}',
         headers={'Authorization': f'Bearer {access_token}'},
         json={
             'quantity': 99,
@@ -246,8 +385,34 @@ def test_update_dn_detail(client, access_token):
     assert response.status_code == 200
     data = response.get_json()
     assert data['quantity'] == 99
-    assert data['picked_quantity'] == 50
+    assert data['picked_quantity'] == 0  # B-12：picked_quantity 由拣货流程计算，PUT 里的值忽略
     assert data['remark'] == 'Updated detail remark'
+
+
+def test_update_dn_detail_rejects_quantity_above_available(client, access_token):
+    """B-15：改量时可用量 = onhand - locked - 其它单据预占（本单自身预占已加回）。"""
+    with client.application.app_context():
+        dn = get_dn()
+        detail = dn.details[0]
+        goods_id = detail.goods_id
+        inventory = get_inventory_by_goods_id_and_warehouse_id(goods_id, dn.warehouse_id)
+        own_reserved = sum(d.quantity for d in dn.details if d.goods_id == goods_id)
+        other_lines = own_reserved - detail.quantity
+        inventory.locked_stock = 0
+        # 其它 DN 预占 = dn_stock - 本单预占；让本行最多只能改到 other_available
+        inventory.onhand_stock = inventory.dn_stock - own_reserved + other_lines + 15
+        db.session.commit()
+        detail_id = detail.id
+        dn_id = dn.id
+
+    headers = {'Authorization': f'Bearer {access_token}'}
+    # 恰好等于可用量：允许
+    response = client.put(f'/dn/{dn_id}/details/{detail_id}', headers=headers, json={'quantity': 15})
+    assert response.status_code == 200, response.get_json()
+    # 超出 1：拒绝
+    response = client.put(f'/dn/{dn_id}/details/{detail_id}', headers=headers, json={'quantity': 16})
+    assert response.status_code == 400
+    assert response.get_json()['code'] == 16032
 
 
 def test_delete_dn_detail(client, access_token):
@@ -314,6 +479,10 @@ def test_sync_dn_details(client):
         user = get_operator_user()
         existing_detail = dn.details[0]
         new_goods_id = 2
+        # 本用例只验证同步机制，把在库量抬高避免撞可用量校验（可用量校验见 test_sync_dn_details_rejects_over_available）
+        inventory = get_inventory_by_goods_id_and_warehouse_id(existing_detail.goods_id, dn.warehouse_id)
+        inventory.onhand_stock = 1000
+        db.session.commit()
 
         # 测试混合操作（更新+新增+删除）
         new_data = [
@@ -356,6 +525,161 @@ def test_sync_dn_details(client):
         with pytest.raises(BadRequestException) as excinfo:
             DNService.sync_dn_details(dn.id, [],created_by=user.id)
 
+def test_sync_dn_details_rejects_over_available(client):
+    """B-15：sync 时每个商品变更后的计划量都要过「排除本单预占后的可用量」校验。"""
+    with client.application.app_context():
+        dn = get_dn()
+        user = get_operator_user()
+        goods_id = dn.details[0].goods_id
+        inventory = get_inventory_by_goods_id_and_warehouse_id(goods_id, dn.warehouse_id)
+        own_reserved = sum(d.quantity for d in dn.details if d.goods_id == goods_id)
+        inventory.locked_stock = 0
+        inventory.onhand_stock = inventory.dn_stock - own_reserved + 50   # 本单可用 50
+        db.session.commit()
+
+        # 50 恰好可用
+        DNService.sync_dn_details(dn.id, [{'goods_id': goods_id, 'quantity': 50}], created_by=user.id)
+        assert sum(d.quantity for d in get_dn_by_id(dn.id).details) == 50
+
+        with pytest.raises(BadRequestException) as excinfo:
+            DNService.sync_dn_details(dn.id, [{'goods_id': goods_id, 'quantity': 51}], created_by=user.id)
+        assert excinfo.value.biz_code == 16032
+
+        with pytest.raises(BadRequestException) as excinfo:
+            DNService.sync_dn_details(dn.id, [{'goods_id': goods_id, 'quantity': 0}], created_by=user.id)
+        assert excinfo.value.biz_code == 16033
+
+
+def test_goods_code_never_falls_back_to_company_1(client):
+    """B-17：按 goods_code 解析商品时用单据仓库所属公司，不能回落到 company 1。"""
+    with client.application.app_context():
+        admin = get_admin_user()
+        company_b = Company.query.filter_by(name='Company B').first()
+        warehouse_b = Warehouse(name='WH-B', address='b', phone='1', zip_code='1',
+                                company_id=company_b.id, created_by=admin.id)
+        recipient_b = Recipient(name='R-B', address='b', zip_code='1', phone='1', email='rb@b.com',
+                                contact='c', country='us', created_by=admin.id, company_id=company_b.id)
+        db.session.add_all([warehouse_b, recipient_b])
+        db.session.commit()
+
+        # G001 属于 Company A：在 Company B 的仓库上按 code 找不到 → 16030，而不是解析成 A 的商品
+        with pytest.raises(BadRequestException) as excinfo:
+            DNService.create_dn({
+                'recipient_id': recipient_b.id,
+                'warehouse_id': warehouse_b.id,
+                'shipping_address': 'x',
+                'expected_shipping_date': '2026-01-01',
+                'details': [{'goods_code': 'G001', 'quantity': 1}],
+            }, created_by_id=admin.id)
+        assert excinfo.value.biz_code == 16030
+
+
+def test_create_dn_rejects_company_id_mismatching_warehouse(client):
+    """B-17：请求体显式给出的 company_id 与仓库所属公司不一致 → 403。"""
+    with client.application.app_context():
+        admin = get_admin_user()
+        company_b = Company.query.filter_by(name='Company B').first()
+        with pytest.raises(ForbiddenException) as excinfo:
+            DNService.create_dn({
+                'recipient_id': get_recipient().id,
+                'warehouse_id': get_warehouse().id,
+                'company_id': company_b.id,
+                'shipping_address': 'x',
+                'expected_shipping_date': '2026-01-01',
+                'details': [{'goods_id': get_goods().id, 'quantity': 1}],
+            }, created_by_id=admin.id)
+        assert excinfo.value.biz_code == 12001
+
+
+def test_create_dn_rejects_master_data_of_other_company(client):
+    """B-04：收货人 / 承运商 / 商品必须与仓库同公司，否则 403。"""
+    with client.application.app_context():
+        admin = get_admin_user()
+        company_b = Company.query.filter_by(name='Company B').first()
+        recipient_b = Recipient(name='R-B2', address='b', zip_code='1', phone='1', email='rb2@b.com',
+                                contact='c', country='us', created_by=admin.id, company_id=company_b.id)
+        db.session.add(recipient_b)
+        db.session.commit()
+        warehouse_a = get_warehouse()
+        goods = get_goods()
+
+        with pytest.raises(ForbiddenException) as excinfo:
+            DNService.create_dn({
+                'recipient_id': recipient_b.id,
+                'warehouse_id': warehouse_a.id,
+                'shipping_address': 'x',
+                'expected_shipping_date': '2026-01-01',
+                'details': [{'goods_id': goods.id, 'quantity': 1}],
+            }, created_by_id=admin.id)
+        assert excinfo.value.biz_code == 12001
+
+
+def test_cancel_dn_pending_releases_reservation(client, access_token):
+    """B-33：pending 取消等同 close，dn_stock 预占释放。"""
+    with client.application.app_context():
+        dn = get_dn()
+        dn_id = dn.id
+        goods_id = dn.details[0].goods_id
+        own_reserved = sum(d.quantity for d in dn.details if d.goods_id == goods_id)
+        inventory = get_inventory_by_goods_id_and_warehouse_id(goods_id, dn.warehouse_id)
+        reserved_before = inventory.dn_stock
+        warehouse_id = dn.warehouse_id
+
+    response = client.put(f'/dn/{dn_id}/cancel/', headers={'Authorization': f'Bearer {access_token}'})
+    assert response.status_code == 200
+    assert response.get_json()['status'] == 'closed'
+
+    with client.application.app_context():
+        assert get_dn_by_id(dn_id).closed_at is not None
+        inventory = get_inventory_by_goods_id_and_warehouse_id(goods_id, warehouse_id)
+        assert inventory.dn_stock == reserved_before - own_reserved
+
+
+def test_cancel_dn_in_progress_without_picking_batches(client, access_token):
+    """B-33：in_progress 且拣货任务无批次 → 允许取消，拣货任务停用、预占释放。"""
+    with client.application.app_context():
+        dn = get_dn()
+        dn_id = dn.id
+        goods_id = dn.details[0].goods_id
+        own_reserved = sum(d.quantity for d in dn.details if d.goods_id == goods_id)
+        warehouse_id = dn.warehouse_id
+        DNService.progress_dn(dn.id)           # 创建 pending 拣货任务（无批次）
+        task = PickingTask.query.filter_by(dn_id=dn_id, is_active=True).one()
+        task_id = task.id
+        reserved_before = get_inventory_by_goods_id_and_warehouse_id(goods_id, warehouse_id).dn_stock
+
+    response = client.put(f'/dn/{dn_id}/cancel/', headers={'Authorization': f'Bearer {access_token}'})
+    assert response.status_code == 200, response.get_json()
+    assert response.get_json()['status'] == 'closed'
+
+    with client.application.app_context():
+        assert get_picking_task_by_id(task_id).is_active is False
+        inventory = get_inventory_by_goods_id_and_warehouse_id(goods_id, warehouse_id)
+        assert inventory.dn_stock == reserved_before - own_reserved
+
+
+def test_cancel_dn_conflicts_once_picking_started(client, access_token):
+    """B-33：拣货任务已有批次 / 明细，或单据已过拣货阶段 → 409。"""
+    headers = {'Authorization': f'Bearer {access_token}'}
+    with client.application.app_context():
+        dn3 = get_dn_by_id(3)                  # 种子：in_progress，拣货任务已有明细
+        assert dn3.status == 'in_progress'
+        assert PickingTask.query.filter_by(dn_id=3).first().task_details
+
+    response = client.put('/dn/3/cancel/', headers=headers)
+    assert response.status_code == 409
+    assert response.get_json()['code'] == 16053
+
+    with client.application.app_context():
+        dn = get_dn()
+        dn.status = 'picked'
+        db.session.commit()
+        dn_id = dn.id
+    response = client.put(f'/dn/{dn_id}/cancel/', headers=headers)
+    assert response.status_code == 409
+    assert response.get_json()['code'] == 16052
+
+
 def test_duplicate_goods_validation(client):
     """测试商品重复校验"""
     with client.application.app_context():
@@ -380,6 +704,9 @@ def test_dn_service_update_dn_detail(client):
 
         old_qty = detail.quantity
         old_remark = detail.remark
+        inventory = get_inventory_by_goods_id_and_warehouse_id(detail.goods_id, dn.warehouse_id)
+        inventory.onhand_stock = 5000
+        db.session.commit()
 
         updated_detail = DNService.update_dn_detail(dn.id, detail.id, {
             "quantity": 999,
@@ -531,6 +858,6 @@ def test_dn_service_update_dn_detail_success(client):
             }
         )
         assert updated_detail.quantity == 20
-        assert updated_detail.picked_quantity == 10
+        assert updated_detail.picked_quantity == 5   # B-12：picked_quantity 不接受客户端赋值
         assert updated_detail.remark == "All constraints satisfied"
 

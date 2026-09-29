@@ -8,6 +8,8 @@ import logging
 
 from flask_apscheduler import APScheduler
 
+from config import Config
+
 logger = logging.getLogger(__name__)
 
 scheduler = APScheduler()
@@ -45,7 +47,9 @@ def init_scheduler(app):
 
 def _try_start(app):
     """启动 scheduler，多 worker 环境用文件锁防止重复启动"""
-    is_debug = os.getenv('FLASK_ENV', 'production') == 'development'
+    # 与 config.py 用同一个 FLASK_ENV 判定（默认 development），否则本地不设 env 时
+    # config 走开发模式而这里按生产处理，reloader 父子进程会各启动一份调度器
+    is_debug = Config.FLASK_ENV == 'development'
     if is_debug and os.environ.get('WERKZEUG_RUN_MAIN') != 'true':
         return  # Werkzeug reloader 父进程不启动
 
@@ -64,10 +68,11 @@ def _try_start(app):
 
     try:
         scheduler.start()
-        logger.info('[Scheduler] Started — webhook push every %s min, snapshot at %s:%s',
-                     os.getenv('WEBHOOK_PUSH_INTERVAL_MINUTES', '1'),
-                     os.getenv('SNAPSHOT_HOUR', '2'),
-                     os.getenv('SNAPSHOT_MINUTE', '0'))
+        jobs = {job['id']: job for job in app.config.get('JOBS', [])}
+        logger.info('[Scheduler] Started — webhook push every %s min, snapshot at %s:%02d',
+                     jobs.get('webhook_push', {}).get('minutes', '?'),
+                     jobs.get('inventory_snapshot', {}).get('hour', '?'),
+                     int(jobs.get('inventory_snapshot', {}).get('minute', 0)))
     except Exception as e:
         logger.warning(f'[Scheduler] Failed to start: {e}')
 

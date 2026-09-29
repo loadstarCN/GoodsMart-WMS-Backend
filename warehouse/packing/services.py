@@ -9,8 +9,8 @@ from .models import (
     PackingTaskStatusLog
 )
 
-from warehouse.dn.services import DNService
-from warehouse.inventory.services import InventoryService
+from warehouse.common import require_positive_int, require_bulk_list
+from warehouse.dn.services import DNService, pick_fields, parse_datetime_value
 from dateutil.relativedelta import relativedelta
 from sqlalchemy import and_, func, case, extract
 from datetime import datetime, timedelta
@@ -82,12 +82,17 @@ class PackingTaskService:
     @transactional
     def create_task(data: dict, created_by_id: int) -> PackingTask:
         """
-        创建新的 Packing Task
+        创建新的 Packing Task。只接受 dn_id；status 固定 pending、is_active 固定 True，
+        状态只能经 process / complete 流转。
         """
+        payload = pick_fields(data, ('dn_id',))
+        dn_id = require_positive_int(payload.get('dn_id'), 'dn_id', 16044)
+        get_object_or_404(DN, dn_id)
+
         new_task = PackingTask(
-            dn_id=data['dn_id'],
-            status=data.get('status', 'pending'),
-            is_active=data.get('is_active', True),
+            dn_id=dn_id,
+            status='pending',
+            is_active=True,
             created_by=created_by_id
         )
         db.session.add(new_task)
@@ -111,9 +116,9 @@ class PackingTaskService:
         if task.status != 'pending':
             raise BadRequestException("Cannot update a non-pending Packing Task", 16001)
 
-        task.dn_id = data.get('dn_id', task.dn_id)
-        task.status = data.get('status', task.status)
-        task.is_active = data.get('is_active', task.is_active)
+        # PackingTask 没有可由客户端编辑的业务字段：dn_id 不可改，
+        # status 只经 process / complete 流转，is_active / created_by 忽略。
+        pick_fields(data, ())
 
         # db.session.commit()
         return task
@@ -143,32 +148,6 @@ class PackingTaskService:
         return task.task_details
 
     @staticmethod
-    @transactional
-    def create_task_detail(task_id: int, data: dict, operator_id: int) -> PackingTaskDetail:
-        """
-        创建新的 PackingTaskDetail（仅当所属的 PackingTask 为 pending）
-        
-        如果业务需要绑定到某个 batch_id，也可在 data 中添加 batch_id，
-        并在这里进行赋值： `batch_id=data['batch_id']` (若已定义非 nullable)
-        """
-        task = PackingTaskService.get_task(task_id)
-        if task.status != 'pending':
-            raise BadRequestException("Cannot add Packing Task Detail to a non-pending Packing Task", 16003)
-
-        new_detail = PackingTaskDetail(
-            packing_task_id=task_id,
-            # 如果你的模型里 batch_id 是非空，需要这里指定:
-            # batch_id=data['batch_id'],
-            goods_id=data['goods_id'],
-            packed_quantity=data.get('packed_quantity', 0),
-            packing_time=data.get('packing_time', datetime.now()),
-            operator_id=operator_id
-        )
-        db.session.add(new_detail)
-        # db.session.commit()
-        return new_detail
-
-    @staticmethod
     def get_task_detail(task_id: int, detail_id: int) -> PackingTaskDetail:
         """
         根据 detail_id 获取单个 PackingTaskDetail，并校验其 packing_task_id 是否匹配
@@ -189,12 +168,24 @@ class PackingTaskService:
             raise BadRequestException("Cannot update Packing Task Detail in a non-in_progress Packing Task", 16010)
 
         detail = PackingTaskService.get_task_detail(task_id, detail_id)
-        # 如果你的模型里 batch_id 是非空，需要这里更新:
-        if 'batch_id' in data:
-            detail.batch_id = data['batch_id']
-        detail.goods_id = data.get('goods_id', detail.goods_id)
-        detail.packed_quantity = data.get('packed_quantity', detail.packed_quantity)
-        detail.packing_time = data.get('packing_time', detail.packing_time)
+        if not isinstance(data, dict):
+            raise BadRequestException("Request body must be a JSON object", 16015)
+
+        # goods_id / batch_id 一经批次创建即固定，传入不同的值直接 400
+        for field in ('goods_id', 'batch_id'):
+            if field in data and data[field] != getattr(detail, field):
+                raise BadRequestException(
+                    f"{field} of a packing detail cannot be changed; delete it and pack again.", 16049
+                )
+
+        if 'packed_quantity' in data:
+            new_quantity = require_positive_int(data.get('packed_quantity'), 'packed_quantity')
+            delta = new_quantity - (detail.packed_quantity or 0)
+            if delta > 0:
+                PackingTaskService._assert_within_picked(task, {detail.goods_id: delta})
+            detail.packed_quantity = new_quantity
+        if data.get('packing_time') is not None:
+            detail.packing_time = parse_datetime_value(data['packing_time'], 'packing_time')
         # db.session.commit()
         return detail
 
@@ -222,6 +213,41 @@ class PackingTaskService:
         """
         task = PackingTaskService.get_task(task_id)
         return task.batches  # 或者再加 .all()，取决于你的 relationship lazy 属性
+
+    @staticmethod
+    def _assert_within_picked(task: PackingTask, extra_by_goods: dict | None = None):
+        """
+        按商品维度校验打包任务的累计已打包量不超过其 DN 明细的已拣量，
+        且商品必须在 DN 明细内。
+
+        累计量 = task_details 现有已打包量 + extra_by_goods 本次拟新增量。
+
+        create_batch 是纯追加操作，重复提交会不断累加 packed_quantity，
+        最终在 packing_dn 处撞 DNDetail 的 `packed_quantity <= picked_quantity`
+        数据库约束变成 500、单据永久卡死。此校验与 picking 的 _assert_within_planned 对齐。
+        """
+        extra_by_goods = extra_by_goods or {}
+
+        picked = {}
+        for d in task.dn.details:
+            picked[d.goods_id] = picked.get(d.goods_id, 0) + (d.picked_quantity or 0)
+
+        packed = {}
+        for td in task.task_details:
+            packed[td.goods_id] = packed.get(td.goods_id, 0) + (td.packed_quantity or 0)
+
+        for gid in set(packed) | set(extra_by_goods):
+            if gid not in picked:
+                raise BadRequestException(
+                    f"Goods {gid} is not in the DN.", 16042
+                )
+            total = packed.get(gid, 0) + extra_by_goods.get(gid, 0)
+            if total > picked[gid]:
+                raise BadRequestException(
+                    f"Packed quantity exceeds picked quantity for goods {gid}: "
+                    f"total {total} > picked {picked[gid]}.",
+                    16043
+                )
 
     @staticmethod
     @transactional
@@ -253,12 +279,27 @@ class PackingTaskService:
         if task.status != 'in_progress':
             raise BadRequestException("Cannot create a batch or details in a non-in-progress Packing Task", 16009)
 
-        op_time = data.get('operation_time')
-        if isinstance(op_time, str):
-            # 假设你的日期字符串是标准ISO8601
-            op_time = datetime.fromisoformat(op_time)
+        if not isinstance(data, dict):
+            raise BadRequestException("Request body must be a JSON object", 16015)
+        op_time = parse_datetime_value(data.get('operation_time'), 'operation_time')
 
-        # 1) 创建批次
+        # 1) 明细字段逐条校验：goods_id 必填、packed_quantity 正整数（缺字段 400 而非 500）
+        details_data = []
+        for raw in require_bulk_list(data.get('details') or [], 'details', allow_empty=True):
+            details_data.append({
+                'goods_id': require_positive_int(raw.get('goods_id'), 'goods_id', 16034),
+                'packed_quantity': require_positive_int(raw.get('packed_quantity'), 'packed_quantity'),
+                'packing_time': parse_datetime_value(raw.get('packing_time'), 'packing_time') or datetime.now(),
+            })
+
+        # 2) 权威校验：商品必须在 DN 明细内，累计已打包量（现有 + 本次）不得超过已拣量
+        incoming_by_goods = {}
+        for item in details_data:
+            gid = item['goods_id']
+            incoming_by_goods[gid] = incoming_by_goods.get(gid, 0) + item['packed_quantity']
+        PackingTaskService._assert_within_picked(task, incoming_by_goods)
+
+        # 3) 创建批次
         new_batch = PackingBatch(
             packing_task_id=task.id,
             operator_id=operator_id,
@@ -269,22 +310,17 @@ class PackingTaskService:
         # 使用 flush() 以获取 new_batch.id
         db.session.flush()
 
-        # 2) 如果有 details，就批量创建
-        details_data = data.get('details')
-        if details_data:
-            if not isinstance(details_data, list):
-                raise BadRequestException("'details' must be a list if provided", 16015)
-
-            for item in details_data:
-                detail = PackingTaskDetail(
-                    packing_task_id=task.id,
-                    batch_id=new_batch.id,
-                    goods_id=item['goods_id'],
-                    packed_quantity=item.get('packed_quantity', 0),
-                    packing_time=item.get('packing_time', datetime.now()),
-                    operator_id=operator_id
-                )
-                db.session.add(detail)
+        # 4) 批量创建明细
+        for item in details_data:
+            detail = PackingTaskDetail(
+                packing_task_id=task.id,
+                batch_id=new_batch.id,
+                goods_id=item['goods_id'],
+                packed_quantity=item['packed_quantity'],
+                packing_time=item['packing_time'],
+                operator_id=operator_id
+            )
+            db.session.add(detail)
         
         # db.session.commit()
         return new_batch
@@ -311,9 +347,10 @@ class PackingTaskService:
             raise BadRequestException("Cannot update a batch in a non-in_progress Packing Task", 16013)
 
         batch = PackingTaskService.get_batch(task_id, batch_id)
+        data = pick_fields(data, ('operation_time', 'remark'))
 
-        if 'operation_time' in data:
-            batch.operation_time = data['operation_time']
+        if data.get('operation_time') is not None:
+            batch.operation_time = parse_datetime_value(data['operation_time'], 'operation_time')
         if 'remark' in data:
             batch.remark = data['remark']
 
@@ -393,7 +430,11 @@ class PackingTaskService:
         task = PackingTaskService._get_instance(task_or_id)
         if task.status != 'in_progress':
             raise BadRequestException("Cannot complete a non-in_progress Packing Task", 16008)
-        
+
+        # 防御性校验：累计已打包量不得超过已拣量。对已被重复提交污染的历史单据
+        # 给出明确报错（16043），而非在 packing_dn 处撞 packed<=picked 约束变 500。
+        PackingTaskService._assert_within_picked(task)
+
         task = PackingTaskService._update_task_status(task, 'completed', operator_id)
 
         # 更新DN状态

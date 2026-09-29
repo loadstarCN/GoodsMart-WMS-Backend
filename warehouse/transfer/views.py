@@ -1,26 +1,31 @@
 from flask import g
-from flask_restx import Resource, abort
+from flask_restx import Resource
 from extensions.error import BadRequestException, ForbiddenException, NotFoundException
 from system.common import permission_required
-from warehouse.common import warehouse_required,add_warehouse_filter,check_goods_access, check_location_access
+from warehouse.common import (
+    require_actor_user_id,
+    warehouse_required, add_warehouse_filter, check_goods_access, check_location_access, get_warehouse_owned,
+    require_bulk_list,
+)
 
+from .models import TransferRecord
 from .schemas import (
-    api_ns, 
-    transfer_record_model, 
-    transfer_record_input_model, 
+    api_ns,
+    transfer_record_model,
+    transfer_record_input_model,
     transfer_pagination_parser,
     transfer_pagination_model
 )
 from system.common import paginate
 from .services import TransferService
-from warehouse.goods.services import GoodsLocationService, GoodsService
-from warehouse.location.models import Location
+from warehouse.goods.services import GoodsLocationService
 
 @api_ns.doc(security="jsonWebToken")
 @api_ns.route('/')
 class TransferRecordList(Resource):
-    
+
     @permission_required(["all_access","company_all_access","transfer_read"])
+    @warehouse_required()
     @api_ns.expect(transfer_pagination_parser)
     @api_ns.marshal_with(transfer_pagination_model)
     def get(self):
@@ -56,7 +61,7 @@ class TransferRecordList(Resource):
     def post(self):
         """创建新移库记录"""
         data = api_ns.payload
-        created_by = g.current_user.id
+        created_by = require_actor_user_id()
 
         # 需要判断商品和库位是否存在，以及是否是在允许的仓库中
         goods_id = data.get('goods_id')
@@ -69,15 +74,15 @@ class TransferRecordList(Resource):
 
         if not GoodsLocationService.is_goods_in_location(goods_id, from_location_id):
             raise NotFoundException("Goods not found in the specified from_location", 14003)
-       
+
         # 验证员工用户对指定商品的访问权限
         if not check_goods_access(goods_id):
             raise ForbiddenException("You do not have access to this Goods", 12001)
-        
+
         # 验证员工用户对指定库位的访问权限
         if not check_location_access(from_location_id):
             raise ForbiddenException("You do not have access to this Location", 12001)
-        
+
         if not check_location_access(to_location_id):
             raise ForbiddenException("You do not have access to this Location", 12001)
 
@@ -90,11 +95,11 @@ class TransferRecordList(Resource):
 class TransferRecordDetail(Resource):
 
     @permission_required(["all_access","company_all_access","transfer_read"])
+    @warehouse_required()
     @api_ns.marshal_with(transfer_record_model)
     def get(self, record_id):
-        """获取移库记录详情"""
-        record = TransferService.get_transfer_record(record_id)
-        return record
+        """获取移库记录详情（来源库位的仓库必须在可访问范围内）"""
+        return get_warehouse_owned(TransferRecord, record_id, warehouse_attr='from_location.warehouse_id', what='Transfer record')
 
 
 @api_ns.doc(security="jsonWebToken")
@@ -111,7 +116,8 @@ class TransferRecordBulk(Resource):
         预期接收一个列表，每个元素为 transfer_record_input_model 定义的 JSON 对象
         """
         data_list = api_ns.payload  # payload 预期为列表
-        created_by = g.current_user.id
+        created_by = require_actor_user_id()
+        require_bulk_list(data_list, 'records')
 
         # 对每条记录进行基础验证，例如验证商品和库位的存在及访问权限
         for data in data_list:
@@ -124,7 +130,7 @@ class TransferRecordBulk(Resource):
 
             if not GoodsLocationService.is_goods_in_location(goods_id, from_location_id):
                 raise NotFoundException("Goods not found in the specified from_location", 14003)
-            
+
             # 验证对指定商品和库位的访问权限
             if not check_goods_access(goods_id):
                 raise ForbiddenException("You do not have access to this Goods", 12001)
@@ -132,6 +138,6 @@ class TransferRecordBulk(Resource):
                 raise ForbiddenException("You do not have access to this From Location", 12001)
             if not check_location_access(to_location_id):
                 raise ForbiddenException("You do not have access to this To Location", 12001)
-        
+
         new_records = TransferService.bulk_create_transfer_records(data_list, created_by)
         return new_records, 201

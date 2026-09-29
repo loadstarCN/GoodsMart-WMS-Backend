@@ -1,8 +1,10 @@
 from flask import g
 from flask_restx import Resource, abort
-from extensions.error import ForbiddenException
+from extensions.error import BadRequestException
 from system.common import paginate, permission_required
-from system.third_party.utils import get_api_key_company_id
+from system.common.permissions import get_actor_company_id
+from warehouse.common import get_company_owned, require_actor_user_id
+from .models import Warehouse
 from .schemas import api_ns, warehouse_model, warehouse_input_model, pagination_parser, pagination_model
 
 from .services import WarehouseService
@@ -25,18 +27,13 @@ class WarehouseList(Resource):
         filters = {
             'is_active': args.get('is_active'),
             'name': args.get('name'),
+            # 员工 / 公司级 API Key 只能看本公司；平台管理员可按参数筛选
+            'company_id': get_actor_company_id() or args.get('company_id'),
         }
-
-        # Check user type and get the company_id if user type is 'staff'
-        if g.current_user.type == 'staff':
-            company_id = g.current_user.company_id
-            filters['company_id'] = company_id
-        else:
-            filters['company_id'] = get_api_key_company_id() or args.get('company_id')
 
         # Get the filtered query using WarehouseService
         query = WarehouseService.list_warehouses(filters)
-        
+
         return paginate(query, page, per_page, get_all)
 
     @permission_required(["all_access", "company_all_access", "warehouse_edit"])
@@ -45,16 +42,17 @@ class WarehouseList(Resource):
     def post(self):
         """Create a new warehouse"""
         data = api_ns.payload
-        created_by = g.current_user.id
-        # Check if the user is a staff member and restrict access to their company
-        if g.current_user.type == 'staff':
-            company_id = g.current_user.company_id
-            if data.get('company_id') != company_id:
-                raise ForbiddenException("You do not have permission to create a warehouse in this company.", 12001)
-                
+        created_by = require_actor_user_id()
+        # 非平台管理员只能在自己公司建仓库：请求体里的 company_id 直接被覆盖
+        actor_company_id = get_actor_company_id()
+        if actor_company_id is not None:
+            data['company_id'] = actor_company_id
+        elif not data.get('company_id'):
+            raise BadRequestException("company_id is required", 14015)
+
         # Create the new warehouse using WarehouseService
         new_warehouse = WarehouseService.create_warehouse(data, created_by)
-        
+
         return new_warehouse, 201
 
 @api_ns.doc(security="jsonWebToken")
@@ -65,13 +63,7 @@ class WarehouseDetail(Resource):
     @api_ns.marshal_with(warehouse_model)
     def get(self, warehouse_id):
         """Get warehouse details"""
-        user = g.current_user
-        if user.type == 'staff':
-            # Staff can only access their own company's warehouse information
-            if user.company_id != WarehouseService.get_warehouse(warehouse_id).company_id:
-                raise ForbiddenException("You do not have permission to view this warehouse.", 12001)
-        warehouse = WarehouseService.get_warehouse(warehouse_id)
-        return warehouse
+        return get_company_owned(Warehouse, warehouse_id)
 
     @permission_required(["all_access", "company_all_access", "warehouse_edit"])
     @api_ns.expect(warehouse_input_model)
@@ -79,11 +71,9 @@ class WarehouseDetail(Resource):
     def put(self, warehouse_id):
         """Update warehouse details"""
         data = api_ns.payload
-        user = g.current_user
-        if user.type == 'staff':
-            # Staff can only update their own company's warehouse information
-            if user.company_id != WarehouseService.get_warehouse(warehouse_id).company_id:
-                raise ForbiddenException("You do not have permission to update this warehouse.", 12001)
+        get_company_owned(Warehouse, warehouse_id)
+        # 归属公司不允许通过更新接口迁移
+        data.pop('company_id', None)
 
         updated_warehouse = WarehouseService.update_warehouse(warehouse_id, data)
 
@@ -92,11 +82,7 @@ class WarehouseDetail(Resource):
     @permission_required(["all_access", "company_all_access", "warehouse_delete"])
     def delete(self, warehouse_id):
         """Delete a warehouse"""
-        user = g.current_user
-        if user.type == 'staff':
-            # Staff can only delete their own company's warehouse information
-            if user.company_id != WarehouseService.get_warehouse(warehouse_id).company_id:
-                raise ForbiddenException("You do not have permission to delete this warehouse.", 12001)
+        get_company_owned(Warehouse, warehouse_id)
         WarehouseService.delete_warehouse(warehouse_id)
-        
+
         return {"message": "Warehouse deleted successfully"}, 200

@@ -36,8 +36,9 @@ adjustment_detail_fields = {
 # 输出模型：完整的 Adjustment Detail 模型
 adjustment_detail_model = api_ns.model('AdjustmentDetail', adjustment_detail_fields)
 
-# 生成输入模型：复制后删除不需要的字段
+# 生成输入模型：复制后删除不需要的字段（adjustment_id 来自路径）
 adjustment_detail_input_fields = generate_input_fields(adjustment_detail_fields)
+adjustment_detail_input_fields.pop('adjustment_id', None)
 adjustment_detail_input_model = api_ns.model('AdjustmentDetailInput', adjustment_detail_input_fields)
 
 # -----------------------------
@@ -94,7 +95,15 @@ adjustment_base_model = api_ns.model('AdjustmentBase', adjustment_fields)
 
 # 生成输入模型：复制后删除不需要输入的字段
 adjustment_input_fields = generate_input_fields(adjustment_fields)
+# 状态 / 审计字段只由 approve / complete 流程写入，不接受客户端输入
+for key in ['status', 'is_active', 'created_by', 'approved_by', 'operator_id', 'approved_at', 'completed_at']:
+    adjustment_input_fields.pop(key, None)
 adjustment_input_model = api_ns.model('AdjustmentInput', adjustment_input_fields)
+# 创建时可一并带上明细
+adjustment_input_model['details'] = fields.List(
+    fields.Nested(adjustment_detail_input_model),
+    description='Details to create together with the adjustment'
+)
 
 # 定义完整的 Adjustment 模型（包含 details 嵌套字段）
 adjustment_model = api_ns.inherit('Adjustment', adjustment_base_model, {

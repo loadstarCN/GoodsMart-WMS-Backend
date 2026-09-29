@@ -1,14 +1,38 @@
 from datetime import datetime
 from extensions.db import *
-from extensions.error import BadRequestException, NotFoundException
+from extensions.error import BadRequestException, ConflictException, ForbiddenException, NotFoundException
 from extensions.transaction import transactional
+from warehouse.common import lock_goods_location, require_fields, require_non_negative_int
 from warehouse.cyclecount.services import CycleCountTaskService
-from warehouse.goods.services import GoodsLocationService
 from warehouse.inventory.services import InventoryService
 from .models import Adjustment, AdjustmentDetail
 from dateutil.relativedelta import relativedelta
 from sqlalchemy import and_, func, case, extract
 from datetime import datetime, timedelta
+
+
+def _resolve_detail_quantities(data: dict, current: AdjustmentDetail | None = None) -> tuple[int, int, int]:
+    """
+    解析并校验明细的三个数量：system_quantity / actual_quantity / adjustment_quantity。
+    - 缺省值取现有明细（更新）或 0（新建 system_quantity）
+    - system / actual 必须是非负整数（共享校验，拒绝 bool / 小数 / 非数字 → 400 而不是撞 CHECK 变 500）
+    - adjustment_quantity 是派生值：缺省时自动计算；显式给出时必须等于 actual − system，否则 400
+    """
+    if current is not None:
+        # 更新：没传（或传 null）的数量沿用现有明细
+        provided = {k: v for k, v in data.items() if v is not None}
+        data = {'system_quantity': current.system_quantity, 'actual_quantity': current.actual_quantity, **provided}
+    require_fields(data, 'actual_quantity')
+    system_quantity = require_non_negative_int(data.get('system_quantity'), 'system_quantity', default=0)
+    actual_quantity = require_non_negative_int(data['actual_quantity'], 'actual_quantity')
+
+    expected = actual_quantity - system_quantity
+    given = data.get('adjustment_quantity')
+    if given is not None and (isinstance(given, bool) or given != expected):
+        raise BadRequestException(
+            "adjustment_quantity must equal actual_quantity - system_quantity", 16038)
+    return system_quantity, actual_quantity, expected
+
 
 class AdjustmentService:
 
@@ -65,11 +89,12 @@ class AdjustmentService:
         :param created_by_id: 创建者用户 ID
         :return: 新创建的 Adjustment 对象
         """
+        # status / is_active / created_by 不接受客户端输入：新单固定 pending + 启用
         new_adjustment = Adjustment(
             warehouse_id=data['warehouse_id'],
             adjustment_reason=data.get('adjustment_reason'),
-            status=data.get('status', 'pending'),
-            is_active=data.get('is_active', True),
+            status='pending',
+            is_active=True,
             created_by=created_by_id
         )
         db.session.add(new_adjustment)
@@ -105,9 +130,8 @@ class AdjustmentService:
         if adjustment.status != 'pending':
             raise BadRequestException("Cannot update a non-pending Adjustment", 16001)
 
+        # 白名单：只允许改调整原因；status / is_active / created_by 忽略（状态只走 approve / complete）
         adjustment.adjustment_reason = data.get('adjustment_reason', adjustment.adjustment_reason)
-        adjustment.status = data.get('status', adjustment.status)
-        adjustment.is_active = data.get('is_active', adjustment.is_active)
 
         # db.session.commit()
         return adjustment
@@ -160,23 +184,35 @@ class AdjustmentService:
         return adjustment.details
 
     @staticmethod
+    def _assert_details_editable(adjustment: Adjustment):
+        """审批（approved）之后明细冻结：增删改一律 409"""
+        if adjustment.status != 'pending':
+            raise ConflictException(
+                f"Adjustment details are frozen once the adjustment is {adjustment.status}", 16039)
+
+    @staticmethod
     @transactional
     def create_adjustment_detail(adjustment_id: int, data: dict, created_by_id: int) -> AdjustmentDetail:
         """
-        创建新的 AdjustmentDetail
+        创建新的 AdjustmentDetail（仅 pending 的调整单；数量必须自洽）
 
         :param adjustment_id: 所属的 Adjustment ID
         :param data: 包含请求中的调整明细数据
         :param created_by_id: 创建者用户 ID
         :return: 新创建的 AdjustmentDetail 对象
         """
+        adjustment = AdjustmentService.get_adjustment(adjustment_id)
+        AdjustmentService._assert_details_editable(adjustment)
+        require_fields(data, 'goods_id')
+        system_quantity, actual_quantity, adjustment_quantity = _resolve_detail_quantities(data)
+
         new_detail = AdjustmentDetail(
             adjustment_id=adjustment_id,
             goods_id=data['goods_id'],
             location_id=data.get('location_id'),
-            system_quantity=data['system_quantity'],
-            actual_quantity=data['actual_quantity'],
-            adjustment_quantity=data['adjustment_quantity'],
+            system_quantity=system_quantity,
+            actual_quantity=actual_quantity,
+            adjustment_quantity=adjustment_quantity,
             remark=data.get('remark')
         )
         db.session.add(new_detail)
@@ -206,12 +242,14 @@ class AdjustmentService:
         :return: 更新后的 AdjustmentDetail 对象
         """
         detail = AdjustmentService.get_adjustment_detail(adjustment_id, detail_id)
+        AdjustmentService._assert_details_editable(detail.adjustment)
+        system_quantity, actual_quantity, adjustment_quantity = _resolve_detail_quantities(data, detail)
 
         detail.goods_id = data.get('goods_id', detail.goods_id)
         detail.location_id = data.get('location_id', detail.location_id)
-        detail.system_quantity = data.get('system_quantity', detail.system_quantity)
-        detail.actual_quantity = data.get('actual_quantity', detail.actual_quantity)
-        detail.adjustment_quantity = data.get('adjustment_quantity', detail.adjustment_quantity)
+        detail.system_quantity = system_quantity
+        detail.actual_quantity = actual_quantity
+        detail.adjustment_quantity = adjustment_quantity
         detail.remark = data.get('remark', detail.remark)
 
         # db.session.commit()
@@ -221,9 +259,10 @@ class AdjustmentService:
     @transactional
     def delete_adjustment_detail(adjustment_id: int, detail_id: int):
         """
-        删除指定的 AdjustmentDetail
+        删除指定的 AdjustmentDetail（仅 pending 的调整单）
         """
         detail = AdjustmentService.get_adjustment_detail(adjustment_id, detail_id)
+        AdjustmentService._assert_details_editable(detail.adjustment)
         db.session.delete(detail)
         # db.session.commit()
 
@@ -258,6 +297,9 @@ class AdjustmentService:
         adjustment = AdjustmentService._get_instance(task_or_id)
         if adjustment.status != 'pending':
             raise BadRequestException("Cannot approve an Adjustment that is not pending", 16018)
+        # 职责分离：创建人不能审批自己的调整单
+        if adjustment.created_by == operator_id:
+            raise ForbiddenException("The creator of an Adjustment cannot approve it", 16040)
 
         return AdjustmentService._update_adjustment_status(adjustment, 'approved',operator_id)
 
@@ -273,9 +315,9 @@ class AdjustmentService:
 
         adjustment = AdjustmentService._update_adjustment_status(adjustment, 'completed',operator_id)
 
-        # 修改库位信息
+        # 修改库位信息（FOR UPDATE 读取，避免多 worker 并发下丢更新）
         for detail in adjustment.details:
-            goods_location_record = GoodsLocationService.get_goods_location_record(detail.goods_id, detail.location_id)
+            goods_location_record = lock_goods_location(detail.goods_id, detail.location_id)
             if goods_location_record is None:
                 raise NotFoundException(f"GoodsLocation not found for goods_id={detail.goods_id} and location_id={detail.location_id}", 13003)
             goods_location_record.quantity += detail.adjustment_quantity
@@ -301,23 +343,28 @@ class AdjustmentService:
         创建一个新的 Adjustment 任务，并将其与指定的 CycleCount 关联
         """
         cyclecount = CycleCountTaskService.get_task(cyclecount_id)
-        
+
+        # 只有盘点完成后 system_quantity / difference 才是最终值，未完成不能据此生成调整单
+        if cyclecount.status != 'completed':
+            raise BadRequestException("CycleCountTask must be completed before creating an Adjustment", 16041)
+
         if len(cyclecount.task_details) == 0:
             raise BadRequestException("CycleCountTask has no details to create an Adjustment", 16016)
         
         # 遍历task_details，删选出difference不为零的记录
-        task_details = [detail for detail in cyclecount.task_details if detail.difference != 0]
+        task_details = [detail for detail in cyclecount.task_details if (detail.difference or 0) != 0]
         if len(task_details) == 0:
             raise BadRequestException("No differences found in CycleCountTask details", 16020)
-                
+
         adjustment_details = []
         for detail in task_details:
+            system_quantity = detail.system_quantity or 0
             adjustment_detail = AdjustmentDetail(
                 goods_id=detail.goods_id,
                 location_id=detail.location_id,
-                system_quantity=detail.system_quantity,
+                system_quantity=system_quantity,
                 actual_quantity=detail.actual_quantity,
-                adjustment_quantity=detail.difference
+                adjustment_quantity=detail.actual_quantity - system_quantity
             )
             adjustment_details.append(adjustment_detail)
 
@@ -335,8 +382,8 @@ class AdjustmentService:
         return adjustment
     
     @staticmethod
-    def get_cyclecount_monthly_stats(months=6, filters=None):
-        """获取最近N个月各状态Picking统计（支持仓库过滤）
+    def get_adjustment_monthly_stats(months=6, filters=None):
+        """获取最近N个月各状态 Adjustment 统计（支持仓库过滤）
         Args:
             months (int): 统计月份数（默认6个月）
             filters (dict): 过滤条件字典，可包含：
@@ -383,7 +430,7 @@ class AdjustmentService:
         raw_data = {
             f"{int(row.year)}-{int(row.month):02d}": {
                 'pending': row.pending or 0,
-                'in_progress': row.in_progress or 0,
+                'approved': row.approved or 0,
                 'completed': row.completed or 0
             } for row in query.all()
         }
@@ -407,7 +454,7 @@ class AdjustmentService:
 
     @staticmethod
     def get_status_overview(filters=None):
-        """获取各状态ASN在当前月、前一个月和去年同月的统计"""
+        """获取各状态 Adjustment 在当前月、前一个月和去年同月的统计"""
         now = datetime.now()
         current_year = now.year
         current_month = now.month

@@ -12,7 +12,6 @@ class InventoryService:
     @staticmethod
     def _get_for_update(goods_id: int, warehouse_id: int) -> Inventory:
         """SELECT ... FOR UPDATE — 写操作专用，防止并发更新导致库存数据竞争"""
-        from extensions.error import NotFoundException
         inventory = (
             Inventory.query
             .options(lazyload('*'))
@@ -253,14 +252,30 @@ class InventoryService:
         这里的实际分拣数量可能小于签收数量，表示部分商品缺货，也有可能大于签收数量，表示多拣货
         """
         inventory = InventoryService._get_for_update(goods_id, warehouse_id)
-        # if inventory.received_stock < quantity:
-        #     raise BadRequestException("Not enough received stock.", 15006)
+        # 签收库存不足说明单据没有走过 asn_received（或库存已被别的流程扣走），
+        # 静默清零会掩盖数据不一致，直接报错让调用方处理。
+        if inventory.received_stock < quantity:
+            raise BadRequestException("Not enough received stock.", 15006)
         inventory.received_stock -= quantity
-        if inventory.received_stock < 0:
-            inventory.received_stock = 0
         # 分拣库存增加
         inventory.sorted_stock += actual_quantity
         inventory.total_stock = InventoryService._calculate_total_stock(inventory)
+        # db.session.commit()
+
+    @staticmethod
+    @transactional
+    def asn_cancelled(goods_id: int, warehouse_id: int, quantity: int):
+        """
+        取消已签收的 ASN：回滚 asn_received 的签收库存。
+        asn_stock 由调用方在单据关闭后用 update_and_calculate_asn_stock 重算。
+        :param goods_id: 关联的商品 ID
+        :param warehouse_id: 仓库 ID
+        :param quantity: 原签收数量
+        """
+        inventory = InventoryService._get_for_update(goods_id, warehouse_id)
+        if inventory.received_stock < quantity:
+            raise BadRequestException("Not enough received stock to cancel.", 15006)
+        inventory.received_stock -= quantity
         # db.session.commit()
 
     @staticmethod
@@ -295,8 +310,17 @@ class InventoryService:
         InventoryService.update_and_calculate_stock(goods_id, warehouse_id)
         # db.session.commit()
 
-    
-    
+    @staticmethod
+    @transactional
+    def picking_removed(goods_id: int, warehouse_id: int, quantity: int):
+        """
+        拣货下架：只重算在库库存。拣出的货由 dn_picked 计入 picked_stock，
+        不能再进 sorted_stock，否则同一批货会在 total_stock 里被算两次，
+        且可以被再次"上架"回库位。
+        """
+        InventoryService._get_for_update(goods_id, warehouse_id)
+        InventoryService.update_and_calculate_stock(goods_id, warehouse_id)
+
     @staticmethod
     @transactional
     def dn_picked(goods_id: int, warehouse_id: int, quantity: int,picked_quantity: int):
@@ -535,8 +559,3 @@ class InventoryService:
         db.session.add(inventory)
         db.session.flush()
         # db.session.commit()
-
-            
-
-    
-    

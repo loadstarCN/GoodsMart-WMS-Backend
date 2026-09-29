@@ -1,9 +1,6 @@
-import time
-from flask import g
 from flask_restx import Resource
 from system.common import paginate,permission_required
-from warehouse.common import warehouse_required
-from warehouse.common.utils import add_warehouse_filter
+from warehouse.common import warehouse_required, add_warehouse_filter, require_warehouse_scope
 from .schemas import api_ns, inventory_model, inventory_pagination_parser,pagination_model
 from .services import InventoryService
 
@@ -61,7 +58,8 @@ class InventoryDetail(Resource):
         - `goods_id`: Required, the ID of the goods.
         - `warehouse_id`: Required, the ID of the warehouse. This can be provided either as `warehouse_id` in the request or via the `X-Warehouse-ID` header.
         """
-
+        # 路径里的 warehouse_id 必须在调用方可访问范围内（B-24）
+        require_warehouse_scope(warehouse_id, 'Inventory')
         return InventoryService.get_inventory(goods_id,warehouse_id), 200
 
     # @permission_required(["all_access","company_all_access","inventory_edit"])

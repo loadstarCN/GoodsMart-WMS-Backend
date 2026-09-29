@@ -82,12 +82,17 @@ def test_update_asn(client, access_token):
         json={
             'asn_type': 'return_from_customer',
             'status': 'received',
+            'is_active': False,
             'remark': 'Updated remark'
         }
     )
     assert response.status_code == 200
     data = response.get_json()
-    assert data['status'] == 'received'
+    assert data['asn_type'] == 'return_from_customer'
+    assert data['remark'] == 'Updated remark'
+    # status / is_active 只能经动作端点变更，PUT 里传了也被忽略（B-12）
+    assert data['status'] == 'pending'
+    assert data['is_active'] is True
 
 
 def test_create_asn_detail(client, access_token):
@@ -113,7 +118,10 @@ def test_create_asn_detail(client, access_token):
     assert response.status_code == 201
     data = response.get_json()
     assert data['quantity'] == 5
-    assert data['damage_quantity'] == 1
+    assert data['asn_id'] == asn.id
+    # actual / damage_quantity 是分拣完成时聚合出的过程量，客户端传了也被忽略（B-12）
+    assert data['actual_quantity'] == 0
+    assert data['damage_quantity'] == 0
 
 
 def test_get_details_list(client, access_token):
@@ -150,7 +158,7 @@ def test_update_asn_detail(client, access_token):
     assert response.status_code == 200
     data = response.get_json()
     assert data['quantity'] == 99
-    assert data['actual_quantity'] == 50
+    assert data['actual_quantity'] == 0  # 过程量不接受客户端输入（B-12）
     assert data['remark'] == 'Updated detail remark'
 
 
@@ -328,11 +336,24 @@ def test_asn_service_complete_asn(client):
         asn = get_asn()
         assert asn is not None
 
-        asn.status = "received"
-        db.session.commit()
+        # 必须真正走过 receive（签收库存到位），complete 才能扣减 received_stock（B-40）
+        ASNService.receive_asn(asn.id)
 
         updated_asn = ASNService.complete_asn(asn.id)
         assert updated_asn.status == "completed"
+
+
+def test_asn_service_complete_without_received_stock_fails(client):
+    """回归（B-40）：签收库存不足时 complete 不再静默清零，而是报 15006"""
+    with client.application.app_context():
+        asn = get_asn()
+        # 绕过 receive 直接把状态改成 received，此时 received_stock 仍为 0
+        asn.status = "received"
+        db.session.commit()
+
+        with pytest.raises(BadRequestException) as excinfo:
+            ASNService.complete_asn(asn.id)
+        assert excinfo.value.biz_code == 15006
 
 
 def test_close_asn_success_pending(client):
@@ -410,13 +431,14 @@ def test_complete_asn_webhook_payload_includes_weight_and_volume(client):
         db.session.commit()
 
         asn = get_asn()
-        asn.status = 'received'
-        asn.api_key_id = api_key.id
         detail = asn.details[0]
         detail.weight = 0.3
         detail.volume = 0.002
         db.session.commit()
         goods_code = detail.goods.code
+        ASNService.receive_asn(asn.id)
+        asn.api_key_id = api_key.id
+        db.session.commit()
 
         ASNService.complete_asn(asn.id)
 
@@ -455,8 +477,6 @@ def test_complete_asn_webhook_payload_includes_goods_spec(client):
         db.session.commit()
 
         asn = get_asn()
-        asn.status = 'received'
-        asn.api_key_id = api_key.id
         goods = asn.details[0].goods
         goods.weight = Decimal('0.125')
         goods.length = 150
@@ -464,6 +484,9 @@ def test_complete_asn_webhook_payload_includes_goods_spec(client):
         goods.height = 40
         db.session.commit()
         goods_code = goods.code
+        ASNService.receive_asn(asn.id)
+        asn.api_key_id = api_key.id
+        db.session.commit()
 
         ASNService.complete_asn(asn.id)
 

@@ -195,7 +195,9 @@ class User(db.Model):
         self.password_hash = generate_password_hash(password)
 
     def check_password(self, password):
-        """验证密码"""
+        """验证密码（未设置密码的账号永远不能用密码登录）"""
+        if not self.password_hash or password is None:
+            return False
         return check_password_hash(self.password_hash, password)
 
     

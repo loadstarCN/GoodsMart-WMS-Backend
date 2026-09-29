@@ -5,11 +5,17 @@ from extensions.db import *
 from extensions.error import UnauthorizedException
 
 def _validate_staff_user() -> bool:
-    """核心验证逻辑：存在有效用户且为员工类型时返回True，否则阻断请求或放行"""
-    if not hasattr(g, "current_user") or not g.current_user:
-        raise UnauthorizedException("No current user found", 11004)
-        
-    return g.current_user.type == "staff"
+    """是否需要做仓库范围校验：
+    - 员工 → True；平台管理员 → False
+    - 未绑定用户的 API Key：绑定了公司 → True（按公司仓库校验）；超级密钥 → False
+    - 既无用户也无 API Key → 401
+    """
+    user = g.get("current_user")
+    if user:
+        return user.type == "staff"
+    if getattr(g, "current_system", None):
+        return getattr(g, "api_key_company_id", None) is not None
+    raise UnauthorizedException("No current user found", 11004)
 
 def check_warehouse_access(warehouse_id) -> bool:
     """

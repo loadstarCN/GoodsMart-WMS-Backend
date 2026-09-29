@@ -164,7 +164,7 @@ class RecipientService:
         recipient.contact = data.get('contact', recipient.contact)
         recipient.country = data.get('country', recipient.country)
         recipient.is_active = data.get('is_active', recipient.is_active)
-        recipient.company_id = data.get('company_id', recipient.company_id)
+        # company_id 不可通过更新修改（归属固定）
 
         # db.session.commit()
         return recipient

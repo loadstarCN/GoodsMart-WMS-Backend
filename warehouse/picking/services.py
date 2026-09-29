@@ -1,19 +1,16 @@
 from extensions.db import *
 from extensions.error import BadRequestException, NotFoundException
+from warehouse.common import require_positive_int, require_bulk_list, lock_goods_location
 from warehouse.dn.models import DN
-from warehouse.dn.services import DNService
-from warehouse.inventory.services import InventoryService
-from warehouse.goods.models import GoodsLocation
+from warehouse.dn.services import DNService, pick_fields, parse_datetime_value
 from warehouse.location.models import Location
 from warehouse.removal.services import RemovalService
 from .models import PickingTask, PickingTaskDetail, PickingTaskStatusLog,PickingBatch
 from extensions.transaction import transactional
 from dateutil.relativedelta import relativedelta
 from sqlalchemy import and_, func, case, extract
-from sqlalchemy.orm import lazyload
+from sqlalchemy.orm import selectinload, joinedload
 from datetime import datetime, timedelta
-
-from datetime import datetime
 
 class PickingTaskService:
 
@@ -33,7 +30,15 @@ class PickingTaskService:
         """
         根据过滤条件，返回 PickingTask 的查询对象。
         """
-        query = PickingTask.query.order_by(PickingTask.id.desc())
+        # 列表 schema 会逐行汇总 task_details / dn.details，这里一次性预加载，避免 N+1
+        query = (
+            PickingTask.query
+            .options(
+                selectinload(PickingTask.task_details),
+                joinedload(PickingTask.dn).selectinload(DN.details),
+            )
+            .order_by(PickingTask.id.desc())
+        )
 
         if filters.get('dn_id'):
             query = query.filter(PickingTask.dn_id == filters['dn_id'])
@@ -77,12 +82,17 @@ class PickingTaskService:
     @transactional
     def create_task(data: dict, created_by_id: int) -> PickingTask:
         """
-        创建新的 Picking Task 并可选地创建其详情 (PickingTaskDetail)
+        创建新的 Picking Task。只接受 dn_id；status 固定 pending、is_active 固定 True，
+        状态只能经 process / complete 流转。
         """
+        payload = pick_fields(data, ('dn_id',))
+        dn_id = require_positive_int(payload.get('dn_id'), 'dn_id', 16044)
+        get_object_or_404(DN, dn_id)
+
         new_task = PickingTask(
-            dn_id=data['dn_id'],
-            status=data.get('status', 'pending'),
-            is_active=data.get('is_active', True),
+            dn_id=dn_id,
+            status='pending',
+            is_active=True,
             created_by=created_by_id
         )
         db.session.add(new_task)
@@ -106,9 +116,9 @@ class PickingTaskService:
         if task.status != 'pending':
             raise BadRequestException("Cannot update a non-pending Picking Task", 16001)
 
-        task.dn_id = data.get('dn_id', task.dn_id)
-        task.status = data.get('status', task.status)
-        task.is_active = data.get('is_active', task.is_active)
+        # PickingTask 没有可由客户端编辑的业务字段：dn_id 不可改，
+        # status 只经 process / complete 流转，is_active / created_by 忽略。
+        pick_fields(data, ())
 
         # db.session.commit()
         return task
@@ -138,29 +148,6 @@ class PickingTaskService:
         return task.task_details
 
     @staticmethod
-    @transactional
-    def create_task_detail(task_id: int, data: dict, created_by_id: int) -> PickingTaskDetail:
-        """
-        创建新的 PickingTaskDetail（仅当所属的 PickingTask 为 pending）
-        """
-        task = PickingTaskService.get_task(task_id)
-        if task.status != 'pending':
-            raise BadRequestException("Cannot add Picking Task Detail to a non-pending Picking Task", 16003)
-
-        new_detail = PickingTaskDetail(
-            picking_task_id=task_id,
-            location_id=data['location_id'],
-            goods_id=data['goods_id'],
-            # 你若需要 assigned_quantity，可加上：
-            # assigned_quantity=data.get('assigned_quantity', 0),
-            picked_quantity=data.get('picked_quantity', 0),
-            operator_id=created_by_id
-        )
-        db.session.add(new_detail)
-        # db.session.commit()
-        return new_detail
-
-    @staticmethod
     def get_task_detail(task_id: int, detail_id: int) -> PickingTaskDetail:
         """
         根据 detail_id 获取单个 PickingTaskDetail，并校验其 picking_task_id 是否匹配
@@ -174,22 +161,39 @@ class PickingTaskService:
     @transactional
     def update_task_detail(task_id: int, detail_id: int, data: dict) -> PickingTaskDetail:
         """
-        更新指定 PickingTaskDetail（仅当所属的 PickingTask 为 in_progress
+        更新指定 PickingTaskDetail（仅当所属的 PickingTask 为 in_progress）。
+        只允许改 picked_quantity：location_id / goods_id / batch_id 一经批次创建即固定，
+        传入不同的值直接 400（否则可以把明细挪到别的仓库的库位，complete 时跨仓扣库存）。
+        增加的数量要同时通过计划量上限与库位库存校验。
         """
         task = PickingTaskService.get_task(task_id)
         if task.status != 'in_progress':
             raise BadRequestException("Cannot update Picking Task Detail in a non-in-progress Picking Task", 16010)
 
         detail = PickingTaskService.get_task_detail(task_id, detail_id)
+        if not isinstance(data, dict):
+            raise BadRequestException("Request body must be a JSON object", 16015)
 
-        # 如果要更新 batch_id，请确保传入
-        if 'batch_id' in data:
-            detail.batch_id = data['batch_id']
+        for field in ('location_id', 'goods_id', 'batch_id'):
+            if field in data and data[field] != getattr(detail, field):
+                raise BadRequestException(
+                    f"{field} of a picking detail cannot be changed; delete it and pick again.", 16049
+                )
 
-        detail.location_id = data.get('location_id', detail.location_id)
-        detail.goods_id = data.get('goods_id', detail.goods_id)
-        # detail.assigned_quantity = data.get('assigned_quantity', detail.assigned_quantity)
-        detail.picked_quantity = data.get('picked_quantity', detail.picked_quantity)
+        if 'picked_quantity' not in data:
+            return detail
+
+        new_quantity = require_positive_int(data.get('picked_quantity'), 'picked_quantity')
+        PickingTaskService._assert_goods_in_dn(task, [detail.goods_id])
+        delta = new_quantity - (detail.picked_quantity or 0)
+        if delta > 0:
+            PickingTaskService._assert_within_planned(task, {detail.goods_id: delta})
+            PickingTaskService._assert_location_stock(task, [{
+                'goods_id': detail.goods_id,
+                'location_id': detail.location_id,
+                'picked_quantity': delta,
+            }])
+        detail.picked_quantity = new_quantity
         # db.session.commit()
         return detail
 
@@ -241,9 +245,7 @@ class PickingTaskService:
             picked[td.goods_id] = picked.get(td.goods_id, 0) + (td.picked_quantity or 0)
 
         for gid in set(picked) | set(extra_by_goods):
-            # 仅对 DN 计划明细内的商品做上限校验。计划外商品维持系统既有的宽容行为
-            #（_update_and_calculate_quantity 只按 DN 明细聚合，计划外拣货量本就被忽略），
-            # 本校验不扩大限制范围，只精准拦截「同一计划商品被重复/超量拣」。
+            # 计划外商品由 _assert_goods_in_dn 单独拦截（16042），这里只管计划内商品的上限。
             if gid not in planned:
                 continue
             total = picked.get(gid, 0) + extra_by_goods.get(gid, 0)
@@ -255,8 +257,46 @@ class PickingTaskService:
                 )
 
     @staticmethod
-    def _assert_location_stock(task: PickingTask, details_data: list):
-        """Validate that every picked unit exists in the selected warehouse bin."""
+    def _assert_goods_in_dn(task: PickingTask, goods_ids):
+        """
+        拣货明细的商品必须在 DN 明细内。
+
+        拣货下架走 picking_removed（不再计入 sorted_stock），计划外商品被下架后既不进
+        picked_stock 也不进待上架区，会从 total_stock 里凭空消失；与 sorting / packing
+        的「明细必须属于单据」保持一致。批次创建 / 明细改量校验本次涉及的商品，
+        complete 前对全部明细再验一次（拦历史脏数据）。
+        """
+        planned = {d.goods_id for d in task.dn.details}
+        for gid in goods_ids:
+            if gid not in planned:
+                raise BadRequestException(f"Goods {gid} is not in the DN.", 16042)
+
+    @staticmethod
+    def _assert_locations_in_warehouse(task: PickingTask, location_ids):
+        """明细库位必须属于 DN 所在仓库，否则 complete 时会跨仓扣库存。"""
+        location_ids = {lid for lid in location_ids if lid is not None}
+        if not location_ids:
+            return
+        warehouse_by_location = dict(
+            db.session.query(Location.id, Location.warehouse_id)
+            .filter(Location.id.in_(location_ids))
+            .all()
+        )
+        for location_id in location_ids:
+            if warehouse_by_location.get(location_id) != task.dn.warehouse_id:
+                raise BadRequestException(
+                    f"Location {location_id} does not belong to the DN warehouse.", 16054
+                )
+
+    @staticmethod
+    def _assert_location_stock(task: PickingTask, details_data: list, exclude_task_id: int | None = None):
+        """Validate that every picked unit exists in the selected warehouse bin.
+
+        先校验库位属于 DN 仓库，再用共享的 lock_goods_location（FOR UPDATE，无 outer join）
+        锁住库位库存行做余量比对。
+        exclude_task_id：complete 前复核本任务全部明细时，把本任务自身已写入的
+        明细从「其它任务预占」里排除，否则会把自己算两遍。
+        """
         requested = {}
         for item in details_data:
             goods_id = item.get('goods_id')
@@ -271,30 +311,16 @@ class PickingTaskService:
             key = (goods_id, location_id)
             requested[key] = requested.get(key, 0) + quantity
 
+        PickingTaskService._assert_locations_in_warehouse(task, [lid for _, lid in requested])
+
         for (goods_id, location_id), quantity in requested.items():
-            # lazyload('*') 抑制模型上 lazy='joined' 的级联 eager join：
-            # 带 LEFT OUTER JOIN 的 SELECT ... FOR UPDATE 在 PostgreSQL 上直接报
-            # FeatureNotSupported（FOR UPDATE cannot be applied to the nullable
-            # side of an outer join）。of=GoodsLocation 使锁只落在库存行上，
-            # 不连带锁 join 进来的 locations 行。
-            stock = (
-                GoodsLocation.query
-                .options(lazyload('*'))
-                .join(Location, GoodsLocation.location_id == Location.id)
-                .filter(
-                    GoodsLocation.goods_id == goods_id,
-                    GoodsLocation.location_id == location_id,
-                    Location.warehouse_id == task.dn.warehouse_id,
-                )
-                .with_for_update(of=GoodsLocation)
-                .first()
-            )
+            stock = lock_goods_location(goods_id, location_id)
             if stock is None:
                 raise BadRequestException(
                     f"Goods {goods_id} has no stock in location {location_id}.", 16035
                 )
 
-            already_reserved = (
+            reserved_query = (
                 db.session.query(func.coalesce(func.sum(PickingTaskDetail.picked_quantity), 0))
                 .join(PickingTask)
                 .filter(
@@ -303,8 +329,10 @@ class PickingTaskService:
                     PickingTask.status == 'in_progress',
                     PickingTask.is_active.is_(True),
                 )
-                .scalar()
             )
+            if exclude_task_id is not None:
+                reserved_query = reserved_query.filter(PickingTask.id != exclude_task_id)
+            already_reserved = reserved_query.scalar()
             available = max((stock.quantity or 0) - (already_reserved or 0), 0)
             if quantity > available:
                 raise BadRequestException(
@@ -339,9 +367,18 @@ class PickingTaskService:
         if task.status != 'in_progress':
             raise BadRequestException("Cannot create batch in a non-in_progress Picking Task", 16012)
 
-        op_time = data.get('operation_time')
-        if isinstance(op_time, str):
-            op_time = datetime.fromisoformat(op_time)
+        if not isinstance(data, dict):
+            raise BadRequestException("Request body must be a JSON object", 16015)
+        op_time = parse_datetime_value(data.get('operation_time'), 'operation_time')
+
+        # 1) 明细字段逐条校验：goods_id / location_id 必填、picked_quantity 正整数（缺字段 400 而非 500）
+        details_data = []
+        for raw in require_bulk_list(data.get('details') or [], 'details', allow_empty=True):
+            details_data.append({
+                'goods_id': require_positive_int(raw.get('goods_id'), 'goods_id', 16034),
+                'location_id': require_positive_int(raw.get('location_id'), 'location_id', 16034),
+                'picked_quantity': require_positive_int(raw.get('picked_quantity'), 'picked_quantity'),
+            })
 
         new_batch = PickingBatch(
             picking_task_id=task.id,
@@ -352,19 +389,14 @@ class PickingTaskService:
         db.session.add(new_batch)
         db.session.flush()  # 以获取 new_batch.id
 
-        # 2) 如果有 details，就批量创建 detail
-        details_data = data.get("details", [])
-        # 2. 强制校验类型（若存在且非列表则报错）
-        if details_data is not None and not isinstance(details_data, list):
-            raise BadRequestException("'details' must be a list (empty is allowed)", 16015)
-
-        # 3. 权威校验：累计已拣量（现有 + 本次）不得超过 DN 计划量，
-        #    阻止重复 / 超量提交污染数据（见 _assert_within_planned）。
+        # 2) 权威校验：累计已拣量（现有 + 本次）不得超过 DN 计划量，
+        #    阻止重复 / 超量提交污染数据（见 _assert_within_planned）；
+        #    库位必须在 DN 仓库内且有足够库存。
         incoming_by_goods = {}
         for item in details_data:
-            gid = item.get('goods_id')
-            if gid is not None:
-                incoming_by_goods[gid] = incoming_by_goods.get(gid, 0) + (item.get('picked_quantity', 0) or 0)
+            gid = item['goods_id']
+            incoming_by_goods[gid] = incoming_by_goods.get(gid, 0) + item['picked_quantity']
+        PickingTaskService._assert_goods_in_dn(task, incoming_by_goods)
         PickingTaskService._assert_within_planned(task, incoming_by_goods)
         PickingTaskService._assert_location_stock(task, details_data)
 
@@ -374,7 +406,7 @@ class PickingTaskService:
                 batch_id=new_batch.id,
                 location_id=item['location_id'],
                 goods_id=item['goods_id'],
-                picked_quantity=item.get('picked_quantity', 0),
+                picked_quantity=item['picked_quantity'],
                 operator_id=operator_id
             )
             db.session.add(detail_obj)
@@ -406,9 +438,10 @@ class PickingTaskService:
             raise BadRequestException("Cannot update a batch in a non-in_progress Picking Task", 16013)
 
         batch = PickingTaskService.get_batch(task_id, batch_id)
+        data = pick_fields(data, ('operation_time', 'remark'))
 
-        if 'operation_time' in data:
-            batch.operation_time = data['operation_time']
+        if data.get('operation_time') is not None:
+            batch.operation_time = parse_datetime_value(data['operation_time'], 'operation_time')
         if 'remark' in data:
             batch.remark = data['remark']
 
@@ -473,6 +506,7 @@ class PickingTaskService:
         return task
 
     @staticmethod
+    @transactional
     def process_task(task_or_id: int | PickingTask, operator_id: int) -> PickingTask:
         """
         将PickingTask从 pending 切换到 in_progress
@@ -496,6 +530,18 @@ class PickingTaskService:
         # 防御性校验：累计已拣量不得超过 DN 计划量。对已被重复提交污染的历史单据
         # 给出明确报错（16029），而非在 dn_picked 处误报 15008 或撞数据库约束。
         PickingTaskService._assert_within_planned(task)
+        # 扣库存前对全部明细复核：商品必须在 DN 明细内、库位必须在 DN 仓库内、
+        # 库位库存仍然足够（明细可能在批次创建后被改量 / 库存被其它流程动过）。
+        PickingTaskService._assert_goods_in_dn(task, {d.goods_id for d in task.task_details})
+        details = [
+            {
+                'goods_id': d.goods_id,
+                'location_id': d.location_id,
+                'picked_quantity': d.picked_quantity or 0,
+            }
+            for d in task.task_details
+        ]
+        PickingTaskService._assert_location_stock(task, details, exclude_task_id=task.id)
 
         task = PickingTaskService._update_task_status(task, 'completed', operator_id)
 
