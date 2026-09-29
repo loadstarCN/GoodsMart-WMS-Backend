@@ -301,6 +301,8 @@ class GoodsLocationService:
         # 根据过滤条件筛选
         if filters.get('goods_id'):
             query = query.filter(GoodsLocation.goods_id == filters['goods_id'])
+        if filters.get('goods_ids'):
+            query = query.filter(GoodsLocation.goods_id.in_(filters['goods_ids']))
         if filters.get('location_id'):
             query = query.filter(GoodsLocation.location_id == filters['location_id'])
 

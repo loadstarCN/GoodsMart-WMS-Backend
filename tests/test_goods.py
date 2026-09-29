@@ -102,6 +102,30 @@ def test_get_goods_locations(client, access_token):
     assert len(data['items']) > 0
 
 
+def test_get_goods_locations_by_goods_ids(client, access_token):
+    # goods_ids：逗号分隔的批量过滤（APP 列表页/拣货详情一次查多件商品的库位）
+    with client.application.app_context():
+        goods_location = get_goods_location()
+        goods_id = goods_location.goods_id
+        response = client.get(
+            f'/goods/locations/?page=1&per_page=100&goods_ids={goods_id},999999',
+            headers={'Authorization': f'Bearer {access_token}'},
+        )
+        assert response.status_code == 200
+        data = response.get_json()
+        assert len(data['items']) > 0
+        for item in data['items']:
+            assert item['goods_id'] == goods_id
+
+        # 不存在的 id 组合应返回空列表而不是报错
+        response = client.get(
+            '/goods/locations/?page=1&per_page=100&goods_ids=999998,999999',
+            headers={'Authorization': f'Bearer {access_token}'},
+        )
+        assert response.status_code == 200
+        assert response.get_json()['items'] == []
+
+
 def test_get_goods_location_detail(client, access_token):
     with client.application.app_context():
         goods_location = get_goods_location()

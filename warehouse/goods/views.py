@@ -161,6 +161,7 @@ class GoodsLocationList(Resource):
 
         filters = {
             'goods_id': args.get('goods_id'),
+            'goods_ids': args.get('goods_ids'),
             'location_id': args.get('location_id'),
             'goods_code': args.get('goods_code'),
             'goods_name': args.get('goods_name'),

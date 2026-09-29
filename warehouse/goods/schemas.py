@@ -127,6 +127,12 @@ goods_pagination_parser.add_argument('company_id', type=int, help='Filter by Com
 # GoodsLocation 分页解析器
 goods_location_pagination_parser = pagination_parser.copy()
 goods_location_pagination_parser.add_argument('goods_id', type=int, help='Filter by Goods ID')
+# 批量查询：APP 列表页/拣货详情一页商品只发一个请求，避免逐条 goods_id 查询（N+1）
+goods_location_pagination_parser.add_argument(
+    'goods_ids',
+    type=lambda s: [int(v) for v in s.split(',') if v.strip()],
+    help='Goods IDs (comma separated)',
+)
 goods_location_pagination_parser.add_argument('goods_code', type=str, help='Filter by Goods Code')
 goods_location_pagination_parser.add_argument('goods_name', type=str, help='Filter by Goods Name')
 goods_location_pagination_parser.add_argument('location_id', type=int, help='Filter by Location ID')
