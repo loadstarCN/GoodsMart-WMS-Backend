@@ -293,6 +293,88 @@ POST /tasks/task/inventory_snapshot
 Authorization: Bearer <token>
 ```
 
+## 海外件：报关快照、装箱与出口单证
+
+跨境发货时，WMS 为每张 DN 保存报关快照、记录箱子，并生成 **商业发票（Commercial Invoice, CI）** 与
+**装箱单（Packing List, PL）** PDF（A4 英文，使用 [reportlab](https://www.reportlab.com/) 生成，BSD 许可）。
+带报关快照的 DN 即海外件（DN 列表 / 详情、打包 / 发货任务里嵌套的 DN 上 `is_export: true`）。
+
+### 出口资料（公司 / 仓库）
+
+发货人信息全部来自 WMS 的公司 / 仓库设置，代码里不写任何公司数据。
+
+| 对象 | 字段 |
+|------|------|
+| 公司（`PUT /warehouse/company/<id>`） | `legal_name_en`、`address_en`、`country_code`（ISO 3166-1 alpha-2，默认 `JP`）、`tax_id_label`、`tax_id`、`export_contact_name`、`export_signatory_name`、`export_signatory_title` |
+| 仓库（`PUT /warehouse/warehouse/<id>`） | `address_en`、`country_code`、`contact_name_en`（与公司地址不同时印为 *Ship From*） |
+
+`country_code` 不合法 → 400 `14020`；文本超长 → 400 `14019`。
+
+### 报关快照
+
+`POST /warehouse/dn/` 顶层可带 `customs`（国内件不带）；`PUT /warehouse/dn/<id>/customs` 整体替换
+（权限 `dn_edit`，发货后不可改）。结构同英文 README 示例：`invoice_number`、`currency`、`incoterm`、
+`export_reason`、`recipient_country`、`recipient_tax_id`、`recipient_tax_id_type`、`freight_charge`、
+`consignee{...}`、`lines[{goods_code, quantity, unit_value, total_value, description_en, hs_code, jp_export_code, origin_country, quantity_unit}]`。
+
+- 结构错误拒绝：`customs` 非对象、`lines` 非数组、字段类型错误 → 400 `16063`（`details.field`）；
+  行的 `goods_code` 不在 DN 明细或重复 → 400 `16064`。
+- 内容不全照收，缺什么在 `problems` 里列出。
+- `invoice_number` 缺省用 DN 的 `order_number`；发票数量一律取**已打包数量**（金额 = 单价 × 已打包数量，
+  已打包 0 的行不上发票）；原产国以商品主数据 `goods.origin_country` 为准，行里的只做记录。
+- `freight_charge` 在发票上单列为 *Freight*，并计入 *Total Invoice Value*。
+- `jp_export_code`（可选，9 位日本出口统计品目番号，前 6 位应等于 HS）存入快照并在接口返回，CI / PL 不印（只印 HS）。
+- 替换快照时，只有印在单证上的内容变了才作废现有单证。
+
+`GET /warehouse/dn/<id>/customs`（`dn_read` 或 `packing_read`）返回
+`{dn_id, is_export, locked, customs, lines[], packages[], totals, exporter, problems[], ready, current_documents[], documents_outdated}`。
+
+- 错误级问题：`NOT_PACKED`、`PACKAGES_MISSING`、`EXPORTER_PROFILE_INCOMPLETE`、`INCOTERM_MISSING`、
+  `EXPORT_REASON_MISSING`、`CURRENCY_INVALID`、`RECIPIENT_COUNTRY_MISSING`、`LINE_MISSING`、`HS_CODE_MISSING`
+  （去掉 `.`、空格、`-` 后须为 6–10 位数字）、`DESCRIPTION_MISSING`、`DESCRIPTION_NOT_ASCII`、`ORIGIN_MISSING`、`UNIT_VALUE_MISSING`。
+- 警告（不拦截）：`RECIPIENT_TAX_ID_MISSING`、`NON_LATIN_TEXT`、`NET_WEIGHT_UNKNOWN`、`GROSS_LT_NET`、
+  `JP_EXPORT_CODE_MISMATCH`（`jp_export_code` 非 9 位数字或前 6 位与 HS 不一致）、
+  `JP_EXPORT_CODE_MISSING`（JPY 发票合计＝货值＋运费超过 200,000 且有行缺 `jp_export_code`）。
+
+### 箱子
+
+`GET / PUT /warehouse/dn/<id>/packages`（读：`dn_read` 或 `packing_read`；写：`packing_edit`），
+DN 须为 `picked` 或 `packed`（否则 409 `16067`）。请求体 `{"packages": [{package_no, gross_weight_kg, length_mm, width_mm, height_mm, remark}]}`，
+返回 `{packages, voided_documents}`。1–99 箱，编号从 1 连续（缺省自动编）；毛重 0.01–999.999 kg（三位小数）；
+长宽高 1–3000 mm 整数；不合法 400 `16066`。已出单证后改箱子 → 现有单证作废（`void_reason: packages_changed`）。
+
+### 单证
+
+| 方法 | 路径 | 权限 |
+|------|------|------|
+| `POST` | `/warehouse/dn/<id>/customs-documents/issue` | `packing_edit` |
+| `GET` | `/warehouse/dn/<id>/customs-documents/?status=issued` | `dn_read` / `packing_read` |
+| `GET` | `/warehouse/dn/<id>/customs-documents/<doc_id>/file` | `dn_read` / `packing_read` |
+
+- 出单证条件：DN 为 `packed`、有报关快照、至少 1 箱、出口资料齐、没有错误级问题；否则 409 `16068`
+  （`details.problems`）；不是海外单 409 `16070`。
+- CI 与 PL 成对签发并存库（`dn_documents`），生成即定稿。数据未变再次签发 → 返回现有版本（200）；
+  数据变了（含运单号 AWB）→ 旧版作废、版本 +1（201）。
+- `file` 以 `application/pdf` inline 返回，响应头 `X-Content-SHA256`。
+- 发货任务已有运单号时 CI 印 AWB No.。发货前用 `PUT /warehouse/delivery/<task_id>/tracking`
+  `{"tracking_number": "...", "carrier_id": 1}` 保存（权限 `delivery_edit`，发货后 409 `16065`），再重新签发；
+  报关视图里 `documents_outdated: true` 表示当前单证与数据不一致。
+
+### 发货拦截与锁定
+
+- 海外 DN 完成发货前必须有当前有效的 CI **和** PL，否则 409 `16069`。完成发货时请求里的运单号与已保存的不同，
+  以请求为准，现有单证仍视为有效。
+- DN 发货（`delivered` / `completed`）后，报关快照、箱子、单证全部锁定 → 409 `16065`。
+- 海外 DN 的 `dn.delivered` 追加 `customs_documents`（含 `download_path`）、`packages`、
+  `invoice_total{currency, goods_value, freight, total}`；国内件 payload 不变。
+
+### 配置
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `DOCUMENT_TIMEZONE` | `Asia/Tokyo` | 单证日期所用时区 |
+| `CUSTOMS_PDF_FONT_PATH` | （不设） | 单证可选 TTF 字体；默认 Helvetica。字体印不出的字符（如日文）退回 reportlab 内置 CID 字体 |
+
 ## 部署
 
 ### 生产环境（Gunicorn）
@@ -326,6 +408,8 @@ stdout_logfile=/var/log/wms-api.out.log
 | 验证错误 | 14000-14999 | 400 | 数据格式错误 |
 | 库存错误 | 15000-15999 | 400 | 库存相关错误 |
 | 状态错误 | 16000-16999 | 400 | 状态流转错误 |
+
+出口单证相关业务码：`14019` 出口资料文本超长、`14020` 国家代码不合法、`16063` 报关结构不合法、`16064` 报关行商品编码不在 DN 明细或重复、`16065` 已发货不可改（409）、`16066` 箱子数据不合法、`16067` 当前状态不能改箱子（409）、`16068` 单证条件不全（409，`details.problems`）、`16069` 发货前必须先出单证（409）、`16070` 不是海外单（409）、`16071` 单证不存在（404）。错误响应可能带结构化的 `details`。
 
 ## 关联项目
 

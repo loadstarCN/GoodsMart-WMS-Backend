@@ -434,6 +434,13 @@ class DNService:
             goods_ids=requested_by_goods.keys(),
         )
 
+        # 海外件：顶层 customs 为报关快照（国内件不带）。结构错误在建单前拒绝（16063 / 16064），
+        # 内容不全照收，由 GET /dn/<id>/customs 的 problems 列出。
+        customs_payload = None
+        if data.get('customs') is not None:
+            from .customs_services import CustomsService
+            customs_payload = CustomsService.parse_for_new_dn(data['customs'], requested_by_goods.keys())
+
         # 新单一律 pending 并预占库存：这里拒绝超额预占，
         # 让不可能完成的集成报文根本进不了拣货。
         DNService._assert_dn_stock_available(warehouse_id, requested_by_goods)
@@ -470,6 +477,10 @@ class DNService:
             db.session.flush()
 
             InventoryService.update_and_calculate_dn_stock(new_detail.goods_id,new_dn.warehouse_id)
+
+        if customs_payload is not None:
+            from .customs_services import CustomsService
+            CustomsService.store_snapshot(new_dn, customs_payload, created_by_id)
 
         # db.session.commit()
 
@@ -877,7 +888,7 @@ class DNService:
         ).first()
         tracking_number = delivery_task.tracking_number if delivery_task else None
 
-        webhook_emit('dn.delivered', {
+        payload = {
             'dn_id': dn.id, 'status': 'delivered', 'order_number': dn.order_number,
             'tracking_number': tracking_number,
             'details': [
@@ -889,7 +900,11 @@ class DNService:
                 }
                 for detail in dn.details
             ],
-        }, api_key_id=dn.api_key_id)
+        }
+        # 海外件追加：当前单证（CI / PL）、箱子、发票合计；国内件 payload 不变
+        from .customs_services import CustomsService
+        payload.update(CustomsService.delivered_webhook_fields(dn))
+        webhook_emit('dn.delivered', payload, api_key_id=dn.api_key_id)
 
         return dn
 

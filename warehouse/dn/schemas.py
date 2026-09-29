@@ -36,6 +36,82 @@ dn_detail_fields = {
 
 dn_detail_model = api_ns.model('DNDetail', dn_detail_fields)
 
+# --------------------------------------------
+# 海外件：报关快照 / 箱子 / 出口单证
+# --------------------------------------------
+
+dn_package_model = api_ns.model('DNPackage', {
+    'package_no': fields.Integer(description='Package number (1..99, consecutive)'),
+    'gross_weight_kg': fields.Float(description='Gross weight in kg (0.01 - 999.999, 3 decimals)'),
+    'length_mm': fields.Integer(description='Length in mm (1 - 3000)'),
+    'width_mm': fields.Integer(description='Width in mm (1 - 3000)'),
+    'height_mm': fields.Integer(description='Height in mm (1 - 3000)'),
+    'remark': fields.String(description='Remark'),
+})
+
+dn_packages_input_model = api_ns.model('DNPackagesInput', {
+    'packages': fields.List(fields.Nested(dn_package_model), required=True,
+                            description='All packages of the DN (full replacement, 1 - 99 items)'),
+})
+
+dn_packages_result_model = api_ns.model('DNPackagesResult', {
+    'packages': fields.List(fields.Nested(dn_package_model)),
+    'voided_documents': fields.List(fields.Integer, description='IDs of customs documents voided by this change'),
+})
+
+dn_document_meta_model = api_ns.model('DNCustomsDocument', {
+    'id': fields.Integer(readOnly=True),
+    'dn_id': fields.Integer(readOnly=True),
+    'doc_type': fields.String(enum=['commercial_invoice', 'packing_list']),
+    'version': fields.Integer(),
+    'document_number': fields.String(),
+    'invoice_date': fields.String(
+        attribute=lambda x: x.invoice_date.isoformat() if getattr(x, 'invoice_date', None) else None,
+        description='YYYY-MM-DD (DOCUMENT_TIMEZONE)'),
+    'issued_at': fields.DateTime(),
+    'issued_by': fields.Integer(description='User ID of the issuer'),
+    'status': fields.String(enum=['issued', 'void']),
+    'sha256': fields.String(description='SHA-256 of the PDF file'),
+    'size_bytes': fields.Integer(),
+    'file_name': fields.String(),
+    'voided_at': fields.DateTime(),
+    'void_reason': fields.String(description='packages_changed / customs_changed / data_changed'),
+})
+
+dn_customs_consignee_model = api_ns.model('DNCustomsConsignee', {
+    'name': fields.String(), 'company': fields.String(),
+    'address_line1': fields.String(), 'address_line2': fields.String(),
+    'city': fields.String(), 'state': fields.String(), 'postal_code': fields.String(),
+    'country': fields.String(description='ISO 3166-1 alpha-2'), 'phone': fields.String(),
+})
+
+dn_customs_line_model = api_ns.model('DNCustomsLine', {
+    'goods_code': fields.String(required=True, description='Must match a goods code in the DN details'),
+    'quantity': fields.Integer(description='Ordered quantity (recorded only; invoice uses packed quantity)'),
+    'unit_value': fields.Float(description='Unit value in the invoice currency'),
+    'total_value': fields.Float(description='Recorded only'),
+    'description_en': fields.String(description='English description (ASCII)'),
+    'hs_code': fields.String(description='HS code, 6 - 10 digits'),
+    'jp_export_code': fields.String(
+        description='Optional 9-digit Japanese export statistics code (first 6 digits = HS); not printed'),
+    'origin_country': fields.String(description='Recorded only; the goods master data is authoritative'),
+    'quantity_unit': fields.String(default='PCS'),
+})
+
+dn_customs_input_model = api_ns.model('DNCustomsInput', {
+    'invoice_number': fields.String(description='Defaults to the DN order_number'),
+    'currency': fields.String(example='JPY'),
+    'incoterm': fields.String(example='DAP'),
+    'export_reason': fields.String(example='SALE'),
+    'recipient_country': fields.String(description='ISO 3166-1 alpha-2; falls back to consignee.country'),
+    'recipient_tax_id': fields.String(),
+    'recipient_tax_id_type': fields.String(
+        description='EORI / PCCC / KR_BRN / CPF / CNPJ / EIN / USCC / TW_UBN / VAT / OTHER'),
+    'freight_charge': fields.Integer(description='Freight printed on the invoice and added to the total'),
+    'consignee': fields.Nested(dn_customs_consignee_model),
+    'lines': fields.List(fields.Nested(dn_customs_line_model)),
+})
+
 # 2) DNDetail 输入模型
 dn_detail_input_fields = generate_input_fields(dn_detail_fields)
 dn_detail_input_model = api_ns.model('DNDetailInput', dn_detail_input_fields)
@@ -114,6 +190,11 @@ dn_fields = {
         ),
         description='Total quantity of goods that has been delivered'
     ),
+    'is_export': fields.Boolean(
+        readOnly=True,
+        attribute=lambda x: x.customs is not None,
+        description='Export shipment (has a customs snapshot)'
+    ),
     
 }
 
@@ -128,7 +209,17 @@ asn_full_fields.update({
     'recipient': fields.Nested(recipient_model, readOnly=True, description='Details of the associated recipient'),
     'carrier': fields.Nested(carrier_model, readOnly=True, description='Details of the associated carrier'),
     'warehouse': fields.Nested(warehouse_model, readOnly=True, description='Details of the associated warehouse'),
-    'details': fields.List(fields.Nested(dn_detail_model), description='List of ASN details')
+    'details': fields.List(fields.Nested(dn_detail_model), description='List of ASN details'),
+    'customs': fields.Raw(
+        readOnly=True,
+        attribute=lambda x: x.customs.to_dict() if x.customs is not None else None,
+        description='Customs snapshot (export shipments only)'
+    ),
+    'packages': fields.List(fields.Nested(dn_package_model), readOnly=True, description='Packages'),
+    'customs_documents': fields.List(
+        fields.Nested(dn_document_meta_model), readOnly=True,
+        description='Customs documents (commercial invoice / packing list), newest first'
+    ),
 })
 
 # 创建完整模型
@@ -145,6 +236,10 @@ dn_input_base_model = api_ns.model('DNInputBase', dn_input_fields)
 # 6) DN 输入模型（可包含明细输入）
 dn_input_model = api_ns.inherit('DNInput', dn_input_base_model, {
     'details': fields.List(fields.Nested(dn_detail_input_model), description='List of DN details'),
+    'customs': fields.Nested(
+        dn_customs_input_model, allow_null=True,
+        description='Customs snapshot for export shipments; omit for domestic shipments'
+    ),
 })
 
 # --------------------------------------------
@@ -173,3 +268,7 @@ dn_monthly_stats_parser.add_argument('recipient_id', type=int, help='Filter by R
 dn_monthly_stats_parser.add_argument('carrier_id', type=int, help='Filter by Carrier ID')
 dn_monthly_stats_parser.add_argument('dn_type', type=str, help='Filter by DN type', choices=DN.DN_TYPES)
 dn_monthly_stats_parser.add_argument('warehouse_id', type=int, help='Filter by Warehouse ID')
+
+dn_customs_documents_parser = reqparse.RequestParser()
+dn_customs_documents_parser.add_argument('status', type=str, choices=('issued', 'void'), location='args',
+                                         help='Filter by document status')

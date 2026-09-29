@@ -1,5 +1,5 @@
 from extensions.db import *
-from extensions.error import BadRequestException
+from extensions.error import BadRequestException, ConflictException
 from extensions.transaction import transactional
 from warehouse.dn.models import DN, DNDetail
 from warehouse.goods.models import Goods
@@ -204,6 +204,36 @@ class DeliveryTaskService:
 
     @staticmethod
     @transactional
+    def save_tracking(task_or_id: int | DeliveryTask, data: dict) -> DeliveryTask:
+        """
+        发货前单独保存运单号（与承运商）：打包录箱子 → 在承运商系统建运单拿到运单号 → 保存 →
+        出单证（商业发票印 AWB No.）→ 完成发货。
+        - 任务 pending / in_progress 可存；DN 已发货或任务已完成 → 409 16065
+        - 已签发的出口单证不自动作废：运单号计入单证数据指纹，重新 issue 时升版本
+        """
+        task = DeliveryTaskService._get_instance(task_or_id)
+        if task.status in ('completed', 'signed') or task.dn.status in ('delivered', 'completed'):
+            raise ConflictException("The shipment has been completed; tracking number is locked.", 16065)
+
+        payload = pick_fields(data or {}, ('tracking_number', 'carrier_id'))
+        if 'tracking_number' in payload:
+            tracking = payload['tracking_number']
+            if tracking is not None and not isinstance(tracking, str):
+                raise BadRequestException("tracking_number must be a string", 40000, field='tracking_number')
+            tracking = (tracking or '').strip() or None
+            if tracking is not None and len(tracking) > 100:
+                raise BadRequestException("tracking_number must not exceed 100 characters", 40000,
+                                          field='tracking_number')
+            task.tracking_number = tracking
+        if payload.get('carrier_id') is not None:
+            carrier_id = require_positive_int(payload['carrier_id'], 'carrier_id', 16044)
+            DNService.assert_company_master_data(task.dn.warehouse.company_id, carrier_id=carrier_id)
+            task.carrier_id = carrier_id
+        db.session.flush()
+        return task
+
+    @staticmethod
+    @transactional
     def delete_task(delivery_id: int):
         """
         删除指定 Delivery（可自行设定状态限制）
@@ -287,6 +317,10 @@ class DeliveryTaskService:
         task = DeliveryTaskService._get_instance(task_or_id)
         if task.status != 'in_progress':
             raise BadRequestException("Cannot complete a non-in-progress Delivery", 16008)
+
+        # 海外件（带报关快照的 DN）必须先有当前有效的商业发票和装箱单 → 否则 409 16069
+        from warehouse.dn.customs_services import CustomsService
+        CustomsService.assert_ready_to_ship(task.dn)
 
         payload = pick_fields(data or {}, (
             'transportation_mode', 'carrier_id', 'tracking_number', 'shipping_cost', 'currency', 'remark',

@@ -2,6 +2,7 @@ from datetime import datetime
 from extensions.db import *
 from extensions.error import BadRequestException, ConflictException
 from extensions.transaction import transactional
+from warehouse.common.export_profile import COMPANY_EXPORT_FIELDS, normalize_export_profile
 from .models import Company
 
 
@@ -65,6 +66,7 @@ class CompanyService:
         """
         创建新 Company
         """
+        export_profile = normalize_export_profile(data, COMPANY_EXPORT_FIELDS)
         new_company = Company(
             name=data['name'],
             email=data.get('email'),
@@ -77,6 +79,9 @@ class CompanyService:
             expired_at=parse_expired_at(data.get('expired_at')),
             created_by=created_by_id
         )
+        # 出口资料只设请求体里给了的字段（country_code 不给时走列默认值）
+        for field, value in export_profile.items():
+            setattr(new_company, field, value)
         db.session.add(new_company)
         # db.session.commit()
         return new_company
@@ -88,6 +93,7 @@ class CompanyService:
         更新 Company 信息
         """
         company = CompanyService.get_company(company_id)
+        export_profile = normalize_export_profile(data, COMPANY_EXPORT_FIELDS)
 
         company.name = data.get('name', company.name)
         company.email = data.get('email', company.email)
@@ -100,6 +106,8 @@ class CompanyService:
             company.is_active = bool(data['is_active'])
         if 'expired_at' in data:
             company.expired_at = parse_expired_at(data['expired_at'])
+        for field, value in export_profile.items():
+            setattr(company, field, value)
 
         # db.session.commit()
         return company

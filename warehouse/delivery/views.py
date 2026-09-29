@@ -10,6 +10,7 @@ from .schemas import (
     delivery_task_model,
     delivery_task_input_model,
     delivery_task_complete_input_model,
+    delivery_task_tracking_input_model,
     delivery_task_signed_input_model,
     delivery_pagination_model,
     delivery_pagination_parser,
@@ -130,6 +131,24 @@ class DeliveryTaskProcess(Resource):
         updated_delivery = DeliveryTaskService.process_task(task, operator_id)
 
         return updated_delivery
+
+
+@api_ns.doc(security="jsonWebToken")
+@api_ns.route('/<int:task_id>/tracking', '/<int:task_id>/tracking/')
+class DeliveryTaskTracking(Resource):
+
+    @permission_required(["all_access","company_all_access","delivery_edit"])
+    @warehouse_required()
+    @api_ns.expect(delivery_task_tracking_input_model)
+    @api_ns.marshal_with(delivery_task_model)
+    def put(self, task_id):
+        """
+        Save the tracking (AWB) number / carrier before completing the delivery.
+        - Allowed while the task is pending / in_progress; shipped → 409 16065
+        - Issued customs documents are not voided; re-issue them to print the AWB (new version)
+        """
+        task = _owned_task(task_id)
+        return DeliveryTaskService.save_tracking(task, api_ns.payload)
 
 
 @api_ns.doc(security="jsonWebToken")

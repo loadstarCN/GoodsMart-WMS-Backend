@@ -33,6 +33,10 @@ warehouse_model = api_ns.model('Warehouse', {
     'zip_code': fields.String(description='Warehouse Zip Code'),
     'phone': fields.String(description='Warehouse Phone'),
     'default_currency': fields.String(description='Default Currency Code (ISO 4217 standard)', default='JPY'),
+    # 出口资料（仓库地址 ≠ 公司地址时印在单证的 Ship From 栏）
+    'address_en': fields.String(description='Warehouse address in English (export documents)'),
+    'country_code': fields.String(description='Country (ISO 3166-1 alpha-2)', default='JP'),
+    'contact_name_en': fields.String(description='Warehouse contact person (English)'),
     'company_id': fields.Integer(required=True, description='ID of the associated company'),
     'manager_id': fields.Integer(description='Manager ID'),
     'is_active': fields.Boolean(description='Is the warehouse active?'),

@@ -92,6 +92,11 @@ delivery_task_model = api_ns.inherit('DeliveryTask', delivery_task_base_model, {
 delivery_task_input_fields = generate_input_fields(delivery_task_base_fields)
 delivery_task_input_model = api_ns.model('DeliveryTaskInput', delivery_task_input_fields)
 
+delivery_task_tracking_input_model = api_ns.model('DeliveryTaskTrackingInput', {
+    'tracking_number': fields.String(description='Tracking / AWB number (empty string or null clears it)'),
+    'carrier_id': fields.Integer(description='Carrier ID (optional)'),
+})
+
 delivery_task_complete_input_model = api_ns.model('DeliveryTaskCompleteInput', {
     'id': fields.Integer(readOnly=True, description='Delivery Task ID'),
     'tracking_number': fields.String(required=True, description='Tracking number'),

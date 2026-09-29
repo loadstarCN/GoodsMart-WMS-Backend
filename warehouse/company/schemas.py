@@ -45,6 +45,15 @@ company_fields = {
     'created_at': fields.DateTime(readOnly=True, description='Creation timestamp'),
     'updated_at': fields.DateTime(readOnly=True, description='Last updated timestamp'),
     'expired_at': fields.DateTime(description='Expiration timestamp'),
+    # 出口资料（商业发票 / 装箱单的 Shipper / Exporter 栏）
+    'legal_name_en': fields.String(description='Legal name in English (export documents)'),
+    'address_en': fields.String(description='Address in English (export documents)'),
+    'country_code': fields.String(description='Country (ISO 3166-1 alpha-2)', default='JP'),
+    'tax_id_label': fields.String(description='Label printed before the tax ID on export documents'),
+    'tax_id': fields.String(description='Exporter tax ID / corporate number'),
+    'export_contact_name': fields.String(description='Export contact person (English)'),
+    'export_signatory_name': fields.String(description='Signatory name printed on export documents'),
+    'export_signatory_title': fields.String(description='Signatory title printed on export documents'),
     'creator': fields.Nested(user_model, readonly=True, description='Creator details')
 }
 

@@ -47,6 +47,9 @@ class Config:
     SCHEDULER_ENABLED = os.getenv('SCHEDULER_ENABLED', 'True') == 'True'
     # 加密敏感系统设置（SMTP 密码等）的 Fernet 密钥；不设则退回数据库内自动生成的密钥（仅混淆）
     SETTINGS_ENCRYPTION_KEY = os.getenv('SETTINGS_ENCRYPTION_KEY')
+    # 出口单证（商业发票 / 装箱单）：单证日期所用时区；可选 TTF 字体（不设用 Helvetica，非拉丁字符退回内置日文 CID 字体）
+    DOCUMENT_TIMEZONE = os.getenv('DOCUMENT_TIMEZONE', 'Asia/Tokyo')
+    CUSTOMS_PDF_FONT_PATH = os.getenv('CUSTOMS_PDF_FONT_PATH') or None
 
 class DevelopmentConfig(Config):
     DEBUG = True # 只在开发环境中启用调试

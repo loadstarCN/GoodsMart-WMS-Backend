@@ -3,17 +3,19 @@ from werkzeug.exceptions import HTTPException
 
 class APIException(Exception):
     """API异常基类"""
-    def __init__(self, message, biz_code, status_code=400, field=None):
+    def __init__(self, message, biz_code, status_code=400, field=None, details=None):
         """
         :param message: 错误消息
         :param biz_code: 业务错误码
         :param status_code: HTTP状态码 (默认400)
         :param field: 相关字段 (可选)
+        :param details: 结构化的附加信息 (可选，dict/list，响应里原样输出为 details)
         """
         super().__init__(message)
         self.biz_code = biz_code
         self.status_code = status_code
         self.field = field
+        self.details = details
         self.message = message
 
     def __str__(self):
@@ -22,38 +24,38 @@ class APIException(Exception):
 # 400 Bad Request
 class BadRequestException(APIException):
     """400 错误"""
-    def __init__(self, message, biz_code=40000, field=None):
-        super().__init__(message, biz_code, 400, field)
+    def __init__(self, message, biz_code=40000, field=None, details=None):
+        super().__init__(message, biz_code, 400, field, details)
 
 # 401 Unauthorized
 class UnauthorizedException(APIException):
     """401 错误"""
-    def __init__(self, message, biz_code=41000, field=None):
-        super().__init__(message, biz_code, 401, field)
+    def __init__(self, message, biz_code=41000, field=None, details=None):
+        super().__init__(message, biz_code, 401, field, details)
 
 # 403 Forbidden
 class ForbiddenException(APIException):
     """403 错误"""
-    def __init__(self, message, biz_code=42000, field=None):
-        super().__init__(message, biz_code, 403, field)
+    def __init__(self, message, biz_code=42000, field=None, details=None):
+        super().__init__(message, biz_code, 403, field, details)
 
 # 404 Not Found
 class NotFoundException(APIException):
     """404 错误"""
-    def __init__(self, message, biz_code=43000, field=None):
-        super().__init__(message, biz_code, 404, field)
+    def __init__(self, message, biz_code=43000, field=None, details=None):
+        super().__init__(message, biz_code, 404, field, details)
 
 # 409 Conflict
 class ConflictException(APIException):
     """409 错误（资源仍被引用 / 状态冲突）"""
-    def __init__(self, message, biz_code=44000, field=None):
-        super().__init__(message, biz_code, 409, field)
+    def __init__(self, message, biz_code=44000, field=None, details=None):
+        super().__init__(message, biz_code, 409, field, details)
 
 # 500 Internal Server Error
 class InternalServerError(APIException):
     """500 错误"""
-    def __init__(self, message, biz_code=50000, field=None):
-        super().__init__(message, biz_code, 500, field)
+    def __init__(self, message, biz_code=50000, field=None, details=None):
+        super().__init__(message, biz_code, 500, field, details)
 
 def register_error_handlers(app):
     app.config['PROPAGATE_EXCEPTIONS'] = True
@@ -69,6 +71,9 @@ def register_error_handlers(app):
         
         if error.field:
             response["field"] = error.field
+
+        if getattr(error, 'details', None) is not None:
+            response["details"] = error.details
         
         if app.config.get('FLASK_ENV') == 'development':
             response["debug"] = {
