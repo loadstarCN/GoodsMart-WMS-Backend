@@ -79,6 +79,15 @@ input_fields['spec_source'] = fields.String(
 )
 goods_input_model = api_ns.model('GoodsInput', input_fields)
 
+# 只改原产国（仓库作业端用，权限比整条商品编辑小）
+goods_origin_country_input_model = api_ns.model('GoodsOriginCountryInput', {
+    'origin_country': fields.String(
+        required=True,
+        description='ISO 3166-1 alpha-2 (e.g. "CN"); "" or null clears it; invalid code -> 400 (10014)',
+    ),
+    'spec_source': input_fields['spec_source'],
+})
+
 # -----------------------------
 # GoodsLocation 模型定义
 # -----------------------------

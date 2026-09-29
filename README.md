@@ -275,7 +275,10 @@ weight, length, width, height or origin country. The payload is a full snapshot 
 
 Goods `origin_country` accepts ISO 3166-1 alpha-2 codes only (upper-cased; empty string clears it;
 anything else → 400 `10014`). There is no default value. `GET /warehouse/goods/?origin_missing=true`
-lists goods without it. The CSV import accepts an optional `origin_country` column (for existing goods,
+lists goods without it. Warehouse operators can set only the origin with
+`PUT /warehouse/goods/<id>/origin-country` (`{"origin_country": "CN" | "" | null, "spec_source"?: ...}`),
+which requires any of `goods_edit`, `sorting_edit` or `packing_edit` and also emits `goods.spec_updated`.
+The CSV import accepts an optional `origin_country` column (for existing goods,
 `append` only fills empty values and `override` only overwrites with non-empty values).
 
 ## Inventory Snapshot

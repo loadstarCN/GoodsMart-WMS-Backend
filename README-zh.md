@@ -271,6 +271,8 @@ payload 是当前值的完整快照（`null` = 未录入）：
 
 商品 `origin_country` 只接受 ISO 3166-1 alpha-2 代码（自动大写；空串 = 清空；其他值 → 400 `10014`），
 没有默认值。`GET /warehouse/goods/?origin_missing=true` 列出未录入原产国的商品。
+仓库作业账号可用 `PUT /warehouse/goods/<id>/origin-country`（`{"origin_country": "CN" | "" | null, "spec_source"?: ...}`）
+只改原产国，需要 `goods_edit`、`sorting_edit`、`packing_edit` 任一权限，同样触发 `goods.spec_updated`。
 CSV 导入支持可选的 `origin_country` 列（已有商品：`append` 只补空白，`override` 只用非空值覆盖）。
 
 ## 库存快照

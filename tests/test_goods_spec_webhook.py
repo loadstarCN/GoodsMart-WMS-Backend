@@ -555,3 +555,145 @@ def test_api_key_webhook_subscriptions(client, access_token):
     assert response.get_json()['webhook_subscriptions'] == []
     response = client.get(f'/api-keys/api-keys/{key_id}', headers=headers)
     assert response.get_json()['webhook_subscriptions'] == []
+
+
+# ---------------------------------------------------------------------------
+# PUT /goods/<id>/origin-country（仓库作业端最小权限）
+# ---------------------------------------------------------------------------
+
+def _permission_key(company_id, permissions):
+    """只带指定权限的公司级 API Key，返回明文"""
+    plain = uuid.uuid4().hex
+    key = APIKey(key=hash_api_key(plain), system_name=f'perm-{uuid.uuid4().hex[:6]}',
+                 permissions=list(permissions))
+    key.company_id = company_id
+    db.session.add(key)
+    db.session.commit()
+    return plain
+
+
+@pytest.mark.parametrize('permission', ['goods_edit', 'sorting_edit', 'packing_edit'])
+def test_origin_country_endpoint_allowed_permissions(client, goods_id, company_ids, permission):
+    with client.application.app_context():
+        plain = _permission_key(company_ids[0], [permission])
+
+    response = client.put(f'/goods/{goods_id}/origin-country', headers={'X-API-KEY': plain},
+                          json={'origin_country': 'cn'})
+    assert response.status_code == 200, response.get_json()
+    assert response.get_json()['origin_country'] == 'CN'
+
+
+def test_origin_country_endpoint_denied_without_permission(client, goods_id, company_ids):
+    with client.application.app_context():
+        read_only = _permission_key(company_ids[0], ['dn_read', 'goods_read', 'asn_read'])
+        packing_only = _permission_key(company_ids[0], ['packing_edit'])
+
+    response = client.put(f'/goods/{goods_id}/origin-country', headers={'X-API-KEY': read_only},
+                          json={'origin_country': 'CN'})
+    assert response.status_code == 403
+
+    # 打包 / 分拣权限只能改原产国，改不了整条商品
+    response = client.put(f'/goods/{goods_id}', headers={'X-API-KEY': packing_only},
+                          json={'origin_country': 'CN', 'name': 'hijack'})
+    assert response.status_code == 403
+
+    with client.application.app_context():
+        goods = db.session.get(Goods, goods_id)
+        assert goods.origin_country is None
+        assert goods.name == 'Sample Goods'
+
+
+def test_origin_country_endpoint_company_scope(client, goods_id, company_ids):
+    with client.application.app_context():
+        other_company = _permission_key(company_ids[1], ['packing_edit'])
+
+    response = client.put(f'/goods/{goods_id}/origin-country', headers={'X-API-KEY': other_company},
+                          json={'origin_country': 'CN'})
+    assert response.status_code == 403
+    response = client.put('/goods/999999/origin-country', headers={'X-API-KEY': other_company},
+                          json={'origin_country': 'CN'})
+    assert response.status_code == 404
+
+
+def test_origin_country_endpoint_staff_role_with_packing_edit(client, goods_id):
+    """PDA 员工账号：角色只有 packing_edit 也能改原产国"""
+    with client.application.app_context():
+        perm = Permission.query.filter_by(name='packing_edit').first() or Permission(name='packing_edit')
+        role = Role(name='packer_test', description='packing only', is_active=True)
+        role.permissions.append(perm)
+        staff = Staff.query.filter_by(user_name='operator').first()
+        staff.roles.append(role)
+        db.session.add(role)
+        db.session.commit()
+        token = create_access_token(identity=staff)
+
+    response = client.put(f'/goods/{goods_id}/origin-country', headers=_auth(token),
+                          json={'origin_country': 'VN'})
+    assert response.status_code == 200, response.get_json()
+    assert response.get_json()['origin_country'] == 'VN'
+
+
+def test_origin_country_endpoint_only_changes_origin_and_emits(client, access_token, goods_id, company_ids):
+    with client.application.app_context():
+        key_id = _make_key(company_ids[0])
+        before = marshal(db.session.get(Goods, goods_id), goods_simple_model)
+
+    # 其他字段即便放进请求体也不会被改
+    response = client.put(f'/goods/{goods_id}/origin-country', headers=_auth(access_token), json={
+        'origin_country': 'th', 'spec_source': 'station', 'name': 'ignored', 'weight': 99,
+    })
+    assert response.status_code == 200, response.get_json()
+    data = response.get_json()
+    assert data['origin_country'] == 'TH'
+    for field in ('code', 'name', 'weight', 'length', 'width', 'height', 'manufacturer'):
+        assert data[field] == before[field], field
+
+    with client.application.app_context():
+        events = _events(key_id)
+        assert len(events) == 1
+        payload = events[0].payload
+        assert payload['changed_fields'] == ['goods_origin_country']
+        assert payload['goods_origin_country'] == 'TH'
+        assert payload['goods_weight_kg'] == pytest.approx(1.2)
+        assert payload['source'] == 'station'
+
+    # 同值再写 → 不发；清空 → 发（覆盖同一条待发送事件），source 退回登录用户的 manual
+    client.put(f'/goods/{goods_id}/origin-country', headers=_auth(access_token), json={'origin_country': 'TH'})
+    response = client.put(f'/goods/{goods_id}/origin-country', headers=_auth(access_token),
+                          json={'origin_country': None})
+    assert response.status_code == 200
+    assert response.get_json()['origin_country'] is None
+    with client.application.app_context():
+        events = _events(key_id)
+        assert len(events) == 1
+        assert events[0].payload['goods_origin_country'] is None
+        assert events[0].payload['source'] == 'manual'
+
+
+def test_origin_country_endpoint_source_defaults_to_api(client, goods_id, company_ids):
+    with client.application.app_context():
+        key_id = _make_key(company_ids[0])
+        plain = _permission_key(company_ids[0], ['sorting_edit'])
+
+    response = client.put(f'/goods/{goods_id}/origin-country', headers={'X-API-KEY': plain},
+                          json={'origin_country': 'KR'})
+    assert response.status_code == 200
+    with client.application.app_context():
+        assert _events(key_id)[0].payload['source'] == 'api'
+
+
+@pytest.mark.parametrize('body', [{'origin_country': 'XX'}, {'origin_country': 1}, {}, {'spec_source': 'station'}])
+def test_origin_country_endpoint_rejects_invalid(client, access_token, goods_id, company_ids, body):
+    with client.application.app_context():
+        key_id = _make_key(company_ids[0])
+        goods = db.session.get(Goods, goods_id)
+        goods.origin_country = 'JP'
+        db.session.commit()
+
+    response = client.put(f'/goods/{goods_id}/origin-country', headers=_auth(access_token), json=body)
+    assert response.status_code == 400
+    assert response.get_json()['code'] == 10014
+
+    with client.application.app_context():
+        assert db.session.get(Goods, goods_id).origin_country == 'JP'
+        assert _events(key_id) == []

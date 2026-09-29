@@ -20,6 +20,7 @@ from .schemas import (
     goods_model,
     goods_location_model,
     goods_input_model,
+    goods_origin_country_input_model,
     goods_pagination_parser,
     goods_location_pagination_parser,
     goods_location_pagination_model,
@@ -153,6 +154,29 @@ class GoodsDetail(Resource):
         get_company_owned(Goods, goods_id)
         GoodsService.delete_goods(goods_id)
         return {"message": "Goods deleted successfully"}, 200
+
+
+@api_ns.doc(security="jsonWebToken")
+@api_ns.route('/<int:goods_id>/origin-country')
+class GoodsOriginCountry(Resource):
+
+    # 最小权限：仓库作业账号（入库分拣 / 打包）看包装「MADE IN」录入原产国，
+    # 不需要整条商品编辑权限（goods_edit）
+    @permission_required(["all_access","company_all_access","goods_edit","sorting_edit","packing_edit"])
+    @api_ns.expect(goods_origin_country_input_model)
+    @api_ns.marshal_with(goods_model)
+    def put(self, goods_id):
+        """Update only the country of origin of a goods"""
+        # 归属校验与商品修改接口相同
+        get_company_owned(Goods, goods_id)
+        data = api_ns.payload
+        if not isinstance(data, dict):
+            raise BadRequestException("Request body must be a JSON object", 10014)
+        if 'origin_country' not in data:
+            raise BadRequestException("origin_country is required (use \"\" or null to clear it)",
+                                      10014, 'origin_country')
+        spec_source = resolve_spec_source(data.get('spec_source'))
+        return GoodsService.update_origin_country(goods_id, data['origin_country'], spec_source=spec_source)
 
 
 # 库位库存（GoodsLocation）只读：数量只能由上架 / 移库 / 下架 / 调整等单据流程变更，

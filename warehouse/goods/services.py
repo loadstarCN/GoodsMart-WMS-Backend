@@ -305,6 +305,22 @@ class GoodsService:
 
     @staticmethod
     @transactional
+    def update_origin_country(goods_id: int, origin_country, spec_source: str = None) -> Goods:
+        """
+        只改商品原产国（仓库作业端入库 / 打包时看包装「MADE IN」录入）。
+
+        :param origin_country: ISO 3166-1 alpha-2；空串 / None = 清空；不合法 400（10014）
+        :param spec_source: 规格来源，缺省按调用方推断
+        :return: 更新后的 Goods 对象
+        """
+        goods = GoodsService.get_goods(goods_id)
+        spec_before = goods_spec_snapshot(goods)
+        goods.origin_country = clean_origin_country(origin_country)
+        _emit_spec_updated(goods, spec_before, spec_source or resolve_spec_source())
+        return goods
+
+    @staticmethod
+    @transactional
     def delete_goods(goods_id: int):
         """
         删除指定的 Goods。
