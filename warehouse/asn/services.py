@@ -8,7 +8,7 @@ from extensions.transaction import transactional
 from warehouse.common import require_positive_int, require_fields
 from warehouse.carrier.models import Carrier
 from warehouse.goods.models import Goods
-from warehouse.goods.services import GoodsService
+from warehouse.goods.services import GoodsService, goods_spec_snapshot
 from warehouse.inventory.services import InventoryService
 from warehouse.supplier.models import Supplier
 from warehouse.warehouse.models import Warehouse
@@ -600,21 +600,15 @@ class ASNService:
 
     @staticmethod
     def _goods_spec_payload(goods) -> dict:
-        """asn.completed 明细附带的商品主数据规格（单件）
+        """asn.completed 明细附带的商品主数据规格（单件）与原产国
 
-        分拣站（Station）在完成分拣任务之前把称重/测量结果写进商品主数据，
-        所以这里读到的就是本次入库刚测出的值。单位写进字段名，避免订阅方误读：
-        重量 kg（Numeric → float，否则 JSON 序列化失败），尺寸 mm。
-        未测量的为 None。
+        分拣站（Station）在完成分拣任务之前把称重/测量结果、原产国写进商品主数据，
+        所以这里读到的就是本次入库刚录入的值。单位写进字段名，避免订阅方误读：
+        重量 kg（Numeric → float，否则 JSON 序列化失败），尺寸 mm；
+        原产国 goods_origin_country 为 ISO 3166-1 alpha-2 大写代码。
+        未录入的为 None。与 goods.spec_updated 用同一份快照口径。
         """
-        if goods is None:
-            return {}
-        return {
-            'goods_weight_kg': float(goods.weight) if goods.weight is not None else None,
-            'goods_length_mm': goods.length,
-            'goods_width_mm': goods.width,
-            'goods_height_mm': goods.height,
-        }
+        return goods_spec_snapshot(goods)
 
     @staticmethod
     @transactional

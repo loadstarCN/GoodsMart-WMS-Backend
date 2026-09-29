@@ -21,6 +21,9 @@ class WebhookEvent(db.Model):
     )
     event_type = db.Column(db.String(50), nullable=False, index=True)
     payload = db.Column(JSON, nullable=False)
+    # 覆盖键：同一 Key、同类型、同 dedupe_key 的待发送事件只保留一条（新 payload 覆盖旧的），
+    # 如 goods.spec_updated 用 goods:<id>。空值 = 不合并（单据类事件）
+    dedupe_key = db.Column(db.String(100), nullable=True, index=True)
 
     # pending / sent / failed
     status = db.Column(db.String(20), nullable=False, default='pending', index=True)

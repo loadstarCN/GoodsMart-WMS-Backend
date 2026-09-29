@@ -16,6 +16,10 @@ api_key_create_model = api_ns.model('APIKeyCreate', {
     'is_active': fields.Boolean(description='Whether the API Key is active'),
     'webhook_url': fields.String(description='Webhook callback URL (https only in production)'),
     'webhook_secret': fields.String(description='Webhook HMAC-SHA256 signing secret (write-only; empty keeps current)'),
+    'webhook_subscriptions': fields.List(
+        fields.String,
+        description='Subscribed company-wide events (currently only "goods.spec_updated"); omit to keep current',
+    ),
 })
 
 # -----------------------------
@@ -31,6 +35,7 @@ api_key_model = api_ns.model('APIKey', {
     'company_id': fields.Integer(description='Company ID'),
     'webhook_url': fields.String(description='Webhook callback URL'),
     'has_webhook_secret': fields.Boolean(readonly=True, description='Whether a webhook secret is configured'),
+    'webhook_subscriptions': fields.List(fields.String, description='Subscribed company-wide events'),
 })
 
 # 创建响应：额外返回一次明文 key

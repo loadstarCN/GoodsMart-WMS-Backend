@@ -69,6 +69,13 @@ class Goods(db.Model):
         nullable=True,
         info={'description': '高度（毫米）'}
     )
+    # 原产国：入库称重时看包装「MADE IN」录入；不设默认值，未录入即为空
+    origin_country = db.Column(
+        db.String(2),
+        nullable=True,
+        index=True,
+        info={'description': '原产国（ISO 3166-1 alpha-2，大写；空=未录入）'}
+    )
     manufacturer = db.Column(
         db.String(255),
         nullable=True,

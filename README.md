@@ -213,6 +213,11 @@ WMS pushes event notifications to external systems via Webhook with HMAC-SHA256 
 | `dn.in_progress` | DN processing started |
 | `dn.delivered` | DN delivered (includes tracking number) |
 | `dn.completed` | DN completed |
+| `goods.spec_updated` | Goods weight / dimensions / country of origin changed (company-wide, subscription required — see below) |
+
+Document events (`asn.*`, `dn.*`) are sent only to the API Key that created the document.
+`asn.completed` details also carry the goods master data: `goods_weight_kg`, `goods_length_mm`,
+`goods_width_mm`, `goods_height_mm` and `goods_origin_country` (ISO 3166-1 alpha-2, `null` = not recorded).
 
 ### Setup
 
@@ -237,7 +242,41 @@ Events are POSTed as JSON with headers:
 - `X-Webhook-Event`: Event type (e.g., `dn.delivered`)
 - `X-Webhook-Signature`: `sha256=<HMAC-SHA256 hex digest>`
 
-Failed deliveries are retried up to 5 times with exponential backoff (1min, 5min, 30min, 2h, 6h).
+Failed deliveries are retried every 30 minutes, up to 10 attempts (`system/webhook/services.py`).
+
+### `goods.spec_updated` (company-wide subscription)
+
+Sent to **every** API Key of the goods' company that is active, has a `webhook_url`, and lists the
+event in `webhook_subscriptions`. Keys not bound to a company never receive it. Subscribe via the
+API Key endpoints (only `goods.spec_updated` is accepted; anything else → 400 `14018`):
+
+```http
+PUT /system/third-party/api-keys/<id>
+{ "webhook_subscriptions": ["goods.spec_updated"] }
+```
+
+The event is recorded (in the same transaction) whenever creating or updating a goods changes any of
+weight, length, width, height or origin country. The payload is a full snapshot of the current values
+(`null` = not recorded):
+
+```json
+{ "goods_code": "4900000000000", "goods_id": 1,
+  "goods_weight_kg": 0.235, "goods_length_mm": 120, "goods_width_mm": 80, "goods_height_mm": 45,
+  "goods_origin_country": "CN",
+  "changed_fields": ["goods_weight_kg", "goods_origin_country"],
+  "source": "station", "changed_at": "2026-01-01T10:00:00+09:00" }
+```
+
+- `source`: `spec_source` from the goods create/update request body (`station` / `manual` / `import` / `api`);
+  otherwise `api` for API Key calls and `manual` for logged-in users. CSV import uses `import`.
+- While an event for the same goods is still pending for a key, a newer change overwrites its payload
+  instead of queueing another one (`dedupe_key = goods:<id>`; `changed_fields` becomes the union).
+- Headers, signatures and retries are the same as for the other events.
+
+Goods `origin_country` accepts ISO 3166-1 alpha-2 codes only (upper-cased; empty string clears it;
+anything else → 400 `10014`). There is no default value. `GET /warehouse/goods/?origin_missing=true`
+lists goods without it. The CSV import accepts an optional `origin_country` column (for existing goods,
+`append` only fills empty values and `override` only overwrites with non-empty values).
 
 ## Inventory Snapshot
 

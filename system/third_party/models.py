@@ -72,6 +72,14 @@ class APIKey(db.Model):
         db.String(128),
         info={'description': 'Webhook HMAC-SHA256 签名密钥'}
     )
+    # 按公司广播的事件（如 goods.spec_updated）只推给订阅了的 Key；
+    # 单据类事件（asn.* / dn.*）仍按单据来源定向推送，不看这里
+    webhook_subscriptions = db.Column(
+        JSON,
+        default=list,
+        server_default=db.text("'[]'"),
+        info={'description': '订阅的广播事件类型列表'}
+    )
 
     # 关系加载策略优化
     user = db.relationship(

@@ -23,6 +23,12 @@ goods_simple_model = api_ns.model('GoodsSimple', {
     'discount_price': fields.Float(description='Discounted Price'),
     'brand': fields.String(description='Brand Information'),
     'manufacturer': fields.String(description='Manufacturer Information'),
+    # 规格与原产国：各单据里嵌套的商品也要带上（称重站据此判断是否已测过）
+    'weight': fields.Float(description='Weight in kilograms'),
+    'length': fields.Integer(description='Length in millimeters'),
+    'width': fields.Integer(description='Width in millimeters'),
+    'height': fields.Integer(description='Height in millimeters'),
+    'origin_country': fields.String(description='Country of origin (ISO 3166-1 alpha-2); null = not recorded'),
 })
 
 
@@ -40,6 +46,10 @@ goods_base_model = api_ns.model('GoodsBase', {
     'length': fields.Integer(description='Length in millimeters'),
     'width': fields.Integer(description='Width in millimeters'),
     'height': fields.Integer(description='Height in millimeters'),
+    'origin_country': fields.String(
+        description='Country of origin (ISO 3166-1 alpha-2, e.g. "CN"); null = not recorded. '
+                    'Input is upper-cased; empty string clears it; invalid code -> 400 (10014)'
+    ),
     'manufacturer': fields.String(description='Manufacturer Information'),
     'brand': fields.String(description='Brand Information'),
     'image_url': fields.String(description='Goods Image URL'),
@@ -61,6 +71,12 @@ goods_base_model = api_ns.model('GoodsBase', {
 
 # 复制基础模型的字段定义，用于构建输入模型
 input_fields = generate_input_fields(goods_base_model)
+# 只写字段：规格变更来源，随 goods.spec_updated 事件推给订阅方（不落库）
+input_fields['spec_source'] = fields.String(
+    description='Source of a spec change for the goods.spec_updated webhook; '
+                'default: "api" for API Key calls, "manual" for logged-in users',
+    enum=['station', 'manual', 'import', 'api'],
+)
 goods_input_model = api_ns.model('GoodsInput', input_fields)
 
 # -----------------------------
@@ -122,6 +138,8 @@ goods_pagination_parser.add_argument('warehouse_id', type=int, help='Filter by W
 goods_pagination_parser.add_argument('keyword', type=str, help='Search by keyword in name, code, manufacturer, category, tags, brand')
 goods_pagination_parser.add_argument('goods_codes', type=lambda s: [code.strip() for code in s.split(',')], help='Goods Codes (comma separated)')
 goods_pagination_parser.add_argument('company_id', type=int, help='Filter by Company ID')
+goods_pagination_parser.add_argument('origin_missing', type=inputs.boolean,
+                                     help='true: only goods without origin_country; false: only goods with it')
 
 
 # GoodsLocation 分页解析器

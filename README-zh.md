@@ -211,6 +211,11 @@ WMS 通过 Webhook 向外部系统推送事件通知，使用 HMAC-SHA256 签名
 | `dn.in_progress` | DN 开始处理 |
 | `dn.delivered` | DN 已发货（含运单号） |
 | `dn.completed` | DN 完成 |
+| `goods.spec_updated` | 商品重量 / 尺寸 / 原产国变更（按公司广播，需订阅，见下文） |
+
+单据类事件（`asn.*`、`dn.*`）只推给创建该单据的 API Key。`asn.completed` 明细另带商品主数据：
+`goods_weight_kg`、`goods_length_mm`、`goods_width_mm`、`goods_height_mm` 与
+`goods_origin_country`（ISO 3166-1 alpha-2，`null` = 未录入）。
 
 ### 配置
 
@@ -235,7 +240,38 @@ WHERE key = 'your-api-key';
 - `X-Webhook-Event`: 事件类型（如 `dn.delivered`）
 - `X-Webhook-Signature`: `sha256=<HMAC-SHA256 十六进制摘要>`
 
-推送失败最多重试 5 次，采用指数退避（1分钟、5分钟、30分钟、2小时、6小时）。
+推送失败每 30 分钟重试一次，最多 10 次（见 `system/webhook/services.py`）。
+
+### `goods.spec_updated`（按公司订阅）
+
+推给商品所属公司下**所有**「启用、配置了 `webhook_url`、且 `webhook_subscriptions` 含该事件」的 API Key；
+未绑定公司的 Key 收不到。通过 API Key 接口订阅（目前只接受 `goods.spec_updated`，其他值 → 400 `14018`）：
+
+```http
+PUT /system/third-party/api-keys/<id>
+{ "webhook_subscriptions": ["goods.spec_updated"] }
+```
+
+新建 / 修改商品时，重量、长、宽、高、原产国任一发生变化，就在同一事务里记录该事件。
+payload 是当前值的完整快照（`null` = 未录入）：
+
+```json
+{ "goods_code": "4900000000000", "goods_id": 1,
+  "goods_weight_kg": 0.235, "goods_length_mm": 120, "goods_width_mm": 80, "goods_height_mm": 45,
+  "goods_origin_country": "CN",
+  "changed_fields": ["goods_weight_kg", "goods_origin_country"],
+  "source": "station", "changed_at": "2026-01-01T10:00:00+09:00" }
+```
+
+- `source`：取商品新建 / 修改请求体里的 `spec_source`（`station` / `manual` / `import` / `api`）；
+  没传时 API Key 调用为 `api`、登录用户为 `manual`；CSV 导入为 `import`。
+- 同一商品对同一 Key 还有待发送的事件时，新的变更覆盖它的 payload，不再新增
+  （`dedupe_key = goods:<id>`；`changed_fields` 取并集）。
+- 请求头、签名、重试与其他事件相同。
+
+商品 `origin_country` 只接受 ISO 3166-1 alpha-2 代码（自动大写；空串 = 清空；其他值 → 400 `10014`），
+没有默认值。`GET /warehouse/goods/?origin_missing=true` 列出未录入原产国的商品。
+CSV 导入支持可选的 `origin_country` 列（已有商品：`append` 只补空白，`override` 只用非空值覆盖）。
 
 ## 库存快照
 

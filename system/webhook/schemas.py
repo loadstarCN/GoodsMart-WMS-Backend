@@ -21,6 +21,7 @@ EVENT_TYPES = [
     'dn.in_progress',
     'dn.delivered',
     'dn.completed',
+    'goods.spec_updated',
 ]
 
 STATUS_TYPES = ['pending', 'sent', 'failed']
@@ -33,6 +34,7 @@ webhook_event_model = api_ns.model('WebhookEvent', {
     'api_key_id': fields.Integer(description='API Key ID'),
     'event_type': fields.String(description='事件类型', enum=EVENT_TYPES),
     'payload': fields.Raw(description='推送数据'),
+    'dedupe_key': fields.String(description='覆盖键（同键的待发送事件只保留最新一条）'),
     'status': fields.String(description='状态', enum=STATUS_TYPES),
     'attempts': fields.Integer(description='已尝试次数'),
     'next_retry_at': fields.DateTime(description='下次重试时间'),

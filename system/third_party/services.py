@@ -12,6 +12,26 @@ def validate_webhook_url(url):
     from system.webhook.utils import validate_webhook_url as _validate
     return _validate(url)
 
+
+def clean_webhook_subscriptions(subscriptions):
+    """webhook_subscriptions：事件类型字符串列表，只允许白名单里的广播事件；None = 空列表"""
+    from system.webhook.services import SUBSCRIBABLE_EVENT_TYPES  # 延迟导入，原因同上
+
+    if subscriptions is None:
+        return []
+    if not isinstance(subscriptions, list) or not all(isinstance(s, str) for s in subscriptions):
+        raise BadRequestException("webhook_subscriptions must be a list of event types", 14018)
+    cleaned = list(dict.fromkeys(s.strip() for s in subscriptions if s and s.strip()))
+    unknown = [s for s in cleaned if s not in SUBSCRIBABLE_EVENT_TYPES]
+    if unknown:
+        raise BadRequestException(
+            f"Unsupported webhook_subscriptions: {', '.join(unknown)}; "
+            f"allowed: {', '.join(SUBSCRIBABLE_EVENT_TYPES)}",
+            14018,
+        )
+    return cleaned
+
+
 class APIKeyService:
 
     @staticmethod
@@ -106,6 +126,7 @@ class APIKeyService:
         new_api_key.is_active = bool(data.get('is_active', True))
         new_api_key.webhook_url = validate_webhook_url(data.get('webhook_url'))
         new_api_key.webhook_secret = data.get('webhook_secret') or None
+        new_api_key.webhook_subscriptions = clean_webhook_subscriptions(data.get('webhook_subscriptions'))
         db.session.add(new_api_key)
         db.session.flush()
         new_api_key.plain_key = raw_key
@@ -133,6 +154,8 @@ class APIKeyService:
             api_key.webhook_url = validate_webhook_url(data.get('webhook_url'))
         if data.get('webhook_secret'):
             api_key.webhook_secret = data['webhook_secret']
+        if 'webhook_subscriptions' in data:
+            api_key.webhook_subscriptions = clean_webhook_subscriptions(data.get('webhook_subscriptions'))
 
         return api_key
 

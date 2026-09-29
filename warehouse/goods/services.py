@@ -1,11 +1,98 @@
 from datetime import datetime
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from flask import g, has_app_context
 from extensions import db
 from sqlalchemy import or_,func
 from collections import defaultdict
 from extensions.db import get_object_or_404
+from extensions.error import BadRequestException
 from extensions.transaction import transactional
+from system.webhook.services import emit_company_event
+from warehouse.common.countries import normalize_country, is_valid_country
 from warehouse.location.models import Location
 from .models import Goods, GoodsLocation
+
+# 同步给订阅方的商品规格：模型字段 → payload 键（单位写进键名：重量 kg、尺寸 mm）
+SPEC_FIELDS = (
+    ('weight', 'goods_weight_kg'),
+    ('length', 'goods_length_mm'),
+    ('width', 'goods_width_mm'),
+    ('height', 'goods_height_mm'),
+    ('origin_country', 'goods_origin_country'),
+)
+# 规格变更来源（goods.spec_updated 的 source）
+SPEC_SOURCES = ('station', 'manual', 'import', 'api')
+SPEC_UPDATED_EVENT = 'goods.spec_updated'
+
+
+def clean_origin_country(value, field='origin_country'):
+    """原产国入参：None / 空串 = 清空（返回 None）；其余去空白、大写，必须是有效的
+    ISO 3166-1 alpha-2 代码，否则 400（10014）。不做任何默认值。"""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise BadRequestException(f"{field} must be an ISO 3166-1 alpha-2 country code", 10014, field)
+    code = normalize_country(value)
+    if not code:
+        return None
+    if not is_valid_country(code):
+        raise BadRequestException(f"Invalid {field}: '{value}' is not an ISO 3166-1 alpha-2 country code",
+                                  10014, field)
+    return code
+
+
+def resolve_spec_source(requested=None):
+    """规格变更来源：请求体 spec_source（station / manual / import / api）优先；
+    没传或不认识的值 → API Key 调用 = api，登录用户（及其他）= manual"""
+    if isinstance(requested, str) and requested.strip().lower() in SPEC_SOURCES:
+        return requested.strip().lower()
+    system = g.get('current_system') if has_app_context() else None
+    if system and system.get('api_key') is not None:
+        return 'api'
+    return 'manual'
+
+
+def _spec_number(value, exp):
+    """按数据库列的精度规范化（重量 3 位小数、尺寸整数），用于前后比较与 payload 输出。
+    转不了的值原样返回（交给数据库报错）。"""
+    if value is None:
+        return None
+    try:
+        return Decimal(str(value)).quantize(exp, rounding=ROUND_HALF_UP)
+    except (InvalidOperation, ValueError, TypeError):
+        return value
+
+
+def goods_spec_snapshot(goods) -> dict:
+    """商品规格快照（payload 形态）：重量 float kg、尺寸 int mm、原产国大写代码；None = 未录入"""
+    if goods is None:
+        return {}
+    weight = _spec_number(goods.weight, Decimal('0.001'))
+    snapshot = {'goods_weight_kg': float(weight) if isinstance(weight, Decimal) else weight}
+    for attr in ('length', 'width', 'height'):
+        value = _spec_number(getattr(goods, attr), Decimal('1'))
+        snapshot[f'goods_{attr}_mm'] = int(value) if isinstance(value, Decimal) else value
+    snapshot['goods_origin_country'] = goods.origin_country or None
+    return snapshot
+
+
+def _emit_spec_updated(goods, before: dict, source: str):
+    """前后快照有差异 → 在当前事务里记 goods.spec_updated（按公司广播，同一商品待发送的只留最新）"""
+    after = goods_spec_snapshot(goods)
+    changed = [key for _, key in SPEC_FIELDS if before.get(key) != after.get(key)]
+    if not changed:
+        return
+    db.session.flush()  # 新建的商品要先拿到 id
+    payload = {
+        'goods_code': goods.code,
+        'goods_id': goods.id,
+        **after,
+        'changed_fields': changed,
+        'source': source,
+        'changed_at': datetime.now().astimezone().isoformat(timespec='seconds'),
+    }
+    emit_company_event(SPEC_UPDATED_EVENT, payload, goods.company_id, dedupe_key=f'goods:{goods.id}')
+
 
 class GoodsService:
     """
@@ -82,6 +169,12 @@ class GoodsService:
         if filters.get('company_id'):
             query = query.filter(Goods.company_id == filters['company_id'])
 
+        # 原产国未录入 / 已录入
+        if filters.get('origin_missing') is True:
+            query = query.filter(or_(Goods.origin_country.is_(None), Goods.origin_country == ''))
+        elif filters.get('origin_missing') is False:
+            query = query.filter(Goods.origin_country.isnot(None), Goods.origin_country != '')
+
         if filters.get('keyword'):
             keyword = filters['keyword']
             query = query.filter(
@@ -103,12 +196,13 @@ class GoodsService:
 
     @staticmethod
     @transactional
-    def create_goods(data: dict, created_by_id: int) -> Goods:
+    def create_goods(data: dict, created_by_id: int, spec_source: str = None) -> Goods:
         """
         创建一个新的 Goods。
 
         :param data: Goods 数据
         :param created_by_id: 当前用户 ID
+        :param spec_source: 规格来源（station / manual / import / api），缺省按调用方推断
         :return: 新创建的 Goods 对象
         """
 
@@ -126,6 +220,7 @@ class GoodsService:
             length=data.get('length'),
             width=data.get('width'),
             height=data.get('height'),
+            origin_country=clean_origin_country(data.get('origin_country')),
             manufacturer=data.get('manufacturer'),
             brand=data.get('brand'),
             image_url=data.get('image_url'),
@@ -142,6 +237,8 @@ class GoodsService:
             created_by=created_by_id
         )
         db.session.add(new_goods)
+        # 新建即带规格（重量 / 尺寸 / 原产国任一有值）→ 通知订阅方
+        _emit_spec_updated(new_goods, {}, spec_source or resolve_spec_source())
         # db.session.commit()
         return new_goods
 
@@ -165,15 +262,17 @@ class GoodsService:
 
     @staticmethod
     @transactional
-    def update_goods(goods_id: int, data: dict) -> Goods:
+    def update_goods(goods_id: int, data: dict, spec_source: str = None) -> Goods:
         """
         更新指定的 Goods 记录。
 
         :param goods_id: 待更新的 Goods ID
         :param data: 要更新的字段
+        :param spec_source: 规格来源（station / manual / import / api），缺省按调用方推断
         :return: 更新后的 Goods 对象
         """
         goods = GoodsService.get_goods(goods_id)
+        spec_before = goods_spec_snapshot(goods)
         
         goods.code = data.get('code', goods.code)
         goods.name = data.get('name', goods.name)
@@ -183,6 +282,8 @@ class GoodsService:
         goods.length = data.get('length', goods.length)
         goods.width = data.get('width', goods.width)
         goods.height = data.get('height', goods.height)
+        if 'origin_country' in data:
+            goods.origin_country = clean_origin_country(data['origin_country'])
         goods.manufacturer = data.get('manufacturer', goods.manufacturer)
         goods.brand = data.get('brand', goods.brand)
         goods.image_url = data.get('image_url', goods.image_url)
@@ -196,6 +297,8 @@ class GoodsService:
         goods.production_date = data.get('production_date', goods.production_date)
         goods.extra_data = data.get('extra_data', goods.extra_data)
         goods.is_active = data.get('is_active', goods.is_active)
+
+        _emit_spec_updated(goods, spec_before, spec_source or resolve_spec_source())
 
         # db.session.commit()
         return goods
@@ -212,10 +315,15 @@ class GoodsService:
 
     @staticmethod
     @transactional
-    def bulk_create_goods(data: list, created_by_id: int, override_mode: str = 'skip') -> list:
+    def bulk_create_goods(data: list, created_by_id: int, override_mode: str = 'skip',
+                          spec_source: str = 'import') -> list:
         """
         四策略批量创建逻辑[6,7](@ref)
         :param override_mode: 处理策略（skip|active|append|override）
+        :param spec_source: 规格变更来源（goods.spec_updated 的 source），CSV 导入为 import
+
+        原产国（origin_country）对已有商品：append 只补空白；override 只在导入值非空时覆盖——
+        导入永远不会清空已录入的原产国（清空只能在商品编辑里手工做）。
         """
         new_goods = []
         # 可更新字段白名单（排除code/company_id）
@@ -240,7 +348,7 @@ class GoodsService:
 
             if not existing:
                 # 新增记录逻辑
-                new_goods.append(GoodsService.create_goods(goods_data, created_by_id))                
+                new_goods.append(GoodsService.create_goods(goods_data, created_by_id, spec_source=spec_source))
                 continue
                 
             # 策略处理分支
@@ -255,6 +363,7 @@ class GoodsService:
                 new_goods.append(existing)
                 
             elif override_mode == 'append':
+                spec_before = goods_spec_snapshot(existing)
                 for field in updatable_fields:
                     new_val = goods_data.get(field)
                     current_val = getattr(existing, field)
@@ -266,6 +375,10 @@ class GoodsService:
                     # 仅当原字段为空且新值有效时更新
                     if is_current_empty and is_new_valid:
                         setattr(existing, field, new_val)
+                origin_country = clean_origin_country(goods_data.get('origin_country'))
+                if origin_country and not existing.origin_country:
+                    existing.origin_country = origin_country
+                _emit_spec_updated(existing, spec_before, spec_source)
                 existing.is_active = True
                 existing.updated_at = datetime.now()
                 db.session.add(existing)
@@ -273,8 +386,13 @@ class GoodsService:
                 
             elif override_mode == 'override':
                 # 全量字段覆盖
+                spec_before = goods_spec_snapshot(existing)
                 for field in updatable_fields:
                     setattr(existing, field, goods_data.get(field))
+                origin_country = clean_origin_country(goods_data.get('origin_country'))
+                if origin_country:
+                    existing.origin_country = origin_country
+                _emit_spec_updated(existing, spec_before, spec_source)
                 existing.is_active = True
                 existing.updated_at = datetime.now()
                 db.session.add(existing)

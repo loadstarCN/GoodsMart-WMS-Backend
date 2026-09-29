@@ -95,7 +95,9 @@ class WebhookEventRetry(Resource):
     @api_ns.marshal_with(webhook_event_model)
     def post(self, event_id):
         """手动重试推送单个 Webhook 事件"""
-        event = WebhookEvent.query.get_or_404(event_id)
+        # 加行锁：与定时推送、广播事件的待发送覆盖互斥（见 services.push_pending_events）
+        event = WebhookEvent.query.filter(WebhookEvent.id == event_id) \
+            .with_for_update().populate_existing().first_or_404()
         _enforce_event_company_scope(event)
 
         if event.status == 'sent':

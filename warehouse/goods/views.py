@@ -28,7 +28,7 @@ from .schemas import (
     goods_bulk_upload_parser,
 )
 
-from .services import GoodsService, GoodsLocationService
+from .services import GoodsService, GoodsLocationService, clean_origin_country, resolve_spec_source
 
 
 def _parse_csv_number(row, column, line_num):
@@ -40,6 +40,15 @@ def _parse_csv_number(row, column, line_num):
         return float(Decimal(raw))
     except (InvalidOperation, ValueError):
         raise BadRequestException(f"Row {line_num}: invalid number for '{column}': {raw}", 10012)
+
+
+def _parse_csv_origin_country(row, line_num):
+    """CSV 的 origin_country 列：空 → None；不是有效 ISO 3166-1 alpha-2 → 400（10014）"""
+    raw = (row.get('origin_country') or '').strip()
+    try:
+        return clean_origin_country(raw)
+    except BadRequestException:
+        raise BadRequestException(f"Row {line_num}: invalid origin_country: {raw}", 10014, 'origin_country')
 
 
 @api_ns.doc(security="jsonWebToken")
@@ -77,6 +86,7 @@ class GoodsList(Resource):
             'production_date_max': args.get('production_date_max'),
             'keyword': args.get('keyword'),
             'goods_codes': args.get('goods_codes'),
+            'origin_missing': args.get('origin_missing'),
             # 商品是公司级主数据：员工 / 公司级 API Key 强制只看本公司
             'company_id': get_actor_company_id() or args.get('company_id'),
         }
@@ -97,7 +107,8 @@ class GoodsList(Resource):
             data['company_id'] = actor_company_id
         require_fields(data, 'company_id', 'code', 'name')
         created_by = require_actor_user_id()
-        return GoodsService.create_goods(data,created_by), 201
+        spec_source = resolve_spec_source(data.pop('spec_source', None))
+        return GoodsService.create_goods(data, created_by, spec_source=spec_source), 201
 
 
 @api_ns.doc(security="jsonWebToken")
@@ -133,7 +144,8 @@ class GoodsDetail(Resource):
         get_company_owned(Goods, goods_id)
         # 归属公司不允许通过更新接口迁移
         data.pop('company_id', None)
-        return GoodsService.update_goods(goods_id, data)
+        spec_source = resolve_spec_source(data.pop('spec_source', None))
+        return GoodsService.update_goods(goods_id, data, spec_source=spec_source)
 
     @permission_required(["all_access","company_all_access","goods_delete"])
     def delete(self, goods_id):
@@ -266,6 +278,7 @@ class GoodsBulkUpload(Resource):
                 'length': _parse_csv_number(row, 'length', line_num),
                 'width': _parse_csv_number(row, 'width', line_num),
                 'height': _parse_csv_number(row, 'height', line_num),
+                'origin_country': _parse_csv_origin_country(row, line_num),
 
                 # 品牌信息
                 'manufacturer': row.get('manufacturer'),
@@ -297,7 +310,8 @@ class GoodsBulkUpload(Resource):
 
         # 批量创建商品
         created_by = require_actor_user_id()
-        new_goods_list = GoodsService.bulk_create_goods(goods_data, created_by, override_mode=overwrite_mode)
+        new_goods_list = GoodsService.bulk_create_goods(goods_data, created_by, override_mode=overwrite_mode,
+                                                        spec_source='import')
 
         return {
             "message": f"Bulk upload successful. Processed {len(new_goods_list)} goods."
