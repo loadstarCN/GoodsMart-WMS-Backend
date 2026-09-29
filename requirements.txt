@@ -43,6 +43,7 @@ mdurl==0.1.2
 ordered-set==4.1.0
 oss2==2.19.1
 packaging==25.0
+pillow==12.3.0
 pluggy==1.6.0
 psycopg2==2.9.10
 pycparser==2.22
@@ -55,6 +56,7 @@ python-dotenv==1.1.1
 pytz==2025.2
 redis==6.2.0
 referencing==0.36.2
+reportlab==5.0.1
 requests==2.32.4
 rich==13.9.4
 rpds-py==0.25.1

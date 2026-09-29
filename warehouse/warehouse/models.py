@@ -48,6 +48,24 @@ class Warehouse(db.Model):
         default='JPY',
         info={'description': '默认货币代码（ISO 4217标准）'}
     )
+    # ---- 出口资料（仓库地址 ≠ 公司地址时印在单证的 Ship From 栏）----
+    address_en = db.Column(
+        db.String(500),
+        nullable=True,
+        info={'description': '英文地址（出口单证用）'}
+    )
+    country_code = db.Column(
+        db.String(2),
+        nullable=True,
+        default='JP',
+        server_default='JP',
+        info={'description': '所在国家（ISO 3166-1 alpha-2）'}
+    )
+    contact_name_en = db.Column(
+        db.String(100),
+        nullable=True,
+        info={'description': '仓库联系人（英文）'}
+    )
     company_id = db.Column(
         db.Integer, 
         db.ForeignKey('companies.id', ondelete='RESTRICT'),  # 阻止公司删除

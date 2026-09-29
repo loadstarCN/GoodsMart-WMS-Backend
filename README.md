@@ -257,6 +257,122 @@ POST /tasks/task/inventory_snapshot
 Authorization: Bearer <token>
 ```
 
+## Export Shipments: Customs Snapshot, Packages and Documents
+
+For cross-border shipments the WMS keeps a customs snapshot per DN, records the packages, and issues a
+**Commercial Invoice (CI)** and **Packing List (PL)** as PDF (A4, English, generated with
+[reportlab](https://www.reportlab.com/), BSD license). A DN with a customs snapshot is an *export DN*
+(`is_export: true` in DN list / detail and in the DN nested in packing / delivery tasks).
+
+### Exporter profile (company / warehouse)
+
+All exporter data comes from the WMS company / warehouse settings — nothing is hard-coded.
+
+| Entity | Fields |
+|--------|--------|
+| Company (`PUT /warehouse/company/<id>`) | `legal_name_en`, `address_en`, `country_code` (ISO 3166-1 alpha-2, default `JP`), `tax_id_label`, `tax_id`, `export_contact_name`, `export_signatory_name`, `export_signatory_title` |
+| Warehouse (`PUT /warehouse/warehouse/<id>`) | `address_en`, `country_code`, `contact_name_en` (printed as *Ship From* when it differs from the company address) |
+
+Invalid `country_code` → 400 `14020`; text longer than the column → 400 `14019`.
+
+### Customs snapshot
+
+`POST /warehouse/dn/` accepts a top-level `customs` object (omit it for domestic shipments);
+`PUT /warehouse/dn/<id>/customs` replaces it (permission `dn_edit`, not allowed after shipping).
+
+```json
+{ "invoice_number": "INV-0001", "currency": "JPY", "incoterm": "DAP", "export_reason": "SALE",
+  "recipient_country": "DE", "recipient_tax_id": "DE123456789", "recipient_tax_id_type": "EORI",
+  "freight_charge": 8200,
+  "consignee": { "name": "...", "company": "...", "address_line1": "...", "address_line2": null,
+                 "city": "...", "state": null, "postal_code": "...", "country": "DE", "phone": "..." },
+  "lines": [ { "goods_code": "4900000000000", "quantity": 3, "unit_value": 1200, "total_value": 3600,
+               "description_en": "Plastic figure", "hs_code": "9503.00", "jp_export_code": "950300000",
+               "origin_country": "CN", "quantity_unit": "PCS" } ] }
+```
+
+- Structure errors are rejected: `customs` not an object, `lines` not an array, wrong field types → 400 `16063`
+  (`details.field`); a line whose `goods_code` is not in the DN details or is duplicated → 400 `16064`.
+- Incomplete content is accepted and reported as `problems` (see below).
+- `invoice_number` defaults to the DN `order_number`. Invoice quantities are always the **packed** quantities
+  (amount = unit value × packed quantity; lines with nothing packed are left out). The country of origin comes
+  from the goods master data (`goods.origin_country`); the value in the line is recorded only.
+- `freight_charge` is printed as a separate *Freight* line and included in the *Total Invoice Value*.
+- `jp_export_code` (optional, 9-digit Japanese export statistics code whose first 6 digits equal the HS code)
+  is stored and returned but not printed on the CI / PL (they print the HS code only).
+- Replacing the snapshot voids the issued documents only when the printed content changes.
+
+`GET /warehouse/dn/<id>/customs` (permission `dn_read` or `packing_read`) returns
+`{dn_id, is_export, locked, customs, lines[], packages[], totals, exporter, problems[], ready, current_documents[], documents_outdated}`.
+
+| Problem (error) | Meaning |
+|-----------------|---------|
+| `NOT_PACKED` | DN is not packed yet (or nothing is packed) |
+| `PACKAGES_MISSING` | No packages recorded |
+| `EXPORTER_PROFILE_INCOMPLETE` | Company `legal_name_en` / `address_en` / phone (warehouse or company) / country missing |
+| `INCOTERM_MISSING`, `EXPORT_REASON_MISSING`, `CURRENCY_INVALID`, `RECIPIENT_COUNTRY_MISSING` | Header data missing |
+| `LINE_MISSING`, `HS_CODE_MISSING`, `DESCRIPTION_MISSING`, `DESCRIPTION_NOT_ASCII`, `ORIGIN_MISSING`, `UNIT_VALUE_MISSING` | Per packed line (HS code: 6–10 digits after removing `.`, spaces and `-`) |
+
+Warnings (do not block): `RECIPIENT_TAX_ID_MISSING`, `NON_LATIN_TEXT`, `NET_WEIGHT_UNKNOWN`, `GROSS_LT_NET`,
+`JP_EXPORT_CODE_MISMATCH` (`jp_export_code` not 9 digits or its first 6 digits differ from the HS code),
+`JP_EXPORT_CODE_MISSING` (JPY invoice total — goods value + freight — above 200,000 and a line has no `jp_export_code`).
+
+### Packages
+
+`GET / PUT /warehouse/dn/<id>/packages` (read: `dn_read` or `packing_read`; write: `packing_edit`).
+The DN must be `picked` or `packed` (otherwise 409 `16067`).
+
+```json
+{ "packages": [ { "package_no": 1, "gross_weight_kg": 3.25, "length_mm": 400, "width_mm": 300, "height_mm": 250, "remark": null } ] }
+→ 200 { "packages": [...], "voided_documents": [12, 13] }
+```
+
+1–99 packages, numbered consecutively from 1 (auto-numbered when omitted); gross weight 0.01–999.999 kg
+(3 decimals); dimensions 1–3000 mm (integers). Invalid data → 400 `16066`. Changing the packages voids
+the issued documents (`void_reason: packages_changed`).
+
+### Documents
+
+| Method | Path | Permission |
+|--------|------|------------|
+| `POST` | `/warehouse/dn/<id>/customs-documents/issue` | `packing_edit` |
+| `GET` | `/warehouse/dn/<id>/customs-documents/?status=issued` | `dn_read` / `packing_read` |
+| `GET` | `/warehouse/dn/<id>/customs-documents/<doc_id>/file` | `dn_read` / `packing_read` |
+
+- `issue` requires: DN `packed`, customs snapshot, at least one package, complete exporter profile and no
+  error-level problems (otherwise 409 `16068` with `details.problems`; not an export DN → 409 `16070`).
+- The CI and PL are issued together and stored in the database (`dn_documents`), final once generated.
+  Issuing again with unchanged data returns the current version (200); if the data changed (including the
+  AWB / tracking number) the old version is voided and a new version is issued (201).
+- `file` returns `application/pdf` inline with the header `X-Content-SHA256`.
+- The CI prints the AWB number when the delivery task already has a tracking number. Save it before
+  shipping with `PUT /warehouse/delivery/<task_id>/tracking` `{ "tracking_number": "...", "carrier_id": 1 }`
+  (permission `delivery_edit`; 409 `16065` after shipping), then issue again (`documents_outdated: true`
+  in the customs view means the current documents no longer match the data).
+
+### Shipping gate and lock
+
+- Completing the delivery task of an export DN requires a current CI **and** PL → otherwise 409 `16069`.
+  If the tracking number given at completion differs from the saved one, the request wins; the existing
+  documents are still accepted.
+- After the DN is shipped (`delivered` / `completed`) the customs snapshot, packages and documents are locked → 409 `16065`.
+- `dn.delivered` for export DNs additionally carries (domestic payloads are unchanged):
+
+```json
+"customs_documents": [ { "id": 88, "doc_type": "commercial_invoice", "version": 2, "document_number": "INV-0001",
+    "invoice_date": "2026-01-01", "issued_at": "...", "sha256": "...", "size_bytes": 48213,
+    "file_name": "CI_INV-0001_v2.pdf", "download_path": "/warehouse/dn/123/customs-documents/88/file" }, { "...": "packing_list" } ],
+"packages": [ { "package_no": 1, "gross_weight_kg": 3.25, "length_mm": 400, "width_mm": 300, "height_mm": 250 } ],
+"invoice_total": { "currency": "JPY", "goods_value": 45600, "freight": 8200, "total": 53800 }
+```
+
+### Configuration
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `DOCUMENT_TIMEZONE` | `Asia/Tokyo` | Time zone of the invoice date |
+| `CUSTOMS_PDF_FONT_PATH` | (unset) | Optional TTF font for the documents; default Helvetica. Characters the font cannot print (e.g. Japanese) fall back to reportlab's built-in CID font |
+
 ## Deployment
 
 ### Production (Gunicorn)
@@ -290,6 +406,8 @@ stdout_logfile=/var/log/wms-api.out.log
 | Validation | 14000-14999 | 400 | Data format errors |
 | Inventory | 15000-15999 | 400 | Stock-related errors |
 | State | 16000-16999 | 400 | State transition errors |
+
+Business codes of the export-document features: `14019` export profile text too long, `14020` invalid country code, `16063` customs structure invalid, `16064` customs line goods code not in the DN / duplicated, `16065` shipped — customs data / packages / documents locked (409), `16066` invalid packages, `16067` packages cannot be edited in the current DN status (409), `16068` documents cannot be issued yet (409, `details.problems`), `16069` documents required before shipping (409), `16070` not an export DN (409), `16071` document not found (404). Errors may carry a structured `details` object.
 
 ## Related Projects
 

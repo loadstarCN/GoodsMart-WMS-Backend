@@ -3,6 +3,7 @@ from extensions.error import BadRequestException
 from extensions.transaction import transactional
 from warehouse.staff.models import Staff
 from warehouse.staff.services import StaffService
+from warehouse.common.export_profile import WAREHOUSE_EXPORT_FIELDS, normalize_export_profile
 from .models import Warehouse
 
 class WarehouseService:
@@ -53,6 +54,7 @@ class WarehouseService:
         """
         创建新 Warehouse
         """
+        export_profile = normalize_export_profile(data, WAREHOUSE_EXPORT_FIELDS)
         manager_id = data.get('manager_id')
         manager = None  # 显式初始化
         if manager_id:
@@ -72,6 +74,9 @@ class WarehouseService:
             is_active=data.get('is_active', True),
             created_by=created_by_id
         )
+        # 出口资料只设请求体里给了的字段（country_code 不给时走列默认值）
+        for field, value in export_profile.items():
+            setattr(new_warehouse, field, value)
 
         db.session.add(new_warehouse)
         db.session.flush()  # 确保新对象的 ID 被分配
@@ -90,6 +95,7 @@ class WarehouseService:
         更新 Warehouse 信息（company_id 不可变；manager 归属按仓库自己的公司校验）
         """
         warehouse = WarehouseService.get_warehouse(warehouse_id)
+        export_profile = normalize_export_profile(data, WAREHOUSE_EXPORT_FIELDS)
 
         manager = None
         new_manager_id = data.get('manager_id')
@@ -115,6 +121,8 @@ class WarehouseService:
         if 'manager_id' in data:
             warehouse.manager_id = new_manager_id
         warehouse.is_active = data.get('is_active', warehouse.is_active)
+        for field, value in export_profile.items():
+            setattr(warehouse, field, value)
 
         db.session.add(warehouse)
         db.session.flush()  # 确保新对象的 ID 被分配

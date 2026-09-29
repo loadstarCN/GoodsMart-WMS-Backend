@@ -87,6 +87,50 @@ class Company(db.Model):
         info={'description': '账户过期时间'}
     )
 
+    # ---- 出口资料（商业发票 / 装箱单的 Shipper / Exporter 栏）----
+    legal_name_en = db.Column(
+        db.String(255),
+        nullable=True,
+        info={'description': '英文法定名称（出口单证用）'}
+    )
+    address_en = db.Column(
+        db.String(500),
+        nullable=True,
+        info={'description': '英文地址（出口单证用）'}
+    )
+    country_code = db.Column(
+        db.String(2),
+        nullable=True,
+        default='JP',
+        server_default='JP',
+        info={'description': '所在国家（ISO 3166-1 alpha-2）'}
+    )
+    tax_id_label = db.Column(
+        db.String(40),
+        nullable=True,
+        info={'description': '税号在单证上的标签（如 Corporate No.）'}
+    )
+    tax_id = db.Column(
+        db.String(40),
+        nullable=True,
+        info={'description': '出口方税号 / 法人编号'}
+    )
+    export_contact_name = db.Column(
+        db.String(100),
+        nullable=True,
+        info={'description': '出口联系人（英文）'}
+    )
+    export_signatory_name = db.Column(
+        db.String(100),
+        nullable=True,
+        info={'description': '单证签字人姓名（英文）'}
+    )
+    export_signatory_title = db.Column(
+        db.String(100),
+        nullable=True,
+        info={'description': '单证签字人职务（英文）'}
+    )
+
     # 关系加载优化
     creator = db.relationship(
         'User', 
