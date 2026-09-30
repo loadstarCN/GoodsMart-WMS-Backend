@@ -146,15 +146,24 @@ class DeliveryTaskService:
         """
         创建新的 DeliveryTask。只接受白名单字段；status 固定 pending、is_active 固定 True。
         缺 dn_id / recipient_id / shipping_address / expected_shipping_date → 400。
+        DN 有进行中 / 有效 / 结果不明的自动运单（承运商对接）时不能新建（新任务会成为当前发货任务，
+        绕过运单号锁定）→ 409 16078；带的运单号也按自动运单校验（结果不明 16079 / 不一致 16078）。
         """
+        from warehouse.dn.carrier_services import CarrierShipmentService
+        from warehouse.dn.customs_services import CustomsService
+
         payload = pick_fields(data, DELIVERY_CREATE_FIELDS)
         require_fields(payload, 'dn_id', 'recipient_id', 'shipping_address', 'expected_shipping_date')
         dn_id = require_positive_int(payload['dn_id'], 'dn_id', 16044)
         dn = get_object_or_404(DN, dn_id)
+        # 先锁 DN 行：与自动建运单 / 取消串行
+        dn = CustomsService._lock(dn)
         payload = DeliveryTaskService._normalize_payload(payload, dn)
         DeliveryTaskService._assert_shipping_dates(
             payload['expected_shipping_date'], payload.get('actual_shipping_date')
         )
+        CarrierShipmentService.assert_tracking_matches(dn, payload.get('tracking_number'), allow_empty=True)
+        CarrierShipmentService.assert_delivery_tasks_editable(dn, 'added')
 
         new_delivery = DeliveryTask(
             dn_id=dn_id,
@@ -190,7 +199,11 @@ class DeliveryTaskService:
         更新指定 DeliveryTask（completed / signed 后不可改）。
         只接受白名单字段：dn_id 不可改；status / is_active / created_by / *_at
         只经 process / complete / sign 流转，客户端传入一律忽略。
+        运单号：DN 的自动运单结果不明 / 进行中时不能存号码（409 16079）；有有效自动运单时只能是它的号码（16078）。
         """
+        from warehouse.dn.carrier_services import CarrierShipmentService
+        from warehouse.dn.customs_services import CustomsService
+
         delivery = DeliveryTaskService.get_task(delivery_id)
 
         if delivery.status in ('completed', 'signed'):
@@ -198,6 +211,10 @@ class DeliveryTaskService:
 
         payload = pick_fields(data, DELIVERY_UPDATE_FIELDS)
         payload = DeliveryTaskService._normalize_payload(payload, delivery.dn)
+        # 先锁 DN 行再查自动运单：与自动建运单 / 取消串行
+        CustomsService._lock(delivery.dn)
+        if 'tracking_number' in payload:
+            CarrierShipmentService.assert_tracking_matches(delivery.dn, payload['tracking_number'], allow_empty=True)
         DeliveryTaskService._guard_carrier_tracking(delivery, payload)
         DeliveryTaskService._assert_shipping_dates(
             payload.get('expected_shipping_date', delivery.expected_shipping_date),
@@ -226,8 +243,13 @@ class DeliveryTaskService:
         - 任务 pending / in_progress 可存；DN 已发货或任务已完成 → 409 16065
         - 已签发的出口单证不自动作废：运单号计入单证数据指纹，重新 issue 时升版本
         - DN 有有效的自动运单（承运商对接）时，只能存它的号码（清空 / 改成别的 → 409 16078，先取消自动运单）
+        - DN 的自动运单结果不明 / 进行中时不能存号码（409 16079，防止又在承运商网站手工建一张）
         """
+        from warehouse.dn.customs_services import CustomsService
+
         task = DeliveryTaskService._get_instance(task_or_id)
+        # 先锁 DN 行再查自动运单：与自动建运单 / 取消串行（建单流程里调用时 DN 已锁，重复加锁无妨）
+        CustomsService._lock(task.dn)
         if task.status in ('completed', 'signed') or task.dn.status in ('delivered', 'completed'):
             raise ConflictException("The shipment has been completed; tracking number is locked.", 16065)
 
@@ -254,11 +276,18 @@ class DeliveryTaskService:
     @transactional
     def delete_task(delivery_id: int):
         """
-        删除指定 Delivery（可自行设定状态限制）
+        删除指定 Delivery（只能删 pending 的）。
+        DN 有进行中 / 有效 / 结果不明的自动运单时不能删（运单号在任务上，删了等于绕过锁定）→ 409 16078。
         """
+        from warehouse.dn.carrier_services import CarrierShipmentService
+        from warehouse.dn.customs_services import CustomsService
+
         delivery = DeliveryTaskService.get_task(delivery_id)
         if delivery.status != 'pending':
             raise BadRequestException("Cannot delete a non-pending Delivery", 16002)
+        # 先锁 DN 行：与自动建运单 / 取消串行
+        dn = CustomsService._lock(delivery.dn)
+        CarrierShipmentService.assert_delivery_tasks_editable(dn, 'deleted')
 
         db.session.delete(delivery)
         # db.session.commit()

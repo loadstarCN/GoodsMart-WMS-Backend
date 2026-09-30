@@ -56,6 +56,8 @@ class Config:
     FEDEX_API_KEY = os.getenv('FEDEX_API_KEY') or None
     FEDEX_SECRET_KEY = os.getenv('FEDEX_SECRET_KEY') or None
     FEDEX_ACCOUNT_NUMBER = os.getenv('FEDEX_ACCOUNT_NUMBER') or None
+    # 允许用 FedEx 自动建运单的公司 ID（逗号分隔）。运费记在同一个 FedEx 账号上：不设 = 所有公司都不允许
+    FEDEX_ALLOWED_COMPANY_IDS = os.getenv('FEDEX_ALLOWED_COMPANY_IDS', '')
     FEDEX_SERVICE_TYPE = os.getenv('FEDEX_SERVICE_TYPE', 'INTERNATIONAL_ECONOMY')
     FEDEX_PICKUP_TYPE = os.getenv('FEDEX_PICKUP_TYPE', 'USE_SCHEDULED_PICKUP')
     # 面单打印方式：A4（激光打印机，PDF + PAPER_85X11_TOP_HALF_LABEL）/ THERMAL（4 英寸面单机，PDF + STOCK_4X6）；
@@ -73,6 +75,10 @@ class Config:
     FEDEX_DOCUMENT_API_BASE = os.getenv('FEDEX_DOCUMENT_API_BASE') or None
     FEDEX_CONNECT_TIMEOUT_SECONDS = float(os.getenv('FEDEX_CONNECT_TIMEOUT_SECONDS', 5))
     FEDEX_TIMEOUT_SECONDS = float(os.getenv('FEDEX_TIMEOUT_SECONDS', 30))
+    # 建单总时限（OAuth + ETD 上传 + 建单请求，各次请求的超时按剩余时间收缩）；要小于 worker / 反向代理超时
+    FEDEX_CREATE_BUDGET_SECONDS = float(os.getenv('FEDEX_CREATE_BUDGET_SECONDS', 90))
+    # 建单记录停在 pending 超过这么多分钟按「结果不明」处理（进程被杀等）；实际不短于建单总时限 + 75 秒
+    FEDEX_PENDING_STALE_MINUTES = float(os.getenv('FEDEX_PENDING_STALE_MINUTES', 10))
 
 class DevelopmentConfig(Config):
     DEBUG = True # 只在开发环境中启用调试
@@ -94,6 +100,7 @@ class TestingConfig(Config):
     FEDEX_API_KEY = None
     FEDEX_SECRET_KEY = None
     FEDEX_ACCOUNT_NUMBER = None
+    FEDEX_ALLOWED_COMPANY_IDS = ''
     FEDEX_ETD_ENABLED = False
     SQLALCHEMY_DATABASE_URI = os.getenv('SQLALCHEMY_DATABASE_URI_TEST', 'sqlite:///test.db')  # 数据库连接
     REDIS_URL = os.getenv('REDIS_URL_TEST', 'redis://localhost:6379/0') # REDIS配置

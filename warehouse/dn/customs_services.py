@@ -550,6 +550,9 @@ class CustomsService:
         """PUT 快照：DN 未发货才可；内容有变且已签发单证 → 单证作废（customs_changed）。"""
         dn = CustomsService._lock(dn)
         CustomsService._assert_not_locked(dn)
+        # 有进行中 / 有效 / 结果不明的自动运单：报关数据已随运单提交给承运商 → 409 16076（先取消 / 确认作废）
+        from .carrier_services import CarrierShipmentService
+        CarrierShipmentService.assert_customs_editable(dn)
         if isinstance(raw, dict) and isinstance(raw.get('customs'), dict) and 'lines' not in raw:
             raw = raw['customs']
         codes = {d.goods.code for d in dn.details if d.goods is not None}

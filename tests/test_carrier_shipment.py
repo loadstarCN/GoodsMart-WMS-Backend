@@ -1,4 +1,5 @@
-"""海外 DN 在 FedEx 自动建运单（Ship API + ETD）：前置条件、请求体、写库、错误不写库、补偿取消、取消流程。
+"""海外 DN 在 FedEx 自动建运单（Ship API + ETD）：前置条件、请求体、写库、建单记录状态（pending / failed /
+unknown / dismissed）、补偿取消、取消流程、时间预算、公司白名单、运单号 / 报关 / 发货任务锁定。
 
 FedEx 一律 mock：替换 warehouse.dn.fedex_client._send，不联网。
 """
@@ -13,14 +14,17 @@ import base64
 import hashlib
 import io
 import json
+from datetime import datetime as _datetime, timedelta as _timedelta
 from decimal import Decimal
+from http.client import RemoteDisconnected
 from urllib.parse import urlparse
 
 import pytest
 import requests
+from urllib3.exceptions import MaxRetryError, NewConnectionError, ProtocolError
 
 from warehouse.delivery.services import DeliveryTaskService
-from warehouse.dn import fedex_client
+from warehouse.dn import carrier_services, fedex_client
 from warehouse.dn.carrier_services import CarrierShipmentService
 from warehouse.dn.customs_services import CustomsService
 from warehouse.dn.fedex_shipment import (
@@ -144,10 +148,13 @@ def fedex(client, monkeypatch):
     fake = FakeFedex()
     monkeypatch.setattr(fedex_client, '_send', fake)
     fedex_client.clear_token_cache()
+    with client.application.app_context():
+        company_id = get_company().id
     client.application.config.update(
         FEDEX_API_BASE='https://apis-sandbox.fedex.com',
         FEDEX_API_KEY=API_KEY, FEDEX_SECRET_KEY=SECRET, FEDEX_ACCOUNT_NUMBER=ACCOUNT,
         FEDEX_ETD_ENABLED=False, FEDEX_DUTIES_PAYMENT_TYPE='RECIPIENT',
+        FEDEX_ALLOWED_COMPANY_IDS=f' {company_id} ,',
     )
     yield fake
     fedex_client.clear_token_cache()
@@ -182,6 +189,42 @@ def _counts(client, dn_id):
             'documents': DNDocument.query.filter_by(dn_id=dn_id).count(),
             'tracking': DeliveryTask.query.filter_by(dn_id=dn_id).first().tracking_number,
         }
+
+
+def _records(client, dn_id):
+    """该 DN 的建单记录（按 id）"""
+    with client.application.app_context():
+        return [{
+            'id': r.id, 'status': r.status, 'reason': r.reason, 'tracking_number': r.tracking_number,
+            'transaction_id': r.transaction_id, 'sender_country': r.sender_country,
+            'cancel_transaction_id': r.cancel_transaction_id, 'error_message': r.error_message,
+            'dismissed_by': r.dismissed_by, 'dismissed_at': r.dismissed_at,
+        } for r in DNCarrierShipment.query.filter_by(dn_id=dn_id).order_by(DNCarrierShipment.id)]
+
+
+def _states(client, dn_id):
+    return [(r['status'], r['reason'], r['tracking_number']) for r in _records(client, dn_id)]
+
+
+def _get(client, token, dn_id):
+    return client.get(f'/dn/{dn_id}/carrier-shipment', headers=_h(token)).get_json()
+
+
+def _cancel(client, token, dn_id):
+    return client.post(f'/dn/{dn_id}/carrier-shipment/cancel', headers=_h(token))
+
+
+def _dismiss(client, token, dn_id, body=None):
+    return client.post(f'/dn/{dn_id}/carrier-shipment/dismiss',
+                       json={'confirm': True} if body is None else body, headers=_h(token))
+
+
+def _company_id(client):
+    with client.application.app_context():
+        return get_company().id
+
+
+UNRESOLVED_KEYS = {'id', 'status', 'reason', 'tracking_number', 'transaction_id', 'created_at', 'updated_at'}
 
 
 # ---------------------------------------------------------------------------
@@ -526,16 +569,15 @@ def test_duties_paid_by_sender_has_payor(client, access_token, fedex):
 
 
 # ---------------------------------------------------------------------------
-# FedEx 错误：不写库
+# FedEx 错误：记录 failed（确定没建）/ unknown（结果不明）
 # ---------------------------------------------------------------------------
 
-def test_fedex_error_writes_nothing(client, access_token, fedex):
+def test_fedex_rejection_records_failed(client, access_token, fedex):
     dn_id, _task_id = _ready(client, access_token)
     fedex.set('/ship/v1/shipments', (400, {
         'transactionId': 'tx-err-1',
         'errors': [{'code': 'SHIPMENT.USER.UNAUTHORIZED', 'message': 'Requested account is not authorized.'}],
     }))
-    before = _counts(client, dn_id)
     response = _create(client, access_token, dn_id)
     assert response.status_code == 502
     data = response.get_json()
@@ -544,9 +586,22 @@ def test_fedex_error_writes_nothing(client, access_token, fedex):
     assert data['details']['errors'] == [{'code': 'SHIPMENT.USER.UNAUTHORIZED',
                                           'message': 'Requested account is not authorized.'}]
     assert data['details']['transaction_id'] == 'tx-err-1' and data['details']['http_status'] == 400
+    assert data['details']['maybe_processed'] is False and data['details']['unresolved'] is None
     assert SECRET not in response.get_data(as_text=True) and API_KEY not in response.get_data(as_text=True)
-    # 建单前签发的 CI / PL 也随事务回滚
-    assert _counts(client, dn_id) == before == {'shipments': 0, 'documents': 0, 'tracking': None}
+
+    # 确定没有运单：记录 failed（rejected）留痕；建单前签发的 CI / PL 随 pending 记录已提交，照常有效
+    records = _records(client, dn_id)
+    assert [(r['status'], r['reason'], r['tracking_number'], r['transaction_id']) for r in records] == [
+        ('failed', 'rejected', None, 'tx-err-1')]
+    assert 'SHIPMENT.USER.UNAUTHORIZED' in records[0]['error_message']
+    assert _counts(client, dn_id) == {'shipments': 1, 'documents': 2, 'tracking': None}
+    view = _get(client, access_token, dn_id)
+    assert view['can_create'] is True and view['unresolved'] is None and view['can_dismiss'] is False
+    assert view['shipment'] is None
+
+    # 不挡重试
+    fedex.set('/ship/v1/shipments', (200, _ship_body()))
+    assert _create(client, access_token, dn_id).status_code == 201
 
 
 def test_fedex_permission_error_flagged(client, access_token, fedex):
@@ -555,28 +610,135 @@ def test_fedex_permission_error_flagged(client, access_token, fedex):
         {'code': 'FORBIDDEN.ERROR', 'message': 'We could not authorize your credentials.'}]}))
     response = _create(client, access_token, dn_id)
     assert response.status_code == 502 and response.get_json()['details']['permission_denied'] is True
-    assert _counts(client, dn_id)['shipments'] == 0
+    assert _states(client, dn_id) == [('failed', 'rejected', None)]
 
 
-def test_fedex_timeout_returns_504(client, access_token, fedex):
+def test_fedex_timeout_records_unknown_and_blocks_retry(client, access_token, fedex):
     dn_id, _task_id = _ready(client, access_token)
     fedex.errors['/ship/v1/shipments'] = requests.ReadTimeout('read timed out')
     response = _create(client, access_token, dn_id)
     assert response.status_code == 504
-    assert response.get_json()['code'] == 16074
-    assert response.get_json()['details']['maybe_processed'] is True
-    assert _counts(client, dn_id) == {'shipments': 0, 'documents': 0, 'tracking': None}
+    data = response.get_json()
+    assert data['code'] == 16074 and 'dismiss' in data['message']
+    assert data['details']['maybe_processed'] is True
+    unresolved = data['details']['unresolved']
+    assert set(unresolved) == UNRESOLVED_KEYS
+    assert (unresolved['status'], unresolved['reason'], unresolved['tracking_number']) == ('unknown', 'timeout', None)
+    assert unresolved['created_at'] and unresolved['updated_at']
     assert fedex.of('/ship/v1/shipments/cancel') == []
+    assert _states(client, dn_id) == [('unknown', 'timeout', None)]
+    assert _counts(client, dn_id)['tracking'] is None
+
+    view = _get(client, access_token, dn_id)
+    assert view['unresolved'] == unresolved
+    assert view['can_create'] is False and view['can_dismiss'] is True and view['blockers'] == []
+    assert view['shipment'] is None
+
+    # 结果不明时重试：不再调 FedEx，409 16079
+    del fedex.errors['/ship/v1/shipments']
+    again = _create(client, access_token, dn_id)
+    assert again.status_code == 409 and again.get_json()['code'] == 16079
+    assert again.get_json()['details']['unresolved']['id'] == unresolved['id']
+    assert len(fedex.of('/ship/v1/shipments')) == 1
 
 
-def test_etd_upload_error_writes_nothing(client, access_token, fedex):
+@pytest.mark.parametrize('failure, reason, transaction_id', [
+    ('connection_lost', 'connection_error', None),
+    ('http_500', 'server_error', 'tx-500'),
+    ('http_503_html', 'server_error', None),
+    ('non_json_200', 'bad_response', None),
+    ('no_tracking_200', 'bad_response', 'tx-odd'),
+    ('broken_body', 'connection_error', None),
+])
+def test_unclear_results_recorded_unknown(client, access_token, fedex, failure, reason, transaction_id):
+    dn_id, _task_id = _ready(client, access_token)
+    path = '/ship/v1/shipments'
+    if failure == 'connection_lost':
+        fedex.errors[path] = requests.ConnectionError(
+            ProtocolError('Connection aborted.', RemoteDisconnected('Remote end closed connection')))
+    elif failure == 'http_500':
+        fedex.set(path, (500, {'transactionId': 'tx-500', 'errors': [
+            {'code': 'INTERNAL.SERVER.ERROR', 'message': 'We encountered an unexpected error.'}]}))
+    elif failure == 'http_503_html':
+        fedex.set(path, (503, '<html>Service Unavailable</html>'))
+    elif failure == 'non_json_200':
+        fedex.set(path, (200, '<html>OK</html>'))
+    elif failure == 'no_tracking_200':
+        fedex.set(path, (200, {'transactionId': 'tx-odd', 'output': {'transactionShipments': []}}))
+    else:
+        fedex.errors[path] = requests.exceptions.ChunkedEncodingError('Connection broken: IncompleteRead')
+
+    response = _create(client, access_token, dn_id)
+    assert response.status_code == 502 and response.get_json()['code'] == 16073
+    details = response.get_json()['details']
+    assert details['maybe_processed'] is True
+    assert (details['unresolved']['status'], details['unresolved']['reason']) == ('unknown', reason)
+    assert details['unresolved']['transaction_id'] == transaction_id
+    assert _states(client, dn_id) == [('unknown', reason, None)]
+    assert fedex.of('/ship/v1/shipments/cancel') == []
+    assert _create(client, access_token, dn_id).get_json()['code'] == 16079
+
+
+@pytest.mark.parametrize('failure, status_code', [
+    ('connect_timeout', 504),
+    ('refused', 502),
+    ('token_down', 502),
+])
+def test_requests_not_sent_record_failed(client, access_token, fedex, failure, status_code):
+    dn_id, _task_id = _ready(client, access_token)
+    if failure == 'connect_timeout':
+        fedex.errors['/ship/v1/shipments'] = requests.ConnectTimeout('connect timed out')
+    elif failure == 'refused':
+        fedex.errors['/ship/v1/shipments'] = requests.ConnectionError(MaxRetryError(
+            None, '/ship/v1/shipments', NewConnectionError(None, 'Failed to establish a new connection')))
+    else:
+        fedex.set('/oauth/token', (503, {'errors': [{'code': 'SERVICE.UNAVAILABLE.ERROR', 'message': 'down'}]}))
+    response = _create(client, access_token, dn_id)
+    assert response.status_code == status_code
+    assert response.get_json()['details']['maybe_processed'] is False
+    assert response.get_json()['details']['unresolved'] is None
+    assert _states(client, dn_id) == [('failed', 'not_sent', None)]
+    assert _get(client, access_token, dn_id)['can_create'] is True
+
+
+def test_etd_upload_error_records_failed(client, access_token, fedex):
     client.application.config['FEDEX_ETD_ENABLED'] = True
     dn_id, _task_id = _ready(client, access_token)
     fedex.set('/sandbox/documents/v1/etds/upload', (400, {'errors': [{'code': '1001', 'message': 'bad file'}]}))
     response = _create(client, access_token, dn_id)
     assert response.status_code == 502 and response.get_json()['details']['action'] == 'etd_upload'
+    assert response.get_json()['details']['unresolved'] is None
     assert fedex.of('/ship/v1/shipments') == []
-    assert _counts(client, dn_id)['documents'] == 0
+    assert _states(client, dn_id) == [('failed', 'etd_upload_failed', None)]
+    assert _counts(client, dn_id)['documents'] == 2          # 建单前签发的 CI / PL
+    # ETD 上传超时也不会有运单：failed
+    fedex.errors['/sandbox/documents/v1/etds/upload'] = requests.ReadTimeout('read timed out')
+    assert _create(client, access_token, dn_id).status_code == 504
+    assert _states(client, dn_id)[-1] == ('failed', 'etd_upload_failed', None)
+    assert _get(client, access_token, dn_id)['can_create'] is True
+
+
+def test_pending_record_committed_before_fedex_is_called(client, access_token, fedex, monkeypatch):
+    dn_id, _task_id = _ready(client, access_token)
+    seen = {}
+
+    def spy(method, url, **kwargs):
+        if urlparse(url).path == '/ship/v1/shipments':
+            # 调 FedEx 时没有开着的事务（DN 行锁已释放），pending 记录已落库
+            seen['in_transaction'] = db.session().in_transaction()
+            seen['records'] = [(r.status, r.tracking_number, r.sender_country)
+                               for r in DNCarrierShipment.query.filter_by(dn_id=dn_id)]
+            db.session.rollback()
+        return fedex(method, url, **kwargs)
+    monkeypatch.setattr(fedex_client, '_send', spy)
+
+    response = _create(client, access_token, dn_id)
+    assert response.status_code == 201, response.get_json()
+    assert seen == {'in_transaction': False, 'records': [('pending', None, 'JP')]}
+    records = _records(client, dn_id)
+    assert [(r['status'], r['reason'], r['tracking_number'], r['sender_country']) for r in records] == [
+        ('active', None, '794600000001', 'JP')]
+    assert response.get_json()['unresolved'] is None and response.get_json()['can_dismiss'] is False
 
 
 def test_db_failure_after_create_cancels_shipment(client, access_token, fedex, monkeypatch):
@@ -593,7 +755,202 @@ def test_db_failure_after_create_cancels_shipment(client, access_token, fedex, m
     assert cancels[0]['method'] == 'PUT'
     assert cancels[0]['json'] == {'accountNumber': {'value': ACCOUNT}, 'senderCountryCode': 'JP',
                                   'deletionControl': 'DELETE_ALL_PACKAGES', 'trackingNumber': '794600000001'}
-    assert _counts(client, dn_id) == {'shipments': 0, 'documents': 0, 'tracking': None}
+    # 写库回滚了，但补偿结果独立提交留痕：cancelled（compensated），带运单号
+    records = _records(client, dn_id)
+    assert [(r['status'], r['reason'], r['tracking_number'], r['transaction_id'], r['cancel_transaction_id'])
+            for r in records] == [('cancelled', 'compensated', '794600000001', 'tx-ship-0001', 'tx-cancel-0001')]
+    assert _counts(client, dn_id) == {'shipments': 1, 'documents': 2, 'tracking': None}
+    view = _get(client, access_token, dn_id)
+    assert view['can_create'] is True and view['unresolved'] is None
+    assert (view['shipment']['status'], view['shipment']['reason']) == ('cancelled', 'compensated')
+
+
+@pytest.mark.parametrize('cancel_response', [
+    (500, {'transactionId': 'tx-c-500', 'errors': [{'code': 'INTERNAL.SERVER.ERROR', 'message': 'try later'}]}),
+    (200, {'transactionId': 'tx-c-no', 'output': {'cancelledShipment': False,
+                                                  'alerts': [{'code': 'X', 'message': 'Not cancellable'}]}}),
+    (200, {'transactionId': 'tx-c-none', 'output': {}}),          # 没有明确说取消了：不确定
+])
+def test_compensation_failure_records_unknown_with_tracking(client, access_token, fedex, monkeypatch,
+                                                            cancel_response):
+    dn_id, task_id = _ready(client, access_token)
+    monkeypatch.setattr(CarrierShipmentService, '_store_label',
+                        staticmethod(lambda *a, **k: (_ for _ in ()).throw(RuntimeError('disk full'))))
+    fedex.set('/ship/v1/shipments/cancel', cancel_response)
+    assert _create(client, access_token, dn_id).status_code == 500
+
+    records = _records(client, dn_id)
+    assert [(r['status'], r['reason'], r['tracking_number'], r['transaction_id']) for r in records] == [
+        ('unknown', 'compensation_failed', '794600000001', 'tx-ship-0001')]
+    assert records[0]['error_message']
+    view = _get(client, access_token, dn_id)
+    assert view['unresolved']['tracking_number'] == '794600000001' and view['can_dismiss'] is True
+    assert _counts(client, dn_id)['tracking'] is None
+    labels = client.get(f'/dn/{dn_id}/customs-documents/?doc_type=shipping_label', headers=_h(access_token))
+    assert labels.get_json() == []
+    # 运单可能还在 FedEx 上：不能重建、不能手工存号码
+    assert _create(client, access_token, dn_id).get_json()['code'] == 16079
+    response = client.put(f'/delivery/{task_id}/tracking', json={'tracking_number': '794600000001'},
+                          headers=_h(access_token))
+    assert response.status_code == 409 and response.get_json()['code'] == 16079
+
+
+def test_compensation_accepts_already_cancelled(client, access_token, fedex, monkeypatch):
+    dn_id, _task_id = _ready(client, access_token)
+    monkeypatch.setattr(CarrierShipmentService, '_store_label',
+                        staticmethod(lambda *a, **k: (_ for _ in ()).throw(RuntimeError('disk full'))))
+    fedex.set('/ship/v1/shipments/cancel', (404, {'transactionId': 'tx-c-404', 'errors': [
+        {'code': 'TRACKING.TRACKINGNUMBER.NOTFOUND', 'message': 'Tracking number not found.'}]}))
+    assert _create(client, access_token, dn_id).status_code == 500
+    assert _states(client, dn_id) == [('cancelled', 'compensated', '794600000001')]
+
+
+def test_unparseable_response_with_tracking_is_cancelled(client, access_token, fedex, monkeypatch):
+    dn_id, _task_id = _ready(client, access_token)
+
+    def broken(body):
+        raise ValueError('unexpected document structure')
+    monkeypatch.setattr(carrier_services, 'parse_ship_response', broken)
+    response = _create(client, access_token, dn_id)
+    assert response.status_code == 502 and response.get_json()['code'] == 16073
+    assert response.get_json()['details']['unresolved'] is None
+    assert 'cancelled' in response.get_json()['message']
+    assert fedex.of('/ship/v1/shipments/cancel')[0]['json']['trackingNumber'] == '794600000001'
+    assert _states(client, dn_id) == [('cancelled', 'compensated', '794600000001')]
+
+
+@pytest.mark.parametrize('etd, expected', [(False, ('unknown', 'interrupted')), (True, ('failed', 'interrupted'))])
+def test_worker_interrupted_during_fedex_call(client, access_token, fedex, etd, expected):
+    # gunicorn 超时杀 worker 抛 SystemExit：except Exception 接不住，也要把记录落下来
+    client.application.config['FEDEX_ETD_ENABLED'] = etd
+    dn_id, _task_id = _ready(client, access_token)
+    path = '/sandbox/documents/v1/etds/upload' if etd else '/ship/v1/shipments'
+    fedex.errors[path] = SystemExit(1)
+    with pytest.raises(SystemExit):
+        _create(client, access_token, dn_id)
+    assert [(r['status'], r['reason']) for r in _records(client, dn_id)] == [expected]
+
+
+def test_dismiss_unknown_record(client, access_token, fedex):
+    dn_id, task_id = _ready(client, access_token)
+    fedex.errors['/ship/v1/shipments'] = requests.ReadTimeout('read timed out')
+    unresolved = _create(client, access_token, dn_id).get_json()['details']['unresolved']
+
+    for body in ({}, {'confirm': False}, {'confirm': 'true'}, []):
+        response = _dismiss(client, access_token, dn_id, body)
+        assert response.status_code == 400 and response.get_json()['field'] == 'confirm', body
+    assert _states(client, dn_id) == [('unknown', 'timeout', None)]
+
+    response = _dismiss(client, access_token, dn_id)
+    assert response.status_code == 200, response.get_json()
+    data = response.get_json()
+    assert data['unresolved'] is None and data['can_dismiss'] is False and data['can_create'] is True
+    records = _records(client, dn_id)
+    assert (records[0]['id'], records[0]['status'], records[0]['reason']) == (unresolved['id'], 'dismissed',
+                                                                               'timeout')
+    assert records[0]['dismissed_by'] is not None and records[0]['dismissed_at'] is not None
+
+    again = _dismiss(client, access_token, dn_id)
+    assert again.status_code == 409 and again.get_json()['code'] == 16075
+    assert again.get_json()['details']['unresolved'] is None
+
+    # 确认作废后可以重新建单
+    del fedex.errors['/ship/v1/shipments']
+    assert _create(client, access_token, dn_id).status_code == 201
+    assert [r['status'] for r in _records(client, dn_id)] == ['dismissed', 'active']
+
+
+def test_stale_pending_becomes_dismissable(client, access_token, fedex):
+    dn_id, task_id = _ready(client, access_token)
+    with client.application.app_context():
+        now = _datetime.now()
+        record = DNCarrierShipment(dn_id=dn_id, carrier='fedex', status='pending', sender_country='JP',
+                                   created_at=now, updated_at=now)
+        db.session.add(record)
+        db.session.commit()
+        record_id = record.id
+
+    def set_age(seconds):
+        with client.application.app_context():
+            db.session.get(DNCarrierShipment, record_id).created_at = _datetime.now() - _timedelta(seconds=seconds)
+            db.session.commit()
+
+    # 进行中：不能建单、不能确认作废、不能存运单号
+    view = _get(client, access_token, dn_id)
+    assert (view['unresolved']['status'], view['unresolved']['reason']) == ('pending', None)
+    assert view['can_create'] is False and view['can_dismiss'] is False
+    response = _create(client, access_token, dn_id)
+    assert response.get_json()['code'] == 16079 and 'in progress' in response.get_json()['message']
+    response = _dismiss(client, access_token, dn_id)
+    assert response.status_code == 409 and response.get_json()['code'] == 16075
+    assert response.get_json()['details']['unresolved']['status'] == 'pending'
+    response = client.put(f'/delivery/{task_id}/tracking', json={'tracking_number': 'MANUAL-1'},
+                          headers=_h(access_token))
+    assert response.get_json()['code'] == 16079
+
+    # FEDEX_PENDING_STALE_MINUTES = 1，但不短于 建单时限 90 + 补偿 15 + 余量 60 = 165 秒
+    client.application.config['FEDEX_PENDING_STALE_MINUTES'] = 1
+    set_age(150)
+    assert _get(client, access_token, dn_id)['unresolved']['status'] == 'pending'
+    set_age(170)
+    view = _get(client, access_token, dn_id)
+    assert (view['unresolved']['status'], view['unresolved']['reason']) == ('unknown', 'stale')
+    assert view['can_dismiss'] is True
+    assert _dismiss(client, access_token, dn_id).status_code == 200
+    assert _states(client, dn_id) == [('dismissed', 'stale', None)]
+    assert _create(client, access_token, dn_id).status_code == 201
+
+
+def test_unresolved_locks_tracking_customs_packages_and_tasks(client, access_token, fedex):
+    dn_id, task_id = _ready(client, access_token)
+    fedex.errors['/ship/v1/shipments'] = requests.ReadTimeout('read timed out')
+    assert _create(client, access_token, dn_id).status_code == 504
+
+    # 结果不明时存 / 改运单号 → 16079（防止操作员又在 FedEx 上手工建一张）；清空 / 不带号码照常
+    response = client.put(f'/delivery/{task_id}/tracking', json={'tracking_number': 'MANUAL-1'},
+                          headers=_h(access_token))
+    assert response.status_code == 409 and response.get_json()['code'] == 16079
+    assert response.get_json()['details']['unresolved']['status'] == 'unknown'
+    response = client.put(f'/delivery/{task_id}', json={'tracking_number': 'MANUAL-1'}, headers=_h(access_token))
+    assert response.status_code == 409 and response.get_json()['code'] == 16079
+    response = client.put(f'/delivery/{task_id}', json={'tracking_number': None, 'remark': 'x'},
+                          headers=_h(access_token))
+    assert response.status_code == 200, response.get_json()
+    response = client.put(f'/delivery/{task_id}/tracking', json={'tracking_number': None}, headers=_h(access_token))
+    assert response.status_code == 200, response.get_json()
+
+    # 报关数据 / 箱子（可能已随运单提交）→ 16076
+    response = client.put(f'/dn/{dn_id}/customs', json=_customs(freight_charge=9000), headers=_h(access_token))
+    assert response.status_code == 409 and response.get_json()['code'] == 16076
+    details = response.get_json()['details']
+    assert details['reason'] == 'CARRIER_SHIPMENT_OPEN' and details['carrier_shipment']['status'] == 'unknown'
+    changed = [dict(PACKAGES[0], gross_weight_kg=4.5), PACKAGES[1]]
+    response = client.put(f'/dn/{dn_id}/packages', json={'packages': changed}, headers=_h(access_token))
+    assert response.status_code == 409 and response.get_json()['code'] == 16076
+
+    # 发货任务不能新建 / 删除 → 16078
+    response = client.post('/delivery/', json=_task_body(client, dn_id), headers=_h(access_token))
+    assert response.status_code == 409 and response.get_json()['code'] == 16078
+    assert response.get_json()['details']['status'] == 'unknown'
+    response = client.delete(f'/delivery/{task_id}', headers=_h(access_token))
+    assert response.status_code == 409 and response.get_json()['code'] == 16078
+
+    # 确认作废后都放开
+    assert _dismiss(client, access_token, dn_id).status_code == 200
+    response = client.put(f'/dn/{dn_id}/customs', json=_customs(freight_charge=9000), headers=_h(access_token))
+    assert response.status_code == 200, response.get_json()
+    response = client.put(f'/delivery/{task_id}/tracking', json={'tracking_number': 'MANUAL-1'},
+                          headers=_h(access_token))
+    assert response.status_code == 200, response.get_json()
+
+
+def _task_body(client, dn_id, **extra):
+    with client.application.app_context():
+        recipient_id = get_recipient().id
+    body = {'dn_id': dn_id, 'recipient_id': recipient_id, 'shipping_address': 'Hauptstrasse 1, 10115 Berlin',
+            'expected_shipping_date': _datetime.now().date().isoformat()}
+    body.update(extra)
+    return body
 
 
 # ---------------------------------------------------------------------------
@@ -711,11 +1068,13 @@ def test_token_cached_and_refreshed_on_401(client, access_token, fedex):
 def test_permissions_and_cross_company(client, access_token, access_operator_token, fedex):
     dn_id, _task_id = _ready(client, access_token)
     for method, url in (('get', f'/dn/{dn_id}/carrier-shipment'), ('post', f'/dn/{dn_id}/carrier-shipment'),
-                        ('post', f'/dn/{dn_id}/carrier-shipment/cancel')):
+                        ('post', f'/dn/{dn_id}/carrier-shipment/cancel'),
+                        ('post', f'/dn/{dn_id}/carrier-shipment/dismiss')):
         response = getattr(client, method)(url, headers=_h(access_operator_token))
         assert response.status_code == 403, (method, url)
     headers_b, _warehouse_b = _make_company_b(client, company_admin=True)
-    for method, url in (('get', f'/dn/{dn_id}/carrier-shipment'), ('post', f'/dn/{dn_id}/carrier-shipment')):
+    for method, url in (('get', f'/dn/{dn_id}/carrier-shipment'), ('post', f'/dn/{dn_id}/carrier-shipment'),
+                        ('post', f'/dn/{dn_id}/carrier-shipment/dismiss')):
         assert getattr(client, method)(url, headers=headers_b).status_code == 403
     assert fedex.calls == []
 
@@ -935,3 +1294,215 @@ def test_manual_tracking_allowed_after_cancel(client, access_token, fedex):
     response = client.put(f'/delivery/{task_id}/tracking', json={'tracking_number': 'MANUAL-9'},
                           headers=_h(access_token))
     assert response.status_code == 200 and response.get_json()['tracking_number'] == 'MANUAL-9'
+
+
+# ---------------------------------------------------------------------------
+# 公司白名单 / DDP / 发件国 / 已取消 / 时间预算 / 发货任务与报关锁定
+# ---------------------------------------------------------------------------
+
+def test_company_allow_list(client, access_token, fedex):
+    dn_id, _task_id = _ready(client, access_token)
+    company_id = _company_id(client)
+    for value, codes, enabled in ((None, ['FEDEX_COMPANY_NOT_ALLOWED'], False),
+                                  ('', ['FEDEX_COMPANY_NOT_ALLOWED'], False),
+                                  (f'{company_id + 1000}', ['FEDEX_COMPANY_NOT_ALLOWED'], False),
+                                  (f'abc, {company_id}', ['FEDEX_CONFIG_INVALID'], True)):
+        client.application.config['FEDEX_ALLOWED_COMPANY_IDS'] = value
+        view = _get(client, access_token, dn_id)
+        assert [b['code'] for b in view['blockers']] == codes, value
+        assert view['can_create'] is False and view['enabled'] is enabled, value
+        response = _create(client, access_token, dn_id)
+        assert response.status_code == 409 and _codes(response) == codes
+    assert fedex.calls == []
+
+    # 已建的运单：公司后来被移出名单也能取消
+    client.application.config['FEDEX_ALLOWED_COMPANY_IDS'] = f'{company_id + 1000},{company_id}'
+    assert _get(client, access_token, dn_id)['enabled'] is True
+    assert _create(client, access_token, dn_id).status_code == 201
+    client.application.config['FEDEX_ALLOWED_COMPANY_IDS'] = ''
+    assert _cancel(client, access_token, dn_id).status_code == 200
+
+
+def test_ddp_requires_sender_duties(client, access_token, fedex):
+    dn_id, _task_id = _ready(client, access_token, customs=_customs(incoterm='DDP'))
+    response = _create(client, access_token, dn_id)
+    assert response.status_code == 409 and _codes(response) == ['INCOTERM_DUTIES_MISMATCH']
+    blocker = response.get_json()['details']['blockers'][0]
+    assert blocker['field'] == 'incoterm' and 'FEDEX_DUTIES_PAYMENT_TYPE' in blocker['message']
+    assert fedex.calls == []
+    client.application.config['FEDEX_DUTIES_PAYMENT_TYPE'] = 'SENDER'
+    assert _create(client, access_token, dn_id).status_code == 201
+    assert fedex.ship_request()['requestedShipment']['customsClearanceDetail']['commercialInvoice'][
+        'termsOfSale'] == 'DDP'
+
+
+def test_cancel_uses_sender_country_stored_at_creation(client, access_token, fedex):
+    dn_id, _task_id = _ready(client, access_token)
+    created = _create(client, access_token, dn_id).get_json()['shipment']
+    assert created['sender_country'] == 'JP'
+    # 建单后仓库地址改成别的国家：取消仍用建单时的发件国
+    with client.application.app_context():
+        warehouse = get_warehouse()
+        warehouse.address_en = 'Unit 1, 2 Example Road, Kowloon'
+        warehouse.country_code = 'HK'
+        db.session.commit()
+    assert _cancel(client, access_token, dn_id).status_code == 200
+    assert fedex.of('/ship/v1/shipments/cancel')[0]['json']['senderCountryCode'] == 'JP'
+
+
+def test_cancel_without_stored_sender_country_uses_same_rule_as_create(client, access_token, fedex):
+    dn_id, _task_id = _ready(client, access_token)
+    _create(client, access_token, dn_id)
+    with client.application.app_context():
+        DNCarrierShipment.query.filter_by(dn_id=dn_id).one().sender_country = None     # 迁移前的记录
+        company = get_company()
+        company.country_code = 'JP'
+        warehouse = get_warehouse()
+        warehouse.address_en = None             # 没有仓库英文地址 → 用公司的国家（与建单同一口径）
+        warehouse.country_code = 'HK'
+        db.session.commit()
+    assert _cancel(client, access_token, dn_id).status_code == 200
+    assert fedex.of('/ship/v1/shipments/cancel')[0]['json']['senderCountryCode'] == 'JP'
+
+
+@pytest.mark.parametrize('second_response', [
+    (400, {'transactionId': 'tx-c-2', 'errors': [
+        {'code': 'SHIPMENT.ALREADY.CANCELLED', 'message': 'Shipment has already been cancelled.'}]}),
+    (404, {'transactionId': 'tx-c-2', 'errors': [
+        {'code': 'TRACKING.TRACKINGNUMBER.NOTFOUND', 'message': 'Tracking number not found.'}]}),
+    (200, {'transactionId': 'tx-c-2', 'output': {'cancelledShipment': False, 'alerts': [
+        {'code': '8159', 'message': 'Shipment Delete was requested for a tracking number already in a deleted '
+                                    'state.'}]}}),
+])
+def test_cancel_retry_after_local_failure(client, access_token, fedex, monkeypatch, second_response):
+    dn_id, task_id = _ready(client, access_token)
+    created = _create(client, access_token, dn_id).get_json()['shipment']
+
+    # FedEx 取消成功，本地写库失败 → 回滚，记录仍 active
+    original = CustomsService.issue_documents
+    monkeypatch.setattr(CustomsService, 'issue_documents',
+                        staticmethod(lambda *a, **k: (_ for _ in ()).throw(RuntimeError('db down'))))
+    assert _cancel(client, access_token, dn_id).status_code == 500
+    assert _states(client, dn_id) == [('active', None, '794600000001')]
+    monkeypatch.setattr(CustomsService, 'issue_documents', staticmethod(original))
+
+    # 再点取消：FedEx 回「已取消 / 查无此运单」→ 视为取消成功
+    fedex.set('/ship/v1/shipments/cancel', second_response)
+    response = _cancel(client, access_token, dn_id)
+    assert response.status_code == 200, response.get_json()
+    shipment = response.get_json()['shipment']
+    assert (shipment['status'], shipment['reason']) == ('cancelled', 'already_cancelled')
+    assert response.get_json()['can_create'] is True
+    with client.application.app_context():
+        assert db.session.get(DeliveryTask, task_id).tracking_number is None
+        assert db.session.get(DNDocument, created['label_document_id']).status == 'void'
+        assert DNCarrierShipment.query.filter_by(dn_id=dn_id).one().cancel_transaction_id == 'tx-c-2'
+
+
+def test_already_cancelled_codes():
+    matches = carrier_services._already_cancelled
+    for code in ('SHIPMENT.ALREADY.CANCELLED', 'TRACKING.TRACKINGNUMBER.NOTFOUND', 'SHIPMENT.NOT.FOUND',
+                 'TRACKINGNUMBER.DOES.NOT.EXIST', 'ALREADY.DELETED', '8159'):
+        assert matches([{'code': code}]), code
+    for code in ('SHIPMENT.CANCEL.NOTALLOWED', 'ACCOUNT.NUMBER.NOTFOUND', 'NOT.AUTHORIZED.ERROR', 'X', None, ''):
+        assert not matches([{'code': code, 'message': 'shipment already cancelled'}]), code
+    assert not matches(None) and not matches(['8159'])
+
+
+def test_create_budget_limits_request_timeouts(client, access_token, fedex, monkeypatch):
+    dn_id, _task_id = _ready(client, access_token)
+    client.application.config.update(FEDEX_CREATE_BUDGET_SECONDS=20, FEDEX_CONNECT_TIMEOUT_SECONDS=5,
+                                     FEDEX_TIMEOUT_SECONDS=30)
+    now = [1000.0]
+    step = [12]
+    monkeypatch.setattr(fedex_client, '_clock', lambda: now[0])
+
+    def slow(method, url, **kwargs):
+        response = fedex(method, url, **kwargs)
+        now[0] += step[0]
+        return response
+    monkeypatch.setattr(fedex_client, '_send', slow)
+
+    # 每个请求耗 12 秒：token 请求剩 20 秒 → (5, 15)；建单请求只剩 8 秒 → (4, 4)
+    assert _create(client, access_token, dn_id).status_code == 201
+    assert fedex.of('/oauth/token')[0]['timeout'] == (5.0, 15.0)
+    assert fedex.of('/ship/v1/shipments')[0]['timeout'] == (4.0, 4.0)
+    assert _cancel(client, access_token, dn_id).status_code == 200
+
+    # 每个请求耗 16 秒：token 之后只剩 4 秒（< 5）→ 建单请求不发，failed（budget_exhausted），504
+    fedex_client.clear_token_cache()
+    step[0] = 16
+    response = _create(client, access_token, dn_id)
+    assert response.status_code == 504 and response.get_json()['code'] == 16074
+    assert response.get_json()['details']['budget_exhausted'] is True
+    assert response.get_json()['details']['maybe_processed'] is False
+    assert len(fedex.of('/ship/v1/shipments')) == 1
+    assert _states(client, dn_id)[-1] == ('failed', 'budget_exhausted', None)
+
+
+def test_fedex_client_error_classification(client, fedex):
+    """结果不明（maybe_processed）与确定失败的划分"""
+    path = '/ship/v1/shipments'
+    cases = [
+        (lambda: fedex.errors.__setitem__(path, requests.ReadTimeout('read')), True, True),
+        (lambda: fedex.errors.__setitem__(path, requests.ConnectTimeout('connect')), False, True),
+        (lambda: fedex.errors.__setitem__(path, requests.ConnectionError(MaxRetryError(
+            None, path, NewConnectionError(None, 'refused')))), False, False),
+        (lambda: fedex.errors.__setitem__(path, requests.ConnectionError(
+            ProtocolError('Connection aborted.', RemoteDisconnected('closed')))), True, False),
+        (lambda: fedex.errors.__setitem__(path, requests.exceptions.ChunkedEncodingError('broken')), True, False),
+        (lambda: fedex.set(path, (500, {'errors': [{'code': 'INTERNAL.SERVER.ERROR', 'message': 'x'}]})), True, False),
+        (lambda: fedex.set(path, (422, {'errors': [{'code': 'SHIPMENT.VALIDATION', 'message': 'x'}]})), False, False),
+        (lambda: fedex.set(path, (200, 'not json')), True, False),
+    ]
+    with client.application.app_context():
+        for index, (arrange, maybe_processed, timeout) in enumerate(cases):
+            fedex.errors.clear()
+            arrange()
+            with pytest.raises(fedex_client.FedexError) as caught:
+                fedex_client.create_shipment({})
+            assert (caught.value.maybe_processed, caught.value.timeout) == (maybe_processed, timeout), index
+            assert caught.value.what == fedex_client.CREATE_SHIPMENT
+
+        # token 请求失败：业务请求没发，结果确定
+        fedex.errors.clear()
+        fedex_client.clear_token_cache()
+        fedex.set('/oauth/token', (500, {'errors': [{'code': 'INTERNAL.SERVER.ERROR', 'message': 'x'}]}))
+        with pytest.raises(fedex_client.FedexError) as caught:
+            fedex_client.create_shipment({})
+        assert caught.value.maybe_processed is False and caught.value.what == fedex_client.TOKEN_REQUEST
+
+        # 时间预算不够：不发请求
+        calls = len(fedex.calls)
+        with pytest.raises(fedex_client.FedexError) as caught:
+            fedex_client.create_shipment({}, deadline=fedex_client.clock() + 3)
+        assert caught.value.budget_exhausted is True and caught.value.maybe_processed is False
+        assert len(fedex.calls) == calls
+
+
+def test_delivery_tasks_and_customs_locked_while_shipment_active(client, access_token, fedex):
+    dn_id, task_id = _ready(client, access_token)
+    assert _create(client, access_token, dn_id).status_code == 201
+
+    # 新建发货任务会成为「当前任务」绕过运单号锁定 → 16078；删除也不行
+    response = client.post('/delivery/', json=_task_body(client, dn_id), headers=_h(access_token))
+    assert response.status_code == 409 and response.get_json()['code'] == 16078
+    assert response.get_json()['details'] == {'tracking_number': '794600000001', 'carrier': 'fedex',
+                                              'status': 'active'}
+    response = client.post('/delivery/', json=_task_body(client, dn_id, tracking_number='OTHER-1'),
+                           headers=_h(access_token))
+    assert response.status_code == 409 and response.get_json()['code'] == 16078
+    response = client.delete(f'/delivery/{task_id}', headers=_h(access_token))
+    assert response.status_code == 409 and response.get_json()['code'] == 16078
+
+    # 报关数据已随运单提交 → 16076（与改箱子同码）
+    response = client.put(f'/dn/{dn_id}/customs', json=_customs(freight_charge=9000), headers=_h(access_token))
+    assert response.status_code == 409 and response.get_json()['code'] == 16076
+    assert response.get_json()['details']['carrier_shipment']['tracking_number'] == '794600000001'
+
+    # 取消后都放开
+    assert _cancel(client, access_token, dn_id).status_code == 200
+    response = client.put(f'/dn/{dn_id}/customs', json=_customs(freight_charge=9000), headers=_h(access_token))
+    assert response.status_code == 200, response.get_json()
+    response = client.post('/delivery/', json=_task_body(client, dn_id), headers=_h(access_token))
+    assert response.status_code == 201, response.get_json()

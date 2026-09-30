@@ -69,6 +69,19 @@ class GatewayTimeoutException(APIException):
     def __init__(self, message, biz_code=50400, field=None, details=None):
         super().__init__(message, biz_code, 504, field, details)
 
+
+# 承运商运单（FedEx 自动建运单，warehouse/dn/carrier_services.py）业务码
+CARRIER_BIZ_CODES = {
+    16072: "建单前置条件不满足（409，details.blockers）",
+    16073: "承运商返回错误 / 结果不明（502，details.errors / transaction_id / maybe_processed / unresolved）",
+    16074: "承运商超时或时间预算用完（504，details.maybe_processed / unresolved / budget_exhausted）",
+    16075: "没有有效运单可取消 / 没有结果不明的记录可确认作废（409）",
+    16076: "有进行中 / 有效 / 结果不明的运单时不能改箱子或报关数据（409）",
+    16077: "label_format 不合法（400）",
+    16078: "运单号与有效自动运单不一致，或有自动运单时新建 / 删除发货任务（409）",
+    16079: "有进行中 / 结果不明的建单记录：不能再建单、不能保存运单号（409，details.unresolved）",
+}
+
 def register_error_handlers(app):
     app.config['PROPAGATE_EXCEPTIONS'] = True
 

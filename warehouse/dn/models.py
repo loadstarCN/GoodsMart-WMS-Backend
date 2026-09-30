@@ -473,25 +473,36 @@ class DNDocument(db.Model):
 
 
 class DNCarrierShipment(db.Model):
-    """DN 在承运商系统自动建的运单（目前只有 FedEx）。
+    """DN 在承运商系统自动建的运单（目前只有 FedEx），每次建单请求一条记录。
 
-    一张 DN 同一时刻至多一条 active；取消后标 cancelled 留痕，可再建新的。
+    状态：
+    - pending：正在请求承运商（请求前先独立提交这条记录）
+    - active：已建好的有效运单；cancelled：已取消（手工取消，或写库失败后自动取消成功）
+    - failed：承运商明确拒绝 / 请求没发出去，确定没有运单
+    - unknown：结果不明（超时、连接中断、5xx、响应看不懂、自动取消没成功……），承运商那边可能有运单
+    - dismissed：unknown（或卡住的 pending）经操作员确认承运商那边没有这张运单 / 已手工取消
+    一张 DN 同一时刻至多一条 pending / active / unknown（部分唯一索引兜底并发）。
     主运单号同时存到发货任务的 tracking_number 上（走现有保存运单号的逻辑）。
     """
     __tablename__ = 'dn_carrier_shipments'
 
+    STATUSES = ('pending', 'active', 'cancelled', 'failed', 'unknown', 'dismissed')
+    OPEN_STATUSES = ('pending', 'active', 'unknown')        # 同一 DN 至多一条
+    UNRESOLVED_STATUSES = ('pending', 'unknown')
+
     __table_args__ = (
         db.Index('idx_dn_carrier_shipment_dn', 'dn_id', 'status'),
-        # 同一 DN 至多一条有效运单（并发建单时数据库兜底）
+        # 同一 DN 至多一条进行中 / 有效 / 结果不明的运单（并发建单时数据库兜底）
         db.Index(
-            'uq_dn_carrier_shipment_active', 'dn_id', unique=True,
-            postgresql_where=db.text("status = 'active'"),
-            sqlite_where=db.text("status = 'active'"),
+            'uq_dn_carrier_shipment_open', 'dn_id', unique=True,
+            postgresql_where=db.text("status IN ('pending','active','unknown')"),
+            sqlite_where=db.text("status IN ('pending','active','unknown')"),
         ),
-        db.CheckConstraint("status IN ('active','cancelled')", name='chk_dn_carrier_shipment_status'),
+        db.CheckConstraint(
+            "status IN ('pending','active','cancelled','failed','unknown','dismissed')",
+            name='chk_dn_carrier_shipment_status',
+        ),
     )
-
-    STATUSES = ('active', 'cancelled')
 
     id = db.Column(db.Integer, primary_key=True)
     dn_id = db.Column(
@@ -501,10 +512,18 @@ class DNCarrierShipment(db.Model):
         info={'description': 'DN ID'}
     )
     carrier = db.Column(db.String(30), nullable=False, info={'description': '承运商适配器（fedex）'})
-    tracking_number = db.Column(db.String(100), nullable=False, index=True, info={'description': '主运单号'})
+    tracking_number = db.Column(db.String(100), nullable=True, index=True,
+                                info={'description': '主运单号（pending / failed / 结果不明且没拿到号码时为空）'})
     package_tracking_numbers = db.Column(db.JSON, nullable=True, info={'description': '每箱运单号（按箱号）'})
     service_type = db.Column(db.String(50), nullable=True, info={'description': '服务类型'})
-    status = db.Column(db.String(10), nullable=False, default='active', info={'description': 'active / cancelled'})
+    status = db.Column(db.String(10), nullable=False, default='pending',
+                       info={'description': 'pending / active / cancelled / failed / unknown / dismissed'})
+    reason = db.Column(db.String(40), nullable=True,
+                       info={'description': '状态原因（如 timeout / server_error / bad_response / compensation_failed / '
+                                            'rejected / compensated）'})
+    error_message = db.Column(db.String(500), nullable=True, info={'description': '失败 / 结果不明时的错误摘要'})
+    sender_country = db.Column(db.String(2), nullable=True,
+                               info={'description': '建单时的发件国（取消时用同一个值）'})
     ship_date = db.Column(db.Date, nullable=True, info={'description': '发货日（shipDatestamp）'})
     package_count = db.Column(db.Integer, nullable=True, info={'description': '箱数'})
     net_charge = db.Column(db.Numeric(12, 2), nullable=True, info={'description': '运费（承运商回的净额）'})
@@ -532,12 +551,20 @@ class DNCarrierShipment(db.Model):
         info={'description': '建单人ID'}
     )
     created_at = db.Column(db.DateTime, default=db.func.now(), info={'description': '建单时间'})
+    updated_at = db.Column(db.DateTime, nullable=True, info={'description': '状态最后变化时间'})
     cancelled_at = db.Column(db.DateTime, nullable=True, info={'description': '取消时间'})
     cancelled_by = db.Column(
         db.Integer,
         db.ForeignKey('users.id', ondelete='SET NULL'),
         nullable=True,
         info={'description': '取消人ID'}
+    )
+    dismissed_at = db.Column(db.DateTime, nullable=True, info={'description': '确认作废（dismissed）时间'})
+    dismissed_by = db.Column(
+        db.Integer,
+        db.ForeignKey('users.id', ondelete='SET NULL'),
+        nullable=True,
+        info={'description': '确认作废人ID'}
     )
 
     dn = db.relationship(
@@ -576,8 +603,13 @@ class DNCarrierShipment(db.Model):
             'label_parts': self.label_parts or [],
             'etd_document_id': self.etd_document_id,
             'transaction_id': self.transaction_id,
+            'reason': self.reason,
+            'sender_country': self.sender_country,
             'created_at': self.created_at.isoformat() if self.created_at else None,
             'created_by': self.created_by,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None,
             'cancelled_at': self.cancelled_at.isoformat() if self.cancelled_at else None,
             'cancelled_by': self.cancelled_by,
+            'dismissed_at': self.dismissed_at.isoformat() if self.dismissed_at else None,
+            'dismissed_by': self.dismissed_by,
         }
