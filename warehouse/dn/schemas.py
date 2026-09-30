@@ -108,6 +108,11 @@ dn_customs_input_model = api_ns.model('DNCustomsInput', {
     'recipient_tax_id_type': fields.String(
         description='EORI / PCCC / KR_BRN / CPF / CNPJ / EIN / USCC / TW_UBN / VAT / OTHER'),
     'freight_charge': fields.Integer(description='Freight printed on the invoice and added to the total'),
+    'insurance_charge': fields.Integer(
+        description='Optional insurance charge; when > 0 it is printed under Freight and added to the total'),
+    'declared_value_carriage': fields.Integer(
+        description='Optional declared value for carriage (enter it when booking the shipment with the carrier); '
+                    'not printed'),
     'consignee': fields.Nested(dn_customs_consignee_model),
     'lines': fields.List(fields.Nested(dn_customs_line_model)),
 })

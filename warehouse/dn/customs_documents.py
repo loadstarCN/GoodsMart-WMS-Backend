@@ -330,6 +330,10 @@ def render_commercial_invoice(data: dict, meta: dict) -> bytes:
         ('Total Quantity', f"{totals['quantity']:,}"),
         ('Goods Value', f"{currency} {totals['goods_value']}"),
         ('Freight', f"{currency} {totals['freight']}"),
+    ]
+    if totals.get('insurance') is not None:     # 投保且保险费 > 0 时才有
+        total_rows.append(('Insurance', f"{currency} {totals['insurance']}"))
+    total_rows += [
         ('Total Invoice Value', f"{currency} {totals['invoice_total']}"),
         ('Number of Packages', str(totals['package_count'])),
         ('Total Gross Weight', f"{totals['gross_weight_kg']} kg"),

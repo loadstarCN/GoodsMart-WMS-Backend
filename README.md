@@ -325,7 +325,7 @@ Invalid `country_code` → 400 `14020`; text longer than the column → 400 `140
 ```json
 { "invoice_number": "INV-0001", "currency": "JPY", "incoterm": "DAP", "export_reason": "SALE",
   "recipient_country": "DE", "recipient_tax_id": "DE123456789", "recipient_tax_id_type": "EORI",
-  "freight_charge": 8200,
+  "freight_charge": 8200, "insurance_charge": null, "declared_value_carriage": null,
   "consignee": { "name": "...", "company": "...", "address_line1": "...", "address_line2": null,
                  "city": "...", "state": null, "postal_code": "...", "country": "DE", "phone": "..." },
   "lines": [ { "goods_code": "4900000000000", "quantity": 3, "unit_value": 1200, "total_value": 3600,
@@ -340,12 +340,20 @@ Invalid `country_code` → 400 `14020`; text longer than the column → 400 `140
   (amount = unit value × packed quantity; lines with nothing packed are left out). The country of origin comes
   from the goods master data (`goods.origin_country`); the value in the line is recorded only.
 - `freight_charge` is printed as a separate *Freight* line and included in the *Total Invoice Value*.
+- Optional shipping insurance: `insurance_charge` (non-negative integer or `null`) is printed as an *Insurance*
+  line under *Freight* when it is greater than 0 and included in the *Total Invoice Value*;
+  `declared_value_carriage` (non-negative integer or `null`) is the declared value for carriage that the
+  warehouse enters when booking the shipment in the carrier's system — it is shown in the customs view but
+  not printed. Both are optional (requests without them work as before); invalid values → 400 `16063`.
+  Changing either of them voids the issued documents; snapshots without them keep their document fingerprint.
 - `jp_export_code` (optional, 9-digit Japanese export statistics code whose first 6 digits equal the HS code)
   is stored and returned but not printed on the CI / PL (they print the HS code only).
 - Replacing the snapshot voids the issued documents only when the printed content changes.
 
 `GET /warehouse/dn/<id>/customs` (permission `dn_read` or `packing_read`) returns
 `{dn_id, is_export, locked, customs, lines[], packages[], totals, exporter, problems[], ready, current_documents[], documents_outdated}`.
+`totals = {quantity, goods_value, freight, insurance, invoice_total, package_count, gross_weight_kg, net_weight_kg}`
+with `invoice_total = goods_value + freight + insurance` (`insurance` is 0 when not insured).
 
 | Problem (error) | Meaning |
 |-----------------|---------|
@@ -357,7 +365,7 @@ Invalid `country_code` → 400 `14020`; text longer than the column → 400 `140
 
 Warnings (do not block): `RECIPIENT_TAX_ID_MISSING`, `NON_LATIN_TEXT`, `NET_WEIGHT_UNKNOWN`, `GROSS_LT_NET`,
 `JP_EXPORT_CODE_MISMATCH` (`jp_export_code` not 9 digits or its first 6 digits differ from the HS code),
-`JP_EXPORT_CODE_MISSING` (JPY invoice total — goods value + freight — above 200,000 and a line has no `jp_export_code`).
+`JP_EXPORT_CODE_MISSING` (JPY invoice total — goods value + freight + insurance — above 200,000 and a line has no `jp_export_code`).
 
 ### Packages
 
@@ -405,7 +413,7 @@ the issued documents (`void_reason: packages_changed`).
     "invoice_date": "2026-01-01", "issued_at": "...", "sha256": "...", "size_bytes": 48213,
     "file_name": "CI_INV-0001_v2.pdf", "download_path": "/warehouse/dn/123/customs-documents/88/file" }, { "...": "packing_list" } ],
 "packages": [ { "package_no": 1, "gross_weight_kg": 3.25, "length_mm": 400, "width_mm": 300, "height_mm": 250 } ],
-"invoice_total": { "currency": "JPY", "goods_value": 45600, "freight": 8200, "total": 53800 }
+"invoice_total": { "currency": "JPY", "goods_value": 45600, "freight": 8200, "insurance": 0, "total": 53800 }
 ```
 
 ### Configuration

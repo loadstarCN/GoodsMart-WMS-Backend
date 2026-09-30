@@ -1,7 +1,8 @@
 """DN 海外件：报关快照、装箱记录、出口单证（商业发票 CI / 装箱单 PL）。
 
-- 报关快照（dn_customs）：对接方随 DN 带来的发票号、贸易条件、收件人、运费和每个商品的
-  HS / 英文品名 / 成交单价。结构错误拒绝（16063 / 16064），内容不全照收，缺什么由 problems 列出。
+- 报关快照（dn_customs）：对接方随 DN 带来的发票号、贸易条件、收件人、运费（及可选的运送保险费、
+  运送申告价额）和每个商品的 HS / 英文品名 / 成交单价。
+  结构错误拒绝（16063 / 16064），内容不全照收，缺什么由 problems 列出。
 - 装箱（dn_packages）：箱号 / 毛重 / 外箱尺寸，DN 为 picked / packed 时整体替换；
   已签发单证后改箱子，现有单证自动作废。
 - 单证（dn_documents）：条件齐全时生成 CI + PL 的 PDF 并存库（生成即定稿）。
@@ -268,6 +269,10 @@ def parse_customs(raw, dn_goods_codes) -> dict:
     for field, limit in _CUSTOMS_TEXT_LIMITS.items():
         result[field] = _opt_text(raw.get(field), f'customs.{field}', limit, upper=field in _UPPER_FIELDS)
     result['freight_charge'] = _opt_non_negative_int(raw.get('freight_charge'), 'customs.freight_charge')
+    # 运送保险（可选）：不带这两个键的请求照旧（视为没投保）
+    result['insurance_charge'] = _opt_non_negative_int(raw.get('insurance_charge'), 'customs.insurance_charge')
+    result['declared_value_carriage'] = _opt_non_negative_int(
+        raw.get('declared_value_carriage'), 'customs.declared_value_carriage')
 
     consignee_raw = raw.get('consignee')
     if consignee_raw is None:
@@ -509,6 +514,8 @@ class CustomsService:
             'recipient_tax_id': parsed.get('recipient_tax_id'),
             'recipient_tax_id_type': parsed.get('recipient_tax_id_type'),
             'freight_charge': parsed.get('freight_charge'),
+            'insurance_charge': parsed.get('insurance_charge'),
+            'declared_value_carriage': parsed.get('declared_value_carriage'),
             'consignee': parsed.get('consignee'),
             'lines': parsed.get('lines') or [],
         }
@@ -813,8 +820,12 @@ class CustomsService:
                 problem('GROSS_LT_NET', 'warning', "Total gross weight is less than total net weight")
 
         freight = Decimal(customs.freight_charge) if customs and customs.freight_charge is not None else Decimal(0)
+        insurance = (Decimal(customs.insurance_charge)
+                     if customs and customs.insurance_charge is not None else Decimal(0))
+        invoice_total = goods_value + freight + insurance
         # 日本正式出口申报（发票合计超过 20 万日元）要 9 位统计品目番号：缺的行给警告，不拦出单证
-        if customs is not None and (customs.currency or '').upper() == 'JPY'                 and goods_value + freight > JP_EXPORT_CODE_THRESHOLD_JPY:
+        if customs is not None and (customs.currency or '').upper() == 'JPY' \
+                and invoice_total > JP_EXPORT_CODE_THRESHOLD_JPY:
             for line in lines:
                 if line['packed_quantity'] > 0 and line['has_customs_line'] and not line['jp_export_code']:
                     problem('JP_EXPORT_CODE_MISSING', 'warning',
@@ -825,7 +836,8 @@ class CustomsService:
             'quantity': total_qty,
             'goods_value': _num(goods_value),
             'freight': _num(freight),
-            'invoice_total': _num(goods_value + freight),
+            'insurance': _num(insurance),
+            'invoice_total': _num(invoice_total),
             'package_count': len(packages),
             'gross_weight_kg': float(gross_total.quantize(Decimal('0.001'))),
             'net_weight_kg': float(net_total) if (net_known and total_qty > 0) else None,
@@ -899,7 +911,7 @@ class CustomsService:
 
         packages = view['packages']
         totals = view['totals']
-        return {
+        data = {
             'currency': currency,
             'invoice_number': view['invoice_number'],
             'reference': dn.order_number,
@@ -961,6 +973,13 @@ class CustomsService:
             'signatory_title': exporter['signatory_title'],
             'declaration': DECLARATION_TEXT,
         }
+        # 运送保险：保险费 > 0 时 CI 在 Freight 下单列 Insurance；运送申告价额不印，但计入单证指纹。
+        # 只在有值时加键 —— 旧快照（两个都为空）的指纹不变，已签发的单证不会因升级而失效。
+        if customs.insurance_charge:
+            data['totals']['insurance'] = format_money(totals['insurance'], currency)
+        if customs.declared_value_carriage is not None:
+            data['declared_value_carriage'] = format_money(customs.declared_value_carriage, currency)
+        return data
 
     @staticmethod
     def _file_name(prefix: str, invoice_number: str, version: int) -> str:
@@ -1096,6 +1115,7 @@ class CustomsService:
                 'currency': dn.customs.currency,
                 'goods_value': totals['goods_value'],
                 'freight': totals['freight'],
+                'insurance': totals['insurance'],
                 'total': totals['invoice_total'],
             },
         }

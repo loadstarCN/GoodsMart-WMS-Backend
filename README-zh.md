@@ -315,7 +315,7 @@ Authorization: Bearer <token>
 `POST /warehouse/dn/` 顶层可带 `customs`（国内件不带）；`PUT /warehouse/dn/<id>/customs` 整体替换
 （权限 `dn_edit`，发货后不可改）。结构同英文 README 示例：`invoice_number`、`currency`、`incoterm`、
 `export_reason`、`recipient_country`、`recipient_tax_id`、`recipient_tax_id_type`、`freight_charge`、
-`consignee{...}`、`lines[{goods_code, quantity, unit_value, total_value, description_en, hs_code, jp_export_code, origin_country, quantity_unit}]`。
+`insurance_charge`、`declared_value_carriage`、`consignee{...}`、`lines[{goods_code, quantity, unit_value, total_value, description_en, hs_code, jp_export_code, origin_country, quantity_unit}]`。
 
 - 结构错误拒绝：`customs` 非对象、`lines` 非数组、字段类型错误 → 400 `16063`（`details.field`）；
   行的 `goods_code` 不在 DN 明细或重复 → 400 `16064`。
@@ -323,18 +323,24 @@ Authorization: Bearer <token>
 - `invoice_number` 缺省用 DN 的 `order_number`；发票数量一律取**已打包数量**（金额 = 单价 × 已打包数量，
   已打包 0 的行不上发票）；原产国以商品主数据 `goods.origin_country` 为准，行里的只做记录。
 - `freight_charge` 在发票上单列为 *Freight*，并计入 *Total Invoice Value*。
+- 运送保险（可选）：`insurance_charge`（非负整数或 `null`）大于 0 时在 *Freight* 下单列 *Insurance* 并计入
+  *Total Invoice Value*；`declared_value_carriage`（非负整数或 `null`）是运送申告价额，仓库在承运商系统登记出货时填写，
+  报关视图里显示、单证上不印。两个键都可不带（旧请求照旧）；不合法 400 `16063`。任一变化都会作废已签发的单证；
+  没有这两个值的快照单证指纹不变。
 - `jp_export_code`（可选，9 位日本出口统计品目番号，前 6 位应等于 HS）存入快照并在接口返回，CI / PL 不印（只印 HS）。
 - 替换快照时，只有印在单证上的内容变了才作废现有单证。
 
 `GET /warehouse/dn/<id>/customs`（`dn_read` 或 `packing_read`）返回
 `{dn_id, is_export, locked, customs, lines[], packages[], totals, exporter, problems[], ready, current_documents[], documents_outdated}`。
+`totals = {quantity, goods_value, freight, insurance, invoice_total, package_count, gross_weight_kg, net_weight_kg}`，
+`invoice_total = goods_value + freight + insurance`（没投保 `insurance` 为 0）。
 
 - 错误级问题：`NOT_PACKED`、`PACKAGES_MISSING`、`EXPORTER_PROFILE_INCOMPLETE`、`INCOTERM_MISSING`、
   `EXPORT_REASON_MISSING`、`CURRENCY_INVALID`、`RECIPIENT_COUNTRY_MISSING`、`LINE_MISSING`、`HS_CODE_MISSING`
   （去掉 `.`、空格、`-` 后须为 6–10 位数字）、`DESCRIPTION_MISSING`、`DESCRIPTION_NOT_ASCII`、`ORIGIN_MISSING`、`UNIT_VALUE_MISSING`。
 - 警告（不拦截）：`RECIPIENT_TAX_ID_MISSING`、`NON_LATIN_TEXT`、`NET_WEIGHT_UNKNOWN`、`GROSS_LT_NET`、
   `JP_EXPORT_CODE_MISMATCH`（`jp_export_code` 非 9 位数字或前 6 位与 HS 不一致）、
-  `JP_EXPORT_CODE_MISSING`（JPY 发票合计＝货值＋运费超过 200,000 且有行缺 `jp_export_code`）。
+  `JP_EXPORT_CODE_MISSING`（JPY 发票合计＝货值＋运费＋保险费超过 200,000 且有行缺 `jp_export_code`）。
 
 ### 箱子
 
@@ -366,7 +372,7 @@ DN 须为 `picked` 或 `packed`（否则 409 `16067`）。请求体 `{"packages"
   以请求为准，现有单证仍视为有效。
 - DN 发货（`delivered` / `completed`）后，报关快照、箱子、单证全部锁定 → 409 `16065`。
 - 海外 DN 的 `dn.delivered` 追加 `customs_documents`（含 `download_path`）、`packages`、
-  `invoice_total{currency, goods_value, freight, total}`；国内件 payload 不变。
+  `invoice_total{currency, goods_value, freight, insurance, total}`；国内件 payload 不变。
 
 ### 配置
 

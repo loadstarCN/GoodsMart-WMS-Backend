@@ -261,8 +261,8 @@ class DNDetail(db.Model):
 class DNCustoms(db.Model):
     """DN 报关快照（海外件）
 
-    由对接方（批发站）随 DN 带来：发票号、贸易条件、收件人税号、运费、收件人、
-    每个商品的 HS / 英文品名 / 成交单价等。结构合法即整体存下（内容不全照收），
+    由对接方（批发站）随 DN 带来：发票号、贸易条件、收件人税号、运费（及可选的运送保险费、
+    运送申告价额）、收件人、每个商品的 HS / 英文品名 / 成交单价等。结构合法即整体存下（内容不全照收），
     是否能出单证由 problems 判断。一张 DN 至多一条；存在即视为海外件（is_export）。
     """
     __tablename__ = 'dn_customs'
@@ -286,6 +286,14 @@ class DNCustoms(db.Model):
     recipient_tax_id = db.Column(db.String(100), nullable=True, info={'description': '收件人税号'})
     recipient_tax_id_type = db.Column(db.String(30), nullable=True, info={'description': '收件人税号类型（EORI / VAT / ...）'})
     freight_charge = db.Column(db.Integer, nullable=True, info={'description': '运费（发票上单列并计入总额）'})
+    insurance_charge = db.Column(
+        db.Integer, nullable=True,
+        info={'description': '运送保险费（发票上 Freight 下单列并计入总额；没投保为空）'}
+    )
+    declared_value_carriage = db.Column(
+        db.Integer, nullable=True,
+        info={'description': '运送申告价额（在承运商系统登记出货时填写；没投保为空）'}
+    )
     consignee = db.Column(db.JSON, nullable=True, info={'description': '收件人（name/company/address/...）'})
     lines = db.Column(db.JSON, nullable=False, default=list, info={'description': '报关行（按 goods_code）'})
     created_by = db.Column(
@@ -316,6 +324,8 @@ class DNCustoms(db.Model):
             'recipient_tax_id': self.recipient_tax_id,
             'recipient_tax_id_type': self.recipient_tax_id_type,
             'freight_charge': self.freight_charge,
+            'insurance_charge': self.insurance_charge,
+            'declared_value_carriage': self.declared_value_carriage,
             'consignee': self.consignee,
             'lines': self.lines or [],
             'updated_at': self.updated_at.isoformat() if self.updated_at else None,

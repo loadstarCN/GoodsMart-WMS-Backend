@@ -10,6 +10,7 @@ from datetime import date, datetime   # 放在 helpers 之后：helpers 以模�
 from zoneinfo import ZoneInfo
 from system.webhook.models import WebhookEvent
 from warehouse.delivery.services import DeliveryTaskService
+from warehouse.dn.customs_services import CustomsService
 from warehouse.dn.models import DNCustoms, DNDocument, DNPackage
 from warehouse.packing.models import PackingBatch, PackingTask, PackingTaskDetail
 from warehouse.picking.models import PickingBatch, PickingTask, PickingTaskDetail
@@ -215,6 +216,11 @@ def test_create_dn_with_customs_stores_snapshot(client, access_token):
     ({'consignee': 'Max', 'lines': []}, 16063, 'customs.consignee'),
     ({'lines': [{'goods_code': 'G001', 'unit_value': 'abc'}]}, 16063, 'customs.lines[0].unit_value'),
     ({'freight_charge': -1, 'lines': []}, 16063, 'customs.freight_charge'),
+    ({'insurance_charge': -1, 'lines': []}, 16063, 'customs.insurance_charge'),
+    ({'insurance_charge': 12.5, 'lines': []}, 16063, 'customs.insurance_charge'),
+    ({'declared_value_carriage': 'abc', 'lines': []}, 16063, 'customs.declared_value_carriage'),
+    ({'declared_value_carriage': True, 'lines': []}, 16063, 'customs.declared_value_carriage'),
+    ({'declared_value_carriage': {'amount': 1}, 'lines': []}, 16063, 'customs.declared_value_carriage'),
     ({'lines': [{'goods_code': 'NOT-IN-DN'}]}, 16064, 'customs.lines[0].goods_code'),
     ({'lines': [{'goods_code': 'G001'}, {'goods_code': 'G001'}]}, 16064, 'customs.lines[1].goods_code'),
 ])
@@ -456,9 +462,10 @@ def test_documents_pdf_content_and_totals(client, access_token):
     view = client.get(f'/dn/{dn_id}/customs', headers=_h(access_token)).get_json()
     assert view['ready'] is True, view['problems']
     assert view['totals'] == {
-        'quantity': 5, 'goods_value': 45600, 'freight': 8200, 'invoice_total': 53800,
+        'quantity': 5, 'goods_value': 45600, 'freight': 8200, 'insurance': 0, 'invoice_total': 53800,
         'package_count': 2, 'gross_weight_kg': 6.5, 'net_weight_kg': 6.0,
     }
+    assert view['customs']['insurance_charge'] is None and view['customs']['declared_value_carriage'] is None
     assert view['exporter']['legal_name_en'] == 'Example Trading Co., Ltd.'
 
     documents = _issue(client, access_token, dn_id).get_json()['documents']
@@ -481,6 +488,7 @@ def test_documents_pdf_content_and_totals(client, access_token):
                      b'Total Invoice Value', b'JPY 53,800', b'42,000', b'Net Wt',
                      b'I/We hereby certify', b'Taro Example', b'Export Manager', b'Same as Consignee'):
         assert expected in text, expected
+    assert b'Insurance' not in text                  # 没投保：不印 Insurance 行
     lowered = (text + ci.data).lower()
     assert b'exempt' not in lowered and b'consumption' not in lowered
 
@@ -582,6 +590,146 @@ def test_non_latin_consignee_warns_and_still_renders(client, access_token):
 
 
 # ---------------------------------------------------------------------------
+# 运送保险（保险费 / 运送申告价额）
+# ---------------------------------------------------------------------------
+
+def test_insurance_stored_totals_and_printed_on_ci(client, access_token):
+    customs = _customs(insurance_charge=1360, declared_value_carriage='45,600')   # 数字字符串照收
+    dn_id, _task_id = _export_dn_ready(client, access_token, customs=customs)
+
+    view = client.get(f'/dn/{dn_id}/customs', headers=_h(access_token)).get_json()
+    assert view['ready'] is True, view['problems']
+    assert view['customs']['insurance_charge'] == 1360
+    assert view['customs']['declared_value_carriage'] == 45600
+    assert view['totals']['freight'] == 8200
+    assert view['totals']['insurance'] == 1360
+    assert view['totals']['invoice_total'] == 45600 + 8200 + 1360
+    detail = client.get(f'/dn/{dn_id}', headers=_h(access_token)).get_json()
+    assert detail['customs']['insurance_charge'] == 1360
+    assert detail['customs']['declared_value_carriage'] == 45600
+
+    documents = _issue(client, access_token, dn_id).get_json()['documents']
+    ci_text = _pdf_streams(client.get(f"/dn/{dn_id}/customs-documents/{documents[0]['id']}/file",
+                                      headers=_h(access_token)).data)
+    for expected in (b'Freight', b'JPY 8,200', b'Insurance', b'JPY 1,360', b'Total Invoice Value', b'JPY 55,160'):
+        assert expected in ci_text, expected
+    # Insurance 行在 Freight 与 Total Invoice Value 之间
+    assert ci_text.index(b'Freight') < ci_text.index(b'Insurance') < ci_text.index(b'Total Invoice Value')
+    assert b'45,600' in ci_text                         # 货值（申告价额本身不单独印）
+    assert b'Declared' not in ci_text
+    pl_text = _pdf_streams(client.get(f"/dn/{dn_id}/customs-documents/{documents[1]['id']}/file",
+                                      headers=_h(access_token)).data)
+    assert b'Insurance' not in pl_text                  # PL 不变
+
+    with client.application.app_context():
+        fields = CustomsService.delivered_webhook_fields(db.session.get(DN, dn_id))
+    assert fields['invoice_total'] == {'currency': 'JPY', 'goods_value': 45600, 'freight': 8200,
+                                       'insurance': 1360, 'total': 55160}
+
+
+def test_insurance_keys_with_null_accepted(client, access_token):
+    """对接方不保价时两个键都带、值为 null：建 DN 与 PUT customs 都照常接受（等同没带）。"""
+    _prepare(client)
+    response = _create_dn(client, access_token, customs=_customs(insurance_charge=None, declared_value_carriage=None))
+    assert response.status_code == 201, response.get_json()
+    dn_id = response.get_json()['id']
+    assert response.get_json()['customs']['insurance_charge'] is None
+    assert response.get_json()['customs']['declared_value_carriage'] is None
+    view = client.get(f'/dn/{dn_id}/customs', headers=_h(access_token)).get_json()
+    assert view['totals']['insurance'] == 0
+    assert view['totals']['invoice_total'] == 8200          # 还没打包：货值 0 + 运费
+
+    response = client.put(f'/dn/{dn_id}/customs', json=_customs(insurance_charge=None, declared_value_carriage=None),
+                          headers=_h(access_token))
+    assert response.status_code == 200, response.get_json()
+    assert response.get_json()['customs']['insurance_charge'] is None
+    assert response.get_json()['customs']['declared_value_carriage'] is None
+
+
+def test_insurance_zero_charge_not_printed(client, access_token):
+    """投保但保险费为 0（申告价额在免费额度内）：不印 Insurance 行，申告价额照存。"""
+    dn_id, _task_id = _export_dn_ready(client, access_token,
+                                       customs=_customs(insurance_charge=0, declared_value_carriage=45600))
+    view = client.get(f'/dn/{dn_id}/customs', headers=_h(access_token)).get_json()
+    assert view['customs']['insurance_charge'] == 0
+    assert view['customs']['declared_value_carriage'] == 45600
+    assert view['totals']['insurance'] == 0 and view['totals']['invoice_total'] == 53800
+    documents = _issue(client, access_token, dn_id).get_json()['documents']
+    ci_text = _pdf_streams(client.get(f"/dn/{dn_id}/customs-documents/{documents[0]['id']}/file",
+                                      headers=_h(access_token)).data)
+    assert b'Insurance' not in ci_text and b'JPY 53,800' in ci_text
+
+
+def test_old_snapshot_without_insurance_keeps_document_fingerprint(client, access_token):
+    """旧快照（两个新字段为空）的单证数据与加字段前完全相同 → 指纹不变，已签发的单证不会失效。"""
+    dn_id, _task_id = _export_dn_ready(client, access_token)          # 旧请求：不带这两个键
+    first = _issue(client, access_token, dn_id).get_json()
+    with client.application.app_context():
+        dn = db.session.get(DN, dn_id)
+        data = CustomsService._document_data(dn, CustomsService.build_view(dn))
+    assert set(data) == {
+        'currency', 'invoice_number', 'reference', 'awb', 'carrier', 'incoterm', 'terms', 'export_reason',
+        'country_of_export', 'destination', 'exporter', 'ship_from', 'consignee', 'items', 'show_net_weight',
+        'totals', 'packages', 'signatory_name', 'signatory_title', 'declaration',
+    }
+    assert set(data['totals']) == {'quantity', 'goods_value', 'freight', 'invoice_total', 'package_count',
+                                   'gross_weight_kg', 'net_weight_kg'}
+
+    # 显式传 null 与不传等价：不作废、再签发沿用原版本
+    response = client.put(f'/dn/{dn_id}/customs',
+                          json=_customs(insurance_charge=None, declared_value_carriage=None), headers=_h(access_token))
+    assert response.status_code == 200
+    assert response.get_json()['voided_documents'] == []
+    assert response.get_json()['documents_outdated'] is False
+    again = _issue(client, access_token, dn_id)
+    assert again.status_code == 200 and again.get_json()['version'] == first['version'] == 1
+
+
+def test_insurance_change_voids_and_bumps_version(client, access_token):
+    dn_id, _task_id = _export_dn_ready(client, access_token)
+    first_ids = [d['id'] for d in _issue(client, access_token, dn_id).get_json()['documents']]
+
+    # 加上保险 → 现有单证作废（customs_changed），重新签发 v2 带 Insurance 行
+    response = client.put(f'/dn/{dn_id}/customs', json=_customs(insurance_charge=680, declared_value_carriage=45600),
+                          headers=_h(access_token))
+    assert response.status_code == 200, response.get_json()
+    assert sorted(response.get_json()['voided_documents']) == sorted(first_ids)
+    assert response.get_json()['totals']['invoice_total'] == 53800 + 680
+    second = _issue(client, access_token, dn_id)
+    assert second.status_code == 201 and second.get_json()['version'] == 2
+    ci_text = _pdf_streams(client.get(f"/dn/{dn_id}/customs-documents/{second.get_json()['documents'][0]['id']}/file",
+                                      headers=_h(access_token)).data)
+    assert b'Insurance' in ci_text and b'JPY 680' in ci_text and b'JPY 54,480' in ci_text
+
+    # 只改运送申告价额（不印，但计入单证指纹）→ 同样作废、升版本
+    response = client.put(f'/dn/{dn_id}/customs', json=_customs(insurance_charge=680, declared_value_carriage=50000),
+                          headers=_h(access_token))
+    assert len(response.get_json()['voided_documents']) == 2
+    assert _issue(client, access_token, dn_id).get_json()['version'] == 3
+
+    # 同样的数据再 PUT：不作废
+    response = client.put(f'/dn/{dn_id}/customs', json=_customs(insurance_charge=680, declared_value_carriage=50000),
+                          headers=_h(access_token))
+    assert response.get_json()['voided_documents'] == []
+
+    # 整体替换：不带这两个键 = 取消保险
+    response = client.put(f'/dn/{dn_id}/customs', json=_customs(), headers=_h(access_token))
+    assert response.get_json()['customs']['insurance_charge'] is None
+    assert response.get_json()['customs']['declared_value_carriage'] is None
+    assert response.get_json()['totals']['insurance'] == 0
+    assert len(response.get_json()['voided_documents']) == 2
+
+
+def test_jp_export_code_threshold_counts_insurance(client, access_token):
+    customs = _customs(insurance_charge=50000, declared_value_carriage=143600)
+    customs['lines'][1]['unit_value'] = 70000                    # 3,600 + 140,000 + 8,200 + 50,000 > 200,000
+    dn_id, _task_id = _export_dn_ready(client, access_token, customs=customs)
+    view = client.get(f'/dn/{dn_id}/customs', headers=_h(access_token)).get_json()
+    assert view['totals']['invoice_total'] == 201800
+    assert 'JP_EXPORT_CODE_MISSING' in _codes(view['problems'], 'warning')
+
+
+# ---------------------------------------------------------------------------
 # 发货拦截 / 锁定 / webhook
 # ---------------------------------------------------------------------------
 
@@ -628,7 +776,8 @@ def test_ship_requires_documents_then_locks(client, access_token):
         {'package_no': 1, 'gross_weight_kg': 3.25, 'length_mm': 400, 'width_mm': 300, 'height_mm': 250},
         {'package_no': 2, 'gross_weight_kg': 3.25, 'length_mm': 400, 'width_mm': 300, 'height_mm': 250},
     ]
-    assert payload['invoice_total'] == {'currency': 'JPY', 'goods_value': 45600, 'freight': 8200, 'total': 53800}
+    assert payload['invoice_total'] == {'currency': 'JPY', 'goods_value': 45600, 'freight': 8200, 'insurance': 0,
+                                        'total': 53800}
 
     view = client.get(f'/dn/{dn_id}/customs', headers=_h(access_token)).get_json()
     assert view['locked'] is True and view['ready'] is False
