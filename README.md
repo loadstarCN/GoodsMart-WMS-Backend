@@ -439,7 +439,7 @@ number by hand (`PUT /warehouse/delivery/<task_id>/tracking`) remains the fallba
 
 `GET` returns `{enabled, carrier: "fedex", can_create, blockers[{code, message, goods_code?, field?}], etd_enabled,
 default_label_format, label_formats{A4|THERMAL: {image_type, stock_type}}, declared_value_carriage, delivery_task_id,
-shipment}`; `shipment` is the latest shipment (active first) or `null`:
+shipment, warnings[]}`; `shipment` is the latest shipment (active first) or `null`:
 `{tracking_number, package_tracking_numbers, status: active|cancelled, service_type, ship_date, package_count,
 net_charge, currency, declared_value, label_format, image_type, label_stock_type, label_document_id,
 label_download_path, label_file_name, label_content_type, label_parts[], etd_document_id, transaction_id,
@@ -463,9 +463,13 @@ Each format's image type (`PDF` / `PNG` / `ZPLII` / `EPL2`) and stock can be ove
   `packed` / already shipped, no active delivery task / its carrier code is not `fedex` / task completed, an active
   shipment already exists (`SHIPMENT_EXISTS`) or a tracking number was saved by hand (`TRACKING_NUMBER_EXISTS`),
   no packages / more than 30 packages, error-level customs problems (same codes as the customs view),
-  declared value for carriage above the customs value of the packed goods
-  (`DECLARED_VALUE_EXCEEDS_CUSTOMS_VALUE` — FedEx rejects it), ship-from or consignee address that does not fit the
-  FedEx format (`SHIPPER_ADDRESS_INVALID` / `RECIPIENT_ADDRESS_INVALID`), consignee name or phone missing.
+  ship-from or consignee address that does not fit the FedEx format (`SHIPPER_ADDRESS_INVALID` /
+  `RECIPIENT_ADDRESS_INVALID`), consignee name or phone missing.
+- **Declared value for carriage** above the customs value of the packed goods is lowered to that value (FedEx
+  rejects a declared value above the customs value, and after partial packing only the goods actually shipped are
+  covered). The value actually submitted is stored as `shipment.declared_value`; `warnings` carries
+  `{code: "DECLARED_VALUE_CAPPED", message, declared_value_carriage, declared_value}` (in `GET` as a preview while
+  no shipment is active, in the `POST` response for what was done).
 - If there is no current CI / PL (or they are outdated) they are issued first with the normal logic.
 - With `FEDEX_ETD_ENABLED` the current CI PDF is uploaded first (Trade Documents Upload API, pre-shipment) and
   the shipment references it (`ELECTRONIC_TRADE_DOCUMENTS`); without it the warehouse prints the CI and packs it
@@ -481,9 +485,14 @@ Each format's image type (`PDF` / `PNG` / `ZPLII` / `EPL2`) and stock can be ove
   duties per `FEDEX_DUTIES_PAYMENT_TYPE`.
 - Address rules: FedEx accepts at most 3 street lines of 35 characters and a city of 35 characters. The English
   address string is split at commas / line breaks — the last part (after removing the country name and the postal
-  code) is the city, e.g. `1-2-3 Example, Minato-ku, Tokyo 105-0000`. The postal code is the warehouse / company
-  `zip_code` (for Japan it is also recognised in the address). A consignee without a postal code is sent with an
+  code) is the city, the other parts become one street line each (joined and re-wrapped when there are more than
+  3 lines). E.g. `4-5-6 Sample-cho, Chuo-ku, Osaka 600-0000, JAPAN` → street lines `4-5-6 Sample-cho` /
+  `Chuo-ku`, city `Osaka`, postal code `6000000`. The postal code is the warehouse / company `zip_code` (for Japan
+  it is also recognised in the address and sent as 7 digits). A consignee without a postal code is sent with an
   empty `postalCode`; US / CA / PR require a 2-letter state code.
+- While a shipment is active the delivery task keeps its tracking number: completing the delivery, saving the
+  tracking number or updating the task with a different number → 409 `16078` (cancel the shipment first; an empty
+  value on completion / update means "unchanged").
 - Commodity weight: goods with a unit weight → unit weight × packed quantity; goods without one share the rest of
   the total gross weight (or, if nothing is left, the gross weight by quantity).
 - FedEx is called **before** anything is written. On success, in one transaction: tracking number → delivery task,
@@ -577,7 +586,7 @@ stdout_logfile=/var/log/wms-api.out.log
 | Inventory | 15000-15999 | 400 | Stock-related errors |
 | State | 16000-16999 | 400 | State transition errors |
 
-Business codes of the export-document features: `14019` export profile text too long, `14020` invalid country code, `16063` customs structure invalid, `16064` customs line goods code not in the DN / duplicated, `16065` shipped — customs data / packages / documents locked (409), `16066` invalid packages, `16067` packages cannot be edited in the current DN status (409), `16068` documents cannot be issued yet (409, `details.problems`), `16069` documents required before shipping (409), `16070` not an export DN (409), `16071` document not found (404). Carrier shipments (FedEx): `16072` preconditions not met (409, `details.blockers`), `16073` FedEx returned an error (502, `details.errors` / `transaction_id`), `16074` FedEx timed out (504), `16075` no active carrier shipment (409), `16076` packages cannot be changed while a carrier shipment is active (409), `16077` invalid `label_format` (400). Errors may carry a structured `details` object.
+Business codes of the export-document features: `14019` export profile text too long, `14020` invalid country code, `16063` customs structure invalid, `16064` customs line goods code not in the DN / duplicated, `16065` shipped — customs data / packages / documents locked (409), `16066` invalid packages, `16067` packages cannot be edited in the current DN status (409), `16068` documents cannot be issued yet (409, `details.problems`), `16069` documents required before shipping (409), `16070` not an export DN (409), `16071` document not found (404). Carrier shipments (FedEx): `16072` preconditions not met (409, `details.blockers`), `16073` FedEx returned an error (502, `details.errors` / `transaction_id`), `16074` FedEx timed out (504), `16075` no active carrier shipment (409), `16076` packages cannot be changed while a carrier shipment is active (409), `16077` invalid `label_format` (400), `16078` tracking number differs from the active carrier shipment (409). Errors may carry a structured `details` object.
 
 ## Related Projects
 

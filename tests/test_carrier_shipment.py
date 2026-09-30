@@ -242,12 +242,36 @@ def test_blockers_listed_together(client, access_token, fedex):
     assert fedex.calls == []
 
 
-def test_declared_value_above_customs_value_blocked(client, access_token, fedex):
-    # 已打包货值 = 1200 × 3 + 21000 × 2 = 45600；FedEx 不收申告价额高于货值的运单
-    dn_id, _task_id = _ready(client, access_token, customs=_customs(declared_value_carriage=45601))
+def test_declared_value_capped_to_packed_goods_value(client, access_token, fedex):
+    # 部分打包：已打包货值 = 1200 × 2 + 21000 × 2 = 44400 < 申告价额 50000 → 压到 44400（FedEx 拒收高于货值的）
+    dn_id, _task_id = _ready(client, access_token, customs=_customs(declared_value_carriage=50000),
+                             packed={'G001': 2, 'G002': 2})
+    preview = client.get(f'/dn/{dn_id}/carrier-shipment', headers=_h(access_token)).get_json()
+    assert preview['can_create'] is True
+    assert [w['code'] for w in preview['warnings']] == ['DECLARED_VALUE_CAPPED']
+
     response = _create(client, access_token, dn_id)
-    assert response.status_code == 409 and _codes(response) == ['DECLARED_VALUE_EXCEEDS_CUSTOMS_VALUE']
-    assert fedex.calls == []
+    assert response.status_code == 201, response.get_json()
+    data = response.get_json()
+    assert data['warnings'] == [{
+        'code': 'DECLARED_VALUE_CAPPED',
+        'message': data['warnings'][0]['message'],
+        'declared_value_carriage': 50000, 'declared_value': 44400,
+    }]
+    assert '44400' in data['warnings'][0]['message']
+    assert data['shipment']['declared_value'] == 44400 and data['declared_value_carriage'] == 50000
+    shipment = fedex.ship_request()['requestedShipment']
+    assert [p['declaredValue']['amount'] for p in shipment['requestedPackageLineItems']] == [22200, 22200]
+    assert shipment['totalDeclaredValue'] == {'amount': 44400, 'currency': 'JYE'}
+    # 建单后 GET 不再重复提示
+    assert client.get(f'/dn/{dn_id}/carrier-shipment', headers=_h(access_token)).get_json()['warnings'] == []
+
+
+def test_declared_value_within_goods_value_unchanged(client, access_token, fedex):
+    dn_id, _task_id = _ready(client, access_token, customs=_customs(declared_value_carriage=45600))
+    response = _create(client, access_token, dn_id)
+    assert response.status_code == 201 and response.get_json()['warnings'] == []
+    assert response.get_json()['shipment']['declared_value'] == 45600
 
 
 def test_blockers_status_packages_task_and_domestic(client, access_token, fedex):
@@ -294,8 +318,8 @@ def test_request_body_fields(client, access_token, fedex):
     assert shipper['contact']['companyName'] == 'Example Trading Co., Ltd.'
     assert shipper['contact']['personName'] == 'Hanako Example'
     assert shipper['contact']['phoneNumber'] == '123456789'
-    assert shipper['address'] == {'streetLines': ['1-2-3 Example, Minato-ku'], 'city': 'Tokyo',
-                                  'postalCode': '105-0000', 'countryCode': 'JP'}
+    assert shipper['address'] == {'streetLines': ['1-2-3 Example', 'Minato-ku'], 'city': 'Tokyo',
+                                  'postalCode': '1050000', 'countryCode': 'JP'}
     assert shipper['tins'] == [{'number': '1234567890123', 'tinType': 'BUSINESS_NATIONAL'}]
 
     recipient = shipment['recipients'][0]
@@ -722,12 +746,12 @@ def test_permissions_and_cross_company(client, access_token, access_operator_tok
 
 def test_address_and_value_helpers():
     assert split_address_text('1-2-3 Example, Minato-ku, Tokyo 105-0000, Japan', 'JP', None, 'Japan') == {
-        'streetLines': ['1-2-3 Example, Minato-ku'], 'city': 'Tokyo', 'postalCode': '105-0000',
+        'streetLines': ['1-2-3 Example', 'Minato-ku'], 'city': 'Tokyo', 'postalCode': '1050000',
         'countryCode': 'JP'}
     # 仓库邮编优先、粘在末段的国家名去掉、长地址折行
     result = split_address_text('Unit 5, 1234-5 Very Long Industrial Park Road Name, Example-machi\n'
                                 'Sample-gun, Fukuoka 8100000 Japan', 'JP', '810-0000', 'Japan')
-    assert result['city'] == 'Fukuoka' and result['postalCode'] == '810-0000'
+    assert result['city'] == 'Fukuoka' and result['postalCode'] == '8100000'
     assert all(len(line) <= 35 for line in result['streetLines']) and len(result['streetLines']) <= 3
     with pytest.raises(AddressError):
         split_address_text('Tokyo 105-0000', 'JP')
@@ -840,3 +864,74 @@ def test_zpl_labels_stored_raw(client, access_token, fedex):
     assert label.status_code == 200 and label.mimetype == 'application/octet-stream'
     assert label.headers['Content-Disposition'] == 'attachment; filename="LABEL_794600000001.zpl"'
     assert label.data == zpl + zpl                      # 各箱原始指令按顺序拼接
+
+
+@pytest.mark.parametrize('zip_code', [None, '600-0000', '6000000'])
+def test_real_warehouse_address_split(zip_code):
+    # 线上仓库的英文地址：末段国名去掉、城市段里的邮编剥掉、一段一行、日本邮编 7 位数字
+    address = split_address_text('4-5-6 Sample-cho, Chuo-ku, Osaka 600-0000, JAPAN', 'JP', zip_code, 'Japan')
+    assert address == {'streetLines': ['4-5-6 Sample-cho', 'Chuo-ku'], 'city': 'Osaka',
+                       'postalCode': '6000000', 'countryCode': 'JP'}
+
+
+def test_warehouse_address_used_as_shipper(client, access_token, fedex):
+    dn_id, _task_id = _ready(client, access_token)
+    with client.application.app_context():
+        warehouse = get_warehouse()
+        warehouse.address_en = '4-5-6 Sample-cho, Chuo-ku, Osaka 600-0000, JAPAN'
+        warehouse.zip_code = '600-0000'
+        warehouse.country_code = 'JP'
+        db.session.commit()
+    assert _create(client, access_token, dn_id).status_code == 201
+    assert fedex.ship_request()['requestedShipment']['shipper']['address'] == {
+        'streetLines': ['4-5-6 Sample-cho', 'Chuo-ku'], 'city': 'Osaka', 'postalCode': '6000000',
+        'countryCode': 'JP'}
+
+
+def test_tracking_number_locked_to_active_shipment(client, access_token, fedex):
+    dn_id, task_id = _ready(client, access_token)
+    assert _create(client, access_token, dn_id).status_code == 201
+
+    # 保存运单号：别的号码 / 清空 → 409 16078；同一号码（空白不同）照常
+    for value in ('999999999999', None, ''):
+        response = client.put(f'/delivery/{task_id}/tracking', json={'tracking_number': value},
+                              headers=_h(access_token))
+        assert response.status_code == 409 and response.get_json()['code'] == 16078, value
+        assert response.get_json()['details']['tracking_number'] == '794600000001'
+    same = client.put(f'/delivery/{task_id}/tracking', json={'tracking_number': '7946 0000 0001'},
+                      headers=_h(access_token))
+    assert same.status_code == 200, same.get_json()
+
+    # 修改发货任务：别的号码 409；空值视为不改
+    response = client.put(f'/delivery/{task_id}', json={'tracking_number': 'OTHER-1'}, headers=_h(access_token))
+    assert response.status_code == 409 and response.get_json()['code'] == 16078
+    response = client.put(f'/delivery/{task_id}', json={'tracking_number': None, 'remark': 'x'},
+                          headers=_h(access_token))
+    assert response.status_code == 200 and response.get_json()['tracking_number'] == '7946 0000 0001'
+
+    # 完成发货：别的号码 409；相同或不传照常
+    response = _ship(client, access_token, task_id, tracking_number='OTHER-2')
+    assert response.status_code == 409 and response.get_json()['code'] == 16078
+    with client.application.app_context():
+        assert db.session.get(DeliveryTask, task_id).status == 'in_progress'
+    response = client.put(f'/delivery/{task_id}/complete/', json={'tracking_number': '794600000001'},
+                          headers=_h(access_token))
+    assert response.status_code == 200, response.get_json()
+    assert response.get_json()['tracking_number'] == '794600000001'
+
+
+def test_complete_without_tracking_keeps_auto_number(client, access_token, fedex):
+    dn_id, task_id = _ready(client, access_token)
+    assert _create(client, access_token, dn_id).status_code == 201
+    response = _ship(client, access_token, task_id, tracking_number='')
+    assert response.status_code == 200, response.get_json()
+    assert response.get_json()['tracking_number'] == '794600000001'
+
+
+def test_manual_tracking_allowed_after_cancel(client, access_token, fedex):
+    dn_id, task_id = _ready(client, access_token)
+    _create(client, access_token, dn_id)
+    assert client.post(f'/dn/{dn_id}/carrier-shipment/cancel', headers=_h(access_token)).status_code == 200
+    response = client.put(f'/delivery/{task_id}/tracking', json={'tracking_number': 'MANUAL-9'},
+                          headers=_h(access_token))
+    assert response.status_code == 200 and response.get_json()['tracking_number'] == 'MANUAL-9'

@@ -395,7 +395,7 @@ DN 须为 `picked` 或 `packed`（否则 409 `16067`）。请求体 `{"packages"
 
 `GET` 返回 `{enabled, carrier: "fedex", can_create, blockers[{code, message, goods_code?, field?}], etd_enabled,
 default_label_format, label_formats{A4|THERMAL: {image_type, stock_type}}, declared_value_carriage, delivery_task_id,
-shipment}`；`shipment` 为最近一条运单（有效的优先），没有为 `null`，含 `label_format`、`image_type`、`label_stock_type`、
+shipment, warnings[]}`；`shipment` 为最近一条运单（有效的优先），没有为 `null`，含 `label_format`、`image_type`、`label_stock_type`、
 `label_file_name`、`label_content_type`、`label_parts[]`（面单存档里各文档的来源、箱号、类型、页数、是否存入）等。
 
 `POST` 可带请求体 `{"label_format": "A4" | "THERMAL"}`（面单打印方式；不带用 `FEDEX_DEFAULT_LABEL_FORMAT`，其它值 400 `16077`）：
@@ -412,8 +412,11 @@ shipment}`；`shipment` 为最近一条运单（有效的优先），没有为 `
 - **前置条件**（不满足的原因一次列全；`POST` 返回 409 `16072`，`details.blockers`）：FedEx 未配置 / 选项不合法、
   非海外 DN、DN 不是 `packed` 或已发货、没有发货任务 / 承运商 code 不是 `fedex` / 任务已完成、已有有效运单
   （`SHIPMENT_EXISTS`）或已手工存过运单号（`TRACKING_NUMBER_EXISTS`）、没有箱子 / 超过 30 箱、报关视图有错误级问题
-  （码同报关视图）、申告价额高于已打包货值（`DECLARED_VALUE_EXCEEDS_CUSTOMS_VALUE`，FedEx 会拒）、发件 / 收件地址
-  放不进 FedEx 格式（`SHIPPER_ADDRESS_INVALID` / `RECIPIENT_ADDRESS_INVALID`）、收件人姓名或电话缺失。
+  （码同报关视图）、发件 / 收件地址放不进 FedEx 格式（`SHIPPER_ADDRESS_INVALID` / `RECIPIENT_ADDRESS_INVALID`）、
+  收件人姓名或电话缺失。
+- **运送申告价额**高于已打包货值时自动压到已打包货值（FedEx 拒收申告价额高于报关货值的运单；部分打包时只保实际发出的货）。
+  实际提交的值记在 `shipment.declared_value`；`warnings` 里给 `{code: "DECLARED_VALUE_CAPPED", message,
+  declared_value_carriage, declared_value}`（`GET` 在没有有效运单时作预告，`POST` 响应里是这次实际做的）。
 - 没有当前有效的 CI / PL（或已过期）时先按现有逻辑签发。
 - `FEDEX_ETD_ENABLED` 开启时，先把当前 CI PDF 上传给 FedEx（Trade Documents Upload API，建单前上传），建单时以
   `ELECTRONIC_TRADE_DOCUMENTS` 引用；关闭时仓库照旧打印 CI 随货。
@@ -423,8 +426,11 @@ shipment}`；`shipment` 为最近一条运单（有效的优先），没有为 `
   每个 WMS 箱子一行包裹（毛重 kg、尺寸 cm，面单印 DN 订单号与发票号）；运送申告价额按箱均分；运费 / 保险费按快照；运费记账到账号，
   关税付款方按 `FEDEX_DUTIES_PAYMENT_TYPE`。
 - 地址规则：FedEx 街道最多 3 行 × 35 字符、城市 ≤ 35 字符。英文地址按逗号 / 换行切段，去掉国家名和邮编后的最后一段
-  为城市，例如 `1-2-3 Example, Minato-ku, Tokyo 105-0000`。邮编取仓库 / 公司的 `zip_code`（日本地址也能从地址里认出）。
-  收件人没有邮编时带空的 `postalCode`；美国 / 加拿大 / 波多黎各必须有两位州代码。
+  为城市，其余各段一段一行（超过 3 行时连起来重新折行）。例：`4-5-6 Sample-cho, Chuo-ku, Osaka 600-0000, JAPAN` →
+  街道 `4-5-6 Sample-cho` / `Chuo-ku`、城市 `Osaka`、邮编 `6000000`。邮编取仓库 / 公司的 `zip_code`
+  （日本地址也能从地址里认出，统一发 7 位数字）。收件人没有邮编时带空的 `postalCode`；美国 / 加拿大 / 波多黎各必须有两位州代码。
+- 有有效运单时发货任务的运单号锁定为该运单号：完成发货、保存运单号、修改发货任务传了别的号码 → 409 `16078`
+  （要换先取消运单；完成发货 / 修改任务时传空值视为不改）。
 - 商品重量：有单件重量的 = 单件重量 × 已打包数量；没有的分摊「总毛重 − 已知重量」（不为正时按数量占比分摊总毛重）。
 - **先调 FedEx，成功后才写库**（一个事务）：运单号 → 发货任务、CI / PL 带 AWB 升版本、面单存档存为
   `doc_type: shipping_label` 的单证、记 `dn_carrier_shipments`。存档包含响应里的**所有**文档（每箱面单 → 辅助运单 → 其他；
@@ -508,7 +514,7 @@ stdout_logfile=/var/log/wms-api.out.log
 | 库存错误 | 15000-15999 | 400 | 库存相关错误 |
 | 状态错误 | 16000-16999 | 400 | 状态流转错误 |
 
-出口单证相关业务码：`14019` 出口资料文本超长、`14020` 国家代码不合法、`16063` 报关结构不合法、`16064` 报关行商品编码不在 DN 明细或重复、`16065` 已发货不可改（409）、`16066` 箱子数据不合法、`16067` 当前状态不能改箱子（409）、`16068` 单证条件不全（409，`details.problems`）、`16069` 发货前必须先出单证（409）、`16070` 不是海外单（409）、`16071` 单证不存在（404）。承运商运单（FedEx）：`16072` 建单前置条件不满足（409，`details.blockers`）、`16073` FedEx 返回错误（502，`details.errors` / `transaction_id`）、`16074` FedEx 超时（504）、`16075` 没有有效运单（409）、`16076` 有有效运单时不能改箱子（409）、`16077` `label_format` 不合法（400）。错误响应可能带结构化的 `details`。
+出口单证相关业务码：`14019` 出口资料文本超长、`14020` 国家代码不合法、`16063` 报关结构不合法、`16064` 报关行商品编码不在 DN 明细或重复、`16065` 已发货不可改（409）、`16066` 箱子数据不合法、`16067` 当前状态不能改箱子（409）、`16068` 单证条件不全（409，`details.problems`）、`16069` 发货前必须先出单证（409）、`16070` 不是海外单（409）、`16071` 单证不存在（404）。承运商运单（FedEx）：`16072` 建单前置条件不满足（409，`details.blockers`）、`16073` FedEx 返回错误（502，`details.errors` / `transaction_id`）、`16074` FedEx 超时（504）、`16075` 没有有效运单（409）、`16076` 有有效运单时不能改箱子（409）、`16077` `label_format` 不合法（400）、`16078` 运单号与有效的自动运单不一致（409）。错误响应可能带结构化的 `details`。
 
 ## 关联项目
 

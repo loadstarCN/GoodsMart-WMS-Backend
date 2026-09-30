@@ -9,6 +9,9 @@
   写库失败则尝试取消刚建的运单并记日志。
 - 面单打印方式（label_format）由建单请求指定：A4（激光打印机）/ THERMAL（4 英寸面单机），不指定用配置默认；
   各格式的 imageType / 纸张见 fedex_shipment.label_settings。
+- 运送申告价额高于已打包货值时自动压到已打包货值（FedEx 拒收申告价额高于报关货值的运单；部分打包时只保实际发出的货），
+  实际提交的值记在运单的 declared_value 上，响应 warnings 里说明。
+- 有有效自动运单时，发货任务的运单号只能是这张运单的号码（完成发货 / 保存运单号 / 修改发货任务传了别的号码 → 409 16078）。
 - 取消：DN 未发货才可；FedEx 取消成功后记录标 cancelled、发货任务上的运单号清掉、面单作废、
   CI / PL 去掉 AWB 重新签发（条件不满足则作废）。
 """
@@ -16,6 +19,7 @@ import hashlib
 import logging
 import re
 from datetime import date, datetime
+from decimal import Decimal, ROUND_FLOOR
 
 from flask import current_app
 
@@ -185,7 +189,8 @@ class CarrierShipmentService:
         """前置条件检查 + 建单要用的数据：{blockers, view, task, shipper, recipient, settings}"""
         blockers = []
         settings = _settings()
-        ctx = {'blockers': blockers, 'settings': settings, 'view': None, 'task': None,
+        ctx = {'blockers': blockers, 'warnings': [], 'declared_value': None, 'settings': settings,
+               'view': None, 'task': None,
                'shipper': None, 'recipient': None}
 
         if not CarrierShipmentService.enabled():
@@ -257,13 +262,9 @@ class CarrierShipmentService:
             blockers.append(_blocker(problem['code'], problem['message'],
                                      goods_code=problem.get('goods_code'), field=problem.get('field')))
 
-        # FedEx 拒绝申告价额高于报关货值（TOTALCARRIAGEVALUE.EXCEEDS.CUSTOMSVALUE，sandbox 实测）
-        goods_value = view['totals']['goods_value'] or 0
-        if customs.declared_value_carriage and customs.declared_value_carriage > goods_value:
-            blockers.append(_blocker(
-                'DECLARED_VALUE_EXCEEDS_CUSTOMS_VALUE',
-                f"Declared value for carriage ({customs.declared_value_carriage}) exceeds the customs value of the "
-                f"packed goods ({goods_value}); FedEx does not accept this", field='declared_value_carriage'))
+        ctx['declared_value'], warning = CarrierShipmentService._declared_value(customs, view)
+        if warning and active is None:
+            ctx['warnings'].append(warning)
 
         exporter = view['exporter']
         if exporter['legal_name_en'] and (exporter['address_en'] or (dn.warehouse.address_en or '').strip()):
@@ -290,11 +291,47 @@ class CarrierShipmentService:
         return ctx
 
     @staticmethod
+    def _declared_value(customs, view):
+        """随运单提交的申告价额（整数，报关币种）与说明：高于已打包货值时压到已打包货值（取整数部分）。
+        FedEx 拒收申告价额高于报关货值的运单（TOTALCARRIAGEVALUE.EXCEEDS.CUSTOMSVALUE，sandbox 实测）。"""
+        requested = customs.declared_value_carriage
+        if not requested:
+            return None, None
+        goods_value = Decimal(str(view['totals']['goods_value'] or 0)).to_integral_value(rounding=ROUND_FLOOR)
+        if requested <= goods_value:
+            return requested, None
+        capped = int(goods_value) or None
+        return capped, {
+            'code': 'DECLARED_VALUE_CAPPED',
+            'message': (f"Declared value for carriage {requested} exceeds the customs value of the packed goods "
+                        f"({goods_value}); {capped or 0} is submitted to FedEx instead"),
+            'declared_value_carriage': requested,
+            'declared_value': capped,
+        }
+
+    @staticmethod
     def blockers(dn: DN) -> list:
         return CarrierShipmentService._collect(dn)['blockers']
 
     @staticmethod
-    def status(dn: DN, ctx=None, alerts=None) -> dict:
+    def assert_tracking_matches(dn: DN, tracking_number, allow_empty=False):
+        """有有效自动运单时，发货任务的运单号只能是它的号码（忽略空白差异）。
+        allow_empty=True：空值视为「不改」由调用方跳过；False：清空也算不一致（要清空请取消运单）。"""
+        shipment = CarrierShipmentService.active_shipment(dn)
+        if shipment is None:
+            return
+        given = ''.join(str(tracking_number or '').split())
+        if not given and allow_empty:
+            return
+        if given != ''.join(shipment.tracking_number.split()):
+            raise ConflictException(
+                f"This DN has an active {shipment.carrier} shipment {shipment.tracking_number}; the tracking number "
+                "cannot be changed. Cancel the carrier shipment first.", 16078,
+                details={'tracking_number': shipment.tracking_number, 'carrier': shipment.carrier},
+            )
+
+    @staticmethod
+    def status(dn: DN, ctx=None, alerts=None, warnings=None) -> dict:
         """GET /dn/<id>/carrier-shipment"""
         ctx = ctx or CarrierShipmentService._collect(dn)
         shipment = CarrierShipmentService.latest_shipment(dn)
@@ -313,6 +350,8 @@ class CarrierShipmentService:
             'declared_value_carriage': customs.declared_value_carriage if customs else None,
             'delivery_task_id': ctx['task'].id if ctx['task'] is not None else None,
             'shipment': shipment.to_dict() if shipment else None,
+            # 建单时会自动做的调整（如申告价额压到已打包货值）；建单响应里是这次实际做了的
+            'warnings': ctx['warnings'] if warnings is None else warnings,
         }
         if alerts is not None:
             payload['alerts'] = alerts
@@ -327,7 +366,7 @@ class CarrierShipmentService:
         view = ctx['view']
         customs = dn.customs
         packages = list(dn.packages)
-        declared_total = customs.declared_value_carriage
+        declared_total = ctx['declared_value']
         declared_split = split_evenly(declared_total, len(packages)) if declared_total else [None] * len(packages)
         package_items = [{
             'gross_weight_kg': p.gross_weight_kg,
@@ -480,7 +519,6 @@ class CarrierShipmentService:
         ship_date = ship_date or datetime.now(_document_timezone()).date()
 
         label_doc = CarrierShipmentService._store_label(dn, tracking, ship_date, archive, user_id)
-        customs = dn.customs
         shipment = DNCarrierShipment(
             dn_id=dn.id,
             carrier=CARRIER_FEDEX,
@@ -492,7 +530,7 @@ class CarrierShipmentService:
             package_count=len(dn.packages),
             net_charge=result['net_charge'],
             currency=result['currency'],
-            declared_value=customs.declared_value_carriage or None,
+            declared_value=ctx['declared_value'],
             label_format=label['label_format'],
             image_type=label['image_type'],
             label_stock_type=label['stock_type'],
@@ -505,7 +543,7 @@ class CarrierShipmentService:
         db.session.add(shipment)
         db.session.flush()
         db.session.expire(dn, ['carrier_shipments', 'customs_documents'])
-        return CarrierShipmentService.status(dn, alerts=result['alerts'])
+        return CarrierShipmentService.status(dn, alerts=result['alerts'], warnings=ctx['warnings'])
 
     @staticmethod
     def _store_label(dn: DN, tracking: str, ship_date, archive: dict, user_id) -> DNDocument:

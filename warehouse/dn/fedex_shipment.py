@@ -6,8 +6,10 @@
 - 地址：FedEx 每行 streetLines ≤ 35 字符、最多 3 行，city ≤ 35 字符。放不下就拦截（不截断地址），
   名称（companyName ≤ 35）超长截断。
 - 发件人地址来自一个英文地址字符串（仓库 address_en，没有则公司 address_en）：按换行 / 逗号切段，
-  去掉末尾的国家名段，去掉邮编（仓库 / 公司的 zip_code；日本地址没有时认 NNN-NNNN），
-  最后一段为 city，其余段按 35 字符折行。
+  去掉末尾的国家名段，去掉邮编（仓库 / 公司的 zip_code；日本地址没有时认 NNN-NNNN，输出统一 7 位数字），
+  最后一段为 city，其余段一段一行（放不下 3 行时连起来按 35 字符折行）。
+  例：'4-5-6 Sample-cho, Chuo-ku, Osaka 600-0000, JAPAN' →
+  streetLines ['4-5-6 Sample-cho', 'Chuo-ku']、city 'Osaka'、postalCode '6000000'。
 - 收件人：consignee 的 address_line1/2 折行；邮编没有也带空串键（FedEx 对没有邮编的地区缺这个键会 422）；
   州代码只对 US / CA / PR 传（两位字母，缺了拦截）。
 - 电话只保留数字。
@@ -179,13 +181,20 @@ def split_evenly(total: int, count: int) -> list:
     return [base + (1 if index < remainder else 0) for index in range(count)]
 
 
+def _wrap(text, width):
+    return [line.rstrip(', ') for line in
+            textwrap.wrap(text, width=width, break_long_words=False, break_on_hyphens=False)]
+
+
 def wrap_lines(parts, width=MAX_LINE, max_lines=MAX_STREET_LINES) -> list:
-    """地址片段（用 ", " 连成一段）按单词折成每行 ≤ width 的行，行尾逗号去掉。放不下抛 AddressError。"""
-    text = ', '.join(' '.join(str(part or '').split()) for part in parts if str(part or '').strip())
-    if not text:
+    """地址片段 → 每行 ≤ width 的街道行：放得下时一段一行（超长的段按单词折）；
+    行数超了再把各段用 ", " 连起来整体按单词折。还放不下抛 AddressError。"""
+    parts = [' '.join(str(part or '').split()) for part in parts if str(part or '').strip()]
+    if not parts:
         raise AddressError("street address is empty")
-    lines = [line.rstrip(', ') for line in
-             textwrap.wrap(text, width=width, break_long_words=False, break_on_hyphens=False)]
+    lines = [line for part in parts for line in _wrap(part, width)]
+    if len(lines) > max_lines:
+        lines = _wrap(', '.join(parts), width)
     for line in lines:
         if len(line) > width:
             raise AddressError(f"'{line}' is longer than {width} characters")
@@ -237,6 +246,8 @@ def split_address_text(text, country_code, postal_code=None, country_name=None) 
     city = segments[-1]
     if len(city) > MAX_LINE:
         raise AddressError(f"city '{city}' is longer than {MAX_LINE} characters")
+    if postal and country_code == 'JP' and len(re.sub(r'\D', '', postal)) == 7:
+        postal = re.sub(r'\D', '', postal)          # 日本邮编统一 7 位数字（去掉 - 和 〒）
     result = {
         'streetLines': wrap_lines(segments[:-1]),
         'city': city,

@@ -146,6 +146,7 @@ class DeliveryTaskTracking(Resource):
         Save the tracking (AWB) number / carrier before completing the delivery.
         - Allowed while the task is pending / in_progress; shipped → 409 16065
         - Issued customs documents are not voided; re-issue them to print the AWB (new version)
+        - While the DN has an active carrier shipment only its tracking number is accepted (409 16078)
         """
         task = _owned_task(task_id)
         return DeliveryTaskService.save_tracking(task, api_ns.payload)

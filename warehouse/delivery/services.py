@@ -52,6 +52,20 @@ class DeliveryTaskService:
             )
 
     @staticmethod
+    def _guard_carrier_tracking(task: DeliveryTask, payload: dict):
+        """DN 有有效的自动运单（承运商对接建的）时：请求里的运单号为空视为不改；
+        与自动运单不同 → 409 16078（要换运单号先取消自动运单）。"""
+        if 'tracking_number' not in payload:
+            return
+        from warehouse.dn.carrier_services import CarrierShipmentService
+        if CarrierShipmentService.active_shipment(task.dn) is None:
+            return
+        if not str(payload['tracking_number'] or '').strip():
+            payload.pop('tracking_number')
+            return
+        CarrierShipmentService.assert_tracking_matches(task.dn, payload['tracking_number'])
+
+    @staticmethod
     def _get_instance(task_or_id: int | DeliveryTask) -> DeliveryTask:
         """
         根据传入参数返回 DeliveryTask 实例。
@@ -184,6 +198,7 @@ class DeliveryTaskService:
 
         payload = pick_fields(data, DELIVERY_UPDATE_FIELDS)
         payload = DeliveryTaskService._normalize_payload(payload, delivery.dn)
+        DeliveryTaskService._guard_carrier_tracking(delivery, payload)
         DeliveryTaskService._assert_shipping_dates(
             payload.get('expected_shipping_date', delivery.expected_shipping_date),
             payload.get('actual_shipping_date', delivery.actual_shipping_date),
@@ -210,6 +225,7 @@ class DeliveryTaskService:
         出单证（商业发票印 AWB No.）→ 完成发货。
         - 任务 pending / in_progress 可存；DN 已发货或任务已完成 → 409 16065
         - 已签发的出口单证不自动作废：运单号计入单证数据指纹，重新 issue 时升版本
+        - DN 有有效的自动运单（承运商对接）时，只能存它的号码（清空 / 改成别的 → 409 16078，先取消自动运单）
         """
         task = DeliveryTaskService._get_instance(task_or_id)
         if task.status in ('completed', 'signed') or task.dn.status in ('delivered', 'completed'):
@@ -224,6 +240,8 @@ class DeliveryTaskService:
             if tracking is not None and len(tracking) > 100:
                 raise BadRequestException("tracking_number must not exceed 100 characters", 40000,
                                           field='tracking_number')
+            from warehouse.dn.carrier_services import CarrierShipmentService
+            CarrierShipmentService.assert_tracking_matches(task.dn, tracking)
             task.tracking_number = tracking
         if payload.get('carrier_id') is not None:
             carrier_id = require_positive_int(payload['carrier_id'], 'carrier_id', 16044)
@@ -326,6 +344,8 @@ class DeliveryTaskService:
             'transportation_mode', 'carrier_id', 'tracking_number', 'shipping_cost', 'currency', 'remark',
         ))
         payload = DeliveryTaskService._normalize_payload(payload, task.dn)
+        # 有有效的自动运单时，完成发货传了别的运单号 → 409 16078（相同或不传照常）
+        DeliveryTaskService._guard_carrier_tracking(task, payload)
         DeliveryTaskService._assert_shipping_dates(task.expected_shipping_date, datetime.now().date())
 
         task = DeliveryTaskService._update_task_status(task, 'completed', operator_id)
