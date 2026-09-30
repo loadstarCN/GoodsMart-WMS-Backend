@@ -720,13 +720,22 @@ def test_insurance_change_voids_and_bumps_version(client, access_token):
     assert len(response.get_json()['voided_documents']) == 2
 
 
-def test_jp_export_code_threshold_counts_insurance(client, access_token):
+def test_jp_export_code_threshold_uses_goods_value_only(client, access_token):
+    """20 万日元按货值（FOB）判断：运费 / 保险费不算进去"""
     customs = _customs(insurance_charge=50000, declared_value_carriage=143600)
-    customs['lines'][1]['unit_value'] = 70000                    # 3,600 + 140,000 + 8,200 + 50,000 > 200,000
+    customs['lines'][1]['unit_value'] = 70000                    # 货值 3,600 + 140,000 ≤ 200,000（加上运费保险才超）
     dn_id, _task_id = _export_dn_ready(client, access_token, customs=customs)
     view = client.get(f'/dn/{dn_id}/customs', headers=_h(access_token)).get_json()
+    assert view['totals']['goods_value'] == 143600
     assert view['totals']['invoice_total'] == 201800
-    assert 'JP_EXPORT_CODE_MISSING' in _codes(view['problems'], 'warning')
+    assert 'JP_EXPORT_CODE_MISSING' not in _codes(view['problems'])
+
+    customs['lines'][1]['unit_value'] = 98300                    # 货值 3,600 + 196,600 = 200,200 > 200,000
+    response = client.put(f'/dn/{dn_id}/customs', json=customs, headers=_h(access_token))
+    assert response.status_code == 200
+    assert response.get_json()['totals']['goods_value'] == 200200
+    missing = [p for p in response.get_json()['problems'] if p['code'] == 'JP_EXPORT_CODE_MISSING']
+    assert {(p['goods_code'], p['level']) for p in missing} == {('G001', 'warning'), ('G002', 'warning')}
 
 
 # ---------------------------------------------------------------------------
@@ -753,6 +762,8 @@ def test_ship_requires_documents_then_locks(client, access_token):
     blocked = _ship(client, access_token, task_id, tracking_number='AWB-1')
     assert blocked.status_code == 409
     assert blocked.get_json()['code'] == 16069
+    assert blocked.get_json()['details'] == {'missing_documents': ['commercial_invoice', 'packing_list'],
+                                             'outdated': False}
     with client.application.app_context():
         assert db.session.get(DN, dn_id).status == 'packed'
         assert db.session.get(DeliveryTask, task_id).status == 'in_progress'
@@ -814,10 +825,15 @@ def test_tracking_saved_before_shipping_prints_awb_and_bumps_version(client, acc
     assert b'AWB No.' in _pdf_streams(ci.data) and b'7946 0000 0001' in _pdf_streams(ci.data)
     assert client.get(f'/dn/{dn_id}/customs', headers=_h(access_token)).get_json()['documents_outdated'] is False
 
-    # 完成发货时运单号与已存的不同：以请求为准，只要求存在有效单证
-    shipped = _ship(client, access_token, task_id, tracking_number='7946 0000 0002')
+    # 完成发货时运单号与 CI 上印的 AWB 不同 → 409 16080（先保存运单号并重出单证）；相同照常
+    rejected = _ship(client, access_token, task_id, tracking_number='7946 0000 0002')
+    assert rejected.status_code == 409 and rejected.get_json()['code'] == 16080
+    assert rejected.get_json()['details'] == {'document_tracking_number': '7946 0000 0001',
+                                              'tracking_number': '7946 0000 0002'}
+    shipped = client.put(f'/delivery/{task_id}/complete/', json={'tracking_number': '7946 0000 0001'},
+                         headers=_h(access_token))
     assert shipped.status_code == 200, shipped.get_json()
-    assert shipped.get_json()['tracking_number'] == '7946 0000 0002'
+    assert shipped.get_json()['tracking_number'] == '7946 0000 0001'
 
     locked = client.put(f'/delivery/{task_id}/tracking', json={'tracking_number': 'X'}, headers=_h(access_token))
     assert locked.status_code == 409 and locked.get_json()['code'] == 16065
@@ -926,3 +942,192 @@ def test_error_response_details_backward_compatible(client, access_token):
     response = client.get('/dn/99999', headers=_h(access_token))
     assert response.status_code == 404
     assert 'details' not in response.get_json()
+
+
+# ---------------------------------------------------------------------------
+# HS 截断 / 数值上限 / 发货人非拉丁字符 / 字体嵌入 / 国家默认值 / 列表预加载
+# ---------------------------------------------------------------------------
+
+def test_ci_prints_only_first_six_hs_digits(client, access_token):
+    customs = _customs()
+    customs['lines'][0]['hs_code'] = '9503.00.0073'             # 10 位：CI 只印前 6 位
+    customs['lines'][1]['hs_code'] = '392640000'                # 9 位
+    dn_id, _task_id = _export_dn_ready(client, access_token, customs=customs)
+    view = client.get(f'/dn/{dn_id}/customs', headers=_h(access_token)).get_json()
+    lines = {line['goods_code']: line for line in view['lines']}
+    assert lines['G001']['hs_code_formatted'] == '9503.00.0073'   # 视图照常显示全部位数
+    assert lines['G002']['hs_code_formatted'] == '3926.40.000'
+    assert 'HS_CODE_MISSING' not in _codes(view['problems'])
+
+    documents = _issue(client, access_token, dn_id).get_json()['documents']
+    ci_text = _pdf_streams(client.get(f"/dn/{dn_id}/customs-documents/{documents[0]['id']}/file",
+                                      headers=_h(access_token)).data)
+    assert b'9503.00' in ci_text and b'3926.40' in ci_text
+    assert b'9503.00.0073' not in ci_text and b'3926.40.000' not in ci_text
+
+
+@pytest.mark.parametrize('path, value, field', [
+    (('lines', 0, 'unit_value'), 1e28, 'customs.lines[0].unit_value'),
+    (('lines', 0, 'unit_value'), '1' + '0' * 30, 'customs.lines[0].unit_value'),
+    (('lines', 0, 'unit_value'), -1e13, 'customs.lines[0].unit_value'),
+    (('lines', 0, 'total_value'), 10 ** 13, 'customs.lines[0].total_value'),
+    (('lines', 0, 'quantity'), 2 ** 31, 'customs.lines[0].quantity'),
+    (('freight_charge',), 2 ** 31, 'customs.freight_charge'),
+    (('insurance_charge',), 2 ** 31, 'customs.insurance_charge'),
+    (('declared_value_carriage',), '99999999999', 'customs.declared_value_carriage'),
+])
+def test_customs_numbers_over_limit_rejected(client, access_token, path, value, field):
+    _prepare(client)
+    customs = _customs()
+    target = customs
+    for key in path[:-1]:
+        target = target[key]
+    target[path[-1]] = value
+    response = _create_dn(client, access_token, customs=customs)
+    assert response.status_code == 400, response.get_json()
+    assert response.get_json()['code'] == 16063
+    assert response.get_json()['details'] == {'field': field}
+
+    # PUT 也一样（以前入库后 GET customs / 出单证 500）
+    dn_id = _create_dn(client, access_token, order_number='ORD-LIMIT-2').get_json()['id']
+    response = client.put(f'/dn/{dn_id}/customs', json=customs, headers=_h(access_token))
+    assert response.status_code == 400 and response.get_json()['code'] == 16063
+
+
+def test_customs_numbers_at_limit_accepted(client, access_token):
+    customs = _customs(freight_charge=2 ** 31 - 1, insurance_charge=2 ** 31 - 1,
+                       declared_value_carriage=2 ** 31 - 1)
+    customs['lines'][0]['unit_value'] = 10 ** 12
+    customs['lines'][0]['total_value'] = '1000000000000'
+    dn_id, _task_id = _export_dn_ready(client, access_token, customs=customs)
+    view = client.get(f'/dn/{dn_id}/customs', headers=_h(access_token))
+    assert view.status_code == 200, view.get_json()
+    assert view.get_json()['totals']['goods_value'] == 3 * 10 ** 12 + 42000
+    assert _issue(client, access_token, dn_id).status_code == 201
+
+
+def test_freight_with_cents_still_rejected(client, access_token):
+    """运费 / 保险费 / 申告价额的列是 INTEGER：带分的币种（USD 等）也只能收整数"""
+    _prepare(client)
+    for key in ('freight_charge', 'insurance_charge', 'declared_value_carriage'):
+        response = _create_dn(client, access_token, customs=_customs(currency='USD', **{key: 12.5}))
+        assert response.status_code == 400 and response.get_json()['code'] == 16063, key
+        assert response.get_json()['details'] == {'field': f'customs.{key}'}
+    assert _create_dn(client, access_token, customs=_customs(currency='USD', freight_charge=12)).status_code == 201
+
+
+def test_exporter_non_latin_text_is_error(client, access_token):
+    dn_id, _task_id = _export_dn_ready(client, access_token)
+    with client.application.app_context():
+        company = get_company()
+        company.export_signatory_name = '山田 太郎'
+        warehouse = get_warehouse()
+        warehouse.address_en = '千葉県市川市 1-2-3'                # 仓库地址 ≠ 公司地址 → 印 Ship From
+        db.session.commit()
+
+    view = client.get(f'/dn/{dn_id}/customs', headers=_h(access_token)).get_json()
+    errors = {(p['code'], p['field']) for p in view['problems'] if p['level'] == 'error'}
+    assert ('EXPORTER_NON_LATIN_TEXT', 'company.export_signatory_name') in errors
+    assert ('EXPORTER_NON_LATIN_TEXT', 'warehouse.address_en') in errors
+    assert 'NON_LATIN_TEXT' not in _codes(view['problems'])
+    assert view['ready'] is False
+    response = _issue(client, access_token, dn_id)
+    assert response.status_code == 409 and response.get_json()['code'] == 16068
+
+    with client.application.app_context():
+        get_company().export_signatory_name = 'Taro Example'
+        get_warehouse().address_en = None
+        db.session.commit()
+    assert _issue(client, access_token, dn_id).status_code == 201
+
+
+def test_exporter_full_width_phone_points_to_source_field(client, access_token):
+    dn_id, _task_id = _export_dn_ready(client, access_token)
+    with client.application.app_context():
+        get_warehouse().phone = '０３-１２３４-５６７８'
+        db.session.commit()
+    view = client.get(f'/dn/{dn_id}/customs', headers=_h(access_token)).get_json()
+    assert ('EXPORTER_NON_LATIN_TEXT', 'warehouse.phone') in {(p['code'], p.get('field')) for p in view['problems']}
+
+
+def _vera_ttf():
+    import os
+    import reportlab
+    return os.path.join(os.path.dirname(reportlab.__file__), 'fonts', 'Vera.ttf')
+
+
+@pytest.mark.parametrize('font_path', [None, 'vera'])
+def test_pdf_font_path_embeds_configured_ttf(client, access_token, monkeypatch, font_path):
+    """CUSTOMS_PDF_FONT_PATH 配了 TTF → 字体子集嵌入 PDF（FontFile2），基础字体印不出的字符用它印；
+    没配 → 保持现状：Helvetica 不嵌入，印不出的字符退回内置 CID 字体"""
+    monkeypatch.setitem(client.application.config, 'CUSTOMS_PDF_FONT_PATH',
+                        _vera_ttf() if font_path else None)
+    customs = _customs()
+    customs['consignee']['name'] = 'Łukasz Čapek'   # 拉丁字母，但不在 Helvetica（cp1252）里
+    dn_id, _task_id = _export_dn_ready(client, access_token, customs=customs)
+    view = client.get(f'/dn/{dn_id}/customs', headers=_h(access_token)).get_json()
+    assert 'NON_LATIN_TEXT' not in _codes(view['problems'])
+    documents = _issue(client, access_token, dn_id).get_json()['documents']
+    ci_id = documents[0]['id']
+    ci = client.get(f'/dn/{dn_id}/customs-documents/{ci_id}/file', headers=_h(access_token)).data
+    if font_path:
+        assert b'/FontFile2' in ci                 # TrueType 子集嵌入
+        assert b'HeiseiKakuGo-W5' not in ci        # 没有退回不嵌入的 CID 字体
+    else:
+        assert b'/FontFile2' not in ci
+        assert b'HeiseiKakuGo-W5' in ci
+
+
+def test_country_code_null_not_masked_in_output(client, access_token):
+    with client.application.app_context():
+        company = get_company()
+        warehouse = get_warehouse()
+        company.country_code = None
+        warehouse.country_code = None
+        db.session.commit()
+        company_id, warehouse_id = company.id, warehouse.id
+
+    assert client.get(f'/company/{company_id}', headers=_h(access_token)).get_json()['country_code'] is None
+    assert client.get(f'/warehouse/{warehouse_id}', headers=_h(access_token)).get_json()['country_code'] is None
+
+    # 单证据此提示补齐（不再被输出默认值 JP 掩盖）
+    _prepare(client)
+    with client.application.app_context():
+        get_company().country_code = None
+        db.session.commit()
+    dn_id = _create_dn(client, access_token).get_json()['id']
+    view = client.get(f'/dn/{dn_id}/customs', headers=_h(access_token)).get_json()
+    assert view['exporter']['country_code'] is None
+    assert ('EXPORTER_PROFILE_INCOMPLETE', 'company.country_code') in {
+        (p['code'], p.get('field')) for p in view['problems']}
+
+    # 新建不传 country_code 仍走列默认值 JP
+    created = client.post('/warehouse/', json={'name': 'Warehouse Z', 'company_id': company_id},
+                          headers=_h(access_token))
+    assert created.status_code == 201, created.get_json()
+    assert created.get_json()['country_code'] == 'JP'
+
+
+def test_dn_list_preloads_customs_and_details(client, access_token):
+    from sqlalchemy import event
+    _prepare(client)
+    ids = [_create_dn(client, access_token, order_number=f'ORD-LIST-{i}').get_json()['id'] for i in range(3)]
+    ids.append(_create_dn(client, access_token, customs=None, order_number='ORD-LIST-DOM').get_json()['id'])
+
+    statements = []
+
+    def record(conn, cursor, statement, parameters, context, executemany):
+        statements.append(statement)
+
+    with client.application.app_context():
+        engine = db.engine
+    event.listen(engine, 'before_cursor_execute', record)
+    try:
+        response = client.get('/dn/?per_page=50', headers=_h(access_token))
+    finally:
+        event.remove(engine, 'before_cursor_execute', record)
+    assert response.status_code == 200, response.get_json()
+    flags = {item['id']: item['is_export'] for item in response.get_json()['items']}
+    assert [flags[i] for i in ids] == [True, True, True, False]
+    assert sum('FROM dn_customs' in s for s in statements) == 1
+    assert sum('FROM dn_details' in s for s in statements) == 1

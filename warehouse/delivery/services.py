@@ -53,17 +53,81 @@ class DeliveryTaskService:
 
     @staticmethod
     def _guard_carrier_tracking(task: DeliveryTask, payload: dict):
-        """DN 有有效的自动运单（承运商对接建的）时：请求里的运单号为空视为不改；
-        与自动运单不同 → 409 16078（要换运单号先取消自动运单）。"""
-        if 'tracking_number' not in payload:
+        """DN 有进行中 / 有效 / 结果不明的自动运单（承运商对接建的）时：
+        - 请求里的运单号为空视为不改；有效运单时与它不同 → 409 16078（要换运单号先取消自动运单）；
+          进行中 / 结果不明时带了运单号 → 409 16079（防止在 FedEx 网站又手工建一张）
+        - 有效运单时：请求里的 carrier_id 为 null 视为不改；承运商与运单的不同 → 409 16078
+          （details {tracking_number, carrier, carrier_id}，carrier_id 为请求里的值）"""
+        if 'tracking_number' not in payload and 'carrier_id' not in payload:
             return
         from warehouse.dn.carrier_services import CarrierShipmentService
-        if CarrierShipmentService.active_shipment(task.dn) is None:
+        shipment = CarrierShipmentService.open_shipment(task.dn)
+        if shipment is None:
             return
-        if not str(payload['tracking_number'] or '').strip():
+        if 'tracking_number' in payload:
+            if not str(payload['tracking_number'] or '').strip():
+                payload.pop('tracking_number')
+            else:
+                CarrierShipmentService.assert_tracking_matches(task.dn, payload['tracking_number'])
+        if 'carrier_id' in payload and shipment.status == 'active':
+            DeliveryTaskService._assert_shipment_carrier(shipment, payload)
+
+    @staticmethod
+    def _assert_shipment_carrier(shipment, payload: dict):
+        """请求里的承运商必须是自动运单的承运商（按承运商 code 比，与建单前置条件同口径）。"""
+        from warehouse.carrier.models import Carrier
+        from warehouse.dn.carrier_services import _carrier_code
+        carrier_id = payload.get('carrier_id')
+        if carrier_id is None:
+            payload.pop('carrier_id', None)
+            return
+        carrier = db.session.get(Carrier, carrier_id)
+        if _carrier_code(carrier) != (shipment.carrier or '').strip().lower():
+            tracking = shipment.tracking_number
+            raise ConflictException(
+                f"This DN has an active {shipment.carrier} shipment"
+                f"{' ' + tracking if tracking else ''}; the carrier cannot be changed. "
+                "Cancel the carrier shipment first.", 16078,
+                details={'tracking_number': tracking, 'carrier': shipment.carrier, 'carrier_id': carrier_id},
+            )
+
+    @staticmethod
+    def _clean_complete_tracking(payload: dict):
+        """完成发货的 tracking_number：空串 / null / 不传 → 从 payload 去掉（不改已存值）；
+        数字按字符串收；其它类型或超过 100 字 → 400。"""
+        if 'tracking_number' not in payload:
+            return
+        tracking = payload['tracking_number']
+        if tracking is None:
             payload.pop('tracking_number')
             return
-        CarrierShipmentService.assert_tracking_matches(task.dn, payload['tracking_number'])
+        if isinstance(tracking, bool) or not isinstance(tracking, (str, int)):
+            raise BadRequestException("tracking_number must be a string", 40000, field='tracking_number')
+        tracking = str(tracking).strip()
+        if not tracking:
+            payload.pop('tracking_number')
+            return
+        if len(tracking) > 100:
+            raise BadRequestException("tracking_number must not exceed 100 characters", 40000,
+                                      field='tracking_number')
+        payload['tracking_number'] = tracking
+
+    @staticmethod
+    def _guard_document_awb(ship_state: dict, payload: dict):
+        """海外件：当前有效 CI 已印 AWB 时，完成发货只能用这个号码（忽略空白差异）。
+        不同 → 409 16080（先保存运单号并重出单证）；相同 → 不改已存值（保持与 CI 一字不差）。
+        CI 没印 AWB 时照常写入请求里的号码。"""
+        document_awb = ship_state.get('awb')
+        requested = payload.get('tracking_number')
+        if not document_awb or not requested:
+            return
+        if ''.join(requested.split()) != ''.join(document_awb.split()):
+            raise ConflictException(
+                f"The current commercial invoice shows AWB {document_awb} but the request has {requested}. "
+                "Save the tracking number and issue the documents again before shipping.", 16080,
+                details={'document_tracking_number': document_awb, 'tracking_number': requested},
+            )
+        payload.pop('tracking_number')
 
     @staticmethod
     def _get_instance(task_or_id: int | DeliveryTask) -> DeliveryTask:
@@ -360,22 +424,34 @@ class DeliveryTaskService:
             "shipping_cost": 100.0,
             "remark": "Delivery completed."
         }
+        - tracking_number 为空串 / null / 不传 → 不改已存的运单号（国内件也一样）
+        - 有有效的自动运单时运单号 / 承运商与运单不一致 → 409 16078
+        - 海外件（DN 带报关快照）按写入前的已存状态检查单证：缺 CI / PL → 409 16069
+          {missing_documents: [...], outdated: false}；已过期 → 409 16069 {missing_documents: [], outdated: true}
+        - 海外件当前 CI 已印 AWB、请求带了不同的运单号 → 409 16080 {document_tracking_number, tracking_number}；
+          CI 没印 AWB 时照常写入请求里的运单号
         """
+        from warehouse.dn.customs_services import CustomsService
         task = DeliveryTaskService._get_instance(task_or_id)
+        # 先锁 DN 行（与改箱子 / 改报关快照 / 出单证 / 建运单串行），防止检查通过后单证被并发作废仍出货；
+        # 拿到锁后重读任务，并发的重复完成在下面的状态检查处挡下
+        CustomsService._lock(task.dn)
+        db.session.refresh(task)
         if task.status != 'in_progress':
             raise BadRequestException("Cannot complete a non-in-progress Delivery", 16008)
-
-        # 海外件（带报关快照的 DN）必须先有当前有效的商业发票和装箱单 → 否则 409 16069
-        from warehouse.dn.customs_services import CustomsService
-        CustomsService.assert_ready_to_ship(task.dn)
 
         payload = pick_fields(data or {}, (
             'transportation_mode', 'carrier_id', 'tracking_number', 'shipping_cost', 'currency', 'remark',
         ))
+        DeliveryTaskService._clean_complete_tracking(payload)
         payload = DeliveryTaskService._normalize_payload(payload, task.dn)
-        # 有有效的自动运单时，完成发货传了别的运单号 → 409 16078（相同或不传照常）
+        # 有有效的自动运单时，完成发货传了别的运单号 / 承运商 → 409 16078（相同或不传照常）
         DeliveryTaskService._guard_carrier_tracking(task, payload)
         DeliveryTaskService._assert_shipping_dates(task.expected_shipping_date, datetime.now().date())
+
+        # 海外件：单证缺失 / 过期 → 409 16069（按写入前的状态）；CI 上的 AWB 与请求不同 → 409 16080
+        ship_state = CustomsService.assert_ready_to_ship(task.dn)
+        DeliveryTaskService._guard_document_awb(ship_state, payload)
 
         task = DeliveryTaskService._update_task_status(task, 'completed', operator_id)
 

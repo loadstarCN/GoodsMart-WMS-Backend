@@ -7,7 +7,7 @@ from collections import defaultdict
 from extensions.db import get_object_or_404
 from extensions.error import BadRequestException
 from extensions.transaction import transactional
-from system.webhook.services import emit_company_event
+from system.webhook.services import emit_company_events
 from warehouse.common.countries import normalize_country, is_valid_country
 from warehouse.location.models import Location
 from .models import Goods, GoodsLocation
@@ -76,22 +76,41 @@ def goods_spec_snapshot(goods) -> dict:
     return snapshot
 
 
-def _emit_spec_updated(goods, before: dict, source: str):
-    """前后快照有差异 → 在当前事务里记 goods.spec_updated（按公司广播，同一商品待发送的只留最新）"""
+def _spec_change(goods, before: dict, source: str):
+    """前后规格快照有差异 → (goods, after, changed_fields, source, changed_at)；没变返回 None。
+    快照在调用时取（之后再改商品也不影响这次记下的值）。"""
     after = goods_spec_snapshot(goods)
     changed = [key for _, key in SPEC_FIELDS if before.get(key) != after.get(key)]
     if not changed:
+        return None
+    return goods, after, changed, source, datetime.now().astimezone().isoformat(timespec='seconds')
+
+
+def _emit_spec_changes(changes: list):
+    """把一批规格变动记成 goods.spec_updated（按公司广播，同一商品待发送的只留最新）。
+    只 flush 一次（新建的商品要先拿到 id），每家公司的订阅 Key / 待发送事件各查一次。"""
+    changes = [c for c in changes if c is not None]
+    if not changes:
         return
-    db.session.flush()  # 新建的商品要先拿到 id
-    payload = {
-        'goods_code': goods.code,
-        'goods_id': goods.id,
-        **after,
-        'changed_fields': changed,
-        'source': source,
-        'changed_at': datetime.now().astimezone().isoformat(timespec='seconds'),
-    }
-    emit_company_event(SPEC_UPDATED_EVENT, payload, goods.company_id, dedupe_key=f'goods:{goods.id}')
+    db.session.flush()
+    by_company = defaultdict(list)
+    for goods, after, changed, source, changed_at in changes:
+        payload = {
+            'goods_code': goods.code,
+            'goods_id': goods.id,
+            **after,
+            'changed_fields': changed,
+            'source': source,
+            'changed_at': changed_at,
+        }
+        by_company[goods.company_id].append((payload, f'goods:{goods.id}'))
+    for company_id, items in by_company.items():
+        emit_company_events(SPEC_UPDATED_EVENT, items, company_id)
+
+
+def _emit_spec_updated(goods, before: dict, source: str):
+    """前后快照有差异 → 在当前事务里记 goods.spec_updated（单件；批量导入走 _emit_spec_changes）"""
+    _emit_spec_changes([_spec_change(goods, before, source)])
 
 
 class GoodsService:
@@ -206,6 +225,15 @@ class GoodsService:
         :return: 新创建的 Goods 对象
         """
 
+        new_goods = GoodsService._build_goods(data, created_by_id)
+        # 新建即带规格（重量 / 尺寸 / 原产国任一有值）→ 通知订阅方
+        _emit_spec_updated(new_goods, {}, spec_source or resolve_spec_source())
+        # db.session.commit()
+        return new_goods
+
+    @staticmethod
+    def _build_goods(data: dict, created_by_id: int) -> Goods:
+        """按请求数据建 Goods 并加入会话（不 flush、不发事件）"""
         # 假设 data['manufacturing_date'] = "2025-01-01"
         if 'manufacturing_date' in data and isinstance(data['manufacturing_date'], str):
             data['manufacturing_date'] = datetime.strptime(data['manufacturing_date'], '%Y-%m-%d').date()
@@ -237,9 +265,6 @@ class GoodsService:
             created_by=created_by_id
         )
         db.session.add(new_goods)
-        # 新建即带规格（重量 / 尺寸 / 原产国任一有值）→ 通知订阅方
-        _emit_spec_updated(new_goods, {}, spec_source or resolve_spec_source())
-        # db.session.commit()
         return new_goods
 
     @staticmethod
@@ -358,13 +383,17 @@ class GoodsService:
             Goods.company_id.in_(company_ids)
         ).all()
         existing_map = {(g.code, g.company_id): g for g in existing_goods_list}
+        # 规格变动先收集，循环结束后一次 flush、按公司一次查订阅 Key / 待发送事件再落 goods.spec_updated
+        spec_changes = []
 
         for goods_data in data:
             existing = existing_map.get((goods_data['code'], goods_data['company_id']))
 
             if not existing:
                 # 新增记录逻辑
-                new_goods.append(GoodsService.create_goods(goods_data, created_by_id, spec_source=spec_source))
+                goods = GoodsService._build_goods(goods_data, created_by_id)
+                spec_changes.append(_spec_change(goods, {}, spec_source))
+                new_goods.append(goods)
                 continue
                 
             # 策略处理分支
@@ -394,7 +423,7 @@ class GoodsService:
                 origin_country = clean_origin_country(goods_data.get('origin_country'))
                 if origin_country and not existing.origin_country:
                     existing.origin_country = origin_country
-                _emit_spec_updated(existing, spec_before, spec_source)
+                spec_changes.append(_spec_change(existing, spec_before, spec_source))
                 existing.is_active = True
                 existing.updated_at = datetime.now()
                 db.session.add(existing)
@@ -408,12 +437,13 @@ class GoodsService:
                 origin_country = clean_origin_country(goods_data.get('origin_country'))
                 if origin_country:
                     existing.origin_country = origin_country
-                _emit_spec_updated(existing, spec_before, spec_source)
+                spec_changes.append(_spec_change(existing, spec_before, spec_source))
                 existing.is_active = True
                 existing.updated_at = datetime.now()
                 db.session.add(existing)
                 new_goods.append(existing)
 
+        _emit_spec_changes(spec_changes)
         return new_goods
 
 

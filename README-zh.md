@@ -266,7 +266,8 @@ payload 是当前值的完整快照（`null` = 未录入）：
 - `source`：取商品新建 / 修改请求体里的 `spec_source`（`station` / `manual` / `import` / `api`）；
   没传时 API Key 调用为 `api`、登录用户为 `manual`；CSV 导入为 `import`。
 - 同一商品对同一 Key 还有待发送的事件时，新的变更覆盖它的 payload，不再新增
-  （`dedupe_key = goods:<id>`；`changed_fields` 取并集）。
+  （`dedupe_key = goods:<id>`；`changed_fields` 取并集）；覆盖时失败计数与下次重试时间清零，新数据立即推送。
+- CSV 批量导入时订阅 Key 与待发送事件按公司各查一次，不随行数增长。
 - 请求头、签名、重试与其他事件相同。
 
 商品 `origin_country` 只接受 ISO 3166-1 alpha-2 代码（自动大写；空串 = 清空；其他值 → 400 `10014`），
@@ -305,10 +306,11 @@ Authorization: Bearer <token>
 
 | 对象 | 字段 |
 |------|------|
-| 公司（`PUT /warehouse/company/<id>`） | `legal_name_en`、`address_en`、`country_code`（ISO 3166-1 alpha-2，默认 `JP`）、`tax_id_label`、`tax_id`、`export_contact_name`、`export_signatory_name`、`export_signatory_title` |
+| 公司（`PUT /warehouse/company/<id>`） | `legal_name_en`、`address_en`、`country_code`（ISO 3166-1 alpha-2，新建不传时为 `JP`）、`tax_id_label`、`tax_id`、`export_contact_name`、`export_signatory_name`、`export_signatory_title` |
 | 仓库（`PUT /warehouse/warehouse/<id>`） | `address_en`、`country_code`、`contact_name_en`（与公司地址不同时印为 *Ship From*） |
 
-`country_code` 不合法 → 400 `14020`；文本超长 → 400 `14019`。
+`country_code` 不合法 → 400 `14020`；文本超长 → 400 `14019`。接口输出不补默认值：库里为空就返回 `null`
+（单证上的出口国取仓库的、仓库为空取公司的，都为空报 `EXPORTER_PROFILE_INCOMPLETE`）。
 
 ### 报关快照
 
@@ -317,8 +319,10 @@ Authorization: Bearer <token>
 `export_reason`、`recipient_country`、`recipient_tax_id`、`recipient_tax_id_type`、`freight_charge`、
 `insurance_charge`、`declared_value_carriage`、`consignee{...}`、`lines[{goods_code, quantity, unit_value, total_value, description_en, hs_code, jp_export_code, origin_country, quantity_unit}]`。
 
-- 结构错误拒绝：`customs` 非对象、`lines` 非数组、字段类型错误 → 400 `16063`（`details.field`）；
-  行的 `goods_code` 不在 DN 明细或重复 → 400 `16064`。
+- 结构错误拒绝：`customs` 非对象、`lines` 非数组、字段类型错误、数值超上限 → 400 `16063`（`details.field`）；
+  行的 `goods_code` 不在 DN 明细或重复 → 400 `16064`。上限：`unit_value` / `total_value` 绝对值 ≤ 1,000,000,000,000；
+  `freight_charge` / `insurance_charge` / `declared_value_carriage` / 行 `quantity` ≤ 2,147,483,647（数据库 INTEGER）。
+- `freight_charge` / `insurance_charge` / `declared_value_carriage` 只收整数（列是 INTEGER），USD 等带分的币种也不收小数。
 - 内容不全照收，缺什么在 `problems` 里列出。
 - `invoice_number` 缺省用 DN 的 `order_number`；发票数量一律取**已打包数量**（金额 = 单价 × 已打包数量，
   已打包 0 的行不上发票）；原产国以商品主数据 `goods.origin_country` 为准，行里的只做记录。
@@ -328,6 +332,7 @@ Authorization: Bearer <token>
   报关视图里显示、单证上不印。两个键都可不带（旧请求照旧）；不合法 400 `16063`。任一变化都会作废已签发的单证；
   没有这两个值的快照单证指纹不变。
 - `jp_export_code`（可选，9 位日本出口统计品目番号，前 6 位应等于 HS）存入快照并在接口返回，CI / PL 不印（只印 HS）。
+- `hs_code` 接受 6–10 位；CI 上只印前 6 位（国际通用的 HS 部分），7–10 位只在报关视图（`hs_code_formatted`）里显示。
 - 替换快照时，只有印在单证上的内容变了才作废现有单证。
 
 `GET /warehouse/dn/<id>/customs`（`dn_read` 或 `packing_read`）返回
@@ -335,12 +340,15 @@ Authorization: Bearer <token>
 `totals = {quantity, goods_value, freight, insurance, invoice_total, package_count, gross_weight_kg, net_weight_kg}`，
 `invoice_total = goods_value + freight + insurance`（没投保 `insurance` 为 0）。
 
-- 错误级问题：`NOT_PACKED`、`PACKAGES_MISSING`、`EXPORTER_PROFILE_INCOMPLETE`、`INCOTERM_MISSING`、
+- 错误级问题：`NOT_PACKED`、`PACKAGES_MISSING`、`EXPORTER_PROFILE_INCOMPLETE`、
+  `EXPORTER_NON_LATIN_TEXT`（发货人一侧印在单证上的文本含非拉丁字符：公司英文名 / 英文地址 / 联系人 / 签署人 / 税号 /
+  电话 / 邮箱、Ship From 的仓库英文地址 / 联系人；`field` 指向要改的主数据字段，如 `company.export_signatory_name`、
+  `warehouse.address_en`、`warehouse.phone`）、`INCOTERM_MISSING`、
   `EXPORT_REASON_MISSING`、`CURRENCY_INVALID`、`RECIPIENT_COUNTRY_MISSING`、`LINE_MISSING`、`HS_CODE_MISSING`
   （去掉 `.`、空格、`-` 后须为 6–10 位数字）、`DESCRIPTION_MISSING`、`DESCRIPTION_NOT_ASCII`、`ORIGIN_MISSING`、`UNIT_VALUE_MISSING`。
-- 警告（不拦截）：`RECIPIENT_TAX_ID_MISSING`、`NON_LATIN_TEXT`、`NET_WEIGHT_UNKNOWN`、`GROSS_LT_NET`、
+- 警告（不拦截）：`RECIPIENT_TAX_ID_MISSING`、`NON_LATIN_TEXT`（收件人含非拉丁字符）、`NET_WEIGHT_UNKNOWN`、`GROSS_LT_NET`、
   `JP_EXPORT_CODE_MISMATCH`（`jp_export_code` 非 9 位数字或前 6 位与 HS 不一致）、
-  `JP_EXPORT_CODE_MISSING`（JPY 发票合计＝货值＋运费＋保险费超过 200,000 且有行缺 `jp_export_code`）。
+  `JP_EXPORT_CODE_MISSING`（JPY 货值（FOB，不含运费 / 保险费）超过 200,000 且有行缺 `jp_export_code`）。
 
 ### 箱子
 
@@ -368,8 +376,14 @@ DN 须为 `picked` 或 `packed`（否则 409 `16067`）。请求体 `{"packages"
 
 ### 发货拦截与锁定
 
-- 海外 DN 完成发货前必须有当前有效的 CI **和** PL，否则 409 `16069`。完成发货时请求里的运单号与已保存的不同，
-  以请求为准，现有单证仍视为有效。
+- 完成发货（`PUT /warehouse/delivery/<task_id>/complete/`）请求里 `tracking_number` 为空串 / `null` / 不传 → 不改已存的运单号
+  （国内件也一样）。完成发货先锁 DN 行，与改箱子 / 改快照 / 出单证串行。
+- 海外 DN 按写入前的已存数据检查：没有当前有效的 CI 或 PL → 409 `16069`
+  `details {missing_documents: [...], outdated: false}`；单证已过期（箱子 / 快照 / 运单号 / 出口资料改过没重出）→ 409 `16069`
+  `details {missing_documents: [], outdated: true}`。
+- 当前 CI 已印 AWB，请求又带了不同的运单号（忽略空白差异）→ 409 `16080`
+  `details {document_tracking_number, tracking_number}`：先保存运单号、重出单证再发货；相同则保持已存值。
+  CI 没印 AWB 时照常写入请求里的运单号。
 - DN 发货（`delivered` / `completed`）后，报关快照、箱子、单证全部锁定 → 409 `16065`。
 - 海外 DN 的 `dn.delivered` 追加 `customs_documents`（含 `download_path`）、`packages`、
   `invoice_total{currency, goods_value, freight, insurance, total}`；国内件 payload 不变。
@@ -379,7 +393,7 @@ DN 须为 `picked` 或 `packed`（否则 409 `16067`）。请求体 `{"packages"
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
 | `DOCUMENT_TIMEZONE` | `Asia/Tokyo` | 单证日期所用时区 |
-| `CUSTOMS_PDF_FONT_PATH` | （不设） | 单证可选 TTF 字体；默认 Helvetica。字体印不出的字符（如日文）退回 reportlab 内置 CID 字体 |
+| `CUSTOMS_PDF_FONT_PATH` | （不设） | 单证用的 TrueType 字体（`.ttf`，或 `.ttc` 的第 1 个字体；不支持 CFF 轮廓的 OTF，如 Noto Sans CJK）。设了就用它印全部文字，字体子集嵌入 PDF；要让收件人的日文等也嵌入，选带这些字形的字体（如 IPAexGothic）。字体里没有的字符、以及不设时 Helvetica 印不出的字符，退回 reportlab 内置的日文 CID 字体（不嵌入，依赖阅读器的字体） |
 
 ## 承运商对接（FedEx）
 
@@ -442,7 +456,8 @@ declared_value_carriage, delivery_task_id, shipment, warnings[]}`：
   街道 `4-5-6 Sample-cho` / `Chuo-ku`、城市 `Osaka`、邮编 `6000000`。邮编取仓库 / 公司的 `zip_code`
   （日本地址也能从地址里认出，统一发 7 位数字）。收件人没有邮编时带空的 `postalCode`；美国 / 加拿大 / 波多黎各必须有两位州代码。
 - 有有效运单时发货任务的运单号锁定为该运单号：完成发货、保存运单号、修改发货任务传了别的号码 → 409 `16078`
-  （要换先取消运单；完成发货 / 修改任务时传空值视为不改）。有结果不明 / 进行中的建单记录时，保存运单号或修改发货任务
+  （要换先取消运单；完成发货 / 修改任务时传空值视为不改）。完成发货 / 修改任务传的 `carrier_id` 与运单承运商
+  （按承运商 code）不同也 409 `16078`，`details` 另带请求里的 `carrier_id`；`carrier_id: null` 视为不改。有结果不明 / 进行中的建单记录时，保存运单号或修改发货任务
   带了号码 → 409 `16079`（防止操作员又在 FedEx 网站手工建一张；清空照常）。
 - 有进行中 / 有效 / 结果不明的自动运单时：新建或删除该 DN 的发货任务 → 409 `16078`（新任务会成为当前发货任务、
   绕过运单号锁定；新建时带的运单号也按上面的规则校验）；改报关数据（`PUT /warehouse/dn/<id>/customs`）或箱子
@@ -581,7 +596,7 @@ stdout_logfile=/var/log/wms-api.out.log
 | 库存错误 | 15000-15999 | 400 | 库存相关错误 |
 | 状态错误 | 16000-16999 | 400 | 状态流转错误 |
 
-出口单证相关业务码：`14019` 出口资料文本超长、`14020` 国家代码不合法、`16063` 报关结构不合法、`16064` 报关行商品编码不在 DN 明细或重复、`16065` 已发货不可改（409）、`16066` 箱子数据不合法、`16067` 当前状态不能改箱子（409）、`16068` 单证条件不全（409，`details.problems`）、`16069` 发货前必须先出单证（409）、`16070` 不是海外单（409）、`16071` 单证不存在（404）。承运商运单（FedEx）：`16072` 建单前置条件不满足（409，`details.blockers`）、`16073` FedEx 返回错误（502，`details.errors` / `transaction_id`）、`16074` FedEx 超时（504）、`16075` 没有有效运单（409）、`16076` 有进行中 / 有效 / 结果不明的运单时不能改箱子或报关数据（409）、`16077` `label_format` 不合法（400）、`16078` 运单号与有效的自动运单不一致，或有自动运单时新建 / 删除发货任务（409）、`16079` 有结果不明 / 进行中的建单记录（409，`details.unresolved`）。错误响应可能带结构化的 `details`。
+出口单证相关业务码：`14019` 出口资料文本超长、`14020` 国家代码不合法、`16063` 报关结构不合法、`16064` 报关行商品编码不在 DN 明细或重复、`16065` 已发货不可改（409）、`16066` 箱子数据不合法、`16067` 当前状态不能改箱子（409）、`16068` 单证条件不全（409，`details.problems`）、`16069` 发货前单证缺失或已过期（409，`details {missing_documents, outdated}`）、`16070` 不是海外单（409）、`16071` 单证不存在（404）。承运商运单（FedEx）：`16072` 建单前置条件不满足（409，`details.blockers`）、`16073` FedEx 返回错误（502，`details.errors` / `transaction_id`）、`16074` FedEx 超时（504）、`16075` 没有有效运单（409）、`16076` 有进行中 / 有效 / 结果不明的运单时不能改箱子或报关数据（409）、`16077` `label_format` 不合法（400）、`16078` 运单号 / 承运商与有效的自动运单不一致，或有自动运单时新建 / 删除发货任务（409）、`16079` 有结果不明 / 进行中的建单记录（409，`details.unresolved`）。完成发货：`16080` 运单号与当前 CI 上印的 AWB 不一致（409，`details {document_tracking_number, tracking_number}`）。错误响应可能带结构化的 `details`。
 
 ## 关联项目
 

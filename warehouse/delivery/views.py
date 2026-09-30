@@ -163,6 +163,15 @@ class DeliveryTaskComplete(Resource):
     def put(self, task_id):
         """
         Complete a specific Delivery (set status to completed)
+        - tracking_number empty / null / omitted → the saved tracking number is kept (domestic too)
+        - Active carrier shipment: a different tracking number or carrier → 409 16078
+          (details {tracking_number, carrier[, carrier_id]})
+        - Export DN, checked against the saved data before anything is written:
+          no current CI / PL → 409 16069 {missing_documents: [...], outdated: false};
+          documents out of date → 409 16069 {missing_documents: [], outdated: true}
+        - Export DN whose current CI prints an AWB: a different tracking number → 409 16080
+          {document_tracking_number, tracking_number} (save the tracking number and issue the documents again);
+          when the CI has no AWB the given tracking number is saved as before
         """
         data = api_ns.payload
         operator_id = require_actor_user_id()

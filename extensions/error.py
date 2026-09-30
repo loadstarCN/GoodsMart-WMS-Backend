@@ -1,6 +1,13 @@
 from flask_restx import ValidationError
 from werkzeug.exceptions import HTTPException
 
+# 业务码登记（出口单证 / 发货，完整列表见 README「Business codes」）：
+# 16069  409  海外件发货前单证不可用：details {missing_documents: [...], outdated: bool}
+#             （缺 CI / PL → missing_documents 非空、outdated false；已过期 → missing_documents []、outdated true）
+# 16078  409  有有效自动运单时运单号 / 承运商与运单不一致：details {tracking_number, carrier[, carrier_id]}
+# 16080  409  完成发货的运单号与当前 CI 上印的 AWB 不一致（先保存运单号并重出单证）：
+#             details {document_tracking_number, tracking_number}
+
 class APIException(Exception):
     """API异常基类"""
     def __init__(self, message, biz_code, status_code=400, field=None, details=None):

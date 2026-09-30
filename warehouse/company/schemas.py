@@ -48,7 +48,8 @@ company_fields = {
     # 出口资料（商业发票 / 装箱单的 Shipper / Exporter 栏）
     'legal_name_en': fields.String(description='Legal name in English (export documents)'),
     'address_en': fields.String(description='Address in English (export documents)'),
-    'country_code': fields.String(description='Country (ISO 3166-1 alpha-2)', default='JP'),
+    # 输出不给默认值：库里为空就返回 null，不能用 JP 掩盖没录入的国家（单证会据此提示补齐）
+    'country_code': fields.String(description='Country (ISO 3166-1 alpha-2); null when not set'),
     'tax_id_label': fields.String(description='Label printed before the tax ID on export documents'),
     'tax_id': fields.String(description='Exporter tax ID / corporate number'),
     'export_contact_name': fields.String(description='Export contact person (English)'),
@@ -62,6 +63,9 @@ company_model = api_ns.model('Company', company_fields)
 
 # 生成输入模型：复制后删除不允许用户输入的字段
 company_input_fields = generate_input_fields(company_fields)
+# 输入：新建时不传 country_code 走列默认值 JP（只影响文档）
+company_input_fields['country_code'] = fields.String(
+    description='Country (ISO 3166-1 alpha-2); defaults to JP when omitted on create', default='JP')
 company_input_model = api_ns.model('CompanyInput', company_input_fields)
 
 # -----------------------------
