@@ -20,7 +20,7 @@ import pytest
 from flask_restx import marshal
 
 from system.webhook.models import WebhookEvent
-from system.webhook.services import emit_company_event, push_pending_events
+from system.webhook.services import emit_company_event, emit_company_events, push_pending_events
 from warehouse.goods.schemas import goods_simple_model
 
 EVENT = 'goods.spec_updated'
@@ -446,6 +446,98 @@ def test_csv_import_origin_country_existing_goods(client, access_token, company_
         assert events[0].payload['goods_origin_country'] == 'VN'
         assert events[0].payload['changed_fields'] == ['goods_origin_country']
         assert events[0].payload['source'] == 'import'
+
+
+def _count_statements(client, func, *needles):
+    """执行 func 期间发出的 SQL 里，各关键字出现的语句条数"""
+    from sqlalchemy import event
+    statements = []
+
+    def record(conn, cursor, statement, parameters, context, executemany):
+        statements.append(statement)
+
+    with client.application.app_context():
+        engine = db.engine
+    event.listen(engine, 'before_cursor_execute', record)
+    try:
+        result = func()
+    finally:
+        event.remove(engine, 'before_cursor_execute', record)
+    return result, {needle: sum(needle in s for s in statements) for needle in needles}
+
+
+def test_csv_import_queries_keys_and_pending_events_once(client, access_token, company_ids):
+    """批量导入：订阅 Key / 待发送事件各查一次，不随行数增长；每件商品仍各有一条事件"""
+    with client.application.app_context():
+        key_id = _make_key(company_ids[0])
+    needles = ('FROM api_keys', 'FROM webhook_events')
+
+    one, one_counts = _count_statements(client, lambda: _upload(
+        client, access_token, "code,name,origin_country\nB000,Bulk Zero,cn\n"), *needles)
+    assert one.status_code == 200, one.get_json()
+    rows = ''.join(f"B00{i},Bulk {i},vn\n" for i in range(1, 6))
+    five, five_counts = _count_statements(client, lambda: _upload(
+        client, access_token, "code,name,origin_country\n" + rows), *needles)
+    assert five.status_code == 200, five.get_json()
+    assert five_counts == one_counts
+
+    with client.application.app_context():
+        events = _events(key_id)
+        assert [e.payload['goods_code'] for e in events] == ['B000', 'B001', 'B002', 'B003', 'B004', 'B005']
+        for event in events:
+            goods = Goods.query.filter_by(code=event.payload['goods_code']).first()
+            assert event.payload['goods_id'] == goods.id and event.dedupe_key == f'goods:{goods.id}'
+            assert event.payload['source'] == 'import'
+
+
+def test_overwriting_pending_event_resets_retry_state(client, company_ids):
+    """覆盖已失败过几次的待发送事件：失败计数 / 下次重试时间清零，新数据立即可发"""
+    from datetime import timedelta
+    with client.application.app_context():
+        key_id = _make_key(company_ids[0])
+        emit_company_event(EVENT, {'n': 1, 'changed_fields': ['a']}, company_ids[0], dedupe_key='goods:1')
+        db.session.commit()
+        event = _events(key_id)[0]
+        event.attempts = 9
+        event.next_retry_at = datetime.now() + timedelta(minutes=30)
+        db.session.commit()
+
+        emit_company_event(EVENT, {'n': 2, 'changed_fields': ['b']}, company_ids[0], dedupe_key='goods:1')
+        db.session.commit()
+        events = _events(key_id)
+        assert len(events) == 1
+        assert events[0].payload == {'n': 2, 'changed_fields': ['a', 'b']}
+        assert events[0].attempts == 0 and events[0].next_retry_at is None
+
+        # 立即会被推送；再失败也只算第 1 次，不会因继承的计数直接标 failed 丢掉新数据
+        with mock.patch('system.webhook.services.requests.post', side_effect=ConnectionError('down')):
+            assert push_pending_events() == (0, 1)
+        event = _events(key_id)[0]
+        assert event.status == 'pending' and event.attempts == 1
+
+
+def test_emit_company_events_batch_merges_like_single_calls(client, company_ids):
+    with client.application.app_context():
+        key_id = _make_key(company_ids[0])
+        emit_company_event(EVENT, {'n': 0, 'changed_fields': ['x']}, company_ids[0], dedupe_key='goods:1')
+        db.session.commit()
+
+        events = emit_company_events(EVENT, [
+            ({'n': 1, 'changed_fields': ['a']}, 'goods:1'),
+            ({'n': 2, 'changed_fields': ['b']}, 'goods:2'),
+            ({'n': 3, 'changed_fields': ['c']}, 'goods:2'),     # 同一批里重复的 key 合并
+            ({'n': 4}, None),                                  # 无 dedupe_key：各自新建
+        ], company_ids[0])
+        db.session.commit()
+        assert len(events) == 3
+        rows = _events(key_id)
+        assert [(e.dedupe_key, e.payload) for e in rows] == [
+            ('goods:1', {'n': 1, 'changed_fields': ['x', 'a']}),
+            ('goods:2', {'n': 3, 'changed_fields': ['b', 'c']}),
+            (None, {'n': 4}),
+        ]
+        # 别的公司 / 没订阅的 Key 不收
+        assert emit_company_events(EVENT, [({'n': 5}, 'goods:9')], company_ids[1]) == []
 
 
 # ---------------------------------------------------------------------------

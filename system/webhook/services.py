@@ -66,22 +66,11 @@ def _merge_pending_payload(old_payload, new_payload):
     return merged
 
 
-def emit_company_event(event_type, payload, company_id, dedupe_key=None):
-    """按公司广播 Webhook 事件（在调用方的事务里落库，随业务一起提交 / 回滚）
-
-    推给该公司所有「启用、配了 webhook 地址、且 webhook_subscriptions 含该事件」的 API Key；
-    只看 Key 自己的 company_id（未绑定公司的平台 Key 不收公司事件）。
-
-    dedupe_key 非空时：同一 Key 已有同类型、同 dedupe_key 且仍待发送的事件 → 用新 payload
-    覆盖那一条（不新增）。正在推送中的那条（被推送进程锁住）跳过，另建新事件，避免新数据
-    被标成「已发送」而实际没送出去。
-
-    Returns:
-        list[WebhookEvent]: 新建或被覆盖的事件
-    """
+def company_event_targets(event_type, company_id) -> list:
+    """该公司「启用、配了 webhook 地址、且 webhook_subscriptions 含该事件」的 API Key（按 id 排序）。
+    只看 Key 自己的 company_id（未绑定公司的平台 Key 不收公司事件）。"""
     if not company_id:
         return []
-
     keys = APIKey.query.filter(
         APIKey.company_id == company_id,
         APIKey.is_active == True,
@@ -89,34 +78,82 @@ def emit_company_event(event_type, payload, company_id, dedupe_key=None):
         APIKey.webhook_url != '',
     ).order_by(APIKey.id).all()
     # 订阅列表是 JSON 数组，各数据库的包含查询写法不同；每家公司 Key 很少，直接在 Python 里筛
-    targets = [k for k in keys if event_type in (k.webhook_subscriptions or [])]
+    return [k for k in keys if event_type in (k.webhook_subscriptions or [])]
 
+
+# 批量查待发送事件时 IN 列表的分块大小
+_DEDUPE_CHUNK = 500
+
+
+def emit_company_event(event_type, payload, company_id, dedupe_key=None):
+    """按公司广播 Webhook 事件（在调用方的事务里落库，随业务一起提交 / 回滚）
+
+    推给该公司所有「启用、配了 webhook 地址、且 webhook_subscriptions 含该事件」的 API Key。
+
+    dedupe_key 非空时：同一 Key 已有同类型、同 dedupe_key 且仍待发送的事件 → 用新 payload
+    覆盖那一条（不新增），并把失败计数 / 下次重试时间清零（新数据立即可发，不继承旧的失败次数）。
+    正在推送中的那条（被推送进程锁住）跳过，另建新事件，避免新数据被标成「已发送」而实际没送出去。
+
+    Returns:
+        list[WebhookEvent]: 新建或被覆盖的事件
+    """
+    return emit_company_events(event_type, [(payload, dedupe_key)], company_id)
+
+
+def emit_company_events(event_type, items, company_id, targets=None):
+    """emit_company_event 的批量版（批量导入用）：items = [(payload, dedupe_key), ...]。
+
+    订阅 Key 只查一次（也可由调用方传 targets）；待发送的同 dedupe_key 事件按 Key 一次查出
+    （分块 IN），同一批里重复的 dedupe_key 按顺序合并到同一条。语义与逐条调用相同。
+    """
+    if not company_id or not items:
+        return []
+    if targets is None:
+        targets = company_event_targets(event_type, company_id)
+    if not targets:
+        return []
+
+    dedupe_keys = sorted({key for _, key in items if key})
     events = []
+    returned = set()   # 已放进 events 的对象（按 id() 去重，同一条被合并多次只返回一次）
     for api_key in targets:
-        existing = None
-        if dedupe_key:
-            existing = WebhookEvent.query.filter(
+        pending = {}   # dedupe_key → 可覆盖的待发送事件（取 id 最大的那条）
+        for start in range(0, len(dedupe_keys), _DEDUPE_CHUNK):
+            chunk = dedupe_keys[start:start + _DEDUPE_CHUNK]
+            rows = WebhookEvent.query.filter(
                 WebhookEvent.api_key_id == api_key.id,
                 WebhookEvent.event_type == event_type,
-                WebhookEvent.dedupe_key == dedupe_key,
+                WebhookEvent.dedupe_key.in_(chunk),
                 WebhookEvent.status == 'pending',
-            ).order_by(WebhookEvent.id.desc()).with_for_update(skip_locked=True).first()
+            ).order_by(WebhookEvent.id).with_for_update(skip_locked=True).all()
+            for row in rows:
+                pending[row.dedupe_key] = row
 
-        if existing is not None:
-            # 整体赋新 dict，JSON 列才会被识别为已修改
-            existing.payload = _merge_pending_payload(existing.payload, payload)
-            events.append(existing)
-            continue
+        for payload, dedupe_key in items:
+            existing = pending.get(dedupe_key) if dedupe_key else None
+            if existing is not None:
+                # 整体赋新 dict，JSON 列才会被识别为已修改
+                existing.payload = _merge_pending_payload(existing.payload, payload)
+                # 新数据不继承旧事件的失败计数与退避：立即可发，重新计 MAX_ATTEMPTS 次
+                existing.attempts = 0
+                existing.next_retry_at = None
+                if id(existing) not in returned:
+                    returned.add(id(existing))
+                    events.append(existing)
+                continue
 
-        event = WebhookEvent(
-            api_key_id=api_key.id,
-            event_type=event_type,
-            payload=dict(payload),
-            dedupe_key=dedupe_key,
-            status='pending',
-        )
-        db.session.add(event)
-        events.append(event)
+            event = WebhookEvent(
+                api_key_id=api_key.id,
+                event_type=event_type,
+                payload=dict(payload),
+                dedupe_key=dedupe_key,
+                status='pending',
+            )
+            db.session.add(event)
+            events.append(event)
+            returned.add(id(event))
+            if dedupe_key:
+                pending[dedupe_key] = event   # 同一批里后面的同 key 合并到这一条
 
     if events:
         db.session.flush()

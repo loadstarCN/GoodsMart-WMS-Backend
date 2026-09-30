@@ -266,7 +266,8 @@ payload 是当前值的完整快照（`null` = 未录入）：
 - `source`：取商品新建 / 修改请求体里的 `spec_source`（`station` / `manual` / `import` / `api`）；
   没传时 API Key 调用为 `api`、登录用户为 `manual`；CSV 导入为 `import`。
 - 同一商品对同一 Key 还有待发送的事件时，新的变更覆盖它的 payload，不再新增
-  （`dedupe_key = goods:<id>`；`changed_fields` 取并集）。
+  （`dedupe_key = goods:<id>`；`changed_fields` 取并集）；覆盖时失败计数与下次重试时间清零，新数据立即推送。
+- CSV 批量导入时订阅 Key 与待发送事件按公司各查一次，不随行数增长。
 - 请求头、签名、重试与其他事件相同。
 
 商品 `origin_country` 只接受 ISO 3166-1 alpha-2 代码（自动大写；空串 = 清空；其他值 → 400 `10014`），

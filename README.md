@@ -270,7 +270,9 @@ weight, length, width, height or origin country. The payload is a full snapshot 
 - `source`: `spec_source` from the goods create/update request body (`station` / `manual` / `import` / `api`);
   otherwise `api` for API Key calls and `manual` for logged-in users. CSV import uses `import`.
 - While an event for the same goods is still pending for a key, a newer change overwrites its payload
-  instead of queueing another one (`dedupe_key = goods:<id>`; `changed_fields` becomes the union).
+  instead of queueing another one (`dedupe_key = goods:<id>`; `changed_fields` becomes the union). Overwriting
+  resets the attempt counter and the next retry time, so the new data is pushed right away.
+- A CSV import looks up the subscribed keys and the pending events once per company, not once per row.
 - Headers, signatures and retries are the same as for the other events.
 
 Goods `origin_country` accepts ISO 3166-1 alpha-2 codes only (upper-cased; empty string clears it;
