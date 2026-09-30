@@ -256,7 +256,7 @@ def test_declared_value_capped_to_packed_goods_value(client, access_token, fedex
     assert data['warnings'] == [{
         'code': 'DECLARED_VALUE_CAPPED',
         'message': data['warnings'][0]['message'],
-        'declared_value_carriage': 50000, 'declared_value': 44400,
+        'requested': 50000, 'applied': 44400,
     }]
     assert '44400' in data['warnings'][0]['message']
     assert data['shipment']['declared_value'] == 44400 and data['declared_value_carriage'] == 50000

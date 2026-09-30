@@ -468,7 +468,7 @@ Each format's image type (`PDF` / `PNG` / `ZPLII` / `EPL2`) and stock can be ove
 - **Declared value for carriage** above the customs value of the packed goods is lowered to that value (FedEx
   rejects a declared value above the customs value, and after partial packing only the goods actually shipped are
   covered). The value actually submitted is stored as `shipment.declared_value`; `warnings` carries
-  `{code: "DECLARED_VALUE_CAPPED", message, declared_value_carriage, declared_value}` (in `GET` as a preview while
+  `{code: "DECLARED_VALUE_CAPPED", message, requested, applied}` (in `GET` as a preview while
   no shipment is active, in the `POST` response for what was done).
 - If there is no current CI / PL (or they are outdated) they are issued first with the normal logic.
 - With `FEDEX_ETD_ENABLED` the current CI PDF is uploaded first (Trade Documents Upload API, pre-shipment) and

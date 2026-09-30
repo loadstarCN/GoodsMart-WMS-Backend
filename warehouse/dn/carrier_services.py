@@ -305,8 +305,8 @@ class CarrierShipmentService:
             'code': 'DECLARED_VALUE_CAPPED',
             'message': (f"Declared value for carriage {requested} exceeds the customs value of the packed goods "
                         f"({goods_value}); {capped or 0} is submitted to FedEx instead"),
-            'declared_value_carriage': requested,
-            'declared_value': capped,
+            'requested': requested,
+            'applied': capped,
         }
 
     @staticmethod

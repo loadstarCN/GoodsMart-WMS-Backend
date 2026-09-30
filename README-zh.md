@@ -416,7 +416,7 @@ shipment, warnings[]}`；`shipment` 为最近一条运单（有效的优先）�
   收件人姓名或电话缺失。
 - **运送申告价额**高于已打包货值时自动压到已打包货值（FedEx 拒收申告价额高于报关货值的运单；部分打包时只保实际发出的货）。
   实际提交的值记在 `shipment.declared_value`；`warnings` 里给 `{code: "DECLARED_VALUE_CAPPED", message,
-  declared_value_carriage, declared_value}`（`GET` 在没有有效运单时作预告，`POST` 响应里是这次实际做的）。
+  requested, applied}`（`GET` 在没有有效运单时作预告，`POST` 响应里是这次实际做的）。
 - 没有当前有效的 CI / PL（或已过期）时先按现有逻辑签发。
 - `FEDEX_ETD_ENABLED` 开启时，先把当前 CI PDF 上传给 FedEx（Trade Documents Upload API，建单前上传），建单时以
   `ELECTRONIC_TRADE_DOCUMENTS` 引用；关闭时仓库照旧打印 CI 随货。
