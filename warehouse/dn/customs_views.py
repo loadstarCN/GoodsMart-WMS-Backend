@@ -124,16 +124,18 @@ class DNCustomsDocumentFile(Resource):
 
     @permission_required(_READ)
     @warehouse_required()
-    @api_ns.produces(['application/pdf'])
+    @api_ns.produces(['application/pdf', 'application/octet-stream'])
     def get(self, dn_id, doc_id):
-        """Download a document PDF (CI / PL / carrier shipping label; inline; header X-Content-SHA256)"""
+        """Download a document (CI / PL / carrier shipping label; header X-Content-SHA256).
+        PDF inline; ZPL / EPL thermal labels as application/octet-stream attachment"""
         dn = _owned_dn(dn_id)
         doc = CustomsService.get_document(dn, doc_id)
+        disposition = 'inline' if doc.content_type == 'application/pdf' else 'attachment'
         return Response(
             doc.content,
-            mimetype='application/pdf',
+            mimetype=doc.content_type,
             headers={
-                'Content-Disposition': f'inline; filename="{doc.file_name}"',
+                'Content-Disposition': f'{disposition}; filename="{doc.file_name}"',
                 'X-Content-SHA256': doc.sha256,
                 'Access-Control-Expose-Headers': 'Content-Disposition, X-Content-SHA256',
                 'Cache-Control': 'private, no-store',

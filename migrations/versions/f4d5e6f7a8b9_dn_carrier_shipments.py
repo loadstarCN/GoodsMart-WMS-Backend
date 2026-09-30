@@ -4,8 +4,8 @@ Revision ID: f4d5e6f7a8b9
 Revises: f3c4d5e6f7a8
 Create Date: 2026-09-30
 
-- dn_carrier_shipments：DN 在承运商系统自动建的运单（主运单号、服务、运费、面单文档、ETD 文档 ID、
-  承运商 transactionId、建单 / 取消人与时间）；同一 DN 至多一条 active（部分唯一索引）
+- dn_carrier_shipments：DN 在承运商系统自动建的运单（主运单号、服务、运费、面单打印方式 / 格式 / 纸张、
+  面单文档及其构成、ETD 文档 ID、承运商 transactionId、建单 / 取消人与时间）；同一 DN 至多一条 active（部分唯一索引）
 - dn_documents.doc_type 允许 shipping_label（承运商面单 PDF）
 """
 from alembic import op
@@ -45,6 +45,10 @@ def upgrade():
         sa.Column('net_charge', sa.Numeric(precision=12, scale=2), nullable=True),
         sa.Column('currency', sa.String(length=10), nullable=True),
         sa.Column('declared_value', sa.Integer(), nullable=True),
+        sa.Column('label_format', sa.String(length=10), nullable=True),
+        sa.Column('image_type', sa.String(length=10), nullable=True),
+        sa.Column('label_stock_type', sa.String(length=40), nullable=True),
+        sa.Column('label_parts', sa.JSON(), nullable=True),
         sa.Column('label_document_id', sa.Integer(), nullable=True),
         sa.Column('etd_document_id', sa.String(length=100), nullable=True),
         sa.Column('transaction_id', sa.String(length=100), nullable=True),

@@ -58,9 +58,13 @@ class Config:
     FEDEX_ACCOUNT_NUMBER = os.getenv('FEDEX_ACCOUNT_NUMBER') or None
     FEDEX_SERVICE_TYPE = os.getenv('FEDEX_SERVICE_TYPE', 'INTERNATIONAL_ECONOMY')
     FEDEX_PICKUP_TYPE = os.getenv('FEDEX_PICKUP_TYPE', 'USE_SCHEDULED_PICKUP')
-    # 面单：PDF（多箱合成一个 PDF）或 PNG（转成 PDF 存档）；纸张如 PAPER_4X6 / PAPER_85X11_TOP_HALF_LABEL
-    FEDEX_LABEL_IMAGE_TYPE = os.getenv('FEDEX_LABEL_IMAGE_TYPE', 'PDF')
-    FEDEX_LABEL_STOCK_TYPE = os.getenv('FEDEX_LABEL_STOCK_TYPE', 'PAPER_4X6')
+    # 面单打印方式：A4（激光打印机，PDF + PAPER_85X11_TOP_HALF_LABEL）/ THERMAL（4 英寸面单机，PDF + STOCK_4X6）；
+    # 建单时可指定，不指定用默认。各格式的 imageType（PDF / PNG / ZPLII / EPL2）与纸张可覆盖，不设用上面的默认
+    FEDEX_DEFAULT_LABEL_FORMAT = os.getenv('FEDEX_DEFAULT_LABEL_FORMAT') or 'A4'
+    FEDEX_LABEL_A4_IMAGE_TYPE = os.getenv('FEDEX_LABEL_A4_IMAGE_TYPE') or None
+    FEDEX_LABEL_A4_STOCK_TYPE = os.getenv('FEDEX_LABEL_A4_STOCK_TYPE') or None
+    FEDEX_LABEL_THERMAL_IMAGE_TYPE = os.getenv('FEDEX_LABEL_THERMAL_IMAGE_TYPE') or None
+    FEDEX_LABEL_THERMAL_STOCK_TYPE = os.getenv('FEDEX_LABEL_THERMAL_STOCK_TYPE') or None
     # 电子贸易单证（ETD）：开启时先把当前 CI 上传给 FedEx，建单时引用；关闭时仓库打印 CI 随货
     FEDEX_ETD_ENABLED = os.getenv('FEDEX_ETD_ENABLED', 'False').lower() in ('1', 'true', 'yes')
     # 关税付款方：RECIPIENT（收件人）/ SENDER（发件人账号）

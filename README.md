@@ -438,10 +438,23 @@ number by hand (`PUT /warehouse/delivery/<task_id>/tracking`) remains the fallba
 | `POST` | `/warehouse/dn/<id>/carrier-shipment/cancel` | `packing_edit` / `delivery_edit` |
 
 `GET` returns `{enabled, carrier: "fedex", can_create, blockers[{code, message, goods_code?, field?}], etd_enabled,
-declared_value_carriage, delivery_task_id, shipment}`; `shipment` is the latest shipment (active first) or `null`:
+default_label_format, label_formats{A4|THERMAL: {image_type, stock_type}}, declared_value_carriage, delivery_task_id,
+shipment}`; `shipment` is the latest shipment (active first) or `null`:
 `{tracking_number, package_tracking_numbers, status: active|cancelled, service_type, ship_date, package_count,
-net_charge, currency, declared_value, label_document_id, label_download_path, etd_document_id, transaction_id,
+net_charge, currency, declared_value, label_format, image_type, label_stock_type, label_document_id,
+label_download_path, label_file_name, label_content_type, label_parts[], etd_document_id, transaction_id,
 created_at, created_by, cancelled_at, cancelled_by}`.
+
+`POST` takes an optional body `{"label_format": "A4" | "THERMAL"}` (how the label will be printed; omitted =
+`FEDEX_DEFAULT_LABEL_FORMAT`; anything else → 400 `16077`):
+
+| `label_format` | Printer | Default image / stock | Pages |
+|----------------|---------|-----------------------|-------|
+| `A4` | Laser printer, plain A4 / Letter paper | `PDF` / `PAPER_85X11_TOP_HALF_LABEL` | Letter page, label on the top half, folding instructions below |
+| `THERMAL` | 4-inch label printer used through its driver | `PDF` / `STOCK_4X6` | 4 × 6 in (≈ 100 × 150 mm) pages |
+
+Do not use `PAPER_4X6` for label printers: FedEx returns a Letter page with the label in the top-left corner.
+Each format's image type (`PDF` / `PNG` / `ZPLII` / `EPL2`) and stock can be overridden by configuration.
 
 ### Creating a shipment
 
@@ -462,7 +475,8 @@ created_at, created_by, cancelled_at, cancelled_by}`.
   and recipient tax ID from the customs snapshot (tax ID types mapped to FedEx `tinType`: EORI → `BUSINESS_UNION`,
   PCCC / CPF → `PERSONAL_NATIONAL`, others → `BUSINESS_NATIONAL`); commodities from the invoice lines
   (**packed quantity**, HS code, country of origin from the goods master data, unit value, amount, weight);
-  one package line per WMS package (gross weight kg, dimensions cm); the declared value for carriage is split
+  one package line per WMS package (gross weight kg, dimensions cm; order number and invoice number as label
+  references); the declared value for carriage is split
   evenly across the packages; freight / insurance as in the snapshot; transportation billed to the account,
   duties per `FEDEX_DUTIES_PAYMENT_TYPE`.
 - Address rules: FedEx accepts at most 3 street lines of 35 characters and a city of 35 characters. The English
@@ -473,12 +487,17 @@ created_at, created_by, cancelled_at, cancelled_by}`.
 - Commodity weight: goods with a unit weight → unit weight × packed quantity; goods without one share the rest of
   the total gross weight (or, if nothing is left, the gross weight by quantity).
 - FedEx is called **before** anything is written. On success, in one transaction: tracking number → delivery task,
-  CI / PL re-issued with the AWB, the labels (one per package, merged into one PDF) stored as a document with
-  `doc_type: shipping_label`, and a `dn_carrier_shipments` record. FedEx errors → 502 `16073` (`details.errors`,
+  CI / PL re-issued with the AWB, the label archive stored as a document with `doc_type: shipping_label`, and a
+  `dn_carrier_shipments` record. The archive holds **every** document of the response (package labels →
+  auxiliary documents → others; for international Express the "FEDEX AWB COPY" pages come inside the first
+  package's label, nothing extra has to be requested): PDF / PNG are merged into one PDF, ZPLII / EPL2 are
+  concatenated raw printer commands (`.zpl` / `.epl`, `application/octet-stream`). `label_parts` lists each
+  document (source, package, content type, doc type, pages, archived). FedEx errors → 502 `16073` (`details.errors`,
   `transaction_id`; nothing saved), timeouts → 504 `16074` (`details.maybe_processed: true` means the shipment may
   exist on the FedEx side — check before retrying). If saving fails after FedEx created the shipment, WMS asks
   FedEx to cancel it and logs the result.
-- The label PDF is downloaded with `GET /warehouse/dn/<id>/customs-documents/<label_document_id>/file`. Labels
+- The label is downloaded with `GET /warehouse/dn/<id>/customs-documents/<label_document_id>/file` (PDF inline,
+  ZPL / EPL as attachment). Labels
   do not count for the "current CI and PL" shipping gate. While a shipment is active, changing the packages is
   refused (409 `16076`) — cancel the shipment first.
 
@@ -497,8 +516,9 @@ success the record is marked `cancelled`, the tracking number on the delivery ta
 | `FEDEX_API_KEY` / `FEDEX_SECRET_KEY` / `FEDEX_ACCOUNT_NUMBER` | (unset) | Credentials of the FedEx developer project; any one missing = feature disabled |
 | `FEDEX_SERVICE_TYPE` | `INTERNATIONAL_ECONOMY` | FedEx service type |
 | `FEDEX_PICKUP_TYPE` | `USE_SCHEDULED_PICKUP` | Pickup type |
-| `FEDEX_LABEL_IMAGE_TYPE` | `PDF` | `PDF` or `PNG` (stored as PDF) |
-| `FEDEX_LABEL_STOCK_TYPE` | `PAPER_4X6` | e.g. `PAPER_85X11_TOP_HALF_LABEL` for A4 / Letter printers |
+| `FEDEX_DEFAULT_LABEL_FORMAT` | `A4` | Label format when the request does not give one (`A4` / `THERMAL`) |
+| `FEDEX_LABEL_A4_IMAGE_TYPE` / `FEDEX_LABEL_A4_STOCK_TYPE` | `PDF` / `PAPER_85X11_TOP_HALF_LABEL` | Override for `A4` |
+| `FEDEX_LABEL_THERMAL_IMAGE_TYPE` / `FEDEX_LABEL_THERMAL_STOCK_TYPE` | `PDF` / `STOCK_4X6` | Override for `THERMAL` (e.g. `ZPLII` for Zebra printers) |
 | `FEDEX_ETD_ENABLED` | `False` | Electronic trade documents (upload the CI) |
 | `FEDEX_DUTIES_PAYMENT_TYPE` | `RECIPIENT` | `RECIPIENT` or `SENDER` (the account) |
 | `FEDEX_DOCUMENT_API_BASE` | (derived) | Trade Documents Upload host; derived from `FEDEX_API_BASE` (sandbox / production) |
@@ -509,11 +529,14 @@ Credentials are never logged or returned. Merging multi-package PDF labels uses 
 
 ### Sandbox smoke test and label certification
 
-`scripts/fedex_sandbox_smoke.py` creates a test shipment with fictitious data in the FedEx **sandbox**, saves the
-label PDFs and cancels the shipment (it refuses to run unless `FEDEX_API_BASE` contains `sandbox`):
+`scripts/fedex_sandbox_smoke.py` creates test shipments in the FedEx **sandbox** for each label format and package
+count, saves the labels as `<service>_<n>pkg_<format>.<ext>` and cancels the shipments (it refuses to run unless
+`FEDEX_API_BASE` contains `sandbox`). Shipper and recipient are fictitious unless given as JSON files (same fields
+as the exporter profile / customs consignee):
 
 ```bash
-python scripts/fedex_sandbox_smoke.py --to US --packages 2 [--etd] [--out ./fedex-sandbox-labels] [--env-file .env]
+python scripts/fedex_sandbox_smoke.py [--label-format A4|THERMAL|both] [--packages 1,2] [--to US|DE|HK] \
+    [--shipper-json shipper.json] [--recipient-json recipient.json] [--etd] [--out ./fedex-sandbox-labels] [--env-file .env]
 ```
 
 Before production use, FedEx requires label certification: print the sandbox labels of the services you use,
@@ -554,7 +577,7 @@ stdout_logfile=/var/log/wms-api.out.log
 | Inventory | 15000-15999 | 400 | Stock-related errors |
 | State | 16000-16999 | 400 | State transition errors |
 
-Business codes of the export-document features: `14019` export profile text too long, `14020` invalid country code, `16063` customs structure invalid, `16064` customs line goods code not in the DN / duplicated, `16065` shipped — customs data / packages / documents locked (409), `16066` invalid packages, `16067` packages cannot be edited in the current DN status (409), `16068` documents cannot be issued yet (409, `details.problems`), `16069` documents required before shipping (409), `16070` not an export DN (409), `16071` document not found (404). Carrier shipments (FedEx): `16072` preconditions not met (409, `details.blockers`), `16073` FedEx returned an error (502, `details.errors` / `transaction_id`), `16074` FedEx timed out (504), `16075` no active carrier shipment (409), `16076` packages cannot be changed while a carrier shipment is active (409). Errors may carry a structured `details` object.
+Business codes of the export-document features: `14019` export profile text too long, `14020` invalid country code, `16063` customs structure invalid, `16064` customs line goods code not in the DN / duplicated, `16065` shipped — customs data / packages / documents locked (409), `16066` invalid packages, `16067` packages cannot be edited in the current DN status (409), `16068` documents cannot be issued yet (409, `details.problems`), `16069` documents required before shipping (409), `16070` not an export DN (409), `16071` document not found (404). Carrier shipments (FedEx): `16072` preconditions not met (409, `details.blockers`), `16073` FedEx returned an error (502, `details.errors` / `transaction_id`), `16074` FedEx timed out (504), `16075` no active carrier shipment (409), `16076` packages cannot be changed while a carrier shipment is active (409), `16077` invalid `label_format` (400). Errors may carry a structured `details` object.
 
 ## Related Projects
 

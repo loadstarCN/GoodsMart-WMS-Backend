@@ -15,6 +15,12 @@
 - 申告价额按箱均分（余数给前面的箱子），合计等于申告价额。
 - 商品净重：商品主数据有单件重量的行 = 单件重量 × 已打包数量；没有的行分摊「箱子总毛重 − 已知净重」
   （不为正时按数量占比分摊总毛重），按已打包数量比例分。
+- 面单打印方式（label_format）：A4（激光打印机，PDF + PAPER_85X11_TOP_HALF_LABEL）/ THERMAL（4 英寸面单机，
+  PDF + STOCK_4X6，页面就是 4x6 英寸）。imageType / stock 可按格式用配置覆盖（ZPLII / EPL2 也支持）。
+  注意 PAPER_4X6 在 FedEx 回的是 Letter 页、面单在左上角（sandbox 实测），热敏机要用 STOCK_4X6。
+- 面单存档：响应里所有文档（每箱 packageDocuments、整票 shipmentDocuments）按「面单 → 辅助运单 → 其他」排序，
+  PDF / PNG 合成一个 PDF，ZPLII / EPL2 把原始指令按同样顺序拼成一个文件；每份文档的类型与页数记在 parts 里。
+  国际件的辅助运单（FEDEX AWB COPY）FedEx 放在每票第一箱面单 PDF 的后几页里（不是单独的文档），请求里不用另外要。
 """
 import base64
 import io
@@ -45,8 +51,25 @@ TOTAL_WEIGHT_UNIT = 'LB'                # 未确认：requestedShipment.totalWei
 KG_TO_LB = Decimal('2.20462262')
 ETD_SPECIAL_SERVICE = 'ELECTRONIC_TRADE_DOCUMENTS'
 ETD_DOCUMENT_TYPE = 'COMMERCIAL_INVOICE'
-SUPPORTED_LABEL_IMAGE_TYPES = ('PDF', 'PNG')
+SUPPORTED_LABEL_IMAGE_TYPES = ('PDF', 'PNG', 'ZPLII', 'EPL2')
 SUPPORTED_DUTIES_PAYMENT_TYPES = ('RECIPIENT', 'SENDER')
+
+# 面单打印方式 → 默认 (imageType, labelStockType)；配置 FEDEX_LABEL_<FORMAT>_IMAGE_TYPE / _STOCK_TYPE 可覆盖
+LABEL_FORMATS = ('A4', 'THERMAL')
+DEFAULT_LABEL_FORMAT = 'A4'
+LABEL_FORMAT_DEFAULTS = {
+    'A4': ('PDF', 'PAPER_85X11_TOP_HALF_LABEL'),   # A4 / Letter 普通纸：上半页面单，下半页折叠说明
+    'THERMAL': ('PDF', 'STOCK_4X6'),               # 4x6 英寸（约 100×150 mm）热敏面单纸
+}
+# 面单存档文件：imageType → (扩展名, Content-Type)
+LABEL_ARCHIVE_FILES = {
+    'PDF': ('pdf', 'application/pdf'),
+    'PNG': ('pdf', 'application/pdf'),
+    'ZPLII': ('zpl', 'application/octet-stream'),
+    'EPL2': ('epl', 'application/octet-stream'),
+}
+# 只在 URL_ONLY 模式出现的「合并件」与各箱面单重复，不进存档
+_MERGED_CONTENT_TYPES = ('MERGED_LABEL_DOCUMENTS', 'MERGED_LABELS_ONLY')
 
 # FedEx 自己的币种代码（与 ISO 4217 不同的那些；日元是 JYE，响应里可能回 JPY，两种都认）
 FEDEX_CURRENCY_CODES = {
@@ -107,6 +130,18 @@ def fedex_currency(code) -> str:
 def iso_currency(code):
     code = (code or '').strip().upper()
     return _ISO_FROM_FEDEX.get(code, code) or None
+
+
+def label_settings(config, label_format=None) -> dict:
+    """面单打印方式 → {label_format, image_type, stock_type}。config 是 dict 样的配置（Flask config）。
+    label_format 为空取 FEDEX_DEFAULT_LABEL_FORMAT；不认识的格式原样返回（由调用方报错）。"""
+    fmt = (label_format or config.get('FEDEX_DEFAULT_LABEL_FORMAT') or DEFAULT_LABEL_FORMAT).strip().upper()
+    image_default, stock_default = LABEL_FORMAT_DEFAULTS.get(fmt, LABEL_FORMAT_DEFAULTS[DEFAULT_LABEL_FORMAT])
+    return {
+        'label_format': fmt,
+        'image_type': (config.get(f'FEDEX_LABEL_{fmt}_IMAGE_TYPE') or image_default).strip().upper(),
+        'stock_type': (config.get(f'FEDEX_LABEL_{fmt}_STOCK_TYPE') or stock_default).strip().upper(),
+    }
 
 
 def tin_type_for(tax_id_type) -> str:
@@ -269,11 +304,12 @@ def _money(amount, currency):
     return {'amount': amount, 'currency': currency}
 
 
-def build_ship_request(*, account_number, settings, ship_date, shipper, recipient, packages,
+def build_ship_request(*, account_number, settings, label, ship_date, shipper, recipient, packages,
                        commodities, invoice, reference=None, etd_document_id=None) -> dict:
     """组装 POST /ship/v1/shipments 请求体。
 
-    settings: {service_type, pickup_type, label_image_type, label_stock_type, duties_payment_type}
+    settings: {service_type, pickup_type, duties_payment_type}
+    label: {image_type, stock_type}（label_settings() 的结果）
     shipper / recipient: {company_name, person_name, phone, email, address{...}, tins[]}
     packages: [{gross_weight_kg, length_mm, width_mm, height_mm, declared_value|None}]
     commodities: [{description, origin_country, hs_code, quantity, quantity_unit, unit_value, amount,
@@ -327,6 +363,9 @@ def build_ship_request(*, account_number, settings, ship_date, shipper, recipien
 
     commodity_items = []
     for line in commodities:
+        weight = Decimal(str(line['weight_kg']))
+        if not COMMODITY_WEIGHT_IS_TOTAL and line['quantity']:
+            weight = weight / Decimal(line['quantity'])
         commodity_items.append({
             'description': str(line['description'])[:450],
             'countryOfManufacture': line['origin_country'],
@@ -336,7 +375,7 @@ def build_ship_request(*, account_number, settings, ship_date, shipper, recipien
             'numberOfPieces': COMMODITY_NUMBER_OF_PIECES,
             'unitPrice': _money(line['unit_value'], currency),
             'customsValue': _money(line['amount'], currency),
-            'weight': {'units': 'KG', 'value': weight_kg(line['weight_kg'])},
+            'weight': {'units': 'KG', 'value': weight_kg(weight)},
             **({'partNumber': str(line['part_number'])[:50]} if line.get('part_number') else {}),
         })
 
@@ -380,8 +419,8 @@ def build_ship_request(*, account_number, settings, ship_date, shipper, recipien
             'payor': {'responsibleParty': {'accountNumber': {'value': account_number}}},
         },
         'labelSpecification': {
-            'imageType': settings['label_image_type'],
-            'labelStockType': settings['label_stock_type'],
+            'imageType': label['image_type'],
+            'labelStockType': label['stock_type'],
             'labelFormatType': LABEL_FORMAT_TYPE,
         },
         'customsClearanceDetail': customs,
@@ -441,10 +480,35 @@ def _net_charge(completed: dict):
     return amount, iso_currency(chosen.get('currency'))
 
 
+def _document(item, source, package_sequence=None, tracking_number=None) -> dict:
+    encoded = item.get('encodedLabel')
+    return {
+        'source': source,
+        'package_sequence': package_sequence,
+        'tracking_number': tracking_number or item.get('trackingNumber'),
+        'content_type': (item.get('contentType') or 'LABEL').upper(),
+        'doc_type': (item.get('docType') or '').upper() or None,
+        'copies': item.get('copiesToPrint'),
+        'content': base64.b64decode(encoded) if encoded else None,
+        'url': item.get('url'),
+    }
+
+
+def _document_rank(document) -> int:
+    """面单 → 辅助运单 → 其他"""
+    if document['content_type'] == 'LABEL':
+        return 0
+    if 'AUXILIARY' in document['content_type']:
+        return 1
+    return 2
+
+
 def parse_ship_response(body: dict) -> dict:
     """Ship API 成功响应 → {tracking_number, package_tracking_numbers, service_type, ship_date,
-    net_charge(Decimal|None), currency, labels[{sequence, content(bytes), doc_type}], transaction_id, alerts}。
+    net_charge(Decimal|None), currency, documents[...], transaction_id, alerts}。
 
+    documents：所有 packageDocuments（按箱号）与 shipmentDocuments，按「面单 → 辅助运单 → 其他」稳定排序；
+    每项 {source, package_sequence, tracking_number, content_type, doc_type, copies, content(bytes|None), url}。
     取不到主运单号抛 ValueError（此时无法取消，调用方记日志）。
     """
     output = body.get('output') or {}
@@ -462,29 +526,19 @@ def parse_ship_response(body: dict) -> dict:
         raise ValueError("FedEx response has no master tracking number")
 
     pieces.sort(key=lambda p: p.get('packageSequenceNumber') or 0)
-    labels = []
+    documents = []
     package_tracking = []
-    for piece in pieces:
+    for index, piece in enumerate(pieces, start=1):
+        sequence = piece.get('packageSequenceNumber') or index
         if piece.get('trackingNumber'):
             package_tracking.append(piece['trackingNumber'])
-        for document in piece.get('packageDocuments') or []:
-            if not isinstance(document, dict) or (document.get('contentType') or 'LABEL') != 'LABEL':
-                continue
-            if document.get('encodedLabel'):
-                labels.append({
-                    'sequence': piece.get('packageSequenceNumber') or len(labels) + 1,
-                    'content': base64.b64decode(document['encodedLabel']),
-                    'doc_type': (document.get('docType') or '').upper() or None,
-                })
-    # 整票级的面单类文件（国际件的辅助面单等）排在各箱面单之后
-    for document in shipment.get('shipmentDocuments') or []:
-        if isinstance(document, dict) and document.get('contentType') in ('LABEL', 'AUXILIARY') \
-                and document.get('encodedLabel'):
-            labels.append({
-                'sequence': 1000 + len(labels),
-                'content': base64.b64decode(document['encodedLabel']),
-                'doc_type': (document.get('docType') or '').upper() or None,
-            })
+        for item in piece.get('packageDocuments') or []:
+            if isinstance(item, dict):
+                documents.append(_document(item, 'package', sequence, piece.get('trackingNumber')))
+    for item in shipment.get('shipmentDocuments') or []:
+        if isinstance(item, dict):
+            documents.append(_document(item, 'shipment'))
+    documents.sort(key=_document_rank)
 
     amount, currency = _net_charge(completed)
     return {
@@ -494,50 +548,97 @@ def parse_ship_response(body: dict) -> dict:
         'ship_date': shipment.get('shipDatestamp'),
         'net_charge': amount,
         'currency': currency,
-        'labels': labels,
+        'documents': documents,
         'transaction_id': body.get('transactionId'),
         'alerts': _alerts(output, shipment),
     }
 
 
 # ------------------------------------------------------------------
-# 面单合成
+# 面单存档
 # ------------------------------------------------------------------
 
-def merge_labels(labels, image_type) -> bytes:
-    """各箱面单合成一个 PDF：PDF 逐页拼接；PNG 每张一页（按 203 dpi 定页面大小）。"""
-    if not labels:
-        raise ValueError("FedEx response has no label")
+def _png_to_pdf(content: bytes) -> bytes:
+    """PNG 面单 → 单页 PDF（按 203 dpi 定页面大小）"""
+    from reportlab.lib.utils import ImageReader
+    from reportlab.pdfgen import canvas
+    out = io.BytesIO()
+    image = ImageReader(io.BytesIO(content))
+    width_px, height_px = image.getSize()
+    width, height = width_px * 72 / 203, height_px * 72 / 203
+    pdf = canvas.Canvas(out, pagesize=(width, height))
+    pdf.drawImage(image, 0, 0, width=width, height=height)
+    pdf.showPage()
+    pdf.save()
+    return out.getvalue()
+
+
+def _part(document, archived, pages=None, note=None) -> dict:
+    part = {k: document[k] for k in ('source', 'package_sequence', 'tracking_number', 'content_type',
+                                     'doc_type', 'copies')}
+    part.update({'pages': pages, 'archived': archived})
+    if note:
+        part['note'] = note
+    return part
+
+
+def build_label_archive(documents, image_type) -> dict:
+    """所有面单文档 → 一个存档文件 {content, extension, content_type, parts}。
+
+    PDF / PNG：PDF 文档逐页拼接、PNG 每张转一页，合成一个 PDF（只有一份 PDF 时原样保存）；
+    ZPLII / EPL2：同类型的原始指令按顺序拼接。其它类型、只给了 URL 的、合并件不进存档，parts 里 archived=false。
+    一份都存不进去抛 ValueError。
+    """
     image_type = (image_type or 'PDF').upper()
-    if image_type == 'PDF':
-        if len(labels) == 1:
-            return labels[0]['content']
-        from pypdf import PdfWriter, PdfReader
-        # FedEx 的面单 PDF 字典里有重复键，pypdf 每页都会记 warning（无害），合成时压掉
-        pypdf_logger = logging.getLogger('pypdf')
-        level = pypdf_logger.level
-        pypdf_logger.setLevel(logging.ERROR)
-        try:
-            writer = PdfWriter()
-            for label in labels:
-                writer.append(PdfReader(io.BytesIO(label['content'])))
-            out = io.BytesIO()
-            writer.write(out)
-        finally:
-            pypdf_logger.setLevel(level)
-        return out.getvalue()
-    if image_type == 'PNG':
-        from reportlab.lib.utils import ImageReader
-        from reportlab.pdfgen import canvas
-        out = io.BytesIO()
-        pdf = canvas.Canvas(out)
-        for label in labels:
-            image = ImageReader(io.BytesIO(label['content']))
-            width_px, height_px = image.getSize()
-            width, height = width_px * 72 / 203, height_px * 72 / 203
-            pdf.setPageSize((width, height))
-            pdf.drawImage(image, 0, 0, width=width, height=height)
-            pdf.showPage()
-        pdf.save()
-        return out.getvalue()
-    raise ValueError(f"Label image type {image_type} cannot be archived as PDF")
+    if image_type not in LABEL_ARCHIVE_FILES:
+        raise ValueError(f"Label image type {image_type} is not supported")
+    extension, content_type = LABEL_ARCHIVE_FILES[image_type]
+    parts = []
+    pdf_chunks = []     # (bytes, pages)
+    raw_chunks = []
+    pdf_mode = extension == 'pdf'
+
+    pypdf_logger = logging.getLogger('pypdf')
+    level = pypdf_logger.level
+    # FedEx 的面单 PDF 字典里有重复键，pypdf 每页都会记 warning（无害）
+    pypdf_logger.setLevel(logging.ERROR)
+    try:
+        from pypdf import PdfReader, PdfWriter
+        for document in documents:
+            kind = document['doc_type'] or image_type
+            if document['content'] is None:
+                parts.append(_part(document, False, note='no content (URL only)'))
+            elif document['content_type'] in _MERGED_CONTENT_TYPES:
+                parts.append(_part(document, False, note='merged duplicate'))
+            elif pdf_mode and kind in ('PDF', 'PNG'):
+                content = document['content'] if kind == 'PDF' else _png_to_pdf(document['content'])
+                pages = len(PdfReader(io.BytesIO(content)).pages)
+                pdf_chunks.append(content)
+                parts.append(_part(document, True, pages))
+            elif not pdf_mode and kind == image_type:
+                text = document['content'].rstrip(b'\r\n') + b'\n'
+                pages = text.count(b'^XA') if image_type == 'ZPLII' else None
+                raw_chunks.append(text)
+                parts.append(_part(document, True, pages))
+            else:
+                parts.append(_part(document, False, note=f'{kind} cannot be archived as {extension}'))
+
+        if pdf_mode:
+            if not pdf_chunks:
+                raise ValueError("FedEx response has no label that can be archived as PDF")
+            if len(pdf_chunks) == 1:
+                content = pdf_chunks[0]
+            else:
+                writer = PdfWriter()
+                for chunk in pdf_chunks:
+                    writer.append(PdfReader(io.BytesIO(chunk)))
+                out = io.BytesIO()
+                writer.write(out)
+                content = out.getvalue()
+        else:
+            if not raw_chunks:
+                raise ValueError(f"FedEx response has no {image_type} label")
+            content = b''.join(raw_chunks)
+    finally:
+        pypdf_logger.setLevel(level)
+    return {'content': content, 'extension': extension, 'content_type': content_type, 'parts': parts}

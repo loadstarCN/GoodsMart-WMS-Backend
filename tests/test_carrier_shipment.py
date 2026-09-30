@@ -24,7 +24,7 @@ from warehouse.dn import fedex_client
 from warehouse.dn.carrier_services import CarrierShipmentService
 from warehouse.dn.customs_services import CustomsService
 from warehouse.dn.fedex_shipment import (
-    AddressError, allocate_commodity_weights, consignee_address, fedex_currency, iso_currency, merge_labels,
+    AddressError, allocate_commodity_weights, build_label_archive, consignee_address, fedex_currency, iso_currency,
     split_address_text, split_evenly, tin_type_for, wrap_lines,
 )
 from warehouse.dn.models import DNCarrierShipment, DNDocument
@@ -44,16 +44,31 @@ def _label_pdf(text: str) -> bytes:
     return out.getvalue()
 
 
-def _ship_body(tracking='794600000001', packages=2, image=b'PDF'):
+def _label_pdf_pages(*texts) -> bytes:
+    from reportlab.pdfgen import canvas
+    out = io.BytesIO()
+    pdf = canvas.Canvas(out, pagesize=(288, 432))
+    for text in texts:
+        pdf.drawString(20, 400, text)
+        pdf.showPage()
+    pdf.save()
+    return out.getvalue()
+
+
+def _ship_body(tracking='794600000001', packages=2, image=b'PDF', shipment_documents=None):
     pieces = []
     for seq in range(1, packages + 1):
-        content = _label_pdf(f'LABEL {seq}') if image == b'PDF' else image
+        if image == b'PDF':
+            content = (_label_pdf_pages('LABEL 1', 'AWB COPY 1', 'AWB COPY 2') if seq == 1
+                       else _label_pdf_pages(f'LABEL {seq}'))
+        else:
+            content = image
         pieces.append({
             'trackingNumber': tracking if seq == 1 else f'{tracking[:-1]}{seq}',
             'masterTrackingNumber': tracking,
             'packageSequenceNumber': seq,
-            'packageDocuments': [{'contentType': 'LABEL', 'docType': 'PDF', 'copiesToPrint': 1,
-                                  'encodedLabel': base64.b64encode(content).decode()}],
+            'packageDocuments': [{'contentType': 'LABEL', 'docType': 'PDF' if image == b'PDF' else 'ZPLII',
+                                  'copiesToPrint': 1, 'encodedLabel': base64.b64encode(content).decode()}],
         })
     return {
         'transactionId': 'tx-ship-0001',
@@ -73,6 +88,7 @@ def _ship_body(tracking='794600000001', packages=2, image=b'PDF'):
                 },
             },
             'alerts': [{'code': 'SHIP.RECIPIENT.POSTALCITY.MISMATCH', 'alertType': 'NOTE', 'message': 'note'}],
+            **({'shipmentDocuments': shipment_documents} if shipment_documents else {}),
         }]},
     }
 
@@ -131,7 +147,7 @@ def fedex(client, monkeypatch):
     client.application.config.update(
         FEDEX_API_BASE='https://apis-sandbox.fedex.com',
         FEDEX_API_KEY=API_KEY, FEDEX_SECRET_KEY=SECRET, FEDEX_ACCOUNT_NUMBER=ACCOUNT,
-        FEDEX_ETD_ENABLED=False, FEDEX_DUTIES_PAYMENT_TYPE='RECIPIENT', FEDEX_LABEL_IMAGE_TYPE='PDF',
+        FEDEX_ETD_ENABLED=False, FEDEX_DUTIES_PAYMENT_TYPE='RECIPIENT',
     )
     yield fake
     fedex_client.clear_token_cache()
@@ -245,8 +261,7 @@ def test_blockers_status_packages_task_and_domestic(client, access_token, fedex)
     for expected in ('NOT_PACKED', 'DELIVERY_TASK_MISSING', 'PACKAGES_MISSING'):
         assert expected in codes, (expected, codes)
 
-    with client.application.app_context():
-        client.application.config['FEDEX_LABEL_IMAGE_TYPE'] = 'ZPLII'
+    client.application.config['FEDEX_LABEL_THERMAL_IMAGE_TYPE'] = 'GIF'
     assert 'FEDEX_CONFIG_INVALID' in _codes(_create(client, access_token, dn_id))
     assert fedex.calls == []
 
@@ -271,8 +286,8 @@ def test_request_body_fields(client, access_token, fedex):
     assert len(shipment['shipDatestamp']) == 10
     assert shipment['shippingChargesPayment'] == {
         'paymentType': 'SENDER', 'payor': {'responsibleParty': {'accountNumber': {'value': ACCOUNT}}}}
-    assert shipment['labelSpecification'] == {
-        'imageType': 'PDF', 'labelStockType': 'PAPER_4X6', 'labelFormatType': 'COMMON2D'}
+    assert shipment['labelSpecification'] == {      # 默认 A4：激光打印机，上半页面单
+        'imageType': 'PDF', 'labelStockType': 'PAPER_85X11_TOP_HALF_LABEL', 'labelFormatType': 'COMMON2D'}
     assert 'shipmentSpecialServices' not in shipment            # ETD 关闭
 
     shipper = shipment['shipper']
@@ -398,8 +413,20 @@ def test_create_saves_tracking_label_and_bumps_ci(client, access_token, fedex):
     # 面单：两箱合成一个 PDF，存 dn_documents（shipping_label）
     label = client.get(shipment['label_download_path'].replace('/warehouse', ''), headers=_h(access_token))
     assert label.status_code == 200 and label.mimetype == 'application/pdf'
-    assert _pdf_pages(label.data) == 2
+    assert _pdf_pages(label.data) == 4                  # 第 1 箱 3 页（主面单 + 2 页 AWB COPY）+ 第 2 箱 1 页
+    assert label.headers['Content-Disposition'].startswith('inline')
     assert label.headers['X-Content-SHA256'] == hashlib.sha256(label.data).hexdigest()
+    assert shipment['label_format'] == 'A4' and shipment['image_type'] == 'PDF'
+    assert shipment['label_stock_type'] == 'PAPER_85X11_TOP_HALF_LABEL'
+    assert shipment['label_file_name'] == 'LABEL_794600000001.pdf'
+    assert shipment['label_content_type'] == 'application/pdf'
+    assert [(p['package_sequence'], p['content_type'], p['pages'], p['archived']) for p in shipment['label_parts']] \
+        == [(1, 'LABEL', 3, True), (2, 'LABEL', 1, True)]
+    assert data['default_label_format'] == 'A4'
+    assert data['label_formats'] == {
+        'A4': {'image_type': 'PDF', 'stock_type': 'PAPER_85X11_TOP_HALF_LABEL'},
+        'THERMAL': {'image_type': 'PDF', 'stock_type': 'STOCK_4X6'},
+    }
     labels = client.get(f'/dn/{dn_id}/customs-documents/?doc_type=shipping_label',
                         headers=_h(access_token)).get_json()
     assert len(labels) == 1 and labels[0]['id'] == shipment['label_document_id']
@@ -728,14 +755,88 @@ def test_address_and_value_helpers():
     assert weights[1] == Decimal('2')
 
 
-def test_merge_png_labels_into_pdf():
+def _doc(content, content_type='LABEL', doc_type='PDF', source='package', sequence=1):
+    return {'source': source, 'package_sequence': sequence, 'tracking_number': None,
+            'content_type': content_type, 'doc_type': doc_type, 'copies': 1, 'content': content, 'url': None}
+
+
+def test_label_archive_png_and_skips():
     from PIL import Image
     images = []
-    for color in ('white', 'black'):
+    for index, color in enumerate(('white', 'black'), start=1):
         buf = io.BytesIO()
         Image.new('RGB', (812, 1218), color).save(buf, format='PNG')
-        images.append({'sequence': len(images) + 1, 'content': buf.getvalue(), 'doc_type': 'PNG'})
-    pdf = merge_labels(images, 'PNG')
-    assert pdf.startswith(b'%PDF-') and _pdf_pages(pdf) == 2
+        images.append(_doc(buf.getvalue(), doc_type='PNG', sequence=index))
+    images.append(_doc(None, content_type='COMMERCIAL_INVOICE', source='shipment', sequence=None))
+    archive = build_label_archive(images, 'PNG')
+    assert archive['extension'] == 'pdf' and archive['content_type'] == 'application/pdf'
+    assert archive['content'].startswith(b'%PDF-') and _pdf_pages(archive['content']) == 2
+    assert [(p['pages'], p['archived']) for p in archive['parts']] == [(1, True), (1, True), (None, False)]
     with pytest.raises(ValueError):
-        merge_labels([], 'PDF')
+        build_label_archive([], 'PDF')
+    with pytest.raises(ValueError):
+        build_label_archive([_doc(b'^XA^XZ', doc_type='ZPLII')], 'PDF')     # 类型不对：一份都存不进
+
+
+def test_thermal_label_format_uses_4x6_stock(client, access_token, fedex):
+    dn_id, _task_id = _ready(client, access_token)
+    response = client.post(f'/dn/{dn_id}/carrier-shipment', json={'label_format': 'thermal'},
+                           headers=_h(access_token))
+    assert response.status_code == 201, response.get_json()
+    assert fedex.ship_request()['requestedShipment']['labelSpecification'] == {
+        'imageType': 'PDF', 'labelStockType': 'STOCK_4X6', 'labelFormatType': 'COMMON2D'}
+    shipment = response.get_json()['shipment']
+    assert (shipment['label_format'], shipment['image_type'], shipment['label_stock_type']) == \
+        ('THERMAL', 'PDF', 'STOCK_4X6')
+
+
+def test_invalid_label_format_rejected(client, access_token, fedex):
+    dn_id, _task_id = _ready(client, access_token)
+    for value in ('LETTER', 5):
+        response = client.post(f'/dn/{dn_id}/carrier-shipment', json={'label_format': value},
+                               headers=_h(access_token))
+        assert response.status_code == 400 and response.get_json()['code'] == 16077
+    assert fedex.calls == []
+
+
+def test_label_documents_ordered_label_auxiliary_other(client, access_token, fedex):
+    extra = [
+        {'contentType': 'COMMERCIAL_INVOICE', 'docType': 'PDF',
+         'encodedLabel': base64.b64encode(_label_pdf_pages('INVOICE')).decode()},
+        {'contentType': 'AUXILIARY', 'docType': 'PDF',
+         'encodedLabel': base64.b64encode(_label_pdf_pages('AUX')).decode()},
+        {'contentType': 'MERGED_LABEL_DOCUMENTS', 'docType': 'PDF', 'url': 'https://example.invalid/merged'},
+    ]
+    fedex.set('/ship/v1/shipments', (200, _ship_body(shipment_documents=extra)))
+    dn_id, _task_id = _ready(client, access_token)
+    response = _create(client, access_token, dn_id)
+    assert response.status_code == 201, response.get_json()
+    shipment = response.get_json()['shipment']
+    assert [(p['source'], p['content_type'], p['pages'], p['archived']) for p in shipment['label_parts']] == [
+        ('package', 'LABEL', 3, True), ('package', 'LABEL', 1, True),
+        ('shipment', 'AUXILIARY', 1, True),
+        ('shipment', 'COMMERCIAL_INVOICE', 1, True), ('shipment', 'MERGED_LABEL_DOCUMENTS', None, False),
+    ]
+    label = client.get(shipment['label_download_path'].replace('/warehouse', ''), headers=_h(access_token))
+    from pypdf import PdfReader
+    pages = [page.extract_text().strip() for page in PdfReader(io.BytesIO(label.data)).pages]
+    assert pages == ['LABEL 1', 'AWB COPY 1', 'AWB COPY 2', 'LABEL 2', 'AUX', 'INVOICE']
+
+
+def test_zpl_labels_stored_raw(client, access_token, fedex):
+    client.application.config['FEDEX_LABEL_THERMAL_IMAGE_TYPE'] = 'ZPLII'
+    zpl = b'^XA^FDLABEL^FS^XZ\n^XA^FDAWB COPY^FS^PQ2\n^XZ\n'
+    fedex.set('/ship/v1/shipments', (200, _ship_body(packages=2, image=zpl)))
+    dn_id, _task_id = _ready(client, access_token)
+    response = client.post(f'/dn/{dn_id}/carrier-shipment', json={'label_format': 'THERMAL'},
+                           headers=_h(access_token))
+    assert response.status_code == 201, response.get_json()
+    assert fedex.ship_request()['requestedShipment']['labelSpecification']['imageType'] == 'ZPLII'
+    shipment = response.get_json()['shipment']
+    assert shipment['image_type'] == 'ZPLII' and shipment['label_file_name'] == 'LABEL_794600000001.zpl'
+    assert shipment['label_content_type'] == 'application/octet-stream'
+    assert [p['pages'] for p in shipment['label_parts']] == [2, 2]
+    label = client.get(shipment['label_download_path'].replace('/warehouse', ''), headers=_h(access_token))
+    assert label.status_code == 200 and label.mimetype == 'application/octet-stream'
+    assert label.headers['Content-Disposition'] == 'attachment; filename="LABEL_794600000001.zpl"'
+    assert label.data == zpl + zpl                      # 各箱原始指令按顺序拼接

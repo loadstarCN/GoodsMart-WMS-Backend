@@ -394,7 +394,18 @@ DN 须为 `picked` 或 `packed`（否则 409 `16067`）。请求体 `{"packages"
 | `POST` | `/warehouse/dn/<id>/carrier-shipment/cancel` | `packing_edit` / `delivery_edit` |
 
 `GET` 返回 `{enabled, carrier: "fedex", can_create, blockers[{code, message, goods_code?, field?}], etd_enabled,
-declared_value_carriage, delivery_task_id, shipment}`；`shipment` 为最近一条运单（有效的优先），没有为 `null`。
+default_label_format, label_formats{A4|THERMAL: {image_type, stock_type}}, declared_value_carriage, delivery_task_id,
+shipment}`；`shipment` 为最近一条运单（有效的优先），没有为 `null`，含 `label_format`、`image_type`、`label_stock_type`、
+`label_file_name`、`label_content_type`、`label_parts[]`（面单存档里各文档的来源、箱号、类型、页数、是否存入）等。
+
+`POST` 可带请求体 `{"label_format": "A4" | "THERMAL"}`（面单打印方式；不带用 `FEDEX_DEFAULT_LABEL_FORMAT`，其它值 400 `16077`）：
+
+| `label_format` | 打印机 | 默认 imageType / 纸张 | 页面 |
+|----------------|--------|------------------------|------|
+| `A4` | 激光打印机、A4 / Letter 普通纸 | `PDF` / `PAPER_85X11_TOP_HALF_LABEL` | Letter 页，上半页面单、下半页折叠说明 |
+| `THERMAL` | 4 英寸面单机（走驱动当普通打印机用） | `PDF` / `STOCK_4X6` | 4 × 6 英寸（约 100 × 150 mm） |
+
+面单机不要用 `PAPER_4X6`：FedEx 回的是 Letter 页、面单在左上角。各格式的 imageType（`PDF` / `PNG` / `ZPLII` / `EPL2`）与纸张可用配置覆盖。
 
 ### 建单
 
@@ -409,17 +420,19 @@ declared_value_carriage, delivery_task_id, shipment}`；`shipment` 为最近一�
 - 请求内容：发件人 = 公司出口资料（英文名、电话（仓库优先）、联系人、税号）+ 仓库英文地址（仓库没有则用公司的）；
   收件人与税号来自报关快照（税号类型映射到 FedEx `tinType`：EORI → `BUSINESS_UNION`，PCCC / CPF → `PERSONAL_NATIONAL`，
   其余 → `BUSINESS_NATIONAL`）；商品来自发票明细（**已打包数量**、HS、原产国（商品主数据）、单价、金额、重量）；
-  每个 WMS 箱子一行包裹（毛重 kg、尺寸 cm）；运送申告价额按箱均分；运费 / 保险费按快照；运费记账到账号，
+  每个 WMS 箱子一行包裹（毛重 kg、尺寸 cm，面单印 DN 订单号与发票号）；运送申告价额按箱均分；运费 / 保险费按快照；运费记账到账号，
   关税付款方按 `FEDEX_DUTIES_PAYMENT_TYPE`。
 - 地址规则：FedEx 街道最多 3 行 × 35 字符、城市 ≤ 35 字符。英文地址按逗号 / 换行切段，去掉国家名和邮编后的最后一段
   为城市，例如 `1-2-3 Example, Minato-ku, Tokyo 105-0000`。邮编取仓库 / 公司的 `zip_code`（日本地址也能从地址里认出）。
   收件人没有邮编时带空的 `postalCode`；美国 / 加拿大 / 波多黎各必须有两位州代码。
 - 商品重量：有单件重量的 = 单件重量 × 已打包数量；没有的分摊「总毛重 − 已知重量」（不为正时按数量占比分摊总毛重）。
-- **先调 FedEx，成功后才写库**（一个事务）：运单号 → 发货任务、CI / PL 带 AWB 升版本、面单（每箱一张，合成一个 PDF）
-  存为 `doc_type: shipping_label` 的单证、记 `dn_carrier_shipments`。FedEx 报错 → 502 `16073`（`details.errors`、
+- **先调 FedEx，成功后才写库**（一个事务）：运单号 → 发货任务、CI / PL 带 AWB 升版本、面单存档存为
+  `doc_type: shipping_label` 的单证、记 `dn_carrier_shipments`。存档包含响应里的**所有**文档（每箱面单 → 辅助运单 → 其他；
+  国际件的「FEDEX AWB COPY」在第一箱面单 PDF 的后几页，不用另外要）：PDF / PNG 合成一个 PDF，ZPLII / EPL2 把原始打印指令
+  按同样顺序拼成一个文件（`.zpl` / `.epl`，`application/octet-stream`）。FedEx 报错 → 502 `16073`（`details.errors`、
   `transaction_id`，不写任何东西）；超时 → 504 `16074`（`details.maybe_processed: true` 表示 FedEx 侧可能已建单，
   重试前先去 FedEx 确认）。FedEx 建单成功但写库失败时，WMS 调 FedEx 取消该运单并记日志。
-- 面单用 `GET /warehouse/dn/<id>/customs-documents/<label_document_id>/file` 下载；面单不参与「必须有有效 CI + PL」
+- 面单用 `GET /warehouse/dn/<id>/customs-documents/<label_document_id>/file` 下载（PDF inline，ZPL / EPL 作为附件）；面单不参与「必须有有效 CI + PL」
   的发货拦截。有有效运单时改箱子 → 409 `16076`（先取消运单）。
 
 ### 取消
@@ -436,8 +449,9 @@ DN 发货前可取消（发货后 409 `16065`；没有有效运单 409 `16075`�
 | `FEDEX_API_KEY` / `FEDEX_SECRET_KEY` / `FEDEX_ACCOUNT_NUMBER` | （不设） | FedEx 开发者项目凭证；缺任一项 = 功能关闭 |
 | `FEDEX_SERVICE_TYPE` | `INTERNATIONAL_ECONOMY` | 服务类型 |
 | `FEDEX_PICKUP_TYPE` | `USE_SCHEDULED_PICKUP` | 揽收方式 |
-| `FEDEX_LABEL_IMAGE_TYPE` | `PDF` | `PDF` 或 `PNG`（都存成 PDF） |
-| `FEDEX_LABEL_STOCK_TYPE` | `PAPER_4X6` | A4 / Letter 打印机可用 `PAPER_85X11_TOP_HALF_LABEL` 等 |
+| `FEDEX_DEFAULT_LABEL_FORMAT` | `A4` | 建单请求不指定时的面单打印方式（`A4` / `THERMAL`） |
+| `FEDEX_LABEL_A4_IMAGE_TYPE` / `FEDEX_LABEL_A4_STOCK_TYPE` | `PDF` / `PAPER_85X11_TOP_HALF_LABEL` | 覆盖 `A4` 的格式 / 纸张 |
+| `FEDEX_LABEL_THERMAL_IMAGE_TYPE` / `FEDEX_LABEL_THERMAL_STOCK_TYPE` | `PDF` / `STOCK_4X6` | 覆盖 `THERMAL` 的格式 / 纸张（Zebra 等可设 `ZPLII`） |
 | `FEDEX_ETD_ENABLED` | `False` | 电子贸易单证（上传 CI） |
 | `FEDEX_DUTIES_PAYMENT_TYPE` | `RECIPIENT` | `RECIPIENT` 或 `SENDER`（记账到账号） |
 | `FEDEX_DOCUMENT_API_BASE` | （自动） | Trade Documents Upload 的地址，默认按 `FEDEX_API_BASE` 选测试 / 正式 |
@@ -448,11 +462,13 @@ OAuth token（`/oauth/token`，client credentials）进程内缓存到过期前�
 
 ### 测试环境冒烟与面单认证
 
-`scripts/fedex_sandbox_smoke.py` 用虚构数据在 FedEx **测试环境**建一票运单、保存面单 PDF 后取消
-（`FEDEX_API_BASE` 不含 `sandbox` 时拒绝执行）：
+`scripts/fedex_sandbox_smoke.py` 按面单打印方式 × 箱数在 FedEx **测试环境**各建一票运单，面单按
+`<服务>_<箱数>pkg_<打印方式>.<扩展名>` 保存后取消（`FEDEX_API_BASE` 不含 `sandbox` 时拒绝执行）。发件人 / 收件人默认虚构，
+认证样张可用 JSON 文件给出（字段同出口资料 / 报关快照 consignee）：
 
 ```bash
-python scripts/fedex_sandbox_smoke.py --to US --packages 2 [--etd] [--out ./fedex-sandbox-labels] [--env-file .env]
+python scripts/fedex_sandbox_smoke.py [--label-format A4|THERMAL|both] [--packages 1,2] [--to US|DE|HK] \
+    [--shipper-json shipper.json] [--recipient-json recipient.json] [--etd] [--out ./fedex-sandbox-labels] [--env-file .env]
 ```
 
 正式使用前 FedEx 要求面单认证：用测试环境打出所用服务的面单，扫描后连同 Label Cover Sheet 发给 FedEx
@@ -492,7 +508,7 @@ stdout_logfile=/var/log/wms-api.out.log
 | 库存错误 | 15000-15999 | 400 | 库存相关错误 |
 | 状态错误 | 16000-16999 | 400 | 状态流转错误 |
 
-出口单证相关业务码：`14019` 出口资料文本超长、`14020` 国家代码不合法、`16063` 报关结构不合法、`16064` 报关行商品编码不在 DN 明细或重复、`16065` 已发货不可改（409）、`16066` 箱子数据不合法、`16067` 当前状态不能改箱子（409）、`16068` 单证条件不全（409，`details.problems`）、`16069` 发货前必须先出单证（409）、`16070` 不是海外单（409）、`16071` 单证不存在（404）。承运商运单（FedEx）：`16072` 建单前置条件不满足（409，`details.blockers`）、`16073` FedEx 返回错误（502，`details.errors` / `transaction_id`）、`16074` FedEx 超时（504）、`16075` 没有有效运单（409）、`16076` 有有效运单时不能改箱子（409）。错误响应可能带结构化的 `details`。
+出口单证相关业务码：`14019` 出口资料文本超长、`14020` 国家代码不合法、`16063` 报关结构不合法、`16064` 报关行商品编码不在 DN 明细或重复、`16065` 已发货不可改（409）、`16066` 箱子数据不合法、`16067` 当前状态不能改箱子（409）、`16068` 单证条件不全（409，`details.problems`）、`16069` 发货前必须先出单证（409）、`16070` 不是海外单（409）、`16071` 单证不存在（404）。承运商运单（FedEx）：`16072` 建单前置条件不满足（409，`details.blockers`）、`16073` FedEx 返回错误（502，`details.errors` / `transaction_id`）、`16074` FedEx 超时（504）、`16075` 没有有效运单（409）、`16076` 有有效运单时不能改箱子（409）、`16077` `label_format` 不合法（400）。错误响应可能带结构化的 `details`。
 
 ## 关联项目
 

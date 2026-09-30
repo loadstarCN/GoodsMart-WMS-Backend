@@ -441,6 +441,18 @@ class DNDocument(db.Model):
         info={'description': 'DN'}
     )
 
+    # 文件扩展名 → Content-Type（面单可能是 ZPL / EPL 打印机指令）
+    CONTENT_TYPES = {
+        'pdf': 'application/pdf',
+        'zpl': 'application/octet-stream',
+        'epl': 'application/octet-stream',
+    }
+
+    @property
+    def content_type(self) -> str:
+        extension = (self.file_name or '').rsplit('.', 1)[-1].lower()
+        return self.CONTENT_TYPES.get(extension, 'application/octet-stream')
+
     def to_meta(self) -> dict:
         return {
             'id': self.id,
@@ -498,6 +510,11 @@ class DNCarrierShipment(db.Model):
     net_charge = db.Column(db.Numeric(12, 2), nullable=True, info={'description': '运费（承运商回的净额）'})
     currency = db.Column(db.String(10), nullable=True, info={'description': '运费币种（ISO 4217）'})
     declared_value = db.Column(db.Integer, nullable=True, info={'description': '随运单提交的申告价额（合计）'})
+    label_format = db.Column(db.String(10), nullable=True, info={'description': '面单打印方式（A4 / THERMAL）'})
+    image_type = db.Column(db.String(10), nullable=True, info={'description': '面单格式（PDF / PNG / ZPLII / EPL2）'})
+    label_stock_type = db.Column(db.String(40), nullable=True, info={'description': '面单纸张（FedEx labelStockType）'})
+    label_parts = db.Column(db.JSON, nullable=True,
+                            info={'description': '面单存档里的各文档（类型、箱号、页数、是否存入）'})
     label_document_id = db.Column(
         db.Integer,
         db.ForeignKey('dn_documents.id', ondelete='SET NULL'),
@@ -546,11 +563,17 @@ class DNCarrierShipment(db.Model):
             'net_charge': float(self.net_charge) if self.net_charge is not None else None,
             'currency': self.currency,
             'declared_value': self.declared_value,
+            'label_format': self.label_format,
+            'image_type': self.image_type,
+            'label_stock_type': self.label_stock_type,
             'label_document_id': self.label_document_id,
             'label_download_path': (
                 f"/warehouse/dn/{self.dn_id}/customs-documents/{self.label_document_id}/file"
                 if self.label_document_id else None
             ),
+            'label_file_name': self.label_document.file_name if self.label_document else None,
+            'label_content_type': self.label_document.content_type if self.label_document else None,
+            'label_parts': self.label_parts or [],
             'etd_document_id': self.etd_document_id,
             'transaction_id': self.transaction_id,
             'created_at': self.created_at.isoformat() if self.created_at else None,

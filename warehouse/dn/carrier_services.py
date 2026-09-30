@@ -7,6 +7,8 @@
 - 先调 FedEx，成功后才在一个事务里写库：主运单号走现有保存运单号的逻辑存到发货任务、CI / PL 带 AWB 升版本、
   面单存 dn_documents（shipping_label）、记 dn_carrier_shipments。FedEx 失败不写任何东西；
   写库失败则尝试取消刚建的运单并记日志。
+- 面单打印方式（label_format）由建单请求指定：A4（激光打印机）/ THERMAL（4 英寸面单机），不指定用配置默认；
+  各格式的 imageType / 纸张见 fedex_shipment.label_settings。
 - 取消：DN 未发货才可；FedEx 取消成功后记录标 cancelled、发货任务上的运单号清掉、面单作废、
   CI / PL 去掉 AWB 重新签发（条件不满足则作废）。
 """
@@ -19,7 +21,7 @@ from flask import current_app
 
 from extensions.db import db
 from extensions.error import (
-    BadGatewayException, ConflictException, GatewayTimeoutException,
+    BadGatewayException, BadRequestException, ConflictException, GatewayTimeoutException,
 )
 from extensions.transaction import transactional
 from warehouse.common.countries import COUNTRY_NAMES_EN
@@ -27,9 +29,10 @@ from . import fedex_client
 from .customs_services import CustomsService, DOC_CI, DOC_TYPES, _document_timezone, LOCKED_DN_STATUSES
 from .fedex_client import FedexError
 from .fedex_shipment import (
-    AddressError, MAX_PACKAGES_PER_REQUEST, SUPPORTED_DUTIES_PAYMENT_TYPES, SUPPORTED_LABEL_IMAGE_TYPES,
-    SHIPPER_TIN_TYPE, allocate_commodity_weights, build_ship_request, consignee_address, merge_labels,
-    parse_ship_response, split_address_text, split_evenly, tin_type_for,
+    AddressError, LABEL_FORMATS, MAX_PACKAGES_PER_REQUEST, SUPPORTED_DUTIES_PAYMENT_TYPES,
+    SUPPORTED_LABEL_IMAGE_TYPES, SHIPPER_TIN_TYPE, allocate_commodity_weights, build_label_archive,
+    build_ship_request, consignee_address, label_settings, parse_ship_response, split_address_text,
+    split_evenly, tin_type_for,
 )
 from .models import DN, DNCarrierShipment, DNDocument
 
@@ -54,11 +57,25 @@ def _settings() -> dict:
     return {
         'service_type': cfg.get('FEDEX_SERVICE_TYPE') or 'INTERNATIONAL_ECONOMY',
         'pickup_type': cfg.get('FEDEX_PICKUP_TYPE') or 'USE_SCHEDULED_PICKUP',
-        'label_image_type': (cfg.get('FEDEX_LABEL_IMAGE_TYPE') or 'PDF').upper(),
-        'label_stock_type': cfg.get('FEDEX_LABEL_STOCK_TYPE') or 'PAPER_4X6',
         'duties_payment_type': (cfg.get('FEDEX_DUTIES_PAYMENT_TYPE') or 'RECIPIENT').upper(),
         'etd_enabled': bool(cfg.get('FEDEX_ETD_ENABLED')),
+        'default_label_format': label_settings(cfg)['label_format'],
+        'label_formats': {fmt: label_settings(cfg, fmt) for fmt in LABEL_FORMATS},
     }
+
+
+def resolve_label_format(value) -> dict:
+    """建单请求的 label_format（A4 / THERMAL，大小写不限；空 = 配置默认）→ label_settings。
+    请求里的值不合法 400 16077；配置默认不合法由 blockers（FEDEX_CONFIG_INVALID）报。"""
+    if value is not None and not isinstance(value, str):
+        raise BadRequestException("label_format must be one of " + ' / '.join(LABEL_FORMATS), 16077,
+                                  field='label_format')
+    value = (value or '').strip() or None
+    settings = label_settings(current_app.config, value)
+    if value is not None and settings['label_format'] not in LABEL_FORMATS:
+        raise BadRequestException("label_format must be one of " + ' / '.join(LABEL_FORMATS), 16077,
+                                  field='label_format')
+    return settings
 
 
 def _carrier_code(carrier) -> str:
@@ -174,9 +191,14 @@ class CarrierShipmentService:
         if not CarrierShipmentService.enabled():
             blockers.append(_blocker('FEDEX_NOT_CONFIGURED',
                                      "FedEx is not configured (FEDEX_API_KEY / FEDEX_SECRET_KEY / FEDEX_ACCOUNT_NUMBER)"))
-        if settings['label_image_type'] not in SUPPORTED_LABEL_IMAGE_TYPES:
+        if settings['default_label_format'] not in LABEL_FORMATS:
             blockers.append(_blocker('FEDEX_CONFIG_INVALID',
-                                     f"FEDEX_LABEL_IMAGE_TYPE must be one of {', '.join(SUPPORTED_LABEL_IMAGE_TYPES)}"))
+                                     f"FEDEX_DEFAULT_LABEL_FORMAT must be one of {', '.join(LABEL_FORMATS)}"))
+        for fmt, label in settings['label_formats'].items():
+            if label['image_type'] not in SUPPORTED_LABEL_IMAGE_TYPES:
+                blockers.append(_blocker('FEDEX_CONFIG_INVALID',
+                                         f"FEDEX_LABEL_{fmt}_IMAGE_TYPE must be one of "
+                                         f"{', '.join(SUPPORTED_LABEL_IMAGE_TYPES)}"))
         if settings['duties_payment_type'] not in SUPPORTED_DUTIES_PAYMENT_TYPES:
             blockers.append(_blocker('FEDEX_CONFIG_INVALID',
                                      "FEDEX_DUTIES_PAYMENT_TYPE must be one of "
@@ -283,6 +305,11 @@ class CarrierShipmentService:
             'can_create': not ctx['blockers'],
             'blockers': ctx['blockers'],
             'etd_enabled': ctx['settings']['etd_enabled'],
+            'default_label_format': ctx['settings']['default_label_format'],
+            'label_formats': {
+                fmt: {'image_type': label['image_type'], 'stock_type': label['stock_type']}
+                for fmt, label in ctx['settings']['label_formats'].items()
+            },
             'declared_value_carriage': customs.declared_value_carriage if customs else None,
             'delivery_task_id': ctx['task'].id if ctx['task'] is not None else None,
             'shipment': shipment.to_dict() if shipment else None,
@@ -296,7 +323,7 @@ class CarrierShipmentService:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _ship_request(dn: DN, ctx: dict, etd_document_id=None) -> dict:
+    def _ship_request(dn: DN, ctx: dict, label: dict, etd_document_id=None) -> dict:
         view = ctx['view']
         customs = dn.customs
         packages = list(dn.packages)
@@ -341,6 +368,7 @@ class CarrierShipmentService:
         return build_ship_request(
             account_number=current_app.config.get('FEDEX_ACCOUNT_NUMBER'),
             settings=ctx['settings'],
+            label=label,
             ship_date=datetime.now(_document_timezone()).date(),
             shipper=ctx['shipper'],
             recipient=ctx['recipient'],
@@ -352,11 +380,12 @@ class CarrierShipmentService:
         )
 
     @staticmethod
-    def create_shipment(dn: DN, user_id) -> dict:
+    def create_shipment(dn: DN, user_id, label_format=None) -> dict:
         """POST /dn/<id>/carrier-shipment。写库失败时尝试取消刚建的 FedEx 运单（补偿）。"""
+        label = resolve_label_format(label_format)
         outcome = {}
         try:
-            return CarrierShipmentService._create(dn, user_id, outcome)
+            return CarrierShipmentService._create(dn, user_id, label, outcome)
         except Exception:
             if outcome.get('tracking_number'):
                 CarrierShipmentService._compensate(dn.id, outcome)
@@ -376,7 +405,7 @@ class CarrierShipmentService:
 
     @staticmethod
     @transactional
-    def _create(dn: DN, user_id, outcome: dict) -> dict:
+    def _create(dn: DN, user_id, label: dict, outcome: dict) -> dict:
         from warehouse.delivery.services import DeliveryTaskService
 
         dn = CustomsService._lock(dn)
@@ -410,7 +439,7 @@ class CarrierShipmentService:
                                           details={'carrier': CARRIER_FEDEX, 'action': 'etd_upload',
                                                    'errors': [], 'transaction_id': None, 'http_status': None})
 
-        request = CarrierShipmentService._ship_request(dn, ctx, etd_document_id)
+        request = CarrierShipmentService._ship_request(dn, ctx, label, etd_document_id)
         try:
             body = fedex_client.create_shipment(request)
         except FedexError as exc:
@@ -431,7 +460,7 @@ class CarrierShipmentService:
         # 从这里起 FedEx 上已有运单：之后任何失败都会触发补偿取消
         outcome['tracking_number'] = result['tracking_number']
 
-        label_pdf = merge_labels(result['labels'], settings['label_image_type'])
+        archive = build_label_archive(result['documents'], label['image_type'])
         tracking = result['tracking_number']
 
         # 运单号：复用现有保存运单号的逻辑；CI / PL 带 AWB 升版本
@@ -450,7 +479,7 @@ class CarrierShipmentService:
                 ship_date = None
         ship_date = ship_date or datetime.now(_document_timezone()).date()
 
-        label_doc = CarrierShipmentService._store_label(dn, tracking, ship_date, label_pdf, user_id)
+        label_doc = CarrierShipmentService._store_label(dn, tracking, ship_date, archive, user_id)
         customs = dn.customs
         shipment = DNCarrierShipment(
             dn_id=dn.id,
@@ -464,6 +493,10 @@ class CarrierShipmentService:
             net_charge=result['net_charge'],
             currency=result['currency'],
             declared_value=customs.declared_value_carriage or None,
+            label_format=label['label_format'],
+            image_type=label['image_type'],
+            label_stock_type=label['stock_type'],
+            label_parts=archive['parts'],
             label_document_id=label_doc.id,
             etd_document_id=etd_document_id,
             transaction_id=result['transaction_id'],
@@ -475,12 +508,13 @@ class CarrierShipmentService:
         return CarrierShipmentService.status(dn, alerts=result['alerts'])
 
     @staticmethod
-    def _store_label(dn: DN, tracking: str, ship_date, content: bytes, user_id) -> DNDocument:
+    def _store_label(dn: DN, tracking: str, ship_date, archive: dict, user_id) -> DNDocument:
         max_version = (
             db.session.query(db.func.max(DNDocument.version))
             .filter(DNDocument.dn_id == dn.id, DNDocument.doc_type == DOC_LABEL)
             .scalar()
         )
+        content = archive['content']
         digest = hashlib.sha256(content).hexdigest()
         safe = _FILE_SAFE.sub('_', tracking).strip('_')[:80] or 'LABEL'
         doc = DNDocument(
@@ -493,7 +527,7 @@ class CarrierShipmentService:
             sha256=digest,
             data_sha256=digest,
             size_bytes=len(content),
-            file_name=f"LABEL_{safe}.pdf",
+            file_name=f"LABEL_{safe}.{archive['extension']}",
             content=content,
             issued_at=datetime.now(),
             issued_by=user_id,
