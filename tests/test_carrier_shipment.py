@@ -935,6 +935,12 @@ def test_unresolved_locks_tracking_customs_packages_and_tasks(client, access_tok
     response = client.delete(f'/delivery/{task_id}', headers=_h(access_token))
     assert response.status_code == 409 and response.get_json()['code'] == 16078
 
+    # 完成发货时手工带运单号 → 16079（不能绕过「结果不明」直接发走）；任务仍是进行中
+    response = _ship(client, access_token, task_id, tracking_number='MANUAL-2')
+    assert response.status_code == 409 and response.get_json()['code'] == 16079
+    with client.application.app_context():
+        assert db.session.get(DeliveryTask, task_id).status == 'in_progress'
+
     # 确认作废后都放开
     assert _dismiss(client, access_token, dn_id).status_code == 200
     response = client.put(f'/dn/{dn_id}/customs', json=_customs(freight_charge=9000), headers=_h(access_token))
