@@ -17,7 +17,10 @@ jobs:
           script: |
             set -e
             cd /var/www/api_wms
-            git pull origin main
+            # 跟上远端 main：用 fetch + reset --keep 而不是 pull（2026-09-30 改写过历史，pull 会因分叉失败）；
+            # 服务器上有与本次更新冲突的本地改动时 --keep 会中止，不会覆盖
+            git fetch origin main
+            git reset --keep FETCH_HEAD
             pip install -r requirements.txt -q
             # 迁移 / 种子脚本只需要应用上下文，不要在这些一次性进程里启动调度器
             FLASK_ENV=production SCHEDULER_ENABLED=False FLASK_APP=app:create_app flask db upgrade
