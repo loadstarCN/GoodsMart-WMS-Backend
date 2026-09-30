@@ -99,7 +99,9 @@ delivery_task_tracking_input_model = api_ns.model('DeliveryTaskTrackingInput', {
 
 delivery_task_complete_input_model = api_ns.model('DeliveryTaskCompleteInput', {
     'id': fields.Integer(readOnly=True, description='Delivery Task ID'),
-    'tracking_number': fields.String(required=True, description='Tracking number'),
+    'tracking_number': fields.String(
+        description='Tracking number (empty / null / omitted keeps the saved one; export DN whose current CI '
+                    'prints an AWB accepts only that number → otherwise 409 16080)'),
     'shipping_cost': fields.Float(required=True, description='Shipping cost'),
     'currency': fields.String(description='Currency code (ISO 4217 standard)', default='JPY'),
     'carrier_id': fields.Integer(description='Carrier ID'),

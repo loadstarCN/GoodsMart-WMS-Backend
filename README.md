@@ -402,9 +402,17 @@ the issued documents (`void_reason: packages_changed`).
 
 ### Shipping gate and lock
 
-- Completing the delivery task of an export DN requires a current CI **and** PL → otherwise 409 `16069`.
-  If the tracking number given at completion differs from the saved one, the request wins; the existing
-  documents are still accepted.
+- Completing a delivery task (`PUT /warehouse/delivery/<task_id>/complete/`) with `tracking_number` empty, `null`
+  or omitted keeps the saved tracking number (domestic DNs too). Completion locks the DN row first, so it is
+  serialised with package / customs changes and document issuing.
+- Export DNs are checked against the saved data before anything is written: no current CI or PL → 409 `16069`
+  `details {missing_documents: [...], outdated: false}`; documents out of date (packages / customs data /
+  tracking number / exporter profile changed without re-issuing) → 409 `16069`
+  `details {missing_documents: [], outdated: true}`.
+- If the current CI prints an AWB and the request carries a different tracking number (ignoring whitespace)
+  → 409 `16080` `details {document_tracking_number, tracking_number}`: save the tracking number and issue the
+  documents again first. The same number keeps the saved value. When the CI has no AWB, the given tracking number
+  is saved as before.
 - After the DN is shipped (`delivered` / `completed`) the customs snapshot, packages and documents are locked → 409 `16065`.
 - `dn.delivered` for export DNs additionally carries (domestic payloads are unchanged):
 
@@ -492,7 +500,9 @@ Each format's image type (`PDF` / `PNG` / `ZPLII` / `EPL2`) and stock can be ove
   empty `postalCode`; US / CA / PR require a 2-letter state code.
 - While a shipment is active the delivery task keeps its tracking number: completing the delivery, saving the
   tracking number or updating the task with a different number → 409 `16078` (cancel the shipment first; an empty
-  value on completion / update means "unchanged").
+  value on completion / update means "unchanged"). A `carrier_id` on completion / update whose carrier (by code)
+  differs from the shipment's → 409 `16078` as well, with the requested `carrier_id` added to `details`;
+  `carrier_id: null` means "unchanged".
 - Commodity weight: goods with a unit weight → unit weight × packed quantity; goods without one share the rest of
   the total gross weight (or, if nothing is left, the gross weight by quantity).
 - FedEx is called **before** anything is written. On success, in one transaction: tracking number → delivery task,
@@ -586,7 +596,7 @@ stdout_logfile=/var/log/wms-api.out.log
 | Inventory | 15000-15999 | 400 | Stock-related errors |
 | State | 16000-16999 | 400 | State transition errors |
 
-Business codes of the export-document features: `14019` export profile text too long, `14020` invalid country code, `16063` customs structure invalid, `16064` customs line goods code not in the DN / duplicated, `16065` shipped — customs data / packages / documents locked (409), `16066` invalid packages, `16067` packages cannot be edited in the current DN status (409), `16068` documents cannot be issued yet (409, `details.problems`), `16069` documents required before shipping (409), `16070` not an export DN (409), `16071` document not found (404). Carrier shipments (FedEx): `16072` preconditions not met (409, `details.blockers`), `16073` FedEx returned an error (502, `details.errors` / `transaction_id`), `16074` FedEx timed out (504), `16075` no active carrier shipment (409), `16076` packages cannot be changed while a carrier shipment is active (409), `16077` invalid `label_format` (400), `16078` tracking number differs from the active carrier shipment (409). Errors may carry a structured `details` object.
+Business codes of the export-document features: `14019` export profile text too long, `14020` invalid country code, `16063` customs structure invalid, `16064` customs line goods code not in the DN / duplicated, `16065` shipped — customs data / packages / documents locked (409), `16066` invalid packages, `16067` packages cannot be edited in the current DN status (409), `16068` documents cannot be issued yet (409, `details.problems`), `16069` documents missing or out of date before shipping (409, `details {missing_documents, outdated}`), `16070` not an export DN (409), `16071` document not found (404). Carrier shipments (FedEx): `16072` preconditions not met (409, `details.blockers`), `16073` FedEx returned an error (502, `details.errors` / `transaction_id`), `16074` FedEx timed out (504), `16075` no active carrier shipment (409), `16076` packages cannot be changed while a carrier shipment is active (409), `16077` invalid `label_format` (400), `16078` tracking number / carrier differs from the active carrier shipment (409). Delivery completion: `16080` tracking number differs from the AWB printed on the current CI (409, `details {document_tracking_number, tracking_number}`). Errors may carry a structured `details` object.
 
 ## Related Projects
 

@@ -1084,17 +1084,33 @@ class CustomsService:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def assert_ready_to_ship(dn: DN):
-        """带报关快照的 DN 没有当前有效的 CI 和 PL → 409 16069。国内件不受影响。"""
+    def assert_ready_to_ship(dn: DN) -> dict:
+        """发货前检查（按当前已存的数据）。国内件不检查，返回 {}。
+
+        海外件（带报关快照）：
+        - 没有当前有效的 CI 或 PL → 409 16069，details {missing_documents: [...], outdated: false}
+        - 有但已过期（数据指纹变了：箱子 / 快照 / 运单号 / 公司资料等改过没重出）
+          → 409 16069，details {missing_documents: [], outdated: true}
+        通过时返回 {'awb': 当前单证上印的运单号（没印为 None）}。
+        """
         if dn.customs is None:
-            return
+            return {}
         current = CustomsService.current_documents(dn)
         missing = [t for t in DOC_TYPES if t not in current]
         if missing:
             raise ConflictException(
                 "Export shipment requires a current commercial invoice and packing list before shipping.",
-                16069, details={'missing_documents': missing},
+                16069, details={'missing_documents': missing, 'outdated': False},
             )
+        if CustomsService.build_view(dn)['documents_outdated']:
+            raise ConflictException(
+                "The commercial invoice / packing list no longer match the current data "
+                "(packages, customs data or tracking number changed); issue them again before shipping.",
+                16069, details={'missing_documents': [], 'outdated': True},
+            )
+        # 单证未过期 ⇒ 印在 CI 上的 AWB 就是 _document_data 里的 awb（发货任务上现存的运单号）
+        delivery_task = CustomsService._delivery_task(dn)
+        return {'awb': (delivery_task.tracking_number if delivery_task else None) or None}
 
     @staticmethod
     def delivered_webhook_fields(dn: DN) -> dict:

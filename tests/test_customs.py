@@ -753,6 +753,8 @@ def test_ship_requires_documents_then_locks(client, access_token):
     blocked = _ship(client, access_token, task_id, tracking_number='AWB-1')
     assert blocked.status_code == 409
     assert blocked.get_json()['code'] == 16069
+    assert blocked.get_json()['details'] == {'missing_documents': ['commercial_invoice', 'packing_list'],
+                                             'outdated': False}
     with client.application.app_context():
         assert db.session.get(DN, dn_id).status == 'packed'
         assert db.session.get(DeliveryTask, task_id).status == 'in_progress'
@@ -814,10 +816,15 @@ def test_tracking_saved_before_shipping_prints_awb_and_bumps_version(client, acc
     assert b'AWB No.' in _pdf_streams(ci.data) and b'7946 0000 0001' in _pdf_streams(ci.data)
     assert client.get(f'/dn/{dn_id}/customs', headers=_h(access_token)).get_json()['documents_outdated'] is False
 
-    # 完成发货时运单号与已存的不同：以请求为准，只要求存在有效单证
-    shipped = _ship(client, access_token, task_id, tracking_number='7946 0000 0002')
+    # 完成发货时运单号与 CI 上印的 AWB 不同 → 409 16080（先保存运单号并重出单证）；相同照常
+    rejected = _ship(client, access_token, task_id, tracking_number='7946 0000 0002')
+    assert rejected.status_code == 409 and rejected.get_json()['code'] == 16080
+    assert rejected.get_json()['details'] == {'document_tracking_number': '7946 0000 0001',
+                                              'tracking_number': '7946 0000 0002'}
+    shipped = client.put(f'/delivery/{task_id}/complete/', json={'tracking_number': '7946 0000 0001'},
+                         headers=_h(access_token))
     assert shipped.status_code == 200, shipped.get_json()
-    assert shipped.get_json()['tracking_number'] == '7946 0000 0002'
+    assert shipped.get_json()['tracking_number'] == '7946 0000 0001'
 
     locked = client.put(f'/delivery/{task_id}/tracking', json={'tracking_number': 'X'}, headers=_h(access_token))
     assert locked.status_code == 409 and locked.get_json()['code'] == 16065

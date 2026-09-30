@@ -914,6 +914,15 @@ def test_tracking_number_locked_to_active_shipment(client, access_token, fedex):
     assert response.status_code == 409 and response.get_json()['code'] == 16078
     with client.application.app_context():
         assert db.session.get(DeliveryTask, task_id).status == 'in_progress'
+    # 上面存成了带空格的写法：与 CI 上印的 AWB 不再一字不差 → 单证过期，完成发货 409 16069
+    response = client.put(f'/delivery/{task_id}/complete/', json={'tracking_number': '794600000001'},
+                          headers=_h(access_token))
+    assert response.status_code == 409 and response.get_json()['code'] == 16069
+    assert response.get_json()['details'] == {'missing_documents': [], 'outdated': True}
+    # 存回与 CI 一致的号码后照常
+    same = client.put(f'/delivery/{task_id}/tracking', json={'tracking_number': '794600000001'},
+                      headers=_h(access_token))
+    assert same.status_code == 200, same.get_json()
     response = client.put(f'/delivery/{task_id}/complete/', json={'tracking_number': '794600000001'},
                           headers=_h(access_token))
     assert response.status_code == 200, response.get_json()
