@@ -305,10 +305,11 @@ Authorization: Bearer <token>
 
 | 对象 | 字段 |
 |------|------|
-| 公司（`PUT /warehouse/company/<id>`） | `legal_name_en`、`address_en`、`country_code`（ISO 3166-1 alpha-2，默认 `JP`）、`tax_id_label`、`tax_id`、`export_contact_name`、`export_signatory_name`、`export_signatory_title` |
+| 公司（`PUT /warehouse/company/<id>`） | `legal_name_en`、`address_en`、`country_code`（ISO 3166-1 alpha-2，新建不传时为 `JP`）、`tax_id_label`、`tax_id`、`export_contact_name`、`export_signatory_name`、`export_signatory_title` |
 | 仓库（`PUT /warehouse/warehouse/<id>`） | `address_en`、`country_code`、`contact_name_en`（与公司地址不同时印为 *Ship From*） |
 
-`country_code` 不合法 → 400 `14020`；文本超长 → 400 `14019`。
+`country_code` 不合法 → 400 `14020`；文本超长 → 400 `14019`。接口输出不补默认值：库里为空就返回 `null`
+（单证上的出口国取仓库的、仓库为空取公司的，都为空报 `EXPORTER_PROFILE_INCOMPLETE`）。
 
 ### 报关快照
 
@@ -317,8 +318,10 @@ Authorization: Bearer <token>
 `export_reason`、`recipient_country`、`recipient_tax_id`、`recipient_tax_id_type`、`freight_charge`、
 `insurance_charge`、`declared_value_carriage`、`consignee{...}`、`lines[{goods_code, quantity, unit_value, total_value, description_en, hs_code, jp_export_code, origin_country, quantity_unit}]`。
 
-- 结构错误拒绝：`customs` 非对象、`lines` 非数组、字段类型错误 → 400 `16063`（`details.field`）；
-  行的 `goods_code` 不在 DN 明细或重复 → 400 `16064`。
+- 结构错误拒绝：`customs` 非对象、`lines` 非数组、字段类型错误、数值超上限 → 400 `16063`（`details.field`）；
+  行的 `goods_code` 不在 DN 明细或重复 → 400 `16064`。上限：`unit_value` / `total_value` 绝对值 ≤ 1,000,000,000,000；
+  `freight_charge` / `insurance_charge` / `declared_value_carriage` / 行 `quantity` ≤ 2,147,483,647（数据库 INTEGER）。
+- `freight_charge` / `insurance_charge` / `declared_value_carriage` 只收整数（列是 INTEGER），USD 等带分的币种也不收小数。
 - 内容不全照收，缺什么在 `problems` 里列出。
 - `invoice_number` 缺省用 DN 的 `order_number`；发票数量一律取**已打包数量**（金额 = 单价 × 已打包数量，
   已打包 0 的行不上发票）；原产国以商品主数据 `goods.origin_country` 为准，行里的只做记录。
@@ -328,6 +331,7 @@ Authorization: Bearer <token>
   报关视图里显示、单证上不印。两个键都可不带（旧请求照旧）；不合法 400 `16063`。任一变化都会作废已签发的单证；
   没有这两个值的快照单证指纹不变。
 - `jp_export_code`（可选，9 位日本出口统计品目番号，前 6 位应等于 HS）存入快照并在接口返回，CI / PL 不印（只印 HS）。
+- `hs_code` 接受 6–10 位；CI 上只印前 6 位（国际通用的 HS 部分），7–10 位只在报关视图（`hs_code_formatted`）里显示。
 - 替换快照时，只有印在单证上的内容变了才作废现有单证。
 
 `GET /warehouse/dn/<id>/customs`（`dn_read` 或 `packing_read`）返回
@@ -335,12 +339,15 @@ Authorization: Bearer <token>
 `totals = {quantity, goods_value, freight, insurance, invoice_total, package_count, gross_weight_kg, net_weight_kg}`，
 `invoice_total = goods_value + freight + insurance`（没投保 `insurance` 为 0）。
 
-- 错误级问题：`NOT_PACKED`、`PACKAGES_MISSING`、`EXPORTER_PROFILE_INCOMPLETE`、`INCOTERM_MISSING`、
+- 错误级问题：`NOT_PACKED`、`PACKAGES_MISSING`、`EXPORTER_PROFILE_INCOMPLETE`、
+  `EXPORTER_NON_LATIN_TEXT`（发货人一侧印在单证上的文本含非拉丁字符：公司英文名 / 英文地址 / 联系人 / 签署人 / 税号 /
+  电话 / 邮箱、Ship From 的仓库英文地址 / 联系人；`field` 指向要改的主数据字段，如 `company.export_signatory_name`、
+  `warehouse.address_en`、`warehouse.phone`）、`INCOTERM_MISSING`、
   `EXPORT_REASON_MISSING`、`CURRENCY_INVALID`、`RECIPIENT_COUNTRY_MISSING`、`LINE_MISSING`、`HS_CODE_MISSING`
   （去掉 `.`、空格、`-` 后须为 6–10 位数字）、`DESCRIPTION_MISSING`、`DESCRIPTION_NOT_ASCII`、`ORIGIN_MISSING`、`UNIT_VALUE_MISSING`。
-- 警告（不拦截）：`RECIPIENT_TAX_ID_MISSING`、`NON_LATIN_TEXT`、`NET_WEIGHT_UNKNOWN`、`GROSS_LT_NET`、
+- 警告（不拦截）：`RECIPIENT_TAX_ID_MISSING`、`NON_LATIN_TEXT`（收件人含非拉丁字符）、`NET_WEIGHT_UNKNOWN`、`GROSS_LT_NET`、
   `JP_EXPORT_CODE_MISMATCH`（`jp_export_code` 非 9 位数字或前 6 位与 HS 不一致）、
-  `JP_EXPORT_CODE_MISSING`（JPY 发票合计＝货值＋运费＋保险费超过 200,000 且有行缺 `jp_export_code`）。
+  `JP_EXPORT_CODE_MISSING`（JPY 货值（FOB，不含运费 / 保险费）超过 200,000 且有行缺 `jp_export_code`）。
 
 ### 箱子
 
@@ -385,7 +392,7 @@ DN 须为 `picked` 或 `packed`（否则 409 `16067`）。请求体 `{"packages"
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
 | `DOCUMENT_TIMEZONE` | `Asia/Tokyo` | 单证日期所用时区 |
-| `CUSTOMS_PDF_FONT_PATH` | （不设） | 单证可选 TTF 字体；默认 Helvetica。字体印不出的字符（如日文）退回 reportlab 内置 CID 字体 |
+| `CUSTOMS_PDF_FONT_PATH` | （不设） | 单证用的 TrueType 字体（`.ttf`，或 `.ttc` 的第 1 个字体；不支持 CFF 轮廓的 OTF，如 Noto Sans CJK）。设了就用它印全部文字，字体子集嵌入 PDF；要让收件人的日文等也嵌入，选带这些字形的字体（如 IPAexGothic）。字体里没有的字符、以及不设时 Helvetica 印不出的字符，退回 reportlab 内置的日文 CID 字体（不嵌入，依赖阅读器的字体） |
 
 ## 承运商对接（FedEx）
 

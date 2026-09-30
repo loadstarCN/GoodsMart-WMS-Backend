@@ -34,6 +34,10 @@ LOCKED_DN_STATUSES = ('delivered', 'completed')       # 发货后锁定
 PACKAGE_EDITABLE_STATUSES = ('picked', 'packed')      # 可录箱子的 DN 状态
 MAX_PACKAGES = 99
 MAX_CUSTOMS_LINES = 500
+# 数值上限：运费 / 保险费 / 申告价额 / 数量存 INTEGER 列（PostgreSQL 上限 2^31-1）；
+# 单价 / 行金额存 JSON，上限 1e12 让「单价 × 打包数」的合计远在 Decimal 28 位精度以内
+MAX_INT_VALUE = 2 ** 31 - 1
+MAX_LINE_VALUE = Decimal('1000000000000')
 
 # 无小数位的币种（金额按整数印）
 ZERO_DECIMAL_CURRENCIES = frozenset({'JPY', 'KRW', 'VND', 'CLP', 'ISK', 'PYG', 'UGX', 'XAF', 'XOF'})
@@ -89,7 +93,7 @@ _LINE_TEXT_LIMITS = {
     'quantity_unit': 10,
 }
 
-# 日本出口申报（輸出申告）用的 9 位统计品目番号：发票合计超过这个金额（JPY）时提示补齐
+# 日本出口申报（輸出申告）用的 9 位统计品目番号：货值（FOB，不含运费 / 保险费）超过这个金额（JPY）时提示补齐
 JP_EXPORT_CODE_THRESHOLD_JPY = 200000
 
 _HS_STRIP = re.compile(r'[.\s\-]')
@@ -144,6 +148,13 @@ def format_hs_code(hs_code) -> str:
 def hs_code_valid(hs_code) -> bool:
     digits = _HS_STRIP.sub('', str(hs_code or ''))
     return digits.isdigit() and 6 <= len(digits) <= 10
+
+
+def printed_hs_code(hs_code) -> str:
+    """CI 上印的 HS：只取前 6 位（国际通用的 HS 部分）。7–10 位是各国自己的细分
+    （如日本 9 位统计番号），只在报关视图里显示，不印到发给进口国的单证上。"""
+    digits = _HS_STRIP.sub('', str(hs_code or ''))
+    return format_hs_code(digits[:6])
 
 
 def jp_export_code_problem(jp_export_code, hs_code):
@@ -225,8 +236,9 @@ def _opt_text(value, field: str, limit: int, upper: bool = False):
     return text or None
 
 
-def _opt_decimal(value, field: str):
-    """数字或数字字符串 → Decimal；None / 空串 → None；其它类型 16063。"""
+def _opt_decimal(value, field: str, maximum: Decimal = None):
+    """数字或数字字符串 → Decimal；None / 空串 → None；其它类型 16063。
+    给了 maximum 时绝对值超过它也 16063（防止金额运算溢出 Decimal 精度 / 数据库整数列）。"""
     if value is None:
         return None
     if isinstance(value, bool):
@@ -245,11 +257,15 @@ def _opt_decimal(value, field: str):
         raise _structure_error(f"{field} must be a number", field)
     if not number.is_finite():
         raise _structure_error(f"{field} must be a number", field)
+    if maximum is not None and abs(number) > maximum:
+        raise _structure_error(f"{field} must not exceed {maximum:,}", field)
     return number
 
 
-def _opt_non_negative_int(value, field: str):
-    number = _opt_decimal(value, field)
+def _opt_non_negative_int(value, field: str, maximum: int = MAX_INT_VALUE):
+    """非负整数（默认上限 = 数据库 INTEGER 上限）；超上限 / 小数 / 负数 16063。
+    运费 / 保险费 / 申告价额的列是 INTEGER，只能收整数（带分的币种也按整数收，见 README）。"""
+    number = _opt_decimal(value, field, maximum=Decimal(maximum))
     if number is None:
         return None
     if number != number.to_integral_value() or number < 0:
@@ -316,8 +332,8 @@ def parse_customs(raw, dn_goods_codes) -> dict:
                 field=f'{prefix}.goods_code', details={'field': f'{prefix}.goods_code', 'goods_code': goods_code},
             )
         seen.add(goods_code)
-        unit_value = _opt_decimal(item.get('unit_value'), f'{prefix}.unit_value')
-        total_value = _opt_decimal(item.get('total_value'), f'{prefix}.total_value')
+        unit_value = _opt_decimal(item.get('unit_value'), f'{prefix}.unit_value', maximum=MAX_LINE_VALUE)
+        total_value = _opt_decimal(item.get('total_value'), f'{prefix}.total_value', maximum=MAX_LINE_VALUE)
         lines.append({
             'goods_code': goods_code,
             'quantity': _opt_non_negative_int(item.get('quantity'), f'{prefix}.quantity'),
@@ -646,6 +662,29 @@ class CustomsService:
         }
 
     @staticmethod
+    def _exporter_printed_text(dn: DN, exporter: dict) -> list:
+        """发货人一侧印在单证上的文本：[(说明, 值, problems.field)]。field = 该去改的主数据字段（表.列）。"""
+        phone_field = 'warehouse.phone' if (dn.warehouse.phone or '').strip() else 'company.phone'
+        items = [
+            ('legal_name_en', exporter.get('legal_name_en'), 'company.legal_name_en'),
+            ('address_en', exporter.get('address_en'), 'company.address_en'),
+            ('contact_name', exporter.get('contact_name'), 'company.export_contact_name'),
+            ('signatory_name', exporter.get('signatory_name'), 'company.export_signatory_name'),
+            ('signatory_title', exporter.get('signatory_title'), 'company.export_signatory_title'),
+            ('tax_id_label', exporter.get('tax_id_label'), 'company.tax_id_label'),
+            ('tax_id', exporter.get('tax_id'), 'company.tax_id'),
+            ('phone', exporter.get('phone'), phone_field),
+            ('email', exporter.get('email'), 'company.email'),
+        ]
+        ship_from = exporter.get('ship_from')
+        if ship_from:
+            items += [
+                ('ship_from.address_en', ship_from.get('address_en'), 'warehouse.address_en'),
+                ('ship_from.contact_name', ship_from.get('contact_name'), 'warehouse.contact_name_en'),
+            ]
+        return items
+
+    @staticmethod
     def _consignee(dn: DN, customs: DNCustoms | None) -> dict:
         """Consignee / Ship To：报关快照里的 consignee 优先，没有则退回 DN 收货人。"""
         consignee = dict((customs.consignee if customs else None) or {})
@@ -815,14 +854,16 @@ class CustomsService:
             if not customs.recipient_tax_id:
                 problem('RECIPIENT_TAX_ID_MISSING', 'warning', "Recipient tax ID is not provided",
                         field='recipient_tax_id')
+            # 收件人的非拉丁字符（如收件国本地文字）只提示；发货人（WMS 自己的出口资料）的一律拦
             for key in CONSIGNEE_FIELDS:
                 if has_non_latin(consignee.get(key)):
                     problem('NON_LATIN_TEXT', 'warning', f"Consignee {key} contains non-Latin characters",
                             field=f'consignee.{key}')
-            for key in ('legal_name_en', 'address_en', 'contact_name', 'signatory_name', 'signatory_title'):
-                if has_non_latin(exporter.get(key)):
-                    problem('NON_LATIN_TEXT', 'warning', f"Exporter {key} contains non-Latin characters",
-                            field=f'company.{key}')
+            for label, value, field in CustomsService._exporter_printed_text(dn, exporter):
+                if has_non_latin(value):
+                    problem('EXPORTER_NON_LATIN_TEXT', 'error',
+                            f"Exporter {label} contains non-Latin characters; use English / Latin letters only",
+                            field=field)
             if total_qty > 0 and not net_known:
                 problem('NET_WEIGHT_UNKNOWN', 'warning',
                         "Net weight cannot be calculated: some goods have no unit weight")
@@ -833,14 +874,15 @@ class CustomsService:
         insurance = (Decimal(customs.insurance_charge)
                      if customs and customs.insurance_charge is not None else Decimal(0))
         invoice_total = goods_value + freight + insurance
-        # 日本正式出口申报（发票合计超过 20 万日元）要 9 位统计品目番号：缺的行给警告，不拦出单证
+        # 日本正式出口申报（申告价格 = FOB，即货值合计超过 20 万日元）要 9 位统计品目番号：
+        # 按货值判断，运费 / 保险费不算进去；缺的行给警告，不拦出单证
         if customs is not None and (customs.currency or '').upper() == 'JPY' \
-                and invoice_total > JP_EXPORT_CODE_THRESHOLD_JPY:
+                and goods_value > JP_EXPORT_CODE_THRESHOLD_JPY:
             for line in lines:
                 if line['packed_quantity'] > 0 and line['has_customs_line'] and not line['jp_export_code']:
                     problem('JP_EXPORT_CODE_MISSING', 'warning',
                             f"Japanese export statistics code of goods {line['goods_code']} is missing "
-                            f"(invoice total exceeds {JP_EXPORT_CODE_THRESHOLD_JPY:,} JPY)",
+                            f"(goods value exceeds {JP_EXPORT_CODE_THRESHOLD_JPY:,} JPY)",
                             goods_code=line['goods_code'], field='jp_export_code')
         totals = {
             'quantity': total_qty,
@@ -910,7 +952,7 @@ class CustomsService:
             items.append({
                 'goods_code': line['goods_code'],
                 'description': line['description_en'],
-                'hs_code': format_hs_code(line['hs_code']),
+                'hs_code': printed_hs_code(line['hs_code']),
                 'origin': _country_label(line['origin_country']),
                 'quantity': line['packed_quantity'],
                 'unit': line['quantity_unit'],

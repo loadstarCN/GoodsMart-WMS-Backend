@@ -1,6 +1,7 @@
 from datetime import datetime, timedelta, date
 from dateutil.relativedelta import relativedelta
 from sqlalchemy import and_, func, case, extract
+from sqlalchemy.orm import selectinload
 from extensions.db import *
 from extensions.error import (
     BadRequestException, ConflictException, ForbiddenException, NotFoundException,
@@ -320,7 +321,11 @@ class DNService:
         :param filters: dict 类型，包含可能的过滤字段
         :return: 一个 SQLAlchemy Query 对象或已经过滤后的结果
         """
-        query = DN.query.order_by(DN.id.desc())
+        # 列表 schema 逐行用 details（数量汇总）和 customs（is_export），这里一次性预加载，避免 N+1
+        query = DN.query.options(
+            selectinload(DN.details),
+            selectinload(DN.customs),
+        ).order_by(DN.id.desc())
 
         # 假设在 DN 模型里定义了 DN_TYPES, DN_STATUSES, 并且有相应的字段
         # 这里只是示例，根据实际需求增加筛选条件

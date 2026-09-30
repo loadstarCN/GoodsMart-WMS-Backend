@@ -312,10 +312,12 @@ All exporter data comes from the WMS company / warehouse settings — nothing is
 
 | Entity | Fields |
 |--------|--------|
-| Company (`PUT /warehouse/company/<id>`) | `legal_name_en`, `address_en`, `country_code` (ISO 3166-1 alpha-2, default `JP`), `tax_id_label`, `tax_id`, `export_contact_name`, `export_signatory_name`, `export_signatory_title` |
+| Company (`PUT /warehouse/company/<id>`) | `legal_name_en`, `address_en`, `country_code` (ISO 3166-1 alpha-2, `JP` when omitted on create), `tax_id_label`, `tax_id`, `export_contact_name`, `export_signatory_name`, `export_signatory_title` |
 | Warehouse (`PUT /warehouse/warehouse/<id>`) | `address_en`, `country_code`, `contact_name_en` (printed as *Ship From* when it differs from the company address) |
 
-Invalid `country_code` → 400 `14020`; text longer than the column → 400 `14019`.
+Invalid `country_code` → 400 `14020`; text longer than the column → 400 `14019`. Responses do not fill in a
+default: an empty country is returned as `null` (the documents use the warehouse country, then the company
+country; neither set → `EXPORTER_PROFILE_INCOMPLETE`).
 
 ### Customs snapshot
 
@@ -333,8 +335,13 @@ Invalid `country_code` → 400 `14020`; text longer than the column → 400 `140
                "origin_country": "CN", "quantity_unit": "PCS" } ] }
 ```
 
-- Structure errors are rejected: `customs` not an object, `lines` not an array, wrong field types → 400 `16063`
-  (`details.field`); a line whose `goods_code` is not in the DN details or is duplicated → 400 `16064`.
+- Structure errors are rejected: `customs` not an object, `lines` not an array, wrong field types, numbers over
+  the limit → 400 `16063` (`details.field`); a line whose `goods_code` is not in the DN details or is duplicated
+  → 400 `16064`. Limits: `unit_value` / `total_value` at most 1,000,000,000,000 in absolute value;
+  `freight_charge` / `insurance_charge` / `declared_value_carriage` / line `quantity` at most 2,147,483,647
+  (database INTEGER).
+- `freight_charge`, `insurance_charge` and `declared_value_carriage` are stored as integers, so amounts with cents
+  (USD etc.) are rejected as well.
 - Incomplete content is accepted and reported as `problems` (see below).
 - `invoice_number` defaults to the DN `order_number`. Invoice quantities are always the **packed** quantities
   (amount = unit value × packed quantity; lines with nothing packed are left out). The country of origin comes
@@ -348,6 +355,8 @@ Invalid `country_code` → 400 `14020`; text longer than the column → 400 `140
   Changing either of them voids the issued documents; snapshots without them keep their document fingerprint.
 - `jp_export_code` (optional, 9-digit Japanese export statistics code whose first 6 digits equal the HS code)
   is stored and returned but not printed on the CI / PL (they print the HS code only).
+- `hs_code` accepts 6-10 digits; the CI prints only the first 6 (the internationally harmonised part). Digits 7-10
+  are shown in the customs view (`hs_code_formatted`) only.
 - Replacing the snapshot voids the issued documents only when the printed content changes.
 
 `GET /warehouse/dn/<id>/customs` (permission `dn_read` or `packing_read`) returns
@@ -360,12 +369,14 @@ with `invoice_total = goods_value + freight + insurance` (`insurance` is 0 when 
 | `NOT_PACKED` | DN is not packed yet (or nothing is packed) |
 | `PACKAGES_MISSING` | No packages recorded |
 | `EXPORTER_PROFILE_INCOMPLETE` | Company `legal_name_en` / `address_en` / phone (warehouse or company) / country missing |
+| `EXPORTER_NON_LATIN_TEXT` | Exporter text printed on the documents contains non-Latin characters (company English name / address / contact / signatory / tax ID / phone / email, *Ship From* warehouse address / contact); `field` names the master-data field to fix, e.g. `company.export_signatory_name`, `warehouse.address_en`, `warehouse.phone` |
 | `INCOTERM_MISSING`, `EXPORT_REASON_MISSING`, `CURRENCY_INVALID`, `RECIPIENT_COUNTRY_MISSING` | Header data missing |
 | `LINE_MISSING`, `HS_CODE_MISSING`, `DESCRIPTION_MISSING`, `DESCRIPTION_NOT_ASCII`, `ORIGIN_MISSING`, `UNIT_VALUE_MISSING` | Per packed line (HS code: 6–10 digits after removing `.`, spaces and `-`) |
 
-Warnings (do not block): `RECIPIENT_TAX_ID_MISSING`, `NON_LATIN_TEXT`, `NET_WEIGHT_UNKNOWN`, `GROSS_LT_NET`,
+Warnings (do not block): `RECIPIENT_TAX_ID_MISSING`, `NON_LATIN_TEXT` (consignee text with non-Latin characters),
+`NET_WEIGHT_UNKNOWN`, `GROSS_LT_NET`,
 `JP_EXPORT_CODE_MISMATCH` (`jp_export_code` not 9 digits or its first 6 digits differ from the HS code),
-`JP_EXPORT_CODE_MISSING` (JPY invoice total — goods value + freight + insurance — above 200,000 and a line has no `jp_export_code`).
+`JP_EXPORT_CODE_MISSING` (JPY goods value — FOB, without freight and insurance — above 200,000 and a line has no `jp_export_code`).
 
 ### Packages
 
@@ -429,7 +440,7 @@ the issued documents (`void_reason: packages_changed`).
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `DOCUMENT_TIMEZONE` | `Asia/Tokyo` | Time zone of the invoice date |
-| `CUSTOMS_PDF_FONT_PATH` | (unset) | Optional TTF font for the documents; default Helvetica. Characters the font cannot print (e.g. Japanese) fall back to reportlab's built-in CID font |
+| `CUSTOMS_PDF_FONT_PATH` | (unset) | TrueType font for the documents (`.ttf`, or the first font of a `.ttc`; CFF-outline OTF such as Noto Sans CJK is not supported). When set, all text is printed with it and the used glyphs are embedded in the PDF; to embed e.g. Japanese consignee text, pick a font with those glyphs (such as IPAexGothic). Characters the font lacks, and characters Helvetica cannot print when unset, fall back to reportlab's built-in Japanese CID font (not embedded; relies on the viewer's fonts) |
 
 ## Carrier Integration (FedEx)
 

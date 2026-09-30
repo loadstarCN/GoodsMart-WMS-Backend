@@ -35,7 +35,8 @@ warehouse_model = api_ns.model('Warehouse', {
     'default_currency': fields.String(description='Default Currency Code (ISO 4217 standard)', default='JPY'),
     # 出口资料（仓库地址 ≠ 公司地址时印在单证的 Ship From 栏）
     'address_en': fields.String(description='Warehouse address in English (export documents)'),
-    'country_code': fields.String(description='Country (ISO 3166-1 alpha-2)', default='JP'),
+    # 输出不给默认值：库里为空就返回 null（出单证时回退用公司的国家）
+    'country_code': fields.String(description='Country (ISO 3166-1 alpha-2); null when not set'),
     'contact_name_en': fields.String(description='Warehouse contact person (English)'),
     'company_id': fields.Integer(required=True, description='ID of the associated company'),
     'manager_id': fields.Integer(description='Manager ID'),
@@ -53,6 +54,9 @@ warehouse_model = api_ns.model('Warehouse', {
 # 从输出模型复制字段后删除只读和关联字段
 # -----------------------------
 warehouse_input_fields = generate_input_fields(warehouse_model)
+# 输入：新建时不传 country_code 走列默认值 JP（只影响文档）
+warehouse_input_fields['country_code'] = fields.String(
+    description='Country (ISO 3166-1 alpha-2); defaults to JP when omitted on create', default='JP')
 warehouse_input_model = api_ns.model('WarehouseInput', warehouse_input_fields)
 
 # -----------------------------
