@@ -111,10 +111,11 @@ class DNCustomsDocumentList(Resource):
     @api_ns.expect(dn_customs_documents_parser)
     @api_ns.marshal_list_with(dn_document_meta_model)
     def get(self, dn_id):
-        """List customs documents of a DN (`status=issued` for the current ones)"""
+        """List documents of a DN (`status=issued` for the current ones; `doc_type` to filter,
+        e.g. shipping_label for carrier labels)"""
         dn = _owned_dn(dn_id)
         args = dn_customs_documents_parser.parse_args()
-        return CustomsService.list_documents(dn, args.get('status')), 200
+        return CustomsService.list_documents(dn, args.get('status'), args.get('doc_type')), 200
 
 
 @api_ns.doc(security="jsonWebToken")
@@ -125,7 +126,7 @@ class DNCustomsDocumentFile(Resource):
     @warehouse_required()
     @api_ns.produces(['application/pdf'])
     def get(self, dn_id, doc_id):
-        """Download a customs document PDF (inline; header X-Content-SHA256)"""
+        """Download a document PDF (CI / PL / carrier shipping label; inline; header X-Content-SHA256)"""
         dn = _owned_dn(dn_id)
         doc = CustomsService.get_document(dn, doc_id)
         return Response(

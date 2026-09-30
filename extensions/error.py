@@ -57,6 +57,18 @@ class InternalServerError(APIException):
     def __init__(self, message, biz_code=50000, field=None, details=None):
         super().__init__(message, biz_code, 500, field, details)
 
+# 502 Bad Gateway
+class BadGatewayException(APIException):
+    """502 错误（上游外部服务返回错误，如承运商接口）"""
+    def __init__(self, message, biz_code=50200, field=None, details=None):
+        super().__init__(message, biz_code, 502, field, details)
+
+# 504 Gateway Timeout
+class GatewayTimeoutException(APIException):
+    """504 错误（上游外部服务超时）"""
+    def __init__(self, message, biz_code=50400, field=None, details=None):
+        super().__init__(message, biz_code, 504, field, details)
+
 def register_error_handlers(app):
     app.config['PROPAGATE_EXCEPTIONS'] = True
 

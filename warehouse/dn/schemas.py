@@ -6,7 +6,7 @@ from warehouse.goods.schemas import goods_simple_model as goods_model
 from warehouse.carrier.schemas import carrier_simple_model,carrier_model
 from warehouse.recipient.schemas import recipient_base_model,recipient_model
 from warehouse.warehouse.schemas import warehouse_simple_model,warehouse_model
-from .models import DN  
+from .models import DN, DNDocument
 
 # 定义 DN 命名空间（类似于 ASN 的 api_ns）
 api_ns = Namespace('dn', description='Delivery Note (DN) related operations', authorizations=authorizations)
@@ -62,7 +62,7 @@ dn_packages_result_model = api_ns.model('DNPackagesResult', {
 dn_document_meta_model = api_ns.model('DNCustomsDocument', {
     'id': fields.Integer(readOnly=True),
     'dn_id': fields.Integer(readOnly=True),
-    'doc_type': fields.String(enum=['commercial_invoice', 'packing_list']),
+    'doc_type': fields.String(enum=['commercial_invoice', 'packing_list', 'shipping_label']),
     'version': fields.Integer(),
     'document_number': fields.String(),
     'invoice_date': fields.String(
@@ -75,7 +75,8 @@ dn_document_meta_model = api_ns.model('DNCustomsDocument', {
     'size_bytes': fields.Integer(),
     'file_name': fields.String(),
     'voided_at': fields.DateTime(),
-    'void_reason': fields.String(description='packages_changed / customs_changed / data_changed'),
+    'void_reason': fields.String(
+        description='packages_changed / customs_changed / data_changed / shipment_cancelled'),
 })
 
 dn_customs_consignee_model = api_ns.model('DNCustomsConsignee', {
@@ -223,7 +224,7 @@ asn_full_fields.update({
     'packages': fields.List(fields.Nested(dn_package_model), readOnly=True, description='Packages'),
     'customs_documents': fields.List(
         fields.Nested(dn_document_meta_model), readOnly=True,
-        description='Customs documents (commercial invoice / packing list), newest first'
+        description='Documents (commercial invoice / packing list / carrier shipping label), newest first'
     ),
 })
 
@@ -277,3 +278,5 @@ dn_monthly_stats_parser.add_argument('warehouse_id', type=int, help='Filter by W
 dn_customs_documents_parser = reqparse.RequestParser()
 dn_customs_documents_parser.add_argument('status', type=str, choices=('issued', 'void'), location='args',
                                          help='Filter by document status')
+dn_customs_documents_parser.add_argument('doc_type', type=str, choices=DNDocument.DOC_TYPES, location='args',
+                                         help='Filter by document type')

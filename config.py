@@ -51,6 +51,25 @@ class Config:
     DOCUMENT_TIMEZONE = os.getenv('DOCUMENT_TIMEZONE', 'Asia/Tokyo')
     CUSTOMS_PDF_FONT_PATH = os.getenv('CUSTOMS_PDF_FONT_PATH') or None
 
+    # 承运商对接：FedEx 自动建运单（Ship API）。API Key / Secret Key / 账号缺任一项 = 功能关闭
+    FEDEX_API_BASE = os.getenv('FEDEX_API_BASE') or 'https://apis-sandbox.fedex.com'
+    FEDEX_API_KEY = os.getenv('FEDEX_API_KEY') or None
+    FEDEX_SECRET_KEY = os.getenv('FEDEX_SECRET_KEY') or None
+    FEDEX_ACCOUNT_NUMBER = os.getenv('FEDEX_ACCOUNT_NUMBER') or None
+    FEDEX_SERVICE_TYPE = os.getenv('FEDEX_SERVICE_TYPE', 'INTERNATIONAL_ECONOMY')
+    FEDEX_PICKUP_TYPE = os.getenv('FEDEX_PICKUP_TYPE', 'USE_SCHEDULED_PICKUP')
+    # 面单：PDF（多箱合成一个 PDF）或 PNG（转成 PDF 存档）；纸张如 PAPER_4X6 / PAPER_85X11_TOP_HALF_LABEL
+    FEDEX_LABEL_IMAGE_TYPE = os.getenv('FEDEX_LABEL_IMAGE_TYPE', 'PDF')
+    FEDEX_LABEL_STOCK_TYPE = os.getenv('FEDEX_LABEL_STOCK_TYPE', 'PAPER_4X6')
+    # 电子贸易单证（ETD）：开启时先把当前 CI 上传给 FedEx，建单时引用；关闭时仓库打印 CI 随货
+    FEDEX_ETD_ENABLED = os.getenv('FEDEX_ETD_ENABLED', 'False').lower() in ('1', 'true', 'yes')
+    # 关税付款方：RECIPIENT（收件人）/ SENDER（发件人账号）
+    FEDEX_DUTIES_PAYMENT_TYPE = os.getenv('FEDEX_DUTIES_PAYMENT_TYPE', 'RECIPIENT')
+    # Trade Documents Upload API 的地址（与 Ship API 不同域）；不设则按 FEDEX_API_BASE 是否为测试环境自动选
+    FEDEX_DOCUMENT_API_BASE = os.getenv('FEDEX_DOCUMENT_API_BASE') or None
+    FEDEX_CONNECT_TIMEOUT_SECONDS = float(os.getenv('FEDEX_CONNECT_TIMEOUT_SECONDS', 5))
+    FEDEX_TIMEOUT_SECONDS = float(os.getenv('FEDEX_TIMEOUT_SECONDS', 30))
+
 class DevelopmentConfig(Config):
     DEBUG = True # 只在开发环境中启用调试
     WEBHOOK_URL_STRICT = os.getenv('WEBHOOK_URL_STRICT', 'False') == 'True'
@@ -67,6 +86,11 @@ class TestingConfig(Config):
     WEBHOOK_URL_STRICT = False
     RATELIMIT_ENABLED = False
     SCHEDULER_ENABLED = False
+    # 测试里 FedEx 一律关闭（用例需要时自己设置并 mock HTTP），本机 .env 里的凭证不影响测试
+    FEDEX_API_KEY = None
+    FEDEX_SECRET_KEY = None
+    FEDEX_ACCOUNT_NUMBER = None
+    FEDEX_ETD_ENABLED = False
     SQLALCHEMY_DATABASE_URI = os.getenv('SQLALCHEMY_DATABASE_URI_TEST', 'sqlite:///test.db')  # 数据库连接
     REDIS_URL = os.getenv('REDIS_URL_TEST', 'redis://localhost:6379/0') # REDIS配置
     OSS_ENDPOINT = os.getenv('OSS_ENDPOINT_TEST')  # 阿里云 OSS Endpoint

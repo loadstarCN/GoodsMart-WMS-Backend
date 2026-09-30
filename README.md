@@ -189,7 +189,7 @@ GoodsMart-WMS-Backend/
 - Delivery note creation and management
 - Order picking
 - Packing
-- Delivery with tracking number
+- Delivery with tracking number (or create the shipment in FedEx automatically)
 - Payment/COD management
 
 ### Inventory Operations
@@ -423,6 +423,103 @@ the issued documents (`void_reason: packages_changed`).
 | `DOCUMENT_TIMEZONE` | `Asia/Tokyo` | Time zone of the invoice date |
 | `CUSTOMS_PDF_FONT_PATH` | (unset) | Optional TTF font for the documents; default Helvetica. Characters the font cannot print (e.g. Japanese) fall back to reportlab's built-in CID font |
 
+## Carrier Integration (FedEx)
+
+For export DNs whose delivery task uses a carrier with code `fedex`, WMS can create the shipment in FedEx
+(Ship API) instead of creating it by hand on the FedEx website and typing the tracking number. Everything
+else stays the same: the tracking number is saved on the delivery task by the existing tracking logic, the
+CI / PL are re-issued with the AWB, shipping completes and `dn.delivered` is sent as before. Saving a tracking
+number by hand (`PUT /warehouse/delivery/<task_id>/tracking`) remains the fallback when FedEx is unavailable.
+
+| Method | Path | Permission |
+|--------|------|------------|
+| `GET` | `/warehouse/dn/<id>/carrier-shipment` | `dn_read` / `packing_read` |
+| `POST` | `/warehouse/dn/<id>/carrier-shipment` | `packing_edit` / `delivery_edit` |
+| `POST` | `/warehouse/dn/<id>/carrier-shipment/cancel` | `packing_edit` / `delivery_edit` |
+
+`GET` returns `{enabled, carrier: "fedex", can_create, blockers[{code, message, goods_code?, field?}], etd_enabled,
+declared_value_carriage, delivery_task_id, shipment}`; `shipment` is the latest shipment (active first) or `null`:
+`{tracking_number, package_tracking_numbers, status: active|cancelled, service_type, ship_date, package_count,
+net_charge, currency, declared_value, label_document_id, label_download_path, etd_document_id, transaction_id,
+created_at, created_by, cancelled_at, cancelled_by}`.
+
+### Creating a shipment
+
+- **Blockers** (all listed at once; `POST` answers 409 `16072` with `details.blockers`): FedEx not configured
+  (`FEDEX_NOT_CONFIGURED`) or invalid options (`FEDEX_CONFIG_INVALID`), not an export DN (`NOT_EXPORT`), DN not
+  `packed` / already shipped, no active delivery task / its carrier code is not `fedex` / task completed, an active
+  shipment already exists (`SHIPMENT_EXISTS`) or a tracking number was saved by hand (`TRACKING_NUMBER_EXISTS`),
+  no packages / more than 30 packages, error-level customs problems (same codes as the customs view),
+  declared value for carriage above the customs value of the packed goods
+  (`DECLARED_VALUE_EXCEEDS_CUSTOMS_VALUE` — FedEx rejects it), ship-from or consignee address that does not fit the
+  FedEx format (`SHIPPER_ADDRESS_INVALID` / `RECIPIENT_ADDRESS_INVALID`), consignee name or phone missing.
+- If there is no current CI / PL (or they are outdated) they are issued first with the normal logic.
+- With `FEDEX_ETD_ENABLED` the current CI PDF is uploaded first (Trade Documents Upload API, pre-shipment) and
+  the shipment references it (`ELECTRONIC_TRADE_DOCUMENTS`); without it the warehouse prints the CI and packs it
+  with the goods as before.
+- The request is built from the DN: shipper = company export profile (English name, phone — warehouse first,
+  contact, tax ID) with the warehouse English address (company address if the warehouse has none); consignee
+  and recipient tax ID from the customs snapshot (tax ID types mapped to FedEx `tinType`: EORI → `BUSINESS_UNION`,
+  PCCC / CPF → `PERSONAL_NATIONAL`, others → `BUSINESS_NATIONAL`); commodities from the invoice lines
+  (**packed quantity**, HS code, country of origin from the goods master data, unit value, amount, weight);
+  one package line per WMS package (gross weight kg, dimensions cm); the declared value for carriage is split
+  evenly across the packages; freight / insurance as in the snapshot; transportation billed to the account,
+  duties per `FEDEX_DUTIES_PAYMENT_TYPE`.
+- Address rules: FedEx accepts at most 3 street lines of 35 characters and a city of 35 characters. The English
+  address string is split at commas / line breaks — the last part (after removing the country name and the postal
+  code) is the city, e.g. `1-2-3 Example, Minato-ku, Tokyo 105-0000`. The postal code is the warehouse / company
+  `zip_code` (for Japan it is also recognised in the address). A consignee without a postal code is sent with an
+  empty `postalCode`; US / CA / PR require a 2-letter state code.
+- Commodity weight: goods with a unit weight → unit weight × packed quantity; goods without one share the rest of
+  the total gross weight (or, if nothing is left, the gross weight by quantity).
+- FedEx is called **before** anything is written. On success, in one transaction: tracking number → delivery task,
+  CI / PL re-issued with the AWB, the labels (one per package, merged into one PDF) stored as a document with
+  `doc_type: shipping_label`, and a `dn_carrier_shipments` record. FedEx errors → 502 `16073` (`details.errors`,
+  `transaction_id`; nothing saved), timeouts → 504 `16074` (`details.maybe_processed: true` means the shipment may
+  exist on the FedEx side — check before retrying). If saving fails after FedEx created the shipment, WMS asks
+  FedEx to cancel it and logs the result.
+- The label PDF is downloaded with `GET /warehouse/dn/<id>/customs-documents/<label_document_id>/file`. Labels
+  do not count for the "current CI and PL" shipping gate. While a shipment is active, changing the packages is
+  refused (409 `16076`) — cancel the shipment first.
+
+### Cancelling
+
+Allowed until the DN is shipped (409 `16065` afterwards; 409 `16075` without an active shipment). FedEx
+`PUT /ship/v1/shipments/cancel` (`DELETE_ALL_PACKAGES`); if FedEx refuses → 502 `16073` with the reason. On
+success the record is marked `cancelled`, the tracking number on the delivery task is cleared, the label is voided
+(`void_reason: shipment_cancelled`) and the CI / PL are re-issued without the AWB (voided if they can no longer be issued).
+
+### Configuration
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `FEDEX_API_BASE` | `https://apis-sandbox.fedex.com` | `https://apis.fedex.com` for production |
+| `FEDEX_API_KEY` / `FEDEX_SECRET_KEY` / `FEDEX_ACCOUNT_NUMBER` | (unset) | Credentials of the FedEx developer project; any one missing = feature disabled |
+| `FEDEX_SERVICE_TYPE` | `INTERNATIONAL_ECONOMY` | FedEx service type |
+| `FEDEX_PICKUP_TYPE` | `USE_SCHEDULED_PICKUP` | Pickup type |
+| `FEDEX_LABEL_IMAGE_TYPE` | `PDF` | `PDF` or `PNG` (stored as PDF) |
+| `FEDEX_LABEL_STOCK_TYPE` | `PAPER_4X6` | e.g. `PAPER_85X11_TOP_HALF_LABEL` for A4 / Letter printers |
+| `FEDEX_ETD_ENABLED` | `False` | Electronic trade documents (upload the CI) |
+| `FEDEX_DUTIES_PAYMENT_TYPE` | `RECIPIENT` | `RECIPIENT` or `SENDER` (the account) |
+| `FEDEX_DOCUMENT_API_BASE` | (derived) | Trade Documents Upload host; derived from `FEDEX_API_BASE` (sandbox / production) |
+| `FEDEX_CONNECT_TIMEOUT_SECONDS` / `FEDEX_TIMEOUT_SECONDS` | `5` / `30` | Timeouts |
+
+The OAuth token (`/oauth/token`, client credentials) is cached in the process until shortly before it expires.
+Credentials are never logged or returned. Merging multi-package PDF labels uses [pypdf](https://pypi.org/project/pypdf/) (BSD).
+
+### Sandbox smoke test and label certification
+
+`scripts/fedex_sandbox_smoke.py` creates a test shipment with fictitious data in the FedEx **sandbox**, saves the
+label PDFs and cancels the shipment (it refuses to run unless `FEDEX_API_BASE` contains `sandbox`):
+
+```bash
+python scripts/fedex_sandbox_smoke.py --to US --packages 2 [--etd] [--out ./fedex-sandbox-labels] [--env-file .env]
+```
+
+Before production use, FedEx requires label certification: print the sandbox labels of the services you use,
+scan them and send them with the label cover sheet to FedEx (see developer.fedex.com → Certification). After
+approval switch `FEDEX_API_BASE` and the credentials to production.
+
 ## Deployment
 
 ### Production (Gunicorn)
@@ -457,7 +554,7 @@ stdout_logfile=/var/log/wms-api.out.log
 | Inventory | 15000-15999 | 400 | Stock-related errors |
 | State | 16000-16999 | 400 | State transition errors |
 
-Business codes of the export-document features: `14019` export profile text too long, `14020` invalid country code, `16063` customs structure invalid, `16064` customs line goods code not in the DN / duplicated, `16065` shipped — customs data / packages / documents locked (409), `16066` invalid packages, `16067` packages cannot be edited in the current DN status (409), `16068` documents cannot be issued yet (409, `details.problems`), `16069` documents required before shipping (409), `16070` not an export DN (409), `16071` document not found (404). Errors may carry a structured `details` object.
+Business codes of the export-document features: `14019` export profile text too long, `14020` invalid country code, `16063` customs structure invalid, `16064` customs line goods code not in the DN / duplicated, `16065` shipped — customs data / packages / documents locked (409), `16066` invalid packages, `16067` packages cannot be edited in the current DN status (409), `16068` documents cannot be issued yet (409, `details.problems`), `16069` documents required before shipping (409), `16070` not an export DN (409), `16071` document not found (404). Carrier shipments (FedEx): `16072` preconditions not met (409, `details.blockers`), `16073` FedEx returned an error (502, `details.errors` / `transaction_id`), `16074` FedEx timed out (504), `16075` no active carrier shipment (409), `16076` packages cannot be changed while a carrier shipment is active (409). Errors may carry a structured `details` object.
 
 ## Related Projects
 

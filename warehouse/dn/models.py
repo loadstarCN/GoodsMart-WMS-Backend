@@ -384,21 +384,24 @@ class DNPackage(db.Model):
 
 
 class DNDocument(db.Model):
-    """DN 出口单证（商业发票 / 装箱单）PDF。
+    """DN 出口单证（商业发票 / 装箱单）与承运商面单 PDF。
 
     生成即定稿：PDF 字节存库，不再改写；数据变化时旧版作废（status=void）、新版 version+1。
     同一版本的发票与装箱单成对签发，共享 version 与 data_sha256（单证数据指纹）。
+    承运商面单（shipping_label）版本单独递增，不参与「海外 DN 必须有有效 CI + PL」的发货拦截；
+    document_number = 主运单号，invoice_date = 发货日，运单取消时作废。
     """
     __tablename__ = 'dn_documents'
 
     __table_args__ = (
         db.UniqueConstraint('dn_id', 'doc_type', 'version', name='uq_dn_document_version'),
         db.Index('idx_dn_document_status', 'dn_id', 'status'),
-        db.CheckConstraint("doc_type IN ('commercial_invoice','packing_list')", name='chk_dn_document_type'),
+        db.CheckConstraint("doc_type IN ('commercial_invoice','packing_list','shipping_label')",
+                           name='chk_dn_document_type'),
         db.CheckConstraint("status IN ('issued','void')", name='chk_dn_document_status'),
     )
 
-    DOC_TYPES = ('commercial_invoice', 'packing_list')
+    DOC_TYPES = ('commercial_invoice', 'packing_list', 'shipping_label')
     STATUSES = ('issued', 'void')
 
     id = db.Column(db.Integer, primary_key=True)
@@ -408,7 +411,8 @@ class DNDocument(db.Model):
         nullable=False,
         info={'description': 'DN ID'}
     )
-    doc_type = db.Column(db.String(30), nullable=False, info={'description': 'commercial_invoice / packing_list'})
+    doc_type = db.Column(db.String(30), nullable=False,
+                         info={'description': 'commercial_invoice / packing_list / shipping_label'})
     version = db.Column(db.Integer, nullable=False, info={'description': '版本（同 DN 递增，发票与装箱单共用）'})
     document_number = db.Column(db.String(80), nullable=False, info={'description': '单证号（发票号）'})
     invoice_date = db.Column(db.Date, nullable=False, info={'description': '单证日期（DOCUMENT_TIMEZONE）'})
@@ -453,4 +457,104 @@ class DNDocument(db.Model):
             'file_name': self.file_name,
             'voided_at': self.voided_at.isoformat() if self.voided_at else None,
             'void_reason': self.void_reason,
+        }
+
+
+class DNCarrierShipment(db.Model):
+    """DN 在承运商系统自动建的运单（目前只有 FedEx）。
+
+    一张 DN 同一时刻至多一条 active；取消后标 cancelled 留痕，可再建新的。
+    主运单号同时存到发货任务的 tracking_number 上（走现有保存运单号的逻辑）。
+    """
+    __tablename__ = 'dn_carrier_shipments'
+
+    __table_args__ = (
+        db.Index('idx_dn_carrier_shipment_dn', 'dn_id', 'status'),
+        # 同一 DN 至多一条有效运单（并发建单时数据库兜底）
+        db.Index(
+            'uq_dn_carrier_shipment_active', 'dn_id', unique=True,
+            postgresql_where=db.text("status = 'active'"),
+            sqlite_where=db.text("status = 'active'"),
+        ),
+        db.CheckConstraint("status IN ('active','cancelled')", name='chk_dn_carrier_shipment_status'),
+    )
+
+    STATUSES = ('active', 'cancelled')
+
+    id = db.Column(db.Integer, primary_key=True)
+    dn_id = db.Column(
+        db.Integer,
+        db.ForeignKey('dn.id', ondelete='CASCADE'),
+        nullable=False,
+        info={'description': 'DN ID'}
+    )
+    carrier = db.Column(db.String(30), nullable=False, info={'description': '承运商适配器（fedex）'})
+    tracking_number = db.Column(db.String(100), nullable=False, index=True, info={'description': '主运单号'})
+    package_tracking_numbers = db.Column(db.JSON, nullable=True, info={'description': '每箱运单号（按箱号）'})
+    service_type = db.Column(db.String(50), nullable=True, info={'description': '服务类型'})
+    status = db.Column(db.String(10), nullable=False, default='active', info={'description': 'active / cancelled'})
+    ship_date = db.Column(db.Date, nullable=True, info={'description': '发货日（shipDatestamp）'})
+    package_count = db.Column(db.Integer, nullable=True, info={'description': '箱数'})
+    net_charge = db.Column(db.Numeric(12, 2), nullable=True, info={'description': '运费（承运商回的净额）'})
+    currency = db.Column(db.String(10), nullable=True, info={'description': '运费币种（ISO 4217）'})
+    declared_value = db.Column(db.Integer, nullable=True, info={'description': '随运单提交的申告价额（合计）'})
+    label_document_id = db.Column(
+        db.Integer,
+        db.ForeignKey('dn_documents.id', ondelete='SET NULL'),
+        nullable=True,
+        info={'description': '面单（dn_documents.shipping_label）'}
+    )
+    etd_document_id = db.Column(db.String(100), nullable=True, info={'description': 'ETD 上传的 CI 文档 ID'})
+    transaction_id = db.Column(db.String(100), nullable=True, info={'description': '建单请求的承运商 transactionId'})
+    cancel_transaction_id = db.Column(db.String(100), nullable=True,
+                                      info={'description': '取消请求的承运商 transactionId'})
+    created_by = db.Column(
+        db.Integer,
+        db.ForeignKey('users.id', ondelete='SET NULL'),
+        nullable=True,
+        info={'description': '建单人ID'}
+    )
+    created_at = db.Column(db.DateTime, default=db.func.now(), info={'description': '建单时间'})
+    cancelled_at = db.Column(db.DateTime, nullable=True, info={'description': '取消时间'})
+    cancelled_by = db.Column(
+        db.Integer,
+        db.ForeignKey('users.id', ondelete='SET NULL'),
+        nullable=True,
+        info={'description': '取消人ID'}
+    )
+
+    dn = db.relationship(
+        'DN',
+        backref=db.backref(
+            'carrier_shipments', lazy='select', cascade='all, delete-orphan',
+            order_by='DNCarrierShipment.id.desc()',
+        ),
+        info={'description': 'DN'}
+    )
+    label_document = db.relationship('DNDocument', foreign_keys=[label_document_id], lazy='select')
+
+    def to_dict(self) -> dict:
+        return {
+            'id': self.id,
+            'carrier': self.carrier,
+            'tracking_number': self.tracking_number,
+            'package_tracking_numbers': self.package_tracking_numbers or [],
+            'status': self.status,
+            'service_type': self.service_type,
+            'ship_date': self.ship_date.isoformat() if self.ship_date else None,
+            'package_count': self.package_count,
+            'net_charge': float(self.net_charge) if self.net_charge is not None else None,
+            'currency': self.currency,
+            'declared_value': self.declared_value,
+            'label_document_id': self.label_document_id,
+            'label_download_path': (
+                f"/warehouse/dn/{self.dn_id}/customs-documents/{self.label_document_id}/file"
+                if self.label_document_id else None
+            ),
+            'etd_document_id': self.etd_document_id,
+            'transaction_id': self.transaction_id,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'created_by': self.created_by,
+            'cancelled_at': self.cancelled_at.isoformat() if self.cancelled_at else None,
+            'cancelled_by': self.cancelled_by,
         }

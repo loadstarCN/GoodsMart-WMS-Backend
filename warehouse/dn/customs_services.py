@@ -7,6 +7,7 @@
   已签发单证后改箱子，现有单证自动作废。
 - 单证（dn_documents）：条件齐全时生成 CI + PL 的 PDF 并存库（生成即定稿）。
   单证数据不变 → 返回现有版本；变了 → 作废旧版、版本 +1。
+  同表里的承运商面单（shipping_label，见 carrier_services.py）不参与这里的签发 / 作废 / 发货拦截。
 - 发票数量一律取已打包数量；原产国以 WMS 商品主数据为准（报关行里的只做记录）。
 - DN 发货后（delivered / completed）快照、箱子、单证全部锁定（16065）。
 """
@@ -468,10 +469,10 @@ class CustomsService:
 
     @staticmethod
     def current_documents(dn: DN) -> dict:
-        """当前有效（issued）的单证：{doc_type: DNDocument}，同类型取最新版本。"""
+        """当前有效（issued）的出口单证（CI / PL）：{doc_type: DNDocument}，同类型取最新版本。"""
         docs = (
             DNDocument.query
-            .filter(DNDocument.dn_id == dn.id, DNDocument.status == 'issued')
+            .filter(DNDocument.dn_id == dn.id, DNDocument.status == 'issued', DNDocument.doc_type.in_(DOC_TYPES))
             .order_by(DNDocument.version.desc(), DNDocument.id.desc())
             .all()
         )
@@ -484,7 +485,8 @@ class CustomsService:
     def _void_current_documents(dn: DN, reason: str) -> list:
         now = datetime.now()
         voided = []
-        for doc in DNDocument.query.filter(DNDocument.dn_id == dn.id, DNDocument.status == 'issued').all():
+        for doc in DNDocument.query.filter(DNDocument.dn_id == dn.id, DNDocument.status == 'issued',
+                                           DNDocument.doc_type.in_(DOC_TYPES)).all():
             doc.status = 'void'
             doc.voided_at = now
             doc.void_reason = reason
@@ -584,6 +586,14 @@ class CustomsService:
 
         if _package_signature(dn.packages) == _package_signature(packages):
             return {'packages': CustomsService.packages_payload(dn), 'voided_documents': []}
+
+        # 已在承运商建了运单：箱数 / 重量 / 尺寸已随运单提交，先取消运单再改箱子
+        from .carrier_services import CarrierShipmentService
+        if CarrierShipmentService.has_active_shipment(dn):
+            raise ConflictException(
+                "Packages cannot be changed while an active carrier shipment exists; cancel the shipment first.",
+                16076,
+            )
 
         # 先删后插：同一次 flush 里 UOW 会先 INSERT 再 DELETE，撞 (dn_id, package_no) 唯一约束
         for old in list(dn.packages):
@@ -1016,7 +1026,11 @@ class CustomsService:
             }
 
         CustomsService._void_current_documents(dn, 'data_changed')
-        max_version = db.session.query(db.func.max(DNDocument.version)).filter(DNDocument.dn_id == dn.id).scalar()
+        max_version = (
+            db.session.query(db.func.max(DNDocument.version))
+            .filter(DNDocument.dn_id == dn.id, DNDocument.doc_type.in_(DOC_TYPES))
+            .scalar()
+        )
         version = (max_version or 0) + 1
         issued_at = datetime.now()
         invoice_date = datetime.now(_document_timezone()).date()
@@ -1050,10 +1064,12 @@ class CustomsService:
         return 201, {'version': version, 'documents': [doc.to_meta() for doc in documents]}
 
     @staticmethod
-    def list_documents(dn: DN, status=None) -> list:
+    def list_documents(dn: DN, status=None, doc_type=None) -> list:
         query = DNDocument.query.filter(DNDocument.dn_id == dn.id)
         if status:
             query = query.filter(DNDocument.status == status)
+        if doc_type:
+            query = query.filter(DNDocument.doc_type == doc_type)
         return query.order_by(DNDocument.version.desc(), DNDocument.id.asc()).all()
 
     @staticmethod

@@ -187,7 +187,7 @@ GoodsMart-WMS-Backend/
 - 发货单创建与管理
 - 拣货
 - 打包
-- 发货（含运单号）
+- 发货（含运单号；也可在 FedEx 自动建运单）
 - 代收付款管理
 
 ### 库存运营
@@ -381,6 +381,83 @@ DN 须为 `picked` 或 `packed`（否则 409 `16067`）。请求体 `{"packages"
 | `DOCUMENT_TIMEZONE` | `Asia/Tokyo` | 单证日期所用时区 |
 | `CUSTOMS_PDF_FONT_PATH` | （不设） | 单证可选 TTF 字体；默认 Helvetica。字体印不出的字符（如日文）退回 reportlab 内置 CID 字体 |
 
+## 承运商对接（FedEx）
+
+海外 DN 的发货任务承运商 code 为 `fedex` 时，WMS 可以直接在 FedEx 建运单（Ship API），替代「在 FedEx 网站手工建运单、
+再把运单号存进 WMS」这一步；其余流程不变：运单号走现有的保存运单号逻辑存到发货任务、CI / PL 带 AWB 重新签发、完成发货、
+`dn.delivered` 照旧。手工保存运单号（`PUT /warehouse/delivery/<task_id>/tracking`）保留，作为 FedEx 不可用时的退路。
+
+| 方法 | 路径 | 权限 |
+|------|------|------|
+| `GET` | `/warehouse/dn/<id>/carrier-shipment` | `dn_read` / `packing_read` |
+| `POST` | `/warehouse/dn/<id>/carrier-shipment` | `packing_edit` / `delivery_edit` |
+| `POST` | `/warehouse/dn/<id>/carrier-shipment/cancel` | `packing_edit` / `delivery_edit` |
+
+`GET` 返回 `{enabled, carrier: "fedex", can_create, blockers[{code, message, goods_code?, field?}], etd_enabled,
+declared_value_carriage, delivery_task_id, shipment}`；`shipment` 为最近一条运单（有效的优先），没有为 `null`。
+
+### 建单
+
+- **前置条件**（不满足的原因一次列全；`POST` 返回 409 `16072`，`details.blockers`）：FedEx 未配置 / 选项不合法、
+  非海外 DN、DN 不是 `packed` 或已发货、没有发货任务 / 承运商 code 不是 `fedex` / 任务已完成、已有有效运单
+  （`SHIPMENT_EXISTS`）或已手工存过运单号（`TRACKING_NUMBER_EXISTS`）、没有箱子 / 超过 30 箱、报关视图有错误级问题
+  （码同报关视图）、申告价额高于已打包货值（`DECLARED_VALUE_EXCEEDS_CUSTOMS_VALUE`，FedEx 会拒）、发件 / 收件地址
+  放不进 FedEx 格式（`SHIPPER_ADDRESS_INVALID` / `RECIPIENT_ADDRESS_INVALID`）、收件人姓名或电话缺失。
+- 没有当前有效的 CI / PL（或已过期）时先按现有逻辑签发。
+- `FEDEX_ETD_ENABLED` 开启时，先把当前 CI PDF 上传给 FedEx（Trade Documents Upload API，建单前上传），建单时以
+  `ELECTRONIC_TRADE_DOCUMENTS` 引用；关闭时仓库照旧打印 CI 随货。
+- 请求内容：发件人 = 公司出口资料（英文名、电话（仓库优先）、联系人、税号）+ 仓库英文地址（仓库没有则用公司的）；
+  收件人与税号来自报关快照（税号类型映射到 FedEx `tinType`：EORI → `BUSINESS_UNION`，PCCC / CPF → `PERSONAL_NATIONAL`，
+  其余 → `BUSINESS_NATIONAL`）；商品来自发票明细（**已打包数量**、HS、原产国（商品主数据）、单价、金额、重量）；
+  每个 WMS 箱子一行包裹（毛重 kg、尺寸 cm）；运送申告价额按箱均分；运费 / 保险费按快照；运费记账到账号，
+  关税付款方按 `FEDEX_DUTIES_PAYMENT_TYPE`。
+- 地址规则：FedEx 街道最多 3 行 × 35 字符、城市 ≤ 35 字符。英文地址按逗号 / 换行切段，去掉国家名和邮编后的最后一段
+  为城市，例如 `1-2-3 Example, Minato-ku, Tokyo 105-0000`。邮编取仓库 / 公司的 `zip_code`（日本地址也能从地址里认出）。
+  收件人没有邮编时带空的 `postalCode`；美国 / 加拿大 / 波多黎各必须有两位州代码。
+- 商品重量：有单件重量的 = 单件重量 × 已打包数量；没有的分摊「总毛重 − 已知重量」（不为正时按数量占比分摊总毛重）。
+- **先调 FedEx，成功后才写库**（一个事务）：运单号 → 发货任务、CI / PL 带 AWB 升版本、面单（每箱一张，合成一个 PDF）
+  存为 `doc_type: shipping_label` 的单证、记 `dn_carrier_shipments`。FedEx 报错 → 502 `16073`（`details.errors`、
+  `transaction_id`，不写任何东西）；超时 → 504 `16074`（`details.maybe_processed: true` 表示 FedEx 侧可能已建单，
+  重试前先去 FedEx 确认）。FedEx 建单成功但写库失败时，WMS 调 FedEx 取消该运单并记日志。
+- 面单用 `GET /warehouse/dn/<id>/customs-documents/<label_document_id>/file` 下载；面单不参与「必须有有效 CI + PL」
+  的发货拦截。有有效运单时改箱子 → 409 `16076`（先取消运单）。
+
+### 取消
+
+DN 发货前可取消（发货后 409 `16065`；没有有效运单 409 `16075`）。调 FedEx `PUT /ship/v1/shipments/cancel`
+（`DELETE_ALL_PACKAGES`），FedEx 拒绝 → 502 `16073` 带原因。成功后记录标 `cancelled`、发货任务上的运单号清空、
+面单作废（`void_reason: shipment_cancelled`）、CI / PL 去掉 AWB 重新签发（条件不满足时作废）。
+
+### 配置
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `FEDEX_API_BASE` | `https://apis-sandbox.fedex.com` | 正式环境为 `https://apis.fedex.com` |
+| `FEDEX_API_KEY` / `FEDEX_SECRET_KEY` / `FEDEX_ACCOUNT_NUMBER` | （不设） | FedEx 开发者项目凭证；缺任一项 = 功能关闭 |
+| `FEDEX_SERVICE_TYPE` | `INTERNATIONAL_ECONOMY` | 服务类型 |
+| `FEDEX_PICKUP_TYPE` | `USE_SCHEDULED_PICKUP` | 揽收方式 |
+| `FEDEX_LABEL_IMAGE_TYPE` | `PDF` | `PDF` 或 `PNG`（都存成 PDF） |
+| `FEDEX_LABEL_STOCK_TYPE` | `PAPER_4X6` | A4 / Letter 打印机可用 `PAPER_85X11_TOP_HALF_LABEL` 等 |
+| `FEDEX_ETD_ENABLED` | `False` | 电子贸易单证（上传 CI） |
+| `FEDEX_DUTIES_PAYMENT_TYPE` | `RECIPIENT` | `RECIPIENT` 或 `SENDER`（记账到账号） |
+| `FEDEX_DOCUMENT_API_BASE` | （自动） | Trade Documents Upload 的地址，默认按 `FEDEX_API_BASE` 选测试 / 正式 |
+| `FEDEX_CONNECT_TIMEOUT_SECONDS` / `FEDEX_TIMEOUT_SECONDS` | `5` / `30` | 超时（秒） |
+
+OAuth token（`/oauth/token`，client credentials）进程内缓存到过期前。凭证不写日志、不出现在响应里。
+多箱 PDF 面单合成使用 [pypdf](https://pypi.org/project/pypdf/)（BSD）。
+
+### 测试环境冒烟与面单认证
+
+`scripts/fedex_sandbox_smoke.py` 用虚构数据在 FedEx **测试环境**建一票运单、保存面单 PDF 后取消
+（`FEDEX_API_BASE` 不含 `sandbox` 时拒绝执行）：
+
+```bash
+python scripts/fedex_sandbox_smoke.py --to US --packages 2 [--etd] [--out ./fedex-sandbox-labels] [--env-file .env]
+```
+
+正式使用前 FedEx 要求面单认证：用测试环境打出所用服务的面单，扫描后连同 Label Cover Sheet 发给 FedEx
+（见 developer.fedex.com → Certification），通过后把 `FEDEX_API_BASE` 与凭证换成正式环境。
+
 ## 部署
 
 ### 生产环境（Gunicorn）
@@ -415,7 +492,7 @@ stdout_logfile=/var/log/wms-api.out.log
 | 库存错误 | 15000-15999 | 400 | 库存相关错误 |
 | 状态错误 | 16000-16999 | 400 | 状态流转错误 |
 
-出口单证相关业务码：`14019` 出口资料文本超长、`14020` 国家代码不合法、`16063` 报关结构不合法、`16064` 报关行商品编码不在 DN 明细或重复、`16065` 已发货不可改（409）、`16066` 箱子数据不合法、`16067` 当前状态不能改箱子（409）、`16068` 单证条件不全（409，`details.problems`）、`16069` 发货前必须先出单证（409）、`16070` 不是海外单（409）、`16071` 单证不存在（404）。错误响应可能带结构化的 `details`。
+出口单证相关业务码：`14019` 出口资料文本超长、`14020` 国家代码不合法、`16063` 报关结构不合法、`16064` 报关行商品编码不在 DN 明细或重复、`16065` 已发货不可改（409）、`16066` 箱子数据不合法、`16067` 当前状态不能改箱子（409）、`16068` 单证条件不全（409，`details.problems`）、`16069` 发货前必须先出单证（409）、`16070` 不是海外单（409）、`16071` 单证不存在（404）。承运商运单（FedEx）：`16072` 建单前置条件不满足（409，`details.blockers`）、`16073` FedEx 返回错误（502，`details.errors` / `transaction_id`）、`16074` FedEx 超时（504）、`16075` 没有有效运单（409）、`16076` 有有效运单时不能改箱子（409）。错误响应可能带结构化的 `details`。
 
 ## 关联项目
 
