@@ -8,6 +8,14 @@ from flask_jwt_extended import JWTManager, create_access_token
 import uuid
 # 扩展和系统工具
 from extensions import db, error, redis_client, limiter
+
+# 测试用内存版 Redis。本机没有 Redis 时每次访问都要等连接失败（Windows 上约 2 秒 / 次），
+# 而 JWT 吊销名单每个请求都查一次 Redis，全量测试会被拖到约 1 小时，吊销相关的测试也测不了。
+# 装了 fakeredis（requirements.txt）就用它；没装则照旧连 REDIS_URL_TEST
+try:
+    import fakeredis
+except ImportError:  # pragma: no cover
+    fakeredis = None
 from extensions.jwt import register_jwt_callbacks
 from system.third_party.models import APIKey
 from system.third_party.utils import hash_api_key
@@ -96,6 +104,8 @@ def setup_app():
     db.init_app(app)
     jwt = JWTManager(app)
     redis_client.init_app(app)
+    if fakeredis is not None:
+        redis_client._redis_client = fakeredis.FakeStrictRedis()
     limiter.init_app(app)
 
     # 注册 JWT 回调（与生产 app.py 共用同一套：含停用用户拒绝、token 吊销）
