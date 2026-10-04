@@ -3,7 +3,7 @@
 restx 的 expect(model) 没有开启 validate，所以 service 层必须自己把关；
 统一在这里做，避免各模块各写一套（并且都忘了 bool 是 int 的子类）。
 """
-from extensions.error import BadRequestException
+from extensions.error import BadRequestException, ConflictException
 
 MAX_BULK_ITEMS = 500
 
@@ -63,3 +63,14 @@ def require_fields(data, *fields, code=40000):
     if missing:
         raise BadRequestException(f"Missing required field(s): {', '.join(missing)}", code)
     return data
+
+
+def require_active_task(task, what=None):
+    """单据（DN / ASN）取消时下属任务被停用（is_active=False），停用的任务一律不能再操作 → 409 16088。
+    以前只在最后 complete 时被单据状态挡下，之前的 process / 追加批次 / 改明细照样能做。"""
+    if task is not None and not task.is_active:
+        raise ConflictException(
+            f"{what or type(task).__name__} {task.id} has been deactivated (its document was cancelled); "
+            "it can no longer be operated.", 16088, details={'task_id': task.id}
+        )
+    return task

@@ -670,11 +670,21 @@ def test_cancel_dn_conflicts_once_picking_started(client, access_token):
     assert response.status_code == 409
     assert response.get_json()['code'] == 16053
 
+    # picked 且已拣出货 → 16053（一件都没拣出的 picked DN 允许取消，见 test_task_lifecycle_rules.py）
     with client.application.app_context():
         dn = get_dn()
         dn.status = 'picked'
+        dn.details[0].picked_quantity = 1
         db.session.commit()
         dn_id = dn.id
+    response = client.put(f'/dn/{dn_id}/cancel/', headers=headers)
+    assert response.status_code == 409
+    assert response.get_json()['code'] == 16053
+
+    with client.application.app_context():
+        dn = get_dn_by_id(dn_id)
+        dn.status = 'packed'
+        db.session.commit()
     response = client.put(f'/dn/{dn_id}/cancel/', headers=headers)
     assert response.status_code == 409
     assert response.get_json()['code'] == 16052

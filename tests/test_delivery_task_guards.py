@@ -1,7 +1,7 @@
 """发货任务守卫（审计 B-57 / B-58 / B-67）
 
-- 一张 DN 同时只允许一条未完成（pending / in_progress）的有效发货任务：手工新建 → 409 16090；
-  DN 已发货 → 409 16065；打包完成自动生成时已有手工任务 → 复用那条，不再生成第二条
+- 发货任务只由打包完成自动生成（手工新建接口 POST /delivery/ 已去掉 → 405）；一张 DN 同时只允许一条
+  未完成（pending / in_progress）的有效发货任务：自动生成时已有（修复前手工建的存量任务）→ 复用那条
 - 海外 DN 只能对当前发货任务（最新的有效任务）完成发货 / 存运单号 / 修改 → 409 16091
 - 完成发货后任务上的运单号（请求值，没带则已存值）与 CI 上印的 AWB 不同 → 409 16080
 - dn.delivered 的 tracking_number 取被完成的那条任务的运单号
@@ -15,7 +15,7 @@ from .helpers import *
 from .test_customs import (
     _create_dn, _export_dn_ready, _force_packed, _h, _issue, _pdf_streams, _prepare, _ship, _webhook_key,
 )
-from .test_carrier_shipment import _cancel, _create, _ready, _records, _task_body, fedex  # noqa: F401  fedex 是 fixture
+from .test_carrier_shipment import _cancel, _create, _ready, _records, fedex  # noqa: F401  fedex 是 fixture
 from .test_delivery_complete import _other_carrier
 
 from system.webhook.models import WebhookEvent
@@ -66,33 +66,25 @@ def _complete(client, token, task_id, body):
 # B-57：一张 DN 只允许一条未完成的有效发货任务
 # ---------------------------------------------------------------------------
 
-def test_second_unfinished_task_rejected(client, access_token):
+def test_manual_create_endpoint_removed(client, access_token):
     dn_id, task_id = _domestic_packed(client, access_token, 'ORD-GUARD-ONE')
-
-    response = client.post('/delivery/', json=_task_body(client, dn_id), headers=_h(access_token))
-    assert response.status_code == 409 and response.get_json()['code'] == 16090
-    assert response.get_json()['details'] == {'delivery_task_id': task_id, 'status': 'pending'}
-
-    # in_progress 也算未完成
-    assert client.put(f'/delivery/{task_id}/process/', headers=_h(access_token)).status_code == 200
-    response = client.post('/delivery/', json=_task_body(client, dn_id), headers=_h(access_token))
-    assert response.status_code == 409 and response.get_json()['code'] == 16090
-    assert response.get_json()['details'] == {'delivery_task_id': task_id, 'status': 'in_progress'}
-
-    # 完成后 DN 已发货：新任务永远完成不了，也不能建 → 16065
-    assert _complete(client, access_token, task_id, {}).status_code == 200
-    response = client.post('/delivery/', json=_task_body(client, dn_id), headers=_h(access_token))
-    assert response.status_code == 409 and response.get_json()['code'] == 16065
+    response = client.post('/delivery/', json={'dn_id': dn_id}, headers=_h(access_token))
+    assert response.status_code == 405
     assert _task_ids(client, dn_id) == [task_id]
 
 
-def test_packing_reuses_manual_task(client, access_token):
-    """打包完成前已手工建了发货任务：自动生成时复用它（不报错，打包完成不被卡住），DN 仍只有一条任务"""
+def test_packing_reuses_legacy_manual_task(client, access_token):
+    """打包完成前已有（修复前手工建的）发货任务：自动生成时复用它（不报错，打包完成不被卡住），DN 仍只有一条任务"""
     _prepare(client)
     dn_id = _create_dn(client, access_token, customs=None, order_number='ORD-GUARD-MANUAL').get_json()['id']
-    response = client.post('/delivery/', json=_task_body(client, dn_id, remark='manual'), headers=_h(access_token))
-    assert response.status_code == 201, response.get_json()
-    manual_id = response.get_json()['id']
+    with client.application.app_context():
+        dn = db.session.get(DN, dn_id)
+        manual = DeliveryTask(dn_id=dn_id, recipient_id=dn.recipient_id, shipping_address=dn.shipping_address,
+                              expected_shipping_date=dn.expected_shipping_date, status='pending',
+                              remark='manual', created_by=dn.created_by)
+        db.session.add(manual)
+        db.session.commit()
+        manual_id = manual.id
 
     task_id = _force_packed(client, dn_id)     # 内部调 create_delivery_task_from_dn（打包完成的同一入口）
     assert task_id == manual_id
@@ -206,7 +198,7 @@ def test_cancelled_tracking_rejected(client, access_token, fedex):
     assert _cancel(client, access_token, dn_id).status_code == 200
     assert client.put(f'/delivery/{task_id}/process/', headers=_h(access_token)).status_code == 200
     expected = {'tracking_number': None, 'cancelled_tracking_number': '794600000001', 'carrier': 'fedex',
-                'status': 'cancelled'}
+                'status': 'cancelled', 'record_status': 'cancelled'}
 
     # 完成发货（PDA 表单还停在旧预填值）/ 保存运单号 / 修改任务：已取消的号码（各种写法）→ 16078
     for value in ('794600000001', '7946 0000 0001', '7946-0000-0001'):

@@ -8,5 +8,6 @@ from .ownership import (
 )
 from .validation import (
     require_positive_int, require_non_negative_int, require_bulk_list, require_fields, MAX_BULK_ITEMS,
+    require_active_task,
 )
 from .locks import lock_goods_location, lock_goods_locations_for_goods

@@ -7,6 +7,7 @@ from warehouse.dn.models import DN, DNDetail
 from warehouse.goods.models import Goods
 from warehouse.common import require_positive_int, require_fields
 from warehouse.common.locks import lock_row
+from warehouse.common.validation import require_active_task
 from warehouse.dn.services import (
     DNService, pick_fields, parse_date_value, parse_datetime_value,
 )
@@ -15,13 +16,12 @@ from sqlalchemy import and_, func, case, extract
 from datetime import datetime, timedelta
 from .models import DeliveryTask, DeliveryTaskStatusLog
 
-# 请求体白名单：dn_id 只在创建时接受；status / is_active / created_by / *_at 只经流程端点变更
+# 请求体白名单：status / is_active / created_by / *_at 只经流程端点变更
 DELIVERY_UPDATE_FIELDS = (
     'recipient_id', 'shipping_address', 'expected_shipping_date', 'actual_shipping_date',
     'transportation_mode', 'carrier_id', 'tracking_number', 'shipping_cost', 'currency',
     'order_number', 'remark',
 )
-DELIVERY_CREATE_FIELDS = ('dn_id',) + DELIVERY_UPDATE_FIELDS
 # 未完成的发货任务：一张 DN 同时只允许一条（is_active 的）
 UNFINISHED_TASK_STATUSES = ('pending', 'in_progress')
 
@@ -229,7 +229,8 @@ class DeliveryTaskService:
         """
         task = DeliveryTaskService._get_instance(task_or_id)
         lock_row(task.dn)
-        return lock_row(task)
+        # 所属 DN 已取消（任务被停用）→ 409 16088
+        return require_active_task(lock_row(task), 'Delivery Task')
 
     @staticmethod
     def list_tasks(filters: dict):
@@ -294,67 +295,6 @@ class DeliveryTaskService:
             query = query.filter(DN.warehouse_id.in_(filters['warehouse_ids'])) 
 
         return query
-
-    @staticmethod
-    @transactional
-    def create_task(data: dict, created_by_id: int) -> DeliveryTask:
-        """
-        创建新的 DeliveryTask。只接受白名单字段；status 固定 pending、is_active 固定 True。
-        缺 dn_id / recipient_id / shipping_address / expected_shipping_date → 400。
-        DN 有进行中 / 有效 / 结果不明的自动运单（承运商对接）时不能新建（新任务会成为当前发货任务，
-        绕过运单号锁定）→ 409 16078；带的运单号也按自动运单校验（结果不明 16079 / 不一致或已取消 16078）。
-        一张 DN 同时只允许一条未完成（pending / in_progress）的有效发货任务：已有 → 409 16090
-        {delivery_task_id, status}；DN 已发货（delivered / completed）→ 409 16065。
-        """
-        from warehouse.dn.carrier_services import CarrierShipmentService
-        from warehouse.dn.customs_services import CustomsService, LOCKED_DN_STATUSES
-
-        payload = pick_fields(data, DELIVERY_CREATE_FIELDS)
-        require_fields(payload, 'dn_id', 'recipient_id', 'shipping_address', 'expected_shipping_date')
-        dn_id = require_positive_int(payload['dn_id'], 'dn_id', 16044)
-        dn = get_object_or_404(DN, dn_id)
-        # 先锁 DN 行：与自动建运单 / 取消、打包完成自动生成发货任务、并发新建串行
-        dn = CustomsService._lock(dn)
-        payload = DeliveryTaskService._normalize_payload(payload, dn)
-        DeliveryTaskService._assert_shipping_dates(
-            payload['expected_shipping_date'], payload.get('actual_shipping_date')
-        )
-        if 'tracking_number' in payload:
-            payload['tracking_number'] = CarrierShipmentService.assert_tracking_matches(
-                dn, payload['tracking_number'], allow_empty=True)
-        CarrierShipmentService.assert_delivery_tasks_editable(dn, 'added')
-        # 已发货的 DN 不能再建：新任务会成为「当前发货任务」，单证 / 运单都改看它，而它永远完成不了
-        if dn.status in LOCKED_DN_STATUSES:
-            raise ConflictException(
-                f"DN {dn.id} has been shipped ({dn.status}); delivery tasks cannot be added.", 16065)
-        # 一张 DN 同时只允许一条未完成的有效发货任务（多条会绕过运单号锁定、CI 运单号校验和单证过期判定）
-        existing = DeliveryTaskService._unfinished_task(dn)
-        if existing is not None:
-            raise ConflictException(
-                f"DN {dn.id} already has an unfinished delivery task {existing.id} ({existing.status}); "
-                "only one unfinished delivery task is allowed per DN.", 16090,
-                details={'delivery_task_id': existing.id, 'status': existing.status},
-            )
-
-        new_delivery = DeliveryTask(
-            dn_id=dn_id,
-            recipient_id=payload['recipient_id'],
-            shipping_address=payload['shipping_address'],
-            expected_shipping_date=payload['expected_shipping_date'],
-            actual_shipping_date=payload.get('actual_shipping_date'),
-            transportation_mode=payload.get('transportation_mode'),
-            carrier_id=payload.get('carrier_id'),
-            tracking_number=payload.get('tracking_number'),
-            shipping_cost=payload.get('shipping_cost', 0.0),
-            currency=payload.get('currency') or 'JPY',
-            order_number=payload.get('order_number'),
-            status='pending',
-            remark=payload.get('remark'),
-            created_by=created_by_id
-        )
-        db.session.add(new_delivery)
-        # db.session.commit()
-        return new_delivery
 
     @staticmethod
     def get_task(delivery_id: int) -> DeliveryTask:
@@ -551,7 +491,7 @@ class DeliveryTaskService:
         # 先锁 DN 行（与改箱子 / 改报关快照 / 出单证 / 建运单串行），防止检查通过后单证被并发作废仍出货；
         # 再锁任务行并重读（先 DN 后任务），并发的重复完成在下面的状态检查处挡下
         CustomsService._lock(task.dn)
-        lock_row(task)
+        require_active_task(lock_row(task), 'Delivery Task')
         if task.status != 'in_progress':
             raise BadRequestException("Cannot complete a non-in-progress Delivery", 16008)
         # 海外件：单证 / 自动运单只认当前发货任务，完成别的任务会绕过运单锁和单证校验 → 409 16091
@@ -623,10 +563,10 @@ class DeliveryTaskService:
     def create_delivery_task_from_dn(dn_id: int, created_by_id: int) -> DeliveryTask:
         """
         根据 DN 自动生成一个 DeliveryTask（打包完成时调用）。
-        一张 DN 同时只允许一条未完成的有效发货任务：打包完成前已经手工建了（POST /delivery/）→ 复用那条，
-        不再生成第二条，也不报错（报错会让打包完成整体回滚、卡住流程）。
+        发货任务只由这里生成（没有手工新建接口）。一张 DN 同时只允许一条未完成的有效发货任务：
+        已有（例如修复前手工建的存量任务）→ 复用那条，不再生成第二条，也不报错（报错会让打包完成整体回滚）。
         """
-        # 先锁 DN 行再查已有任务：与手工新建（create_task 同样先锁 DN）串行，不会各建一条
+        # 先锁 DN 行再查已有任务：并发的重复生成串行，不会各建一条
         dn = lock_row(DNService.get_dn(dn_id))
         if not dn.details:
             raise BadRequestException("DN has no details to create a Delivery.", 16016)

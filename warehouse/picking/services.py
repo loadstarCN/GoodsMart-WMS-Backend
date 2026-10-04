@@ -1,7 +1,8 @@
 from extensions.db import *
-from extensions.error import BadRequestException, NotFoundException
+from extensions.error import BadRequestException, ConflictException, NotFoundException
 from warehouse.common import require_positive_int, require_bulk_list, lock_goods_location
 from warehouse.common.locks import lock_row
+from warehouse.common.validation import require_active_task
 from warehouse.dn.models import DN
 from warehouse.dn.services import DNService, pick_fields, parse_datetime_value
 from warehouse.location.models import Location
@@ -34,7 +35,8 @@ class PickingTaskService:
         """
         task = PickingTaskService._get_instance(task_or_id)
         lock_row(task.dn)
-        return lock_row(task)
+        # 所属 DN 已取消（任务被停用）→ 409 16088
+        return require_active_task(lock_row(task), 'Picking Task')
 
     @staticmethod
     def list_tasks(filters: dict):
@@ -560,6 +562,12 @@ class PickingTaskService:
             for d in task.task_details
         ]
         PickingTaskService._assert_location_stock(task, details, exclude_task_id=task.id)
+        # 一件都没拣就完成：之后的打包任务按规则（16082）永远完成不了，DN 会卡在 picked → 409 16089。
+        # 确实拣不到货的 DN 请取消（拣货未开始时可取消）
+        if sum(d['picked_quantity'] for d in details) <= 0:
+            raise ConflictException(
+                f"Cannot complete Picking Task {task.id} with nothing picked; cancel the DN instead.", 16089
+            )
 
         task = PickingTaskService._update_task_status(task, 'completed', operator_id)
 

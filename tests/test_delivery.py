@@ -7,27 +7,16 @@ from .helpers import *
 # 以下为测试视图层 (views.py) 逻辑的用例
 # ---------------------------------------------------------
 
-def test_create_task_task(client, access_token):
-    """
-    测试创建 Delivery Task (POST /delivery/)
-    （DN 1 在种子数据里已有一条 pending 的发货任务，一张 DN 只允许一条未完成的任务 → 用没有任务的 DN 2）
-    """
+def test_create_delivery_endpoint_removed(client, access_token):
+    """发货任务只由打包完成自动生成，没有手工新建接口（POST /delivery/ → 405）"""
     response = client.post(
         '/delivery/',
         headers={'Authorization': f'Bearer {access_token}'},
-        json={
-            "dn_id": 2,
-            "recipient_id": 1,
-            "carrier_id": 1,
-            "shipping_address": "New Delivery Address",
-            "status": "pending",
-            "expected_shipping_date": "2022-01-01",
-            "transportation_mode": "express"
-        }
+        json={"dn_id": 2, "recipient_id": 1, "shipping_address": "x", "expected_shipping_date": "2022-01-01"},
     )
-    assert response.status_code == 201
-    data = response.get_json()
-    assert data['shipping_address'] == "New Delivery Address"
+    assert response.status_code == 405
+    with client.application.app_context():
+        assert DeliveryTask.query.filter_by(dn_id=2).count() == 0
 
 
 def test_get_delivery_tasks(client, access_token):
@@ -73,23 +62,20 @@ def test_update_delivery_task(client, access_token):
 
 
 @pytest.mark.parametrize('body', [
-    {"dn_id": 1, "recipient_id": 1, "shipping_address": "x"},                       # 缺 expected_shipping_date
-    {"recipient_id": 1, "shipping_address": "x", "expected_shipping_date": "2026-01-01"},  # 缺 dn_id
-    {"dn_id": 1, "recipient_id": 1, "shipping_address": "x",
-     "expected_shipping_date": "2026-01-01", "transportation_mode": "teleport"},     # 枚举非法
-    {"dn_id": 1, "recipient_id": 1, "shipping_address": "x",
-     "expected_shipping_date": "2026-01-01", "shipping_cost": -1},                  # 运费为负
-    {"dn_id": 1, "recipient_id": 1, "shipping_address": "x",
-     "expected_shipping_date": "2026-01-01", "actual_shipping_date": "2025-12-31"}, # 实际早于计划（撞 CHECK 约束）
-    {"dn_id": 1, "recipient_id": 1, "shipping_address": "x", "expected_shipping_date": "01/01/2026"},  # 日期格式
+    {"transportation_mode": "teleport"},                                            # 枚举非法
+    {"shipping_cost": -1},                                                          # 运费为负
+    {"expected_shipping_date": "2026-01-01", "actual_shipping_date": "2025-12-31"}, # 实际早于计划（撞 CHECK 约束）
+    {"expected_shipping_date": "01/01/2026"},                                       # 日期格式
 ])
-def test_create_delivery_invalid_body_returns_400(client, access_token, body):
-    """B-18：缺字段 / 枚举非法 / 数值非法 → 400 而非 500"""
-    response = client.post('/delivery/', headers={'Authorization': f'Bearer {access_token}'}, json=body)
+def test_update_delivery_invalid_body_returns_400(client, access_token, body):
+    """B-18：枚举非法 / 数值非法 / 日期非法 → 400 而非 500"""
+    with client.application.app_context():
+        task_id = get_delivery_task().id
+    response = client.put(f'/delivery/{task_id}', headers={'Authorization': f'Bearer {access_token}'}, json=body)
     assert response.status_code == 400, response.get_json()
 
 
-def test_create_delivery_rejects_recipient_of_other_company(client, access_token):
+def test_update_delivery_rejects_recipient_of_other_company(client, access_token):
     """B-04：收货人 / 承运商必须与 DN 仓库同公司 → 403"""
     with client.application.app_context():
         admin = get_admin_user()
@@ -99,10 +85,10 @@ def test_create_delivery_rejects_recipient_of_other_company(client, access_token
         db.session.add(recipient_b)
         db.session.commit()
         recipient_b_id = recipient_b.id
+        task_id = get_delivery_task().id
 
-    response = client.post('/delivery/', headers={'Authorization': f'Bearer {access_token}'}, json={
-        "dn_id": 1, "recipient_id": recipient_b_id, "shipping_address": "x",
-        "expected_shipping_date": "2026-01-01",
+    response = client.put(f'/delivery/{task_id}', headers={'Authorization': f'Bearer {access_token}'}, json={
+        "recipient_id": recipient_b_id,
     })
     assert response.status_code == 403
     assert response.get_json()['code'] == 12001
@@ -134,31 +120,6 @@ def test_delete_delivery_task(client, access_token):
 # 以下为直接测试服务层 (services.py) 逻辑的用例
 # ---------------------------------------------------------
 
-def test_delivery_task_service_create_task(client):
-    """
-    测试通过服务层创建一个新的 DeliveryTask（用没有发货任务的 DN 2，见 test_create_task_task）
-    """
-    with client.application.app_context():
-        user = get_operator_user()
-        dn = get_dn_by_id(2)
-        recipient = get_recipient()
-        carrier = get_carrier()
-        data = {
-            "dn_id": dn.id,
-            "tracking_number": "DT-SERVICE-NEW",
-            "recipient_id": recipient.id,
-            "carrier_id": carrier.id,
-            "shipping_address": "New Address",
-            "status": "pending",
-            "expected_shipping_date": "2022-01-01",
-            "transportation_mode": "express"
-
-        }
-        task = DeliveryTaskService.create_task(data,user.id)
-        assert task is not None
-        assert task.tracking_number == "DT-SERVICE-NEW"
-
-
 def test_delivery_task_service_update_delivery(client):
     """
     测试通过服务层更新 DeliveryTask
@@ -179,30 +140,6 @@ def test_delivery_task_service_update_delivery(client):
         assert updated_task.status == "pending"
         assert updated_task.dn_id == original_dn_id
         assert updated_task.remark == "service updated"
-
-
-def test_create_task_with_invalid_data(client):
-    """
-    测试通过服务层创建 DeliveryTask 时，传入无效数据的情况
-    """
-    with client.application.app_context():
-        user = get_operator_user()
-        dn = get_dn()
-
-        # 创建任务时缺少必要字段，例如收货人
-        invalid_data = {
-            "dn_id": dn.id,
-            "tracking_number": "DT-SERVICE-INVALID",
-            "carrier_id": 1,  # 收货人缺失
-
-            "shipping_address": "Invalid Address",
-            "status": "pending",
-        }
-
-        # B-18：缺必填字段 → 400（BadRequestException），而不是 KeyError 变 500
-        with pytest.raises(BadRequestException) as excinfo:
-            DeliveryTaskService.create_task(invalid_data,user.id)
-        assert excinfo.value.biz_code == 40000
 
 
 def test_update_delivery_with_invalid_status(client):

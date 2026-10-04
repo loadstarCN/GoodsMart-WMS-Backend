@@ -386,8 +386,8 @@ DN 须为 `picked` 或 `packed`（否则 409 `16067`）。请求体 `{"packages"
   CI 没印 AWB 时照常写入请求里的运单号。
 - 当前 CI 已印承运商，请求里的 `carrier_id` 会把它换掉（`null` 按回落到 DN 的承运商算，与单证取数一致）
   → 409 `16092` `details {document_carrier, document_carrier_id, carrier_id}`。
-- 一张 DN 同时只允许一条未完成（`pending` / `in_progress`）的有效发货任务：`POST /warehouse/delivery/` 时已有 → 409 `16090`
-  `details {delivery_task_id, status}`；DN 已发货 → 409 `16065`。打包完成自动生成时已有手工建的任务 → 复用那条，不再生成第二条。
+- 发货任务只在打包完成时自动生成，没有手工新建接口。一张 DN 同时只允许一条未完成（`pending` / `in_progress`）的有效发货任务：
+  已有（例如修复前手工建的存量任务）→ 复用那条，不再生成第二条。
 - 海外 DN 的单证 / 自动运单只认当前发货任务（最新的有效任务）：对别的任务完成发货 / 保存运单号 / 修改 → 409 `16091`
   `details {delivery_task_id, current_status}`。
 - `dn.delivered` 的 `tracking_number` 取被完成的那条任务的运单号。

@@ -1,9 +1,7 @@
 from flask import g
 from flask_restx import Resource
-from extensions.error import BadRequestException
 from system.common import permission_required,paginate
-from warehouse.common import warehouse_required,add_warehouse_filter,get_warehouse_owned,require_positive_int, require_actor_user_id
-from warehouse.dn.models import DN
+from warehouse.common import warehouse_required,add_warehouse_filter,get_warehouse_owned, require_actor_user_id
 from .models import DeliveryTask
 from .schemas import (
     api_ns,
@@ -27,6 +25,7 @@ def _owned_task(task_id: int) -> DeliveryTask:
 @api_ns.doc(security="jsonWebToken")
 @api_ns.route('/')
 class DeliveryTaskList(Resource):
+    """发货任务列表。发货任务只由打包完成自动生成（create_delivery_task_from_dn），没有手工新建接口。"""
 
     @permission_required(["all_access","company_all_access","delivery_read"])
     @warehouse_required()
@@ -59,24 +58,6 @@ class DeliveryTaskList(Resource):
         filters = add_warehouse_filter(filters)
         query = DeliveryTaskService.list_tasks(filters)
         return paginate(query, page, per_page)
-
-    @permission_required(["all_access","company_all_access","delivery_edit"])
-    @warehouse_required()
-    @api_ns.expect(delivery_task_input_model)
-    @api_ns.marshal_with(delivery_task_model)
-    def post(self):
-        """
-        Create a new Delivery (the DN must be accessible; status is always pending)
-        - Only one unfinished (pending / in_progress) delivery task per DN → 409 16090 {delivery_task_id, status}
-        - DN already shipped → 409 16065
-        """
-        data = api_ns.payload
-        if not isinstance(data, dict):
-            raise BadRequestException("Request body must be a JSON object", 16015)
-        get_warehouse_owned(DN, require_positive_int(data.get('dn_id'), 'dn_id', 16044), what='DN')
-        created_by = require_actor_user_id()
-        new_delivery = DeliveryTaskService.create_task(data, created_by)
-        return new_delivery, 201
 
 
 @api_ns.doc(security="jsonWebToken")

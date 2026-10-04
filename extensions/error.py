@@ -6,10 +6,13 @@ from werkzeug.exceptions import HTTPException
 #             （缺 CI / PL → missing_documents 非空、outdated false；已过期 → missing_documents []、outdated true）
 # 16078  409  有有效自动运单时运单号 / 承运商与运单不一致：details {tracking_number, carrier[, carrier_id]}；
 #             用了本 DN 已取消的自动运单号：details {tracking_number: null, cancelled_tracking_number, carrier,
-#             status: 'cancelled'}
+#             status: 'cancelled', record_status: 'cancelled' | 'dismissed'}（已确认作废的运单号同样拦）
 # 16080  409  完成发货后的运单号与当前 CI 上印的 AWB 不一致（先保存运单号并重出单证）：
 #             details {document_tracking_number, tracking_number}
-# 16090  409  DN 已有未完成（pending / in_progress）的有效发货任务，不能再建：details {delivery_task_id, status}
+# 16088  409  任务已停用（所属 DN / ASN 已取消），不能再操作：details {task_id}
+# 16089  409  拣货任务一件都没拣，不能完成（拣不到货请取消 DN）
+# 16090  409  DN 已有未完成（pending / in_progress）的有效发货任务（手工新建接口已去掉，目前不会出现）：
+#             details {delivery_task_id, status}
 # 16091  409  海外 DN 只能对当前发货任务完成发货 / 存运单号 / 修改：details {delivery_task_id, current_status}
 # 16092  409  完成发货的承运商与当前 CI 上印的不一致（先改承运商并重出单证）：
 #             details {document_carrier, document_carrier_id, carrier_id}

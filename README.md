@@ -428,9 +428,9 @@ the issued documents (`void_reason: packages_changed`).
   When the CI has no AWB, the given tracking number is saved as before.
 - If the current CI prints a carrier and the request's `carrier_id` would change it (`null` falls back to the DN's
   carrier, as the CI does) → 409 `16092` `details {document_carrier, document_carrier_id, carrier_id}`.
-- A DN has at most one unfinished (`pending` / `in_progress`) active delivery task: `POST /warehouse/delivery/` for a
-  DN that already has one → 409 `16090` `details {delivery_task_id, status}`; for a shipped DN → 409 `16065`. When
-  packing completes and a task was already created by hand, that task is reused instead of creating a second one.
+- Delivery tasks are created only when packing completes; there is no endpoint to create one by hand. A DN has at most
+  one unfinished (`pending` / `in_progress`) active delivery task: if one already exists (e.g. a legacy hand-made task),
+  it is reused instead of creating a second one.
 - Export DNs: documents and carrier shipments follow the current delivery task (the newest active one); completing,
   saving the tracking number of, or updating another task → 409 `16091` `details {delivery_task_id, current_status}`.
 - `dn.delivered` carries the tracking number of the task that was completed.

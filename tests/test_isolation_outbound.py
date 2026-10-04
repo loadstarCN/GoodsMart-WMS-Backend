@@ -144,8 +144,6 @@ def _assert_all_forbidden(client, headers, ids):
         # POST 主单：把 Company A 的 DN 当外键
         ('POST', '/picking/', {'dn_id': dn}),
         ('POST', '/packing/', {'dn_id': dn}),
-        ('POST', '/delivery/', {'dn_id': dn, 'recipient_id': ids['recipient_id'],
-                                'shipping_address': 'x', 'expected_shipping_date': '2026-01-01'}),
     ]
     for method, url, body in calls:
         response = client.open(url, method=method, headers=headers, json=body)

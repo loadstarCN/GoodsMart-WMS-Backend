@@ -576,11 +576,12 @@ class CarrierShipmentService:
 
     @staticmethod
     def _assert_not_cancelled(dn: DN, given: str):
-        """given（已规范化）是本 DN 已取消（cancelled，含补偿取消 compensated）的自动运单号 → 409 16078。
-        例：取消后 PDA 完成发货表单还停在旧的预填运单号。"""
+        """given（已规范化）是本 DN 已取消（cancelled，含补偿取消 compensated）或已确认作废（dismissed）
+        的自动运单号 → 409 16078。例：取消后 PDA 完成发货表单还停在旧的预填运单号。
+        details.status 统一为 'cancelled'（前端按它显示「运单已取消」），record_status 是记录的实际状态。"""
         cancelled = (
             DNCarrierShipment.query
-            .filter(DNCarrierShipment.dn_id == dn.id, DNCarrierShipment.status == 'cancelled',
+            .filter(DNCarrierShipment.dn_id == dn.id, DNCarrierShipment.status.in_(('cancelled', 'dismissed')),
                     DNCarrierShipment.tracking_number.isnot(None))
             .order_by(DNCarrierShipment.id.desc())
             .all()
@@ -588,10 +589,10 @@ class CarrierShipmentService:
         for record in cancelled:
             if normalize_tracking(record.tracking_number) == given:
                 raise ConflictException(
-                    f"{record.carrier} shipment {record.tracking_number} of this DN has been cancelled; its tracking "
+                    f"{record.carrier} shipment {record.tracking_number} of this DN has been {record.status}; its tracking "
                     "number cannot be used any more. Create a new shipment or enter another tracking number.", 16078,
                     details={'tracking_number': None, 'cancelled_tracking_number': record.tracking_number,
-                             'carrier': record.carrier, 'status': 'cancelled'},
+                             'carrier': record.carrier, 'status': 'cancelled', 'record_status': record.status},
                 )
 
     @staticmethod

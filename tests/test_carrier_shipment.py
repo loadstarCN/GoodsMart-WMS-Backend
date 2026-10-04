@@ -928,10 +928,7 @@ def test_unresolved_locks_tracking_customs_packages_and_tasks(client, access_tok
     response = client.put(f'/dn/{dn_id}/packages', json={'packages': changed}, headers=_h(access_token))
     assert response.status_code == 409 and response.get_json()['code'] == 16076
 
-    # 发货任务不能新建 / 删除 → 16078
-    response = client.post('/delivery/', json=_task_body(client, dn_id), headers=_h(access_token))
-    assert response.status_code == 409 and response.get_json()['code'] == 16078
-    assert response.get_json()['details']['status'] == 'unknown'
+    # 发货任务不能删除 → 16078（手工新建接口已去掉）
     response = client.delete(f'/delivery/{task_id}', headers=_h(access_token))
     assert response.status_code == 409 and response.get_json()['code'] == 16078
 
@@ -948,15 +945,6 @@ def test_unresolved_locks_tracking_customs_packages_and_tasks(client, access_tok
     response = client.put(f'/delivery/{task_id}/tracking', json={'tracking_number': 'MANUAL-1'},
                           headers=_h(access_token))
     assert response.status_code == 200, response.get_json()
-
-
-def _task_body(client, dn_id, **extra):
-    with client.application.app_context():
-        recipient_id = get_recipient().id
-    body = {'dn_id': dn_id, 'recipient_id': recipient_id, 'shipping_address': 'Hauptstrasse 1, 10115 Berlin',
-            'expected_shipping_date': _datetime.now().date().isoformat()}
-    body.update(extra)
-    return body
 
 
 # ---------------------------------------------------------------------------
@@ -1497,15 +1485,10 @@ def test_delivery_tasks_and_customs_locked_while_shipment_active(client, access_
     dn_id, task_id = _ready(client, access_token)
     assert _create(client, access_token, dn_id).status_code == 201
 
-    # 新建发货任务会成为「当前任务」绕过运单号锁定 → 16078；删除也不行
-    response = client.post('/delivery/', json=_task_body(client, dn_id), headers=_h(access_token))
-    assert response.status_code == 409 and response.get_json()['code'] == 16078
+    # 删除发货任务 → 16078（手工新建接口已去掉）
+    response = client.delete(f'/delivery/{task_id}', headers=_h(access_token))
     assert response.get_json()['details'] == {'tracking_number': '794600000001', 'carrier': 'fedex',
                                               'status': 'active'}
-    response = client.post('/delivery/', json=_task_body(client, dn_id, tracking_number='OTHER-1'),
-                           headers=_h(access_token))
-    assert response.status_code == 409 and response.get_json()['code'] == 16078
-    response = client.delete(f'/delivery/{task_id}', headers=_h(access_token))
     assert response.status_code == 409 and response.get_json()['code'] == 16078
 
     # 报关数据已随运单提交 → 16076（与改箱子同码）
@@ -1513,13 +1496,8 @@ def test_delivery_tasks_and_customs_locked_while_shipment_active(client, access_
     assert response.status_code == 409 and response.get_json()['code'] == 16076
     assert response.get_json()['details']['carrier_shipment']['tracking_number'] == '794600000001'
 
-    # 取消后都放开（一张 DN 仍只允许一条未完成的发货任务：先删掉原任务才能新建，否则 16090）
+    # 取消后都放开
     assert _cancel(client, access_token, dn_id).status_code == 200
     response = client.put(f'/dn/{dn_id}/customs', json=_customs(freight_charge=9000), headers=_h(access_token))
     assert response.status_code == 200, response.get_json()
-    response = client.post('/delivery/', json=_task_body(client, dn_id), headers=_h(access_token))
-    assert response.status_code == 409 and response.get_json()['code'] == 16090
-    assert response.get_json()['details'] == {'delivery_task_id': task_id, 'status': 'pending'}
     assert client.delete(f'/delivery/{task_id}', headers=_h(access_token)).status_code == 200
-    response = client.post('/delivery/', json=_task_body(client, dn_id), headers=_h(access_token))
-    assert response.status_code == 201, response.get_json()

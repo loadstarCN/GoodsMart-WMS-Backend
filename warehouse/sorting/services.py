@@ -7,6 +7,7 @@ from extensions.error import BadRequestException, ConflictException, NotFoundExc
 from extensions.transaction import transactional
 from warehouse.common import require_non_negative_int, require_fields
 from warehouse.common.locks import lock_row
+from warehouse.common.validation import require_active_task
 from warehouse.asn.models import ASN
 from warehouse.asn.services import ASNService
 from .models import SortingTask, SortingTaskDetail, SortingTaskStatusLog, SortingBatch
@@ -40,7 +41,8 @@ class SortingTaskService:
         """
         task = SortingTaskService._get_instance(task_or_id)
         lock_row(task.asn)
-        return lock_row(task)
+        # 所属 ASN 已取消（任务被停用）→ 409 16088
+        return require_active_task(lock_row(task), 'Sorting Task')
 
     @staticmethod
     def _parse_datetime(value):
@@ -263,15 +265,18 @@ class SortingTaskService:
         """
         删除指定 SortingTask。规则：
         - 只能删 pending 的任务（400 16002）
-        - 所属 ASN 处于 received 时不能删（409 16087）：分拣任务一律关联 ASN，收货自动生成的任务与手工建的
-          在数据上无法区分；received 的 ASN 只能经分拣完成推进到 completed，删掉后 ASN 永远停在 received。
+        - 所属 ASN 处于 received、且这是它唯一启用中的分拣任务时不能删（409 16087）：received 的 ASN
+          只能经分拣完成推进到 completed，删掉最后一个任务后 ASN 永远停在 received。
+          同一 ASN 还有其他启用中的分拣任务（例如手工多建的重复任务）时可以删
           ASN 为 pending（收货前手工建的任务）/ completed / closed 时 pending 任务仍可删
         """
         # 先锁 ASN、再锁任务并重读：与并发的收货 / 取消 / 分拣开始串行
         task = SortingTaskService._lock(task_or_id)
         if task.status != 'pending':
             raise BadRequestException("Cannot delete a non-pending Sorting Task", 16002)
-        if task.asn is not None and task.asn.status == 'received':
+        if task.asn is not None and task.asn.status == 'received' and not SortingTask.query.filter(
+                SortingTask.asn_id == task.asn_id, SortingTask.id != task.id,
+                SortingTask.is_active.is_(True)).first():
             raise ConflictException(
                 f"Cannot delete a Sorting Task of a received ASN (id={task.asn_id}); "
                 f"the ASN can only be completed through sorting.",

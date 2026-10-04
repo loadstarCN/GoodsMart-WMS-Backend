@@ -992,12 +992,16 @@ class DNService:
         取消 DN 并释放 dn_stock 预占：
         - pending：等同 close
         - in_progress：拣货任务尚无任何批次 / 明细时允许取消，拣货任务一并停用
+        - picked 且一件都没拣出（修复前允许拣货 0 件完成，之后打包永远完成不了）：允许取消，
+          拣货 / 打包任务一并停用；预占已在拣货完成时释放，没有库存要回滚
         - 其它状态：拣货已经发生，409
         """
         # 先锁 DN 行并重读状态，再查拣货任务：拣货批次追加 / 完成同样先锁 DN，三者串行
         dn = lock_row(DNService._get_instance(dn_or_id))
         if dn.status == 'pending':
             return DNService.close_dn(dn)
+        if dn.status == 'picked':
+            return DNService._cancel_picked_nothing(dn)
         if dn.status != 'in_progress':
             raise ConflictException(f"Cannot cancel a DN in '{dn.status}' status.", 16052)
 
@@ -1020,6 +1024,27 @@ class DNService:
         for detail in dn.details:
             InventoryService.update_and_calculate_dn_stock(detail.goods_id, dn.warehouse_id)
 
+        return dn
+
+    @staticmethod
+    def _cancel_picked_nothing(dn: DN) -> DN:
+        """cancel_dn 的 picked 分支（调用方已锁 DN）：只有一件都没拣出、打包也没开始时允许"""
+        from warehouse.packing.models import PackingTask
+        from warehouse.picking.models import PickingTask
+        if any((detail.picked_quantity or 0) > 0 for detail in dn.details):
+            raise ConflictException("Cannot cancel a DN whose picking has already started.", 16053)
+        packing_tasks = PackingTask.query.filter(
+            PackingTask.dn_id == dn.id, PackingTask.is_active.is_(True)).all()
+        if any(task.status != 'pending' or task.batches for task in packing_tasks):
+            raise ConflictException("Cannot cancel a DN whose packing has already started.", 16053)
+        picking_tasks = PickingTask.query.filter(
+            PickingTask.dn_id == dn.id, PickingTask.is_active.is_(True)).all()
+        for task in [*picking_tasks, *packing_tasks]:
+            task.is_active = False
+            db.session.add(task)
+        dn = DNService._update_dn_status(dn, "closed")
+        for detail in dn.details:
+            InventoryService.update_and_calculate_dn_stock(detail.goods_id, dn.warehouse_id)
         return dn
 
     @staticmethod

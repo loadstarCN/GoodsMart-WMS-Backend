@@ -11,6 +11,7 @@ from .models import (
 
 from warehouse.common import require_positive_int, require_bulk_list
 from warehouse.common.locks import lock_row
+from warehouse.common.validation import require_active_task
 from warehouse.dn.services import DNService, pick_fields, parse_datetime_value
 from dateutil.relativedelta import relativedelta
 from sqlalchemy import and_, func, case, extract
@@ -41,7 +42,8 @@ class PackingTaskService:
         """
         task = PackingTaskService._get_instance(task_or_id)
         lock_row(task.dn)
-        return lock_row(task)
+        # 所属 DN 已取消（任务被停用）→ 409 16088
+        return require_active_task(lock_row(task), 'Packing Task')
 
 
     @staticmethod
