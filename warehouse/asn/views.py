@@ -6,6 +6,7 @@ from system.third_party.utils import get_api_key_company_id
 from warehouse.common import (
     require_actor_user_id,
     warehouse_required, add_warehouse_filter, require_warehouse_scope, get_warehouse_owned, require_fields,
+    scoped_cache_key,
 )
 from .models import ASN
 from .schemas import (
@@ -276,7 +277,7 @@ class ASNMonthlyStats(Resource):
     @permission_required(["all_access","company_all_access","asn_read"])
     @warehouse_required()
     @api_ns.expect(asn_monthly_stats_parser)
-    @cache.cached(timeout=60, query_string=True)
+    @cache.cached(timeout=60, make_cache_key=scoped_cache_key)
     def get(self):
         # 解析请求参数
         args = asn_monthly_stats_parser.parse_args()
@@ -302,7 +303,7 @@ class ASNStatusOverviewStats(Resource):
     """
     @permission_required(["all_access","company_all_access","asn_read"])
     @warehouse_required()
-    @cache.cached(timeout=60, query_string=True)
+    @cache.cached(timeout=60, make_cache_key=scoped_cache_key)
     def get(self):
         # 解析请求参数
         args = asn_monthly_stats_parser.parse_args()

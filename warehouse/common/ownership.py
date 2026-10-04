@@ -70,6 +70,32 @@ def get_warehouse_owned(model, object_id, warehouse_attr='warehouse_id', what=No
     return obj
 
 
+def require_company_goods(goods_id, company_id):
+    """请求体里的商品必须属于单据仓库所在公司（否则响应会回显别家公司的商品资料）"""
+    from warehouse.goods.models import Goods
+    goods = db.session.get(Goods, goods_id) if goods_id is not None else None
+    if not goods:
+        raise NotFoundException(f"Goods with id {goods_id} not found", 13001)
+    if goods.company_id != company_id:
+        raise ForbiddenException("Permission denied: goods belongs to another company", 12001)
+    return goods.id
+
+
+def require_source_api_key(api_key_id, company_id):
+    """单据的来源 API Key（定向 Webhook 推送目标）必须属于单据所在公司。
+
+    视图层已在 JWT 路径下把 api_key_id 置空；这里兜底，防止任何入口把别家公司的 Key
+    记成来源、让别家系统收到带合法签名的事件。未绑定公司的平台级 Key 不受限。
+    """
+    if api_key_id is None:
+        return None
+    from system.third_party.models import APIKey
+    api_key = db.session.get(APIKey, api_key_id)
+    if not api_key or (api_key.company_id is not None and api_key.company_id != company_id):
+        raise ForbiddenException("Permission denied: API key belongs to another company", 12001)
+    return api_key_id
+
+
 def require_same_warehouse(expected_warehouse_id, actual_warehouse_id, what='record'):
     """请求体里的外键（库位 / 单据）必须与主单据同仓库"""
     if expected_warehouse_id != actual_warehouse_id:

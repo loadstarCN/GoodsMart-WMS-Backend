@@ -67,6 +67,8 @@ class DeliveryTaskList(Resource):
     def post(self):
         """
         Create a new Delivery (the DN must be accessible; status is always pending)
+        - Only one unfinished (pending / in_progress) delivery task per DN → 409 16090 {delivery_task_id, status}
+        - DN already shipped → 409 16065
         """
         data = api_ns.payload
         if not isinstance(data, dict):
@@ -97,6 +99,7 @@ class DeliveryTaskDetailView(Resource):
     def put(self, task_id):
         """
         Update a specific Delivery (dn_id / status / is_active are not editable)
+        - Export DN: only the current delivery task can be updated → 409 16091 {delivery_task_id, current_status}
         """
         task = _owned_task(task_id)
         data = api_ns.payload
@@ -146,7 +149,10 @@ class DeliveryTaskTracking(Resource):
         Save the tracking (AWB) number / carrier before completing the delivery.
         - Allowed while the task is pending / in_progress; shipped → 409 16065
         - Issued customs documents are not voided; re-issue them to print the AWB (new version)
-        - While the DN has an active carrier shipment only its tracking number is accepted (409 16078)
+        - While the DN has an active carrier shipment only its tracking number (spaces / hyphens ignored; stored as
+          the shipment's own spelling) and carrier are accepted (409 16078)
+        - A tracking number of a cancelled carrier shipment of this DN → 409 16078 (details.status = cancelled)
+        - Export DN: only the current delivery task → 409 16091 {delivery_task_id, current_status}
         """
         task = _owned_task(task_id)
         return DeliveryTaskService.save_tracking(task, api_ns.payload)
@@ -169,9 +175,13 @@ class DeliveryTaskComplete(Resource):
         - Export DN, checked against the saved data before anything is written:
           no current CI / PL → 409 16069 {missing_documents: [...], outdated: false};
           documents out of date → 409 16069 {missing_documents: [], outdated: true}
-        - Export DN whose current CI prints an AWB: a different tracking number → 409 16080
-          {document_tracking_number, tracking_number} (save the tracking number and issue the documents again);
-          when the CI has no AWB the given tracking number is saved as before
+        - Export DN whose current CI prints an AWB: the tracking number after completion (the given one, else the
+          saved one) differs → 409 16080 {document_tracking_number, tracking_number} (save the tracking number and
+          issue the documents again); when the CI has no AWB the given tracking number is saved as before
+        - Export DN whose current CI prints a carrier: a different carrier_id → 409 16092
+          {document_carrier, document_carrier_id, carrier_id}
+        - Export DN: only the current delivery task can be completed → 409 16091 {delivery_task_id, current_status}
+        - A tracking number of a cancelled carrier shipment of this DN → 409 16078 (details.status = cancelled)
         """
         data = api_ns.payload
         operator_id = require_actor_user_id()

@@ -49,6 +49,8 @@ adjustment_fields = {
     'id': fields.Integer(readOnly=True, description='Inventory Adjustment ID'),
     'warehouse_id': fields.Integer(required=True, description='ID of the associated warehouse'),
     'adjustment_reason': fields.String(description='Reason for adjustment'),
+    # 只读：仅由「从盘点单生成调整单」写入，手工创建 / 存量调整单为 null
+    'cyclecount_id': fields.Integer(readOnly=True, description='Source CycleCountTask ID (null if not generated from a cycle count)'),
     'status': fields.String(
         enum=Adjustment.AdjustmentStatuses,
         description='Adjustment status (pending, completed)',

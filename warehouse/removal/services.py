@@ -15,6 +15,16 @@ class RemovalService:
     related to RemovalRecord.
     """
 
+    # 对外下架接口（/removal/、/removal/bulk）允许的 reason。
+    # 覆盖 Web（damaged / returned / transfer / picked / expired / lost / other）与 APP（return / damage / transfer）
+    # 实际传的值；这些下架的货一律进 sorted_stock 待上架。
+    # 'picking' 不在其中：拣货下架只由拣货完成在内部以 from_picking=True 记账（货走 picked_stock），
+    # 客户端传 'picking' 会让货既不进 sorted_stock 也不进 picked_stock，等于免审批报损。
+    PUBLIC_REASONS = frozenset({
+        'return', 'returned', 'damage', 'damaged', 'transfer', 'picked', 'expired', 'lost', 'other',
+    })
+    PICKING_REASON = 'picking'
+
     @staticmethod
     def list_removal_records(filters: dict):
         """
@@ -76,18 +86,30 @@ class RemovalService:
 
     @staticmethod
     @transactional
-    def create_removal_record(data: dict, created_by_id: int) -> RemovalRecord:
+    def create_removal_record(data: dict, created_by_id: int, *, from_picking: bool = False) -> RemovalRecord:
         """
         创建一条新的下架记录
 
         :param data: dict，包含 goods_id, location_id, quantity, reason, remark 等字段
+        :param from_picking: 仅拣货完成（PickingTaskService.complete_task）内部传 True：
+            reason 固定记为 'picking'，库存走 picking_removed（货由 dn_picked 计入 picked_stock）。
+            对外接口不传，reason 必须在 PUBLIC_REASONS 内，否则 400（16083）
         :return: 新创建的 RemovalRecord 实例
         """
-        require_fields(data, 'goods_id', 'location_id', 'quantity', 'reason')
+        if from_picking:
+            require_fields(data, 'goods_id', 'location_id', 'quantity')
+            reason = RemovalService.PICKING_REASON
+        else:
+            require_fields(data, 'goods_id', 'location_id', 'quantity', 'reason')
+            reason = data['reason']
+            if not isinstance(reason, str) or reason not in RemovalService.PUBLIC_REASONS:
+                raise BadRequestException(
+                    f"Invalid removal reason: {reason!r}. Allowed: {', '.join(sorted(RemovalService.PUBLIC_REASONS))}",
+                    16083, field='reason'
+                )
         goods_id = data['goods_id']
         location_id = data['location_id']
         quantity = require_positive_int(data['quantity'], 'quantity')
-        reason = data['reason']
         location = get_object_or_404(Location, location_id)
 
         # 持锁读取商品库位记录：找不到 404，库存不足 400，读改写期间其它事务不能插进来
@@ -116,7 +138,7 @@ class RemovalService:
         db.session.flush()
 
         #更新库存信息：拣货下架的货走 picked_stock（由拣货流程记账），其它原因的下架进入待上架区
-        if reason == 'picking':
+        if from_picking:
             InventoryService.picking_removed(goods_id, location.warehouse_id, quantity)
         else:
             InventoryService.removal_completed(goods_id, location.warehouse_id, quantity)

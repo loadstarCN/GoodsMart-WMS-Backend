@@ -24,7 +24,7 @@ EVENT_TYPES = [
     'goods.spec_updated',
 ]
 
-STATUS_TYPES = ['pending', 'sent', 'failed']
+STATUS_TYPES = ['pending', 'sending', 'sent', 'failed', 'superseded']
 
 # -----------------------------
 # 输出模型
@@ -38,6 +38,7 @@ webhook_event_model = api_ns.model('WebhookEvent', {
     'status': fields.String(description='状态', enum=STATUS_TYPES),
     'attempts': fields.Integer(description='已尝试次数'),
     'next_retry_at': fields.DateTime(description='下次重试时间'),
+    'lease_expires_at': fields.DateTime(description='推送租约到期时间（仅 sending 状态）'),
     'created_at': fields.DateTime(description='创建时间'),
     'sent_at': fields.DateTime(description='发送成功时间'),
     'last_error': fields.String(description='最后一次错误信息'),

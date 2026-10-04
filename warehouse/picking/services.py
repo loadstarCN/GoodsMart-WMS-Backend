@@ -1,6 +1,7 @@
 from extensions.db import *
 from extensions.error import BadRequestException, NotFoundException
 from warehouse.common import require_positive_int, require_bulk_list, lock_goods_location
+from warehouse.common.locks import lock_row
 from warehouse.dn.models import DN
 from warehouse.dn.services import DNService, pick_fields, parse_datetime_value
 from warehouse.location.models import Location
@@ -24,6 +25,16 @@ class PickingTaskService:
         if isinstance(task_or_id, int):
             return PickingTaskService.get_task(task_or_id)
         return task_or_id
+
+    @staticmethod
+    def _lock(task_or_id: int | PickingTask) -> PickingTask:
+        """
+        状态转换 / 批次增删 / 明细改量前调用：先锁 DN 行、再锁任务行（全系统统一的加锁顺序），
+        拿到锁后重读状态。并发的重复提交在调用方现有的状态检查处挡下，不再按内存里的旧状态重复扣库存。
+        """
+        task = PickingTaskService._get_instance(task_or_id)
+        lock_row(task.dn)
+        return lock_row(task)
 
     @staticmethod
     def list_tasks(filters: dict):
@@ -129,7 +140,7 @@ class PickingTaskService:
         """
         删除指定 PickingTask（仅当其 status 为 pending 时）
         """
-        task = PickingTaskService.get_task(task_id)
+        task = PickingTaskService._lock(task_id)
         if task.status != 'pending':
             raise BadRequestException("Cannot delete a non-pending Picking Task", 16002)
 
@@ -166,7 +177,8 @@ class PickingTaskService:
         传入不同的值直接 400（否则可以把明细挪到别的仓库的库位，complete 时跨仓扣库存）。
         增加的数量要同时通过计划量上限与库位库存校验。
         """
-        task = PickingTaskService.get_task(task_id)
+        # 先锁 DN、再锁任务并重读：与并发的批次追加 / 完成串行，计划量校验看到的是最新明细
+        task = PickingTaskService._lock(task_id)
         if task.status != 'in_progress':
             raise BadRequestException("Cannot update Picking Task Detail in a non-in-progress Picking Task", 16010)
 
@@ -203,7 +215,8 @@ class PickingTaskService:
         """
         删除指定的 PickingTaskDetail（仅当所属的 PickingTask 状态为 in_progress
         """
-        task = PickingTaskService.get_task(task_id)
+        # 先锁 DN、再锁任务：完成后明细已扣过库存，不能再删
+        task = PickingTaskService._lock(task_id)
         if task.status != 'in_progress':
             raise BadRequestException("Cannot delete Picking Task Detail from a non-in_progress Picking Task", 16011)
 
@@ -363,7 +376,9 @@ class PickingTaskService:
                 ]
             }
         """
-        task = PickingTaskService._get_instance(task_or_id)
+        # 先锁 DN、再锁任务并重读：并发追加的批次串行执行，下面「不超计划量」的校验
+        # 看到的是前一个请求已提交的明细，不会两个请求都通过
+        task = PickingTaskService._lock(task_or_id)
         if task.status != 'in_progress':
             raise BadRequestException("Cannot create batch in a non-in_progress Picking Task", 16012)
 
@@ -456,7 +471,8 @@ class PickingTaskService:
         - 仅当 PickingTask.status == 'in_progress' 时允许删除
         - 若下方已有明细 (PickingTaskDetail)，视业务决定是否禁止删除或自动删除
         """
-        task = PickingTaskService.get_task(task_id)
+        # 先锁 DN、再锁任务：完成后批次明细已扣过库存，不能再删
+        task = PickingTaskService._lock(task_id)
         if task.status != 'in_progress':
             raise BadRequestException("Cannot delete a batch in a non-in_progress Picking Task", 16014)
 
@@ -511,7 +527,7 @@ class PickingTaskService:
         """
         将PickingTask从 pending 切换到 in_progress
         """
-        task = PickingTaskService._get_instance(task_or_id)
+        task = PickingTaskService._lock(task_or_id)
         if task.status != 'pending':
             raise BadRequestException("Cannot process a non-pending Picking Task", 16007)
 
@@ -523,7 +539,9 @@ class PickingTaskService:
         """
         将PickingTask从 in_progress 切换到 completed，并更新库存
         """
-        task = PickingTaskService._get_instance(task_or_id)
+        # 先锁 DN、再锁任务并重读状态：并发的重复完成在这里挡下，
+        # 不会再扣一遍库位库存、吃掉别的 DN 的预占、多建一个打包任务
+        task = PickingTaskService._lock(task_or_id)
         if task.status != 'in_progress':
             raise BadRequestException("Cannot complete a non-in_progress Picking Task", 16008)
 
@@ -546,14 +564,13 @@ class PickingTaskService:
         task = PickingTaskService._update_task_status(task, 'completed', operator_id)
 
         for detail in task.task_details:
-            # 创建下架记录
+            # 创建下架记录：走 service 内部参数 from_picking（对外接口不接受 reason='picking'）
             RemovalService.create_removal_record({
                 'goods_id': detail.goods_id,
                 'location_id': detail.location_id,
                 'quantity': detail.picked_quantity,
-                'reason': 'picking',
                 'remark': f'DN Picking: {task.dn.order_number}',
-            }, operator_id)
+            }, operator_id, from_picking=True)
 
         # 更新DN状态
         DNService.picking_dn(task.dn)

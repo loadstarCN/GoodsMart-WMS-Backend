@@ -138,6 +138,9 @@ def _enforce_api_key_warehouse_access():
     company = db.session.get(Company, api_company_id)
     warehouses = company.warehouses if company else []
     g.accessible_warehouses = [w for w in warehouses if w.is_active]
+    # 公司没有启用中的仓库：与 staff 一致直接拒绝（空列表会让 add_warehouse_filter 不加过滤）
+    if not g.accessible_warehouses:
+        raise ForbiddenException("API key's company has no accessible warehouses", 12001)
     if getattr(g, "warehouse_id", None) and g.warehouse not in g.accessible_warehouses:
         raise ForbiddenException("Warehouse ID is not accessible to this API key", 12001)
 

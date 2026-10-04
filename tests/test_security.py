@@ -208,9 +208,10 @@ def test_picking_removal_does_not_inflate_sorted_stock(client):
         before = get_inventory_by_goods_id_and_warehouse_id(goods.id, warehouse_id)
         sorted_before, onhand_before, total_before = before.sorted_stock, before.onhand_stock, before.total_stock
 
+        # 拣货下架只能由拣货流程以 from_picking=True 内部调用（B-56）
         RemovalService.create_removal_record({
-            'goods_id': goods.id, 'location_id': location.id, 'quantity': 5, 'reason': 'picking',
-        }, admin_id)
+            'goods_id': goods.id, 'location_id': location.id, 'quantity': 5,
+        }, admin_id, from_picking=True)
 
         after = get_inventory_by_goods_id_and_warehouse_id(goods.id, warehouse_id)
         assert after.sorted_stock == sorted_before

@@ -5,11 +5,12 @@ from sqlalchemy.orm import selectinload
 from extensions.db import *
 from extensions.error import BadRequestException, ConflictException, ForbiddenException, NotFoundException
 from extensions.transaction import transactional
-from warehouse.common import require_positive_int, require_fields
+from warehouse.common import require_positive_int, require_fields, require_source_api_key
 from warehouse.carrier.models import Carrier
 from warehouse.goods.models import Goods
 from warehouse.goods.services import GoodsService, goods_spec_snapshot
 from warehouse.inventory.services import InventoryService
+from warehouse.common.locks import lock_row
 from warehouse.supplier.models import Supplier
 from warehouse.warehouse.models import Warehouse
 from system.webhook.services import emit as webhook_emit
@@ -121,6 +122,19 @@ class ASNService:
         return payload
 
     @staticmethod
+    def _assert_no_duplicate_goods(asn_id: int):
+        """同一 ASN 内同一商品只能有一行明细（与 DN 一致）。须在明细写入 flush 之后调用。"""
+        duplicated = (
+            db.session.query(ASNDetail.goods_id)
+            .filter(ASNDetail.asn_id == asn_id)
+            .group_by(ASNDetail.goods_id)
+            .having(func.count(ASNDetail.id) > 1)
+            .first()
+        )
+        if duplicated:
+            raise BadRequestException(f"Duplicate goods_id: {duplicated[0]}", 16025)
+
+    @staticmethod
     def _ensure_inventory(goods_id: int, warehouse_id: int):
         """明细涉及的商品在该仓库必须有库存记录，没有则创建"""
         try:
@@ -186,8 +200,15 @@ class ASNService:
         )
         totals = {goods_id: (sorted_qty, damage_qty) for goods_id, sorted_qty, damage_qty in rows}
 
-        for asn_detail in asn.details:
-            sorted_quantity, damage_quantity = totals.get(asn_detail.goods_id, (0, 0))
+        # 分拣量按商品汇总，只记到该商品的第一行明细上：新单据已禁止同一商品多行（16025），
+        # 存量单据若有重复行，其余行记 0，避免 asn_completed 逐行累加时重复入账。
+        seen_goods = set()
+        for asn_detail in sorted(asn.details, key=lambda d: d.id):
+            if asn_detail.goods_id in seen_goods:
+                sorted_quantity, damage_quantity = 0, 0
+            else:
+                seen_goods.add(asn_detail.goods_id)
+                sorted_quantity, damage_quantity = totals.get(asn_detail.goods_id, (0, 0))
             asn_detail.sorted_quantity = sorted_quantity
             asn_detail.damage_quantity = damage_quantity
             asn_detail.actual_quantity = sorted_quantity + damage_quantity
@@ -312,7 +333,7 @@ class ASNService:
             order_number=data.get('order_number'),
             remark=data.get('remark'),
             created_by=created_by_id,
-            api_key_id=data.get('api_key_id'),
+            api_key_id=require_source_api_key(data.get('api_key_id'), company_id),
         )
         db.session.add(new_asn)
         db.session.flush()
@@ -332,6 +353,7 @@ class ASNService:
             # 重新计算库存
             InventoryService.update_and_calculate_asn_stock(new_detail.goods_id, new_asn.warehouse_id)
 
+        ASNService._assert_no_duplicate_goods(new_asn.id)
         # db.session.commit()
         return new_asn
 
@@ -347,7 +369,7 @@ class ASNService:
         :return: 更新后的 ASN 对象
         :raises: NotFound 如果该 ASN 不存在
         """
-        asn = ASNService._get_instance(asn_or_id)
+        asn = lock_row(ASNService._get_instance(asn_or_id))
         if asn.status != 'pending':
             raise BadRequestException("Cannot update a non-pending ASN", 16001)
 
@@ -382,7 +404,8 @@ class ASNService:
         """
         删除指定的 ASN（仅当其状态为 pending 时允许删除）。
         """
-        asn = ASNService._get_instance(asn_or_id)
+        # 先锁 ASN 行并重读：与并发的 receive / cancel 串行
+        asn = lock_row(ASNService._get_instance(asn_or_id))
         if asn.status != 'pending':
             raise BadRequestException("Cannot delete a non-pending ASN", 16002)
 
@@ -401,7 +424,7 @@ class ASNService:
         """
         将指定 ASN 标记为非活动状态。
         """
-        asn = ASNService._get_instance(asn_or_id)
+        asn = lock_row(ASNService._get_instance(asn_or_id))
         asn.is_active = False
         db.session.add(asn)
         db.session.flush()
@@ -438,7 +461,7 @@ class ASNService:
         """
         在指定 ASN 下创建一条 ASNDetail（仅当 ASN 状态为 pending 时）
         """
-        asn = ASNService._get_instance(asn_or_id)
+        asn = lock_row(ASNService._get_instance(asn_or_id))
         if asn.status != 'pending':
             raise BadRequestException("Cannot add details to a non-pending ASN", 16003)
 
@@ -446,6 +469,7 @@ class ASNService:
         new_detail = ASNDetail(asn_id=asn.id, created_by=created_by_id, **payload)
         db.session.add(new_detail)
         db.session.flush()
+        ASNService._assert_no_duplicate_goods(asn.id)
 
         # 更新库存信息
         ASNService._ensure_inventory(new_detail.goods_id, asn.warehouse_id)
@@ -460,7 +484,7 @@ class ASNService:
         Update a single ASNDetail record for the specified ASN.
         只接受 DETAIL_WRITABLE_FIELDS（以及换商品用的 goods_id / goods_code）。
         """
-        asn = ASNService._get_instance(asn_or_id)
+        asn = lock_row(ASNService._get_instance(asn_or_id))
         if asn.status != 'pending':
             raise BadRequestException("Cannot update details in a non-pending ASN", 16004)
 
@@ -473,6 +497,7 @@ class ASNService:
 
         db.session.add(detail)
         db.session.flush()
+        ASNService._assert_no_duplicate_goods(asn.id)
 
         # 换了商品时，新旧商品的 ASN 库存都要重算
         if detail.goods_id != old_goods_id:
@@ -493,7 +518,7 @@ class ASNService:
         2. 没有detail_id则创建新记录
         3. 原有detail不在新数据中的则删除
         """
-        asn = ASNService._get_instance(asn_or_id)
+        asn = lock_row(ASNService._get_instance(asn_or_id))
 
         if asn.status != 'pending':
             raise BadRequestException("Cannot sync details in non-pending ASN", 16006)
@@ -534,6 +559,7 @@ class ASNService:
                 db.session.delete(detail)
 
         db.session.flush()
+        ASNService._assert_no_duplicate_goods(asn.id)
         db.session.expire(asn, ['details'])
         latest_details = asn.details # 重新加载后的明细列表
 
@@ -551,7 +577,7 @@ class ASNService:
         """
         删除指定的 ASNDetail（仅当其所属 ASN 状态为 pending 时）
         """
-        asn = ASNService._get_instance(asn_or_id)
+        asn = lock_row(ASNService._get_instance(asn_or_id))
         if asn.status != 'pending':
             raise BadRequestException("Cannot delete details from a non-pending ASN", 16005)
 
@@ -575,7 +601,8 @@ class ASNService:
         参数可以是 ASN 的 id（int）或 ASN 实例。
         如果找不到 ASN，则抛出 NotFound 异常。
         """
-        asn = ASNService._get_instance(asn_or_id)
+        # 先锁 ASN 行并重读状态：并发的重复收货在下面的状态检查处挡下（不会重复记 received_stock / 建两个分拣任务）
+        asn = lock_row(ASNService._get_instance(asn_or_id))
 
         if asn.status != 'pending':
             raise BadRequestException("Cannot receive a non-pending ASN", 16021)
@@ -618,7 +645,8 @@ class ASNService:
         参数可以是 ASN 的 id（int）或 ASN 实例。
         如果找不到 ASN，则抛出 NotFound 异常。
         """
-        asn = ASNService._get_instance(asn_or_id)
+        # 锁 ASN 行并重读状态（分拣完成已先锁过 ASN，同一事务重复加锁无副作用）
+        asn = lock_row(ASNService._get_instance(asn_or_id))
 
         # 判断是否是received状态
         if asn.status != 'received':
@@ -657,7 +685,8 @@ class ASNService:
         参数可以是 ASN 的 id（int）或 ASN 实例。
         如果找不到 ASN，则抛出 NotFound 异常。
         """
-        asn = ASNService._get_instance(asn_or_id)
+        # 先锁 ASN 行并重读状态：与并发的 receive / cancel 串行
+        asn = lock_row(ASNService._get_instance(asn_or_id))
 
         # 判断是否为pending状态
         if asn.status != 'pending':
@@ -683,7 +712,8 @@ class ASNService:
         """
         from warehouse.sorting.models import SortingTask
 
-        asn = ASNService._get_instance(asn_or_id)
+        # 先锁 ASN 行并重读状态，再查分拣任务：分拣批次追加 / 完成同样先锁 ASN，三者串行
+        asn = lock_row(ASNService._get_instance(asn_or_id))
         if asn.status == 'pending':
             return ASNService.close_asn(asn)
         if asn.status != 'received':

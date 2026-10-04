@@ -6,9 +6,11 @@ from extensions.transaction import transactional
 from warehouse.common import (
     require_same_warehouse, require_positive_int, require_bulk_list, require_fields, lock_goods_location,
 )
+from warehouse.common.locks import lock_row
 from warehouse.goods.models import Goods, GoodsLocation
 from warehouse.inventory.services import InventoryService
 from warehouse.location.models import Location
+from warehouse.location.services import LocationService
 from .models import TransferRecord
 
 
@@ -109,6 +111,8 @@ class TransferService:
         to_location = get_object_or_404(Location, to_location_id)
         # 移库只在同一仓库内进行，跨仓库会让 Inventory 记账落到错误的仓库
         require_same_warehouse(from_location.warehouse_id, to_location.warehouse_id, 'to_location')
+        # 先给目标库位行加共享锁再判断启用状态（之后才锁库位库存行）：与并发的停用串行，停用库位不能再移入（400 16085）
+        LocationService.require_active_location(lock_row(to_location, shared=True), 'to_location_id')
 
         # 按库位 id 顺序加锁，避免 A→B 与 B→A 并发时互相等待形成死锁
         locked = {}

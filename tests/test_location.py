@@ -47,7 +47,8 @@ def test_get_location_details(client, access_token):
 
 def test_update_location(client, access_token):
     with client.application.app_context():
-        location = get_location()
+        # 用没有存货的库位（LOC003）：有货的库位不能停用（B-55，见 test_inventory_guards.py）
+        location = get_location_by_id(3)
         response = client.put(f'/location/{location.id}', headers={
             'Authorization': f'Bearer {access_token}'
         }, json={

@@ -99,16 +99,20 @@ def test_create_asn_detail(client, access_token):
     """测试创建 ASNDetail (POST /asn/<asn_id>/details/)"""
     with client.application.app_context():
         asn = get_asn()
-        goods = get_goods()
         assert asn is not None
-        assert goods is not None
+        # 同一 ASN 内同一商品只能一行（16025，见 test_asn_duplicate_goods.py），新建一个单上还没有的本公司商品
+        goods = Goods(code='ASN-NEW-DETAIL', name='New detail goods', unit='pcs',
+                      company_id=asn.warehouse.company_id, is_active=True, created_by=get_admin_user().id)
+        db.session.add(goods)
+        db.session.commit()
+        asn_id, goods_id = asn.id, goods.id
 
     response = client.post(
-        f'/asn/{asn.id}/details/',
+        f'/asn/{asn_id}/details/',
         headers={'Authorization': f'Bearer {access_token}'},
         json={
-            "asn_id": asn.id,
-            "goods_id": goods.id,
+            "asn_id": asn_id,
+            "goods_id": goods_id,
             "quantity": 5,
             "actual_quantity": 2,
             "damage_quantity": 1,
@@ -118,7 +122,7 @@ def test_create_asn_detail(client, access_token):
     assert response.status_code == 201
     data = response.get_json()
     assert data['quantity'] == 5
-    assert data['asn_id'] == asn.id
+    assert data['asn_id'] == asn_id
     # actual / damage_quantity 是分拣完成时聚合出的过程量，客户端传了也被忽略（B-12）
     assert data['actual_quantity'] == 0
     assert data['damage_quantity'] == 0

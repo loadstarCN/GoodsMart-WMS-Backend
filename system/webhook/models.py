@@ -25,10 +25,15 @@ class WebhookEvent(db.Model):
     # 如 goods.spec_updated 用 goods:<id>。空值 = 不合并（单据类事件）
     dedupe_key = db.Column(db.String(100), nullable=True, index=True)
 
-    # pending / sent / failed
+    # pending：待发送 / sending：推送进程已领取、正在发送（带租约）/ sent：已送达 /
+    # failed：重试次数用完或没有回调地址 / superseded：作废，不再发送
+    # （同一对象有了更新的事件，或 Key 已停用 / 已取消订阅；原因见 last_error）
     status = db.Column(db.String(20), nullable=False, default='pending', index=True)
+    # 已尝试次数：领取发送时就 +1 并提交，进程在发送中途被杀也会计数，不会无限重来
     attempts = db.Column(db.Integer, nullable=False, default=0)
     next_retry_at = db.Column(db.DateTime)
+    # sending 租约到期时间：到期仍是 sending（进程被杀 / 卡死）就视为可重新领取；其他状态为空
+    lease_expires_at = db.Column(db.DateTime, nullable=True)
 
     created_at = db.Column(db.DateTime, default=datetime.now)
     sent_at = db.Column(db.DateTime)

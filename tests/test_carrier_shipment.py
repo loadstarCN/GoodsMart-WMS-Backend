@@ -1257,38 +1257,36 @@ def test_tracking_number_locked_to_active_shipment(client, access_token, fedex):
     dn_id, task_id = _ready(client, access_token)
     assert _create(client, access_token, dn_id).status_code == 201
 
-    # 保存运单号：别的号码 / 清空 → 409 16078；同一号码（空白不同）照常
+    # 保存运单号：别的号码 / 清空 → 409 16078；同一号码（空格 / 连字符不同）照常，入库存运单上的标准写法
     for value in ('999999999999', None, ''):
         response = client.put(f'/delivery/{task_id}/tracking', json={'tracking_number': value},
                               headers=_h(access_token))
         assert response.status_code == 409 and response.get_json()['code'] == 16078, value
         assert response.get_json()['details']['tracking_number'] == '794600000001'
-    same = client.put(f'/delivery/{task_id}/tracking', json={'tracking_number': '7946 0000 0001'},
-                      headers=_h(access_token))
-    assert same.status_code == 200, same.get_json()
+    for value in ('7946 0000 0001', '7946-0000-0001'):
+        same = client.put(f'/delivery/{task_id}/tracking', json={'tracking_number': value},
+                          headers=_h(access_token))
+        assert same.status_code == 200, same.get_json()
+        assert same.get_json()['tracking_number'] == '794600000001'
 
-    # 修改发货任务：别的号码 409；空值视为不改
+    # 修改发货任务：别的号码 409；空值视为不改；分组写法同样存成标准写法
     response = client.put(f'/delivery/{task_id}', json={'tracking_number': 'OTHER-1'}, headers=_h(access_token))
     assert response.status_code == 409 and response.get_json()['code'] == 16078
     response = client.put(f'/delivery/{task_id}', json={'tracking_number': None, 'remark': 'x'},
                           headers=_h(access_token))
-    assert response.status_code == 200 and response.get_json()['tracking_number'] == '7946 0000 0001'
+    assert response.status_code == 200 and response.get_json()['tracking_number'] == '794600000001'
+    response = client.put(f'/delivery/{task_id}', json={'tracking_number': '7946 0000 0001'},
+                          headers=_h(access_token))
+    assert response.status_code == 200 and response.get_json()['tracking_number'] == '794600000001'
+    # 存的仍是 CI 上印的标准写法：单证不过期
+    assert client.get(f'/dn/{dn_id}/customs', headers=_h(access_token)).get_json()['documents_outdated'] is False
 
-    # 完成发货：别的号码 409；相同或不传照常
+    # 完成发货：别的号码 409；相同（分组写法也算）或不传照常
     response = _ship(client, access_token, task_id, tracking_number='OTHER-2')
     assert response.status_code == 409 and response.get_json()['code'] == 16078
     with client.application.app_context():
         assert db.session.get(DeliveryTask, task_id).status == 'in_progress'
-    # 上面存成了带空格的写法：与 CI 上印的 AWB 不再一字不差 → 单证过期，完成发货 409 16069
-    response = client.put(f'/delivery/{task_id}/complete/', json={'tracking_number': '794600000001'},
-                          headers=_h(access_token))
-    assert response.status_code == 409 and response.get_json()['code'] == 16069
-    assert response.get_json()['details'] == {'missing_documents': [], 'outdated': True}
-    # 存回与 CI 一致的号码后照常
-    same = client.put(f'/delivery/{task_id}/tracking', json={'tracking_number': '794600000001'},
-                      headers=_h(access_token))
-    assert same.status_code == 200, same.get_json()
-    response = client.put(f'/delivery/{task_id}/complete/', json={'tracking_number': '794600000001'},
+    response = client.put(f'/delivery/{task_id}/complete/', json={'tracking_number': '7946 0000 0001'},
                           headers=_h(access_token))
     assert response.status_code == 200, response.get_json()
     assert response.get_json()['tracking_number'] == '794600000001'
@@ -1515,9 +1513,13 @@ def test_delivery_tasks_and_customs_locked_while_shipment_active(client, access_
     assert response.status_code == 409 and response.get_json()['code'] == 16076
     assert response.get_json()['details']['carrier_shipment']['tracking_number'] == '794600000001'
 
-    # 取消后都放开
+    # 取消后都放开（一张 DN 仍只允许一条未完成的发货任务：先删掉原任务才能新建，否则 16090）
     assert _cancel(client, access_token, dn_id).status_code == 200
     response = client.put(f'/dn/{dn_id}/customs', json=_customs(freight_charge=9000), headers=_h(access_token))
     assert response.status_code == 200, response.get_json()
+    response = client.post('/delivery/', json=_task_body(client, dn_id), headers=_h(access_token))
+    assert response.status_code == 409 and response.get_json()['code'] == 16090
+    assert response.get_json()['details'] == {'delivery_task_id': task_id, 'status': 'pending'}
+    assert client.delete(f'/delivery/{task_id}', headers=_h(access_token)).status_code == 200
     response = client.post('/delivery/', json=_task_body(client, dn_id), headers=_h(access_token))
     assert response.status_code == 201, response.get_json()

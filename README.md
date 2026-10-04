@@ -422,10 +422,18 @@ the issued documents (`void_reason: packages_changed`).
   `details {missing_documents: [...], outdated: false}`; documents out of date (packages / customs data /
   tracking number / exporter profile changed without re-issuing) → 409 `16069`
   `details {missing_documents: [], outdated: true}`.
-- If the current CI prints an AWB and the request carries a different tracking number (ignoring whitespace)
-  → 409 `16080` `details {document_tracking_number, tracking_number}`: save the tracking number and issue the
-  documents again first. The same number keeps the saved value. When the CI has no AWB, the given tracking number
-  is saved as before.
+- If the current CI prints an AWB and the tracking number the task would ship with (the given one, else the saved
+  one) differs (ignoring spaces / hyphens) → 409 `16080` `details {document_tracking_number, tracking_number}`: save
+  the tracking number and issue the documents again first. A matching number is stored exactly as printed on the CI.
+  When the CI has no AWB, the given tracking number is saved as before.
+- If the current CI prints a carrier and the request's `carrier_id` would change it (`null` falls back to the DN's
+  carrier, as the CI does) → 409 `16092` `details {document_carrier, document_carrier_id, carrier_id}`.
+- A DN has at most one unfinished (`pending` / `in_progress`) active delivery task: `POST /warehouse/delivery/` for a
+  DN that already has one → 409 `16090` `details {delivery_task_id, status}`; for a shipped DN → 409 `16065`. When
+  packing completes and a task was already created by hand, that task is reused instead of creating a second one.
+- Export DNs: documents and carrier shipments follow the current delivery task (the newest active one); completing,
+  saving the tracking number of, or updating another task → 409 `16091` `details {delivery_task_id, current_status}`.
+- `dn.delivered` carries the tracking number of the task that was completed.
 - After the DN is shipped (`delivered` / `completed`) the customs snapshot, packages and documents are locked → 409 `16065`.
 - `dn.delivered` for export DNs additionally carries (domestic payloads are unchanged):
 
@@ -525,9 +533,13 @@ Each format's image type (`PDF` / `PNG` / `ZPLII` / `EPL2`) and stock can be ove
   empty `postalCode`; US / CA / PR require a 2-letter state code.
 - While a shipment is active the delivery task keeps its tracking number: completing the delivery, saving the
   tracking number or updating the task with a different number → 409 `16078` (cancel the shipment first; an empty
-  value on completion / update means "unchanged"). A `carrier_id` on completion / update whose carrier (by code)
-  differs from the shipment's → 409 `16078` as well, with the requested `carrier_id` added to `details`;
-  `carrier_id: null` means "unchanged". While a request is pending or its result is unclear, saving a
+  value on completion / update means "unchanged"). Numbers are compared ignoring spaces / hyphens and a matching one
+  is stored as the shipment's own spelling. A `carrier_id` on completion / update / saving the tracking number whose
+  carrier (by code) differs from the shipment's → 409 `16078` as well, with the requested `carrier_id` added to
+  `details`; `carrier_id: null` means "unchanged". The tracking number of a cancelled (or compensation-cancelled)
+  shipment of the DN cannot be saved or shipped with any more → 409 `16078`
+  `details {tracking_number: null, cancelled_tracking_number, carrier, status: "cancelled"}`.
+  While a request is pending or its result is unclear, saving a
   tracking number or updating the task with one → 409 `16079` (so that nobody books a second shipment by hand;
   clearing is allowed).
 - While a shipment is pending, active or unclear: adding or deleting a delivery task of the DN → 409 `16078` (a new
@@ -605,7 +617,7 @@ Allowed until the DN is shipped (409 `16065` afterwards; 409 `16075` without an 
 `PUT /ship/v1/shipments/cancel` (`DELETE_ALL_PACKAGES`; the ship-from country is the `sender_country` stored when the
 shipment was created — records from before the migration derive it the same way as creation); if FedEx refuses →
 502 `16073` with the reason. On success the record is marked `cancelled`, the tracking number on the delivery task is
-cleared, the label is voided (`void_reason: shipment_cancelled`) and the CI / PL are re-issued without the AWB
+cleared (compared ignoring spaces / hyphens), the label is voided (`void_reason: shipment_cancelled`) and the CI / PL are re-issued without the AWB
 (voided if they can no longer be issued). Only the FedEx credentials are required: a shipment can still be cancelled
 after its company was removed from `FEDEX_ALLOWED_COMPANY_IDS`.
 
@@ -690,7 +702,7 @@ stdout_logfile=/var/log/wms-api.out.log
 | Inventory | 15000-15999 | 400 | Stock-related errors |
 | State | 16000-16999 | 400 | State transition errors |
 
-Business codes of the export-document features: `14019` export profile text too long, `14020` invalid country code, `16063` customs structure invalid, `16064` customs line goods code not in the DN / duplicated, `16065` shipped — customs data / packages / documents locked (409), `16066` invalid packages, `16067` packages cannot be edited in the current DN status (409), `16068` documents cannot be issued yet (409, `details.problems`), `16069` documents missing or out of date before shipping (409, `details {missing_documents, outdated}`), `16070` not an export DN (409), `16071` document not found (404). Carrier shipments (FedEx): `16072` preconditions not met (409, `details.blockers`), `16073` FedEx returned an error (502, `details.errors` / `transaction_id`), `16074` FedEx timed out (504), `16075` no active carrier shipment (409), `16076` packages / customs data cannot be changed while a carrier shipment is pending, active or unclear (409), `16077` invalid `label_format` (400), `16078` tracking number / carrier differs from the active carrier shipment, or a delivery task is added / deleted while a carrier shipment exists (409), `16079` a carrier shipment request is pending or its result is unclear (409, `details.unresolved`). Delivery completion: `16080` tracking number differs from the AWB printed on the current CI (409, `details {document_tracking_number, tracking_number}`). Errors may carry a structured `details` object.
+Business codes of the export-document features: `14019` export profile text too long, `14020` invalid country code, `16063` customs structure invalid, `16064` customs line goods code not in the DN / duplicated, `16065` shipped — customs data / packages / documents locked (409), `16066` invalid packages, `16067` packages cannot be edited in the current DN status (409), `16068` documents cannot be issued yet (409, `details.problems`), `16069` documents missing or out of date before shipping (409, `details {missing_documents, outdated}`), `16070` not an export DN (409), `16071` document not found (404). Carrier shipments (FedEx): `16072` preconditions not met (409, `details.blockers`), `16073` FedEx returned an error (502, `details.errors` / `transaction_id`), `16074` FedEx timed out (504), `16075` no active carrier shipment (409), `16076` packages / customs data cannot be changed while a carrier shipment is pending, active or unclear (409), `16077` invalid `label_format` (400), `16078` tracking number / carrier differs from the active carrier shipment, or a delivery task is added / deleted while a carrier shipment exists (409), `16079` a carrier shipment request is pending or its result is unclear (409, `details.unresolved`). Delivery completion: `16080` tracking number differs from the AWB printed on the current CI (409, `details {document_tracking_number, tracking_number}`), `16092` carrier differs from the one printed on the current CI (409, `details {document_carrier, document_carrier_id, carrier_id}`). Delivery tasks: `16090` the DN already has an unfinished delivery task (409, `details {delivery_task_id, status}`), `16091` export DN — not the current delivery task (409, `details {delivery_task_id, current_status}`). Errors may carry a structured `details` object.
 
 ## Related Projects
 

@@ -1,4 +1,6 @@
 """Webhook 事件推送日志 — 视图"""
+from datetime import datetime
+
 from flask_restx import Resource, abort
 from extensions import db
 from extensions.error import ForbiddenException
@@ -6,7 +8,7 @@ from system.common import permission_required, paginate
 from system.third_party.models import APIKey
 from system.third_party.views import _get_user_company_id, _is_super_admin
 from .models import WebhookEvent
-from .services import _send_event
+from .services import retry_event_now
 from .schemas import (
     api_ns,
     webhook_event_model,
@@ -95,21 +97,15 @@ class WebhookEventRetry(Resource):
     @api_ns.marshal_with(webhook_event_model)
     def post(self, event_id):
         """手动重试推送单个 Webhook 事件"""
-        # 加行锁：与定时推送、广播事件的待发送覆盖互斥（见 services.push_pending_events）
+        # 加行锁领取：与定时推送、广播事件的待发送覆盖互斥；领取后即提交，HTTP 期间不持锁
         event = WebhookEvent.query.filter(WebhookEvent.id == event_id) \
             .with_for_update().populate_existing().first_or_404()
         _enforce_event_company_scope(event)
 
         if event.status == 'sent':
             abort(400, '该事件已推送成功，无需重试')
+        if event.status == 'sending' and event.lease_expires_at and event.lease_expires_at > datetime.now():
+            abort(409, '该事件正在推送中，请稍后再试')
 
-        # 手动重试不受次数限制，重置状态为 pending
-        event.status = 'pending'
-        event.next_retry_at = None
-        event.attempts = 0
-
-        # 立即尝试推送
-        _send_event(event)
-        db.session.commit()
-
-        return event
+        # 不受次数限制：计数清零后立即推送一次（Key 已停用 / 已有更新的同对象事件则直接作废）
+        return retry_event_now(event)

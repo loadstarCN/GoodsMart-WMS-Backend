@@ -7,7 +7,7 @@ from system.third_party.utils import get_api_key_company_id
 from warehouse.common import (
     require_actor_user_id,
     warehouse_required, add_warehouse_filter,
-    get_warehouse_owned, require_warehouse_scope,
+    get_warehouse_owned, require_warehouse_scope, scoped_cache_key,
 )
 
 from .models import DN
@@ -84,9 +84,9 @@ class DNList(Resource):
         api_company_id = get_api_key_company_id()
         if api_company_id:
             data['company_id'] = api_company_id
-        # 记录创建来源 API Key（用于定向 Webhook 推送）
-        if g.current_system and g.current_system.get('api_key'):
-            data['api_key_id'] = g.current_system['api_key'].id
+        # 记录创建来源 API Key（用于定向 Webhook 推送）；JWT 路径下不允许客户端自带
+        api_key = g.current_system.get('api_key') if g.current_system else None
+        data['api_key_id'] = api_key.id if api_key else None
         created_by = require_actor_user_id()
         new_dn = DNService.create_dn(data, created_by)
         return new_dn, 201
@@ -272,7 +272,7 @@ class DNMonthlyStats(Resource):
     @permission_required(["all_access","company_all_access","dn_read"])
     @warehouse_required()
     @api_ns.expect(dn_monthly_stats_parser)
-    @cache.cached(timeout=60, query_string=True)
+    @cache.cached(timeout=60, make_cache_key=scoped_cache_key)
     def get(self):
         # 解析请求参数
         args = dn_monthly_stats_parser.parse_args()
@@ -298,7 +298,7 @@ class DNStatusOverviewStats(Resource):
     """
     @permission_required(["all_access","company_all_access","dn_read"])
     @warehouse_required()
-    @cache.cached(timeout=60, query_string=True)
+    @cache.cached(timeout=60, make_cache_key=scoped_cache_key)
     def get(self):
         # 解析请求参数
         args = dn_monthly_stats_parser.parse_args()

@@ -2,7 +2,8 @@ from datetime import datetime
 from extensions.db import *
 from extensions.error import BadRequestException, ConflictException, ForbiddenException, NotFoundException
 from extensions.transaction import transactional
-from warehouse.common import lock_goods_location, require_fields, require_non_negative_int
+from warehouse.common import lock_goods_location, require_fields, require_non_negative_int, require_company_goods
+from warehouse.common.locks import lock_row
 from warehouse.cyclecount.services import CycleCountTaskService
 from warehouse.inventory.services import InventoryService
 from .models import Adjustment, AdjustmentDetail
@@ -126,7 +127,7 @@ class AdjustmentService:
         :return: 更新后的 Adjustment 对象
         :raises ValueError: 如果 Adjustment 不处于 pending 状态
         """
-        adjustment = AdjustmentService.get_adjustment(adjustment_id)
+        adjustment = lock_row(AdjustmentService.get_adjustment(adjustment_id))
         if adjustment.status != 'pending':
             raise BadRequestException("Cannot update a non-pending Adjustment", 16001)
 
@@ -142,7 +143,8 @@ class AdjustmentService:
         """
         删除指定 Adjustment（仅当其状态为 pending 时）
         """
-        adjustment = AdjustmentService.get_adjustment(adjustment_id)
+        # 先锁调整单行并重读：与并发的 approve 串行
+        adjustment = lock_row(AdjustmentService.get_adjustment(adjustment_id))
         if adjustment.status != 'pending':
             raise BadRequestException("Cannot delete a non-pending Adjustment", 16002)
 
@@ -201,9 +203,10 @@ class AdjustmentService:
         :param created_by_id: 创建者用户 ID
         :return: 新创建的 AdjustmentDetail 对象
         """
-        adjustment = AdjustmentService.get_adjustment(adjustment_id)
+        adjustment = lock_row(AdjustmentService.get_adjustment(adjustment_id))
         AdjustmentService._assert_details_editable(adjustment)
         require_fields(data, 'goods_id')
+        require_company_goods(data['goods_id'], adjustment.warehouse.company_id)
         system_quantity, actual_quantity, adjustment_quantity = _resolve_detail_quantities(data)
 
         new_detail = AdjustmentDetail(
@@ -242,8 +245,13 @@ class AdjustmentService:
         :return: 更新后的 AdjustmentDetail 对象
         """
         detail = AdjustmentService.get_adjustment_detail(adjustment_id, detail_id)
+        # 先锁调整单、再锁明细行（与审批 / 完成串行），再按最新状态检查是否可改
+        lock_row(detail.adjustment)
+        detail = lock_row(detail)
         AdjustmentService._assert_details_editable(detail.adjustment)
         system_quantity, actual_quantity, adjustment_quantity = _resolve_detail_quantities(data, detail)
+        if data.get('goods_id') is not None:
+            require_company_goods(data['goods_id'], detail.adjustment.warehouse.company_id)
 
         detail.goods_id = data.get('goods_id', detail.goods_id)
         detail.location_id = data.get('location_id', detail.location_id)
@@ -262,6 +270,9 @@ class AdjustmentService:
         删除指定的 AdjustmentDetail（仅 pending 的调整单）
         """
         detail = AdjustmentService.get_adjustment_detail(adjustment_id, detail_id)
+        # 先锁调整单、再锁明细行（与审批 / 完成串行），再按最新状态检查是否可改
+        lock_row(detail.adjustment)
+        detail = lock_row(detail)
         AdjustmentService._assert_details_editable(detail.adjustment)
         db.session.delete(detail)
         # db.session.commit()
@@ -294,7 +305,8 @@ class AdjustmentService:
         """
         更新 Adjustment 的状态为 approved
         """
-        adjustment = AdjustmentService._get_instance(task_or_id)
+        # 先锁调整单行并重读状态：与并发的重复审批 / 删除串行
+        adjustment = lock_row(AdjustmentService._get_instance(task_or_id))
         if adjustment.status != 'pending':
             raise BadRequestException("Cannot approve an Adjustment that is not pending", 16018)
         # 职责分离：创建人不能审批自己的调整单
@@ -309,7 +321,8 @@ class AdjustmentService:
         """
         更新 Adjustment 的状态为 completed
         """
-        adjustment = AdjustmentService._get_instance(task_or_id)
+        # 先锁调整单行并重读状态（再锁库位 / 库存行）：并发的重复完成在这里挡下，库位数量不会调两次
+        adjustment = lock_row(AdjustmentService._get_instance(task_or_id))
         if adjustment.status != 'approved':
             raise BadRequestException("Cannot complete an Adjustment that is not approved", 16019)
 
@@ -341,12 +354,26 @@ class AdjustmentService:
     def create_adjustment_from_cyclecount(cyclecount_id: int, created_by_id: int) -> Adjustment:
         """
         创建一个新的 Adjustment 任务，并将其与指定的 CycleCount 关联
+        同一盘点单只能有一张启用中的调整单（409 16086）：complete_adjustment 按差值累加，
+        重复生成会让库存被调两倍。调整单记录来源盘点单（cyclecount_id），存量调整单为 NULL 不参与判断
         """
-        cyclecount = CycleCountTaskService.get_task(cyclecount_id)
+        # 先锁盘点单行并重读：并发的重复生成在这里串行，后到的一个能看到前一个已提交的调整单
+        cyclecount = lock_row(CycleCountTaskService.get_task(cyclecount_id))
 
         # 只有盘点完成后 system_quantity / difference 才是最终值，未完成不能据此生成调整单
         if cyclecount.status != 'completed':
             raise BadRequestException("CycleCountTask must be completed before creating an Adjustment", 16041)
+
+        existing = (
+            db.session.query(Adjustment.id)
+            .filter(Adjustment.cyclecount_id == cyclecount.id, Adjustment.is_active.is_(True))
+            .first()
+        )
+        if existing is not None:
+            raise ConflictException(
+                f"An Adjustment (id={existing.id}) has already been created from CycleCountTask {cyclecount.id}",
+                16086, details={'adjustment_id': existing.id}
+            )
 
         if len(cyclecount.task_details) == 0:
             raise BadRequestException("CycleCountTask has no details to create an Adjustment", 16016)
@@ -371,6 +398,7 @@ class AdjustmentService:
         adjustment = Adjustment(
             warehouse_id=cyclecount.warehouse_id,
             adjustment_reason="Adjustment by CycleCountTask ID: {}".format(cyclecount_id),
+            cyclecount_id=cyclecount.id,
             status='pending',
             is_active=True,
             details=adjustment_details,

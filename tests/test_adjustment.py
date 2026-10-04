@@ -328,7 +328,10 @@ def test_create_adjustment_from_completed_cyclecount(client, access_token):
         task = get_cyclecount_task()
         task_id = task.id
         CycleCountTaskService.process_task(task_id, admin_id)
-        details = [{'id': d.id, 'actual_quantity': (d.system_quantity or 0) + 3} for d in task.task_details]
+        # 只提交未完成的明细：已完成明细不能再保存（B-61，409 16017）
+        saved_goods = {d.goods_id for d in task.task_details if d.status != 'completed'}
+        details = [{'id': d.id, 'actual_quantity': (d.system_quantity or 0) + 3}
+                   for d in task.task_details if d.status != 'completed']
         CycleCountTaskService.batch_save_task_details(task_id, details, admin_id)
         CycleCountTaskService.complete_task(task_id, admin_id)
 
@@ -341,7 +344,9 @@ def test_create_adjustment_from_completed_cyclecount(client, access_token):
     assert data['status'] == 'pending'
     assert len(data['details']) >= 1
     for d in data['details']:
-        assert d['adjustment_quantity'] == d['actual_quantity'] - d['system_quantity'] == 3
+        assert d['adjustment_quantity'] == d['actual_quantity'] - d['system_quantity']
+        if d['goods_id'] in saved_goods:
+            assert d['adjustment_quantity'] == 3
 
 
 def test_adjustment_stats_use_adjustment_service(client, access_token):

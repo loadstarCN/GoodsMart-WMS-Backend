@@ -19,7 +19,8 @@ def init_scheduler(app):
     """初始化并启动定时任务调度器"""
     app.config['SCHEDULER_API_ENABLED'] = False
 
-    webhook_interval = int(os.getenv('WEBHOOK_PUSH_INTERVAL_MINUTES', '30'))
+    # 默认每分钟一次（与 .env.example、README 一致）
+    webhook_interval = int(os.getenv('WEBHOOK_PUSH_INTERVAL_MINUTES', '1'))
     snapshot_hour = int(os.getenv('SNAPSHOT_HOUR', '2'))
     snapshot_minute = int(os.getenv('SNAPSHOT_MINUTE', '0'))
 
@@ -30,6 +31,7 @@ def init_scheduler(app):
             'trigger': 'interval',
             'minutes': webhook_interval,
             'misfire_grace_time': 60,
+            'kwargs': {'time_budget': _webhook_time_budget(webhook_interval)},
         },
         {
             'id': 'inventory_snapshot',
@@ -77,7 +79,14 @@ def _try_start(app):
         logger.warning(f'[Scheduler] Failed to start: {e}')
 
 
-def _job_webhook_push():
+def _webhook_time_budget(interval_minutes):
+    """每轮 webhook 推送的时间预算（秒）：推送间隔减去单次推送总时限与余量，不低于默认预算。
+    任务 max_instances=1，本轮拖过下一次触发时间的话下一轮会被跳过"""
+    from system.webhook.services import PUSH_TIME_BUDGET_SECONDS, SEND_DEADLINE_SECONDS
+    return max(PUSH_TIME_BUDGET_SECONDS, interval_minutes * 60 - SEND_DEADLINE_SECONDS - 15)
+
+
+def _job_webhook_push(time_budget=None):
     """定时任务：推送待发送的 Webhook 事件"""
     app = scheduler.app
     if app is None:
@@ -85,7 +94,7 @@ def _job_webhook_push():
     with app.app_context():
         try:
             from system.webhook.services import push_pending_events
-            sent, failed = push_pending_events()
+            sent, failed = push_pending_events(time_budget=time_budget)
             if sent or failed:
                 logger.info(f'[Scheduler] Webhook push: {sent} sent, {failed} failed')
         except Exception as e:

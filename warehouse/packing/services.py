@@ -10,6 +10,7 @@ from .models import (
 )
 
 from warehouse.common import require_positive_int, require_bulk_list
+from warehouse.common.locks import lock_row
 from warehouse.dn.services import DNService, pick_fields, parse_datetime_value
 from dateutil.relativedelta import relativedelta
 from sqlalchemy import and_, func, case, extract
@@ -31,6 +32,16 @@ class PackingTaskService:
         if isinstance(task_or_id, int):
             return PackingTaskService.get_task(task_or_id)
         return task_or_id
+
+    @staticmethod
+    def _lock(task_or_id: int | PackingTask) -> PackingTask:
+        """
+        状态转换 / 批次增删 / 明细改量前调用：先锁 DN 行、再锁任务行（全系统统一的加锁顺序），
+        拿到锁后重读状态。并发的重复提交在调用方现有的状态检查处挡下。
+        """
+        task = PackingTaskService._get_instance(task_or_id)
+        lock_row(task.dn)
+        return lock_row(task)
 
 
     @staticmethod
@@ -129,7 +140,7 @@ class PackingTaskService:
         """
         删除指定 PackingTask（仅当其 status 为 pending 时）
         """
-        task = PackingTaskService.get_task(task_id)
+        task = PackingTaskService._lock(task_id)
         if task.status != 'pending':
             raise BadRequestException("Cannot delete a non-pending Packing Task", 16002)
 
@@ -163,7 +174,7 @@ class PackingTaskService:
         """
         更新指定 PackingTaskDetail（仅当所属的 PackingTask 为 in_progress
         """
-        task = PackingTaskService.get_task(task_id)
+        task = PackingTaskService._lock(task_id)
         if task.status != 'in_progress':
             raise BadRequestException("Cannot update Packing Task Detail in a non-in_progress Packing Task", 16010)
 
@@ -195,7 +206,7 @@ class PackingTaskService:
         """
         删除指定的 PackingTaskDetail（仅当所属的 PackingTask 状态为 in_progress
         """
-        task = PackingTaskService.get_task(task_id)
+        task = PackingTaskService._lock(task_id)
         if task.status != 'in_progress':
             raise BadRequestException("Cannot delete Packing Task Detail from a non-in_progress Packing Task", 16011)
 
@@ -275,7 +286,8 @@ class PackingTaskService:
                 ]
             }
         """
-        task = PackingTaskService._get_instance(task_or_id)
+        # 先锁 DN、再锁任务并重读：并发追加串行执行，「不超已拣量」校验看到前一个请求已提交的明细
+        task = PackingTaskService._lock(task_or_id)
         if task.status != 'in_progress':
             raise BadRequestException("Cannot create a batch or details in a non-in-progress Packing Task", 16009)
 
@@ -365,7 +377,7 @@ class PackingTaskService:
         - 仅当 PackingTask.status == 'in_progress' 时允许删除
         - 若已产生明细（PackingTaskDetail），可视业务决定是否禁止删除或自动删除
         """
-        task = PackingTaskService.get_task(task_id)
+        task = PackingTaskService._lock(task_id)
         if task.status != 'in_progress':
             raise BadRequestException("Cannot delete a batch in a non-in_progress Packing Task", 16014)
 
@@ -415,7 +427,7 @@ class PackingTaskService:
         """
         将 PackingTask 从 pending 切换为 in_progress
         """
-        task = PackingTaskService._get_instance(task_or_id)
+        task = PackingTaskService._lock(task_or_id)
         if task.status != 'pending':
             raise BadRequestException("Cannot process a non-pending Packing Task", 16007)
 
@@ -427,13 +439,19 @@ class PackingTaskService:
         """
         将 PackingTask 从 in_progress 切换为 completed，并更新库存
         """
-        task = PackingTaskService._get_instance(task_or_id)
+        # 先锁 DN、再锁任务并重读状态：并发的重复完成在这里挡下，不会重复记 packed_stock / 多建发货任务
+        task = PackingTaskService._lock(task_or_id)
         if task.status != 'in_progress':
             raise BadRequestException("Cannot complete a non-in_progress Packing Task", 16008)
 
         # 防御性校验：累计已打包量不得超过已拣量。对已被重复提交污染的历史单据
         # 给出明确报错（16043），而非在 packing_dn 处撞 packed<=picked 约束变 500。
         PackingTaskService._assert_within_picked(task)
+
+        # 一件都没打包不能完成：否则 DN 以 0 件进入 packed，已拣的货全部退回待上架，整单白走一遍。
+        # 少打包（0 < 已打包 < 已拣）允许完成，差额由 packing_dn → dn_packed 退回 sorted_stock
+        if sum(d.packed_quantity or 0 for d in task.task_details) <= 0:
+            raise BadRequestException("Cannot complete a Packing Task with nothing packed", 16082)
 
         task = PackingTaskService._update_task_status(task, 'completed', operator_id)
 

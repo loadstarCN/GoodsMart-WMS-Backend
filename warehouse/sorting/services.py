@@ -3,9 +3,10 @@ from dateutil.relativedelta import relativedelta
 from sqlalchemy import and_, func, case, extract
 from sqlalchemy.orm import joinedload, selectinload
 from extensions.db import *
-from extensions.error import BadRequestException, NotFoundException
+from extensions.error import BadRequestException, ConflictException, NotFoundException
 from extensions.transaction import transactional
 from warehouse.common import require_non_negative_int, require_fields
+from warehouse.common.locks import lock_row
 from warehouse.asn.models import ASN
 from warehouse.asn.services import ASNService
 from .models import SortingTask, SortingTaskDetail, SortingTaskStatusLog, SortingBatch
@@ -29,6 +30,17 @@ class SortingTaskService:
         if isinstance(task_or_id, int):
             return SortingTaskService.get_task(task_or_id)
         return task_or_id
+
+    @staticmethod
+    def _lock(task_or_id: int | SortingTask) -> SortingTask:
+        """
+        状态转换 / 批次与明细增删改前调用：先锁 ASN 行、再锁任务行（全系统统一的加锁顺序），
+        拿到锁后重读状态。并发的重复提交在调用方现有的状态检查处挡下；
+        计划量按整张 ASN 校验，锁 ASN 也让同一 ASN 下不同任务的追加串行。
+        """
+        task = SortingTaskService._get_instance(task_or_id)
+        lock_row(task.asn)
+        return lock_row(task)
 
     @staticmethod
     def _parse_datetime(value):
@@ -232,7 +244,7 @@ class SortingTaskService:
         更新指定 SortingTask（仅当其 status 为 pending 时）。
         只允许改 asn_id；status / is_active 只能经 process / complete 或 ASN cancel 变更。
         """
-        task = SortingTaskService._get_instance(task_or_id)
+        task = SortingTaskService._lock(task_or_id)
         if task.status != 'pending':
             raise BadRequestException("Cannot update a non-pending Sorting Task", 16001)
 
@@ -249,11 +261,22 @@ class SortingTaskService:
     @transactional
     def delete_task(task_or_id: int | SortingTask):
         """
-        删除指定 SortingTask（仅当其 status 为 pending 时）
+        删除指定 SortingTask。规则：
+        - 只能删 pending 的任务（400 16002）
+        - 所属 ASN 处于 received 时不能删（409 16087）：分拣任务一律关联 ASN，收货自动生成的任务与手工建的
+          在数据上无法区分；received 的 ASN 只能经分拣完成推进到 completed，删掉后 ASN 永远停在 received。
+          ASN 为 pending（收货前手工建的任务）/ completed / closed 时 pending 任务仍可删
         """
-        task = SortingTaskService._get_instance(task_or_id)
+        # 先锁 ASN、再锁任务并重读：与并发的收货 / 取消 / 分拣开始串行
+        task = SortingTaskService._lock(task_or_id)
         if task.status != 'pending':
             raise BadRequestException("Cannot delete a non-pending Sorting Task", 16002)
+        if task.asn is not None and task.asn.status == 'received':
+            raise ConflictException(
+                f"Cannot delete a Sorting Task of a received ASN (id={task.asn_id}); "
+                f"the ASN can only be completed through sorting.",
+                16087, details={'asn_id': task.asn_id}
+            )
 
         db.session.delete(task)
         # db.session.commit()
@@ -288,7 +311,7 @@ class SortingTaskService:
         注意：此时需要在 data 中包含 batch_id 才能正确关联到 SortingBatch，
         且 goods 必须在 ASN 明细内、累计量不得超过计划量。
         """
-        task = SortingTaskService._get_instance(task_id)
+        task = SortingTaskService._lock(task_id)
         if task.status != 'in_progress':
             raise BadRequestException("Cannot create Sorting Task Detail in a non-in-progress Sorting Task", 16009)
 
@@ -316,7 +339,7 @@ class SortingTaskService:
         """
         更新指定 SortingTaskDetail（仅当所属的 SortingTask 为 in_progress）。
         """
-        task = SortingTaskService._get_instance(task_or_id)
+        task = SortingTaskService._lock(task_or_id)
         if task.status != 'in_progress':
             raise BadRequestException("Cannot update Sorting Task Detail in a non-in-progress Sorting Task", 16010)
 
@@ -351,7 +374,7 @@ class SortingTaskService:
         """
         删除指定的 SortingTaskDetail（仅当所属的 SortingTask 状态为 in_progress）。
         """
-        task = SortingTaskService._get_instance(task_or_id)
+        task = SortingTaskService._lock(task_or_id)
         if task.status != 'in_progress':
             raise BadRequestException("Cannot delete Sorting Task Detail in a non-in-progress Sorting Task",16011)
 
@@ -409,7 +432,8 @@ class SortingTaskService:
         返回: batch
         """
 
-        task = SortingTaskService._get_instance(task_or_id)
+        # 先锁 ASN、再锁任务并重读：并发追加串行执行，「不超计划量」校验看到前一个请求已提交的明细
+        task = SortingTaskService._lock(task_or_id)
         # 统一只允许在 in_progress 状态创建（批次 + 明细）
         if task.status != 'in_progress':
             raise BadRequestException("Cannot create a batch or details in a non-in-progress Sorting Task", 16012)
@@ -481,7 +505,7 @@ class SortingTaskService:
         - 仅当 SortingTask 处于 in_progress 时允许删除
         - 批次下的 SortingTaskDetail 随之级联删除
         """
-        task = SortingTaskService._get_instance(task_or_id)
+        task = SortingTaskService._lock(task_or_id)
         if task.status != 'in_progress':
             raise BadRequestException("Cannot delete a batch in a non-in-progress Sorting Task", 16014)
 
@@ -496,7 +520,7 @@ class SortingTaskService:
         """
         更新 SortingTask 的状态为 in_progress
         """
-        task = SortingTaskService._get_instance(task_or_id)
+        task = SortingTaskService._lock(task_or_id)
 
         if task.status != 'pending':
             raise BadRequestException("Cannot process a non-pending Sorting Task", 16007)
@@ -512,7 +536,8 @@ class SortingTaskService:
         更新 SortingTask 的状态为 completed，并完成其 ASN。
         完成前再验一次累计分拣量不超过 ASN 计划量。
         """
-        task = SortingTaskService._get_instance(task_or_id)
+        # 先锁 ASN、再锁任务并重读状态：并发的重复完成在这里挡下，不会再记一遍 sorted_stock
+        task = SortingTaskService._lock(task_or_id)
         if task.status != 'in_progress':
             raise BadRequestException("Cannot complete a non-in_progress Sorting Task", 16008)
 

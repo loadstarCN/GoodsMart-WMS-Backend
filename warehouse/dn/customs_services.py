@@ -24,6 +24,7 @@ from extensions.db import db
 from extensions.error import BadRequestException, ConflictException, NotFoundException
 from extensions.transaction import transactional
 from warehouse.common.countries import COUNTRY_NAMES_EN, is_valid_country, normalize_country
+from warehouse.common.locks import lock_row
 from .models import DN, DNCustoms, DNPackage, DNDocument
 
 DOC_CI = 'commercial_invoice'
@@ -458,10 +459,9 @@ class CustomsService:
 
     @staticmethod
     def _lock(dn: DN) -> DN:
-        """对 DN 行加锁（只查主键，避免 joined eager load 撞 PostgreSQL 的 FOR UPDATE 限制）并刷新状态。"""
-        db.session.query(DN.id).filter(DN.id == dn.id).with_for_update().first()
-        db.session.refresh(dn)
-        return dn
+        """对 DN 行加锁（只查主键，避免 joined eager load 撞 PostgreSQL 的 FOR UPDATE 限制）并刷新状态。
+        与 DN / 出库任务状态转换共用 lock_row：同一把 DN 行锁，先 DN 后任务。"""
+        return lock_row(dn)
 
     @staticmethod
     def is_locked(dn: DN) -> bool:
@@ -1136,7 +1136,9 @@ class CustomsService:
         - 没有当前有效的 CI 或 PL → 409 16069，details {missing_documents: [...], outdated: false}
         - 有但已过期（数据指纹变了：箱子 / 快照 / 运单号 / 公司资料等改过没重出）
           → 409 16069，details {missing_documents: [], outdated: true}
-        通过时返回 {'awb': 当前单证上印的运单号（没印为 None）}。
+        通过时返回 {'awb': 当前单证上印的运单号（没印为 None）,
+                    'carrier_id' / 'carrier': CI 上印的承运商（与 _document_data 同一口径：当前发货任务的承运商，
+                    没有则 DN 的；都没有为 None）}。
         """
         if dn.customs is None:
             return {}
@@ -1153,9 +1155,14 @@ class CustomsService:
                 "(packages, customs data or tracking number changed); issue them again before shipping.",
                 16069, details={'missing_documents': [], 'outdated': True},
             )
-        # 单证未过期 ⇒ 印在 CI 上的 AWB 就是 _document_data 里的 awb（发货任务上现存的运单号）
+        # 单证未过期 ⇒ 印在 CI 上的 AWB / 承运商就是 _document_data 里的 awb / carrier（当前发货任务上现存的值）
         delivery_task = CustomsService._delivery_task(dn)
-        return {'awb': (delivery_task.tracking_number if delivery_task else None) or None}
+        carrier = (delivery_task.carrier if delivery_task and delivery_task.carrier else None) or dn.carrier
+        return {
+            'awb': (delivery_task.tracking_number if delivery_task else None) or None,
+            'carrier_id': carrier.id if carrier else None,
+            'carrier': carrier.name if carrier else None,
+        }
 
     @staticmethod
     def delivered_webhook_fields(dn: DN) -> dict:

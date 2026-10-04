@@ -10,12 +10,13 @@ from .helpers import *
 def test_create_task_task(client, access_token):
     """
     测试创建 Delivery Task (POST /delivery/)
+    （DN 1 在种子数据里已有一条 pending 的发货任务，一张 DN 只允许一条未完成的任务 → 用没有任务的 DN 2）
     """
     response = client.post(
         '/delivery/',
         headers={'Authorization': f'Bearer {access_token}'},
         json={
-            "dn_id": 1,
+            "dn_id": 2,
             "recipient_id": 1,
             "carrier_id": 1,
             "shipping_address": "New Delivery Address",
@@ -135,11 +136,11 @@ def test_delete_delivery_task(client, access_token):
 
 def test_delivery_task_service_create_task(client):
     """
-    测试通过服务层创建一个新的 DeliveryTask
+    测试通过服务层创建一个新的 DeliveryTask（用没有发货任务的 DN 2，见 test_create_task_task）
     """
     with client.application.app_context():
         user = get_operator_user()
-        dn = get_dn()
+        dn = get_dn_by_id(2)
         recipient = get_recipient()
         carrier = get_carrier()
         data = {

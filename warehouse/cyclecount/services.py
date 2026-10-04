@@ -1,8 +1,9 @@
 from werkzeug.exceptions import NotFound
 from extensions.db import *
-from extensions.error import BadRequestException, NotFoundException
+from extensions.error import BadRequestException, ConflictException, NotFoundException
 from extensions.transaction import transactional
-from warehouse.common import require_bulk_list, require_fields, require_non_negative_int
+from warehouse.common import require_bulk_list, require_fields, require_non_negative_int, require_company_goods
+from warehouse.common.locks import lock_row
 from warehouse.goods.models import Goods
 from .models import (
     CycleCountTask,
@@ -90,7 +91,12 @@ class CycleCountTaskService:
         )
 
         if 'task_details' in data:
+            from warehouse.warehouse.models import Warehouse
+            warehouse = db.session.get(Warehouse, data['warehouse_id'])
+            company_id = warehouse.company_id if warehouse else None
             for detail_data in data['task_details']:
+                # 商品必须属于任务仓库所在公司（否则响应会回显别家公司的商品资料）
+                require_company_goods(detail_data.get('goods_id'), company_id)
                 new_detail = CycleCountTaskDetail(
                     goods_id=detail_data['goods_id'],
                     location_id=detail_data['location_id'],
@@ -115,7 +121,7 @@ class CycleCountTaskService:
         """
         更新指定 CycleCountTask（仅当其状态为 pending 时）
         """
-        task = CycleCountTaskService.get_task(task_id)
+        task = lock_row(CycleCountTaskService.get_task(task_id))
         if task.status != 'pending':
             raise BadRequestException("Cannot update a non-pending CycleCountTask", 16001)
 
@@ -132,7 +138,8 @@ class CycleCountTaskService:
         """
         删除指定 CycleCountTask（仅当其状态为 pending 时）
         """
-        task = CycleCountTaskService.get_task(task_id)
+        # 先锁盘点单行并重读：与并发的 process 串行
+        task = lock_row(CycleCountTaskService.get_task(task_id))
         if task.status != 'pending':
             raise BadRequestException("Cannot delete a non-pending CycleCountTask", 16002)
 
@@ -184,7 +191,7 @@ class CycleCountTaskService:
         """
         创建新的 CycleCountTaskDetail（仅当所属的 CycleCountTask 为 pending）
         """
-        task = CycleCountTaskService.get_task(task_id)
+        task = lock_row(CycleCountTaskService.get_task(task_id))
         if task.status != 'pending':
             raise BadRequestException("Cannot add CycleCountTaskDetail to a non-pending CycleCountTask", 16003)
 
@@ -215,7 +222,7 @@ class CycleCountTaskService:
         """
         更新指定 CycleCountTaskDetail（仅当所属的 CycleCountTask 为 pending）
         """
-        task = CycleCountTaskService.get_task(task_id)
+        task = lock_row(CycleCountTaskService.get_task(task_id))
         if task.status != 'pending':
             raise BadRequestException("Cannot update detail in a non-pending CycleCountTask", 16005)
 
@@ -223,6 +230,8 @@ class CycleCountTaskService:
 
         # 白名单：goods_id / location_id / actual_quantity；
         # status 与 operator_id 只由 complete / batch_save 流程写入，不接受客户端输入
+        if data.get('goods_id') is not None:
+            require_company_goods(data['goods_id'], task.warehouse.company_id)
         detail.goods_id = data.get('goods_id', detail.goods_id)
         detail.location_id = data.get('location_id', detail.location_id)
         if 'actual_quantity' in data:
@@ -239,7 +248,7 @@ class CycleCountTaskService:
         """
         删除指定的 CycleCountTaskDetail（仅当所属的 CycleCountTask 状态为 pending）
         """
-        task = CycleCountTaskService.get_task(task_id)
+        task = lock_row(CycleCountTaskService.get_task(task_id))
         if task.status != 'pending':
             raise BadRequestException("Cannot delete detail from a non-pending CycleCountTask", 16005)
 
@@ -298,7 +307,8 @@ class CycleCountTaskService:
         """
         将CycleCountTask从 pending 切换到 in_progress
         """
-        task = CycleCountTaskService._get_instance(task_or_id)
+        # 先锁盘点单行并重读状态：并发的重复开始在这里挡下，不会重抓一遍账面数量
+        task = lock_row(CycleCountTaskService._get_instance(task_or_id))
         if task.status != 'pending':
             raise BadRequestException("Cannot process a non-pending CycleCountTask", 16007)
 
@@ -310,7 +320,8 @@ class CycleCountTaskService:
         """
         将CycleCountTask从 in_progress 切换到 completed
         """
-        task = CycleCountTaskService._get_instance(task_or_id)
+        # 先锁盘点单行并重读状态：并发的重复完成在这里挡下
+        task = lock_row(CycleCountTaskService._get_instance(task_or_id))
         if task.status != 'in_progress':
             raise BadRequestException("Cannot complete a non-in_progress CycleCountTask", 16008)
 
@@ -359,32 +370,51 @@ class CycleCountTaskService:
         将CycleCountTaskDetail从 pending 切换到 completed
         """
         # 先检查父任务
-        task = CycleCountTaskService.get_task(task_id)
+        task = lock_row(CycleCountTaskService.get_task(task_id))
         if task.status != 'in_progress':
             raise BadRequestException("Cannot complete detail in a task that is not in_progress", 16008)
 
-        detail = CycleCountTaskService.get_task_detail(task_id, detail_id)
+        # 再锁明细行并重读状态：并发的重复完成 / 批量保存在这里串行，已完成的明细 409
+        detail = lock_row(CycleCountTaskService.get_task_detail(task_id, detail_id))
         if detail.status == 'completed':
-            raise BadRequestException("Detail is already completed", 16017)
+            raise ConflictException("Detail is already completed", 16017, details={'detail_ids': [detail.id]})
 
         return CycleCountTaskService._update_task_detail_status(detail, 'completed', operator_id)
-    
+
     @staticmethod
     @transactional
     def batch_save_task_details(task_id: int, details: list, operator_id: int) -> CycleCountTask:
         """
         批量保存 CycleCountTaskDetail
+        - 请求里含 completed 明细时整单拒绝（409 16017，details.detail_ids 列出这些明细），一行都不写
+        - 只改实盘数确有变化的行：operator_id / difference 只写到这些行，不再把整单的操作人改成当前用户
         """
-        task = CycleCountTaskService.get_task(task_id)
+        task = lock_row(CycleCountTaskService.get_task(task_id))
         if task.status != 'in_progress':
             raise BadRequestException("Cannot update details in a non-in_progress CycleCountTask", 16010)
-        
+
+        # 1) 先整单校验并锁住涉及的明细行（父单据已锁，再锁明细），任何一行不合法都不落库
+        updates = []
+        completed_ids = []
         for detail_data in require_bulk_list(details, 'details'):
             require_fields(detail_data, 'id')
-            detail = CycleCountTaskService.get_task_detail(task_id, detail_data['id'])
-            detail.system_quantity = detail.system_quantity or 0  # 将 None 转为 0
+            detail = lock_row(CycleCountTaskService.get_task_detail(task_id, detail_data['id']))
             # 负数 / 小数 / bool / 非数字 → 400（共享校验）
-            detail.actual_quantity = require_non_negative_int(detail_data.get('actual_quantity'), 'actual_quantity')
+            actual_quantity = require_non_negative_int(detail_data.get('actual_quantity'), 'actual_quantity')
+            if detail.status == 'completed':
+                completed_ids.append(detail.id)
+            updates.append((detail, actual_quantity))
+        if completed_ids:
+            raise ConflictException(
+                "Cannot save completed CycleCountTask details", 16017, details={'detail_ids': completed_ids}
+            )
+
+        # 2) 只写实盘数有变化的行
+        for detail, actual_quantity in updates:
+            if detail.actual_quantity == actual_quantity:
+                continue
+            detail.system_quantity = detail.system_quantity or 0  # 将 None 转为 0
+            detail.actual_quantity = actual_quantity
             detail.operator_id = operator_id
             detail.difference = detail.actual_quantity - detail.system_quantity
 

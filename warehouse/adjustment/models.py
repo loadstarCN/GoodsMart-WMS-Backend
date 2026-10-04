@@ -15,6 +15,7 @@ class Adjustment(db.Model):
         # 核心业务查询索引
         db.Index('idx_adjustment_warehouse_status', 'warehouse_id', 'status'),
         db.Index('idx_adjustment_created_time', 'created_at'),
+        db.Index('idx_adjustment_cyclecount', 'cyclecount_id'),                # 按来源盘点单查重
         db.CheckConstraint("status IN ('pending','approved','completed')", name='chk_valid_status')
     )
 
@@ -31,6 +32,12 @@ class Adjustment(db.Model):
         db.String(255),
         nullable=True,
         info={'description': '调整原因'}
+    )
+    cyclecount_id = db.Column(
+        db.Integer,
+        db.ForeignKey('cycle_count_tasks.id', name='fk_adjustments_cyclecount_id', ondelete='RESTRICT'),
+        nullable=True,
+        info={'description': '来源盘点单ID（由盘点单生成时写入；手工创建与存量调整单为 NULL）'}
     )
     status = db.Column(
         db.Enum(*AdjustmentStatuses, name='adjustment_status_enum'),

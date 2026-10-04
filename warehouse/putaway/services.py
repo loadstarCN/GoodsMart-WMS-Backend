@@ -2,9 +2,11 @@ from sqlalchemy import or_
 from extensions.db import *
 from extensions.transaction import transactional
 from warehouse.common import require_positive_int, require_bulk_list, require_fields, lock_goods_location
+from warehouse.common.locks import lock_row
 from warehouse.goods.models import Goods, GoodsLocation
 from warehouse.inventory.services import InventoryService
 from warehouse.location.models import Location
+from warehouse.location.services import LocationService
 from .models import PutawayRecord
 
 
@@ -85,7 +87,10 @@ class PutawayService:
         location_id = data['location_id']
         quantity = require_positive_int(data['quantity'], 'quantity')
         get_object_or_404(Goods, goods_id)
-        location = get_object_or_404(Location, location_id)
+        # 先给目标库位行加共享锁再判断启用状态（再锁库位库存行）：与并发的停用（FOR UPDATE）串行，
+        # 停用库位不能再进货（400 16085）；上架之间不互斥
+        location = LocationService.require_active_location(
+            lock_row(get_object_or_404(Location, location_id), shared=True))
 
         new_record = PutawayRecord(
             goods_id=goods_id,

@@ -104,7 +104,8 @@ delivery_task_complete_input_model = api_ns.model('DeliveryTaskCompleteInput', {
                     'prints an AWB accepts only that number → otherwise 409 16080)'),
     'shipping_cost': fields.Float(required=True, description='Shipping cost'),
     'currency': fields.String(description='Currency code (ISO 4217 standard)', default='JPY'),
-    'carrier_id': fields.Integer(description='Carrier ID'),
+    'carrier_id': fields.Integer(description='Carrier ID (export DN whose current CI prints a carrier accepts only '
+                                             'that carrier → otherwise 409 16092)'),
     'transportation_mode': fields.String(
         description='Transportation mode used for delivery',
         enum=DeliveryTask.DELIVERY_TASK_TRANSPORTATION_MODES

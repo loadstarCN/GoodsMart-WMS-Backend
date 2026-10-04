@@ -490,30 +490,32 @@ def test_csv_import_queries_keys_and_pending_events_once(client, access_token, c
             assert event.payload['source'] == 'import'
 
 
-def test_overwriting_pending_event_resets_retry_state(client, company_ids):
-    """覆盖已失败过几次的待发送事件：失败计数 / 下次重试时间清零，新数据立即可发"""
+def test_failed_pending_event_is_superseded_not_overwritten(client, company_ids):
+    """已推送失败过、在退避中的待发送事件：不覆盖（同一 X-Webhook-Id 不会先后带不同 payload），
+    也不清零退避——另建新事件接替（沿用下次重试时间，changed_fields 取并集），旧事件作废"""
     from datetime import timedelta
     with client.application.app_context():
         key_id = _make_key(company_ids[0])
         emit_company_event(EVENT, {'n': 1, 'changed_fields': ['a']}, company_ids[0], dedupe_key='goods:1')
         db.session.commit()
         event = _events(key_id)[0]
+        retry_at = datetime.now() + timedelta(minutes=30)
         event.attempts = 9
-        event.next_retry_at = datetime.now() + timedelta(minutes=30)
+        event.next_retry_at = retry_at
         db.session.commit()
 
         emit_company_event(EVENT, {'n': 2, 'changed_fields': ['b']}, company_ids[0], dedupe_key='goods:1')
         db.session.commit()
-        events = _events(key_id)
-        assert len(events) == 1
-        assert events[0].payload == {'n': 2, 'changed_fields': ['a', 'b']}
-        assert events[0].attempts == 0 and events[0].next_retry_at is None
+        old, new = _events(key_id)
+        assert (old.status, old.payload, old.attempts) == ('superseded', {'n': 1, 'changed_fields': ['a']}, 9)
+        assert (new.status, new.attempts) == ('pending', 0)
+        assert new.payload == {'n': 2, 'changed_fields': ['a', 'b']}
+        assert new.next_retry_at == retry_at
 
-        # 立即会被推送；再失败也只算第 1 次，不会因继承的计数直接标 failed 丢掉新数据
-        with mock.patch('system.webhook.services.requests.post', side_effect=ConnectionError('down')):
-            assert push_pending_events() == (0, 1)
-        event = _events(key_id)[0]
-        assert event.status == 'pending' and event.attempts == 1
+        # 退避期内不推送
+        with mock.patch('system.webhook.services.requests.post') as post:
+            assert push_pending_events() == (0, 0)
+        post.assert_not_called()
 
 
 def test_emit_company_events_batch_merges_like_single_calls(client, company_ids):

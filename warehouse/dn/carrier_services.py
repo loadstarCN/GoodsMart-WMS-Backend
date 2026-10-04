@@ -22,7 +22,9 @@
   各格式的 imageType / 纸张见 fedex_shipment.label_settings。
 - 运送申告价额高于已打包货值时自动压到已打包货值（FedEx 拒收申告价额高于报关货值的运单；部分打包时只保实际发出的货），
   实际提交的值记在运单的 declared_value 上，响应 warnings 里说明。
-- 有有效自动运单时，发货任务的运单号只能是这张运单的号码（完成发货 / 保存运单号 / 修改发货任务传了别的号码 → 409 16078）。
+- 有有效自动运单时，发货任务的运单号只能是这张运单的号码（完成发货 / 保存运单号 / 修改发货任务传了别的号码 → 409 16078），
+  比对忽略空格 / 连字符，入库统一存运单上的标准写法；承运商也不能换（16078）。
+  已取消（含补偿取消）的自动运单号不能再存到任务上、也不能用来完成发货（16078，details.status = cancelled）。
 - 取消：DN 未发货才可；用建单时记下的发件国；FedEx 取消成功（或回「已取消 / 查无此运单」）后记录标 cancelled、
   发货任务上的运单号清掉、面单作废、CI / PL 去掉 AWB 重新签发（条件不满足则作废）。
 """
@@ -163,6 +165,12 @@ def resolve_label_format(value) -> dict:
 
 def _carrier_code(carrier) -> str:
     return ((getattr(carrier, 'code', None) or '')).strip().lower()
+
+
+def normalize_tracking(value) -> str:
+    """运单号比对用的规范化写法：去掉所有空白和连字符（面单分组写法「7946 0000 0001」/「7946-0000-0001」
+    与运单号 794600000001 视为同一个）。只用于比较，入库仍存原值或运单上的标准写法。"""
+    return ''.join(str(value or '').split()).replace('-', '')
 
 
 def _already_cancelled(items) -> bool:
@@ -531,11 +539,17 @@ class CarrierShipmentService:
 
     @staticmethod
     def assert_tracking_matches(dn: DN, tracking_number, allow_empty=False):
-        """保存 / 修改发货任务运单号前的检查（调用方应先锁 DN 行）：
+        """保存 / 修改发货任务运单号、完成发货前的检查（调用方应先锁 DN 行），返回应写入任务的运单号：
         - 有结果不明 / 进行中的建单记录：给了运单号 → 409 16079（防止在 FedEx 上又手工建一张）；空值放行
-        - 有有效自动运单：运单号只能是它的号码（忽略空白差异），不同 → 409 16078。
-          allow_empty=True：空值视为「不改」由调用方跳过；False：清空也算不一致（要清空请取消运单）。"""
-        given = ''.join(str(tracking_number or '').split())
+        - 有有效自动运单：运单号只能是它的号码（按 normalize_tracking 比，忽略空格 / 连字符差异），
+          不同 → 409 16078；相同 → 返回运单上的标准写法 shipment.tracking_number（入库统一用它，
+          取消运单时才能按号码清掉、CI 上印的也与运单一字不差）。
+          allow_empty=True：空值视为「不改」由调用方跳过；False：清空也算不一致（要清空请取消运单）。
+        - 没有有效运单时，给的是本 DN 已取消（含补偿取消）的自动运单号 → 409 16078，
+          details {tracking_number: null, cancelled_tracking_number, carrier, status: 'cancelled'}
+          （tracking_number 与其它 16078 一样表示「只能用的号码」，这里没有，所以为 null）
+        - 其它情况原样返回 tracking_number。"""
+        given = normalize_tracking(tracking_number)
         unresolved = CarrierShipmentService.unresolved_shipment(dn)
         if unresolved is not None:
             if given:
@@ -544,18 +558,41 @@ class CarrierShipmentService:
                     "The result of the automatic FedEx shipment request for this DN is unclear (or still in "
                     "progress); a tracking number cannot be saved until it is resolved. Check FedEx Ship Manager, "
                     "then dismiss the record (POST /warehouse/dn/<id>/carrier-shipment/dismiss).")
-            return
+            return tracking_number
         shipment = CarrierShipmentService.active_shipment(dn)
         if shipment is None:
-            return
+            if given:
+                CarrierShipmentService._assert_not_cancelled(dn, given)
+            return tracking_number
         if not given and allow_empty:
-            return
-        if given != ''.join(shipment.tracking_number.split()):
+            return tracking_number
+        if given != normalize_tracking(shipment.tracking_number):
             raise ConflictException(
                 f"This DN has an active {shipment.carrier} shipment {shipment.tracking_number}; the tracking number "
                 "cannot be changed. Cancel the carrier shipment first.", 16078,
                 details={'tracking_number': shipment.tracking_number, 'carrier': shipment.carrier},
             )
+        return shipment.tracking_number
+
+    @staticmethod
+    def _assert_not_cancelled(dn: DN, given: str):
+        """given（已规范化）是本 DN 已取消（cancelled，含补偿取消 compensated）的自动运单号 → 409 16078。
+        例：取消后 PDA 完成发货表单还停在旧的预填运单号。"""
+        cancelled = (
+            DNCarrierShipment.query
+            .filter(DNCarrierShipment.dn_id == dn.id, DNCarrierShipment.status == 'cancelled',
+                    DNCarrierShipment.tracking_number.isnot(None))
+            .order_by(DNCarrierShipment.id.desc())
+            .all()
+        )
+        for record in cancelled:
+            if normalize_tracking(record.tracking_number) == given:
+                raise ConflictException(
+                    f"{record.carrier} shipment {record.tracking_number} of this DN has been cancelled; its tracking "
+                    "number cannot be used any more. Create a new shipment or enter another tracking number.", 16078,
+                    details={'tracking_number': None, 'cancelled_tracking_number': record.tracking_number,
+                             'carrier': record.carrier, 'status': 'cancelled'},
+                )
 
     @staticmethod
     def assert_delivery_tasks_editable(dn: DN, action: str):
@@ -1205,7 +1242,9 @@ class CarrierShipmentService:
                     label.status = 'void'
                     label.voided_at = now
                     label.void_reason = 'shipment_cancelled'
-            if task is not None and task.tracking_number == shipment.tracking_number:
+            # 按规范化后的号码比（存量数据可能存成了「7946 0000 0001」这类分组写法），一致才清空
+            if task is not None and task.tracking_number \
+                    and normalize_tracking(task.tracking_number) == normalize_tracking(shipment.tracking_number):
                 DeliveryTaskService.save_tracking(task, {'tracking_number': None})
             db.session.flush()
 

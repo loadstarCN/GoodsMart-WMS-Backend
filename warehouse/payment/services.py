@@ -5,6 +5,7 @@ from warehouse.carrier.models import Carrier
 from warehouse.delivery.models import DeliveryTask
 from warehouse.dn.models import DN
 from warehouse.inventory.services import InventoryService
+from warehouse.common.locks import lock_row
 from warehouse.warehouse.models import Warehouse
 from .models import Payment
 from datetime import datetime
@@ -109,7 +110,8 @@ class PaymentService:
         :return: 更新后的 Payment 对象
         :raises ValueError: 如果 Payment 的状态不可更新
         """
-        payment = PaymentService.get_payment(payment_id)
+        # 锁行并重读状态，与并发的支付 / 取消串行
+        payment = lock_row(PaymentService.get_payment(payment_id))
 
         if payment.status != 'pending':
             raise BadRequestException("Cannot update a non-pending Payment", 16003)
@@ -130,7 +132,8 @@ class PaymentService:
         """
         删除指定 Payment（仅当其状态为 pending 时）
         """
-        payment = PaymentService.get_payment(payment_id)
+        # 锁行并重读状态，与并发的支付 / 取消串行
+        payment = lock_row(PaymentService.get_payment(payment_id))
         if payment.status != 'pending':
             raise BadRequestException("Cannot delete a non-pending Payment", 16002)
 
@@ -147,7 +150,8 @@ class PaymentService:
         :return: 更新后的 Payment 对象
         :raises ValueError: 如果 Payment 不处于 pending 状态
         """
-        payment = PaymentService.get_payment(payment_id)
+        # 锁行并重读状态，与并发的支付 / 取消串行
+        payment = lock_row(PaymentService.get_payment(payment_id))
         if payment.status != 'pending':
             raise BadRequestException("Cannot process a non-pending Payment", 16007)
 
@@ -166,7 +170,8 @@ class PaymentService:
         :return: 更新后的 Payment 对象
         :raises ValueError: 如果 Payment 不处于 pending 状态
         """
-        payment = PaymentService.get_payment(payment_id)
+        # 锁行并重读状态，与并发的支付 / 取消串行
+        payment = lock_row(PaymentService.get_payment(payment_id))
         if payment.status != 'pending':
             raise BadRequestException("Cannot cancel a non-pending Payment", 16028)
 

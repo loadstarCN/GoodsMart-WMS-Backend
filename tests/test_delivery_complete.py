@@ -261,6 +261,11 @@ def test_same_carrier_code_accepted(client, access_token, fedex):
     dn_id, task_id = _ready(client, access_token)
     assert _create(client, access_token, dn_id).status_code == 201
     other_fedex = _other_carrier(client, code='FedEx')      # 另一条 code 也是 fedex 的承运商记录
+    # 自动运单的承运商按 code 比：改任务照常（16078 不拦）
+    response = client.put(f'/delivery/{task_id}', json={'carrier_id': other_fedex}, headers=_h(access_token))
+    assert response.status_code == 200, response.get_json()
+    # 但 CI 上印的还是原承运商：B-67 起完成发货要求与 CI 一致，先重出单证再发货
+    assert _issue(client, access_token, dn_id).status_code == 201
     response = _ship(client, access_token, task_id, carrier_id=other_fedex)
     assert response.status_code == 200, response.get_json()
     assert response.get_json()['carrier_id'] == other_fedex

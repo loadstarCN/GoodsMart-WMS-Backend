@@ -3,7 +3,7 @@ from flask_restx import Resource, marshal
 from extensions import oss
 from extensions.error import BadRequestException, ForbiddenException, UnauthorizedException
 from system.common import paginate, permission_required
-from system.common.permissions import get_actor_company_id
+from system.common.permissions import get_actor_company_id, get_actor_context, assert_grantable_permissions
 from .schemas import api_ns, staff_model, staff_input_model, pagination_parser, pagination_model, upload_parser, warehouse_model
 from .services import StaffService
 
@@ -13,6 +13,39 @@ def _enforce_staff_scope(staff):
     company_id = get_actor_company_id()
     if company_id is not None and staff.company_id != company_id:
         raise ForbiddenException("Permission denied: staff belongs to another company", 12001)
+
+
+def _actor_warehouse_scope():
+    """调用方能分配 / 管理的仓库 id 集合；None 表示不受仓库范围限制
+    （平台管理员、持 company_all_access 者、未绑定员工的公司级 API Key——本就覆盖全公司仓库）。"""
+    is_super, perms, _ = get_actor_context()
+    if is_super or 'company_all_access' in perms:
+        return None
+    actor = g.get('current_user')
+    if actor is None or getattr(actor, 'type', None) != 'staff':
+        return None
+    actor_staff = StaffService.get_staff(actor.id)
+    return {w.id for w in StaffService.accessible_warehouses(actor_staff)}
+
+
+def _enforce_manageable(staff=None, warehouse_ids=None):
+    """非平台管理员只能管理「权限与仓库范围都不超出自己」的员工，
+    防止只有 staff_edit 的员工改 company_admin 的密码 / 角色或删掉他，或把自己的仓库范围扩大到全公司。"""
+    if staff is not None:
+        target_perms = {p.name for role in staff.roles for p in role.permissions}
+        try:
+            assert_grantable_permissions(target_perms)
+        except ForbiddenException:
+            raise ForbiddenException("Not allowed to manage a staff member with higher privileges", 12007)
+
+    scope = _actor_warehouse_scope()
+    if scope is None:
+        return
+    requested = set(warehouse_ids or [])
+    if staff is not None:
+        requested |= {w.id for w in staff.warehouses}
+    if not requested <= scope:
+        raise ForbiddenException("Not allowed to assign warehouses outside your own scope", 12001)
 
 
 @api_ns.doc(security="jsonWebToken")
@@ -61,6 +94,7 @@ class StaffList(Resource):
             data['company_id'] = company_id
         elif not data.get('company_id'):
             raise BadRequestException("company_id is required", 14015)
+        _enforce_manageable(warehouse_ids=data.get('warehouse_ids'))
 
         actor = g.get('current_user')
         new_staff = StaffService.create_staff(data, actor.id if actor else None)
@@ -88,6 +122,7 @@ class StaffDetail(Resource):
         _enforce_staff_scope(staff)
 
         data = api_ns.payload
+        _enforce_manageable(staff, data.get('warehouse_ids'))
         data.pop('company_id', None)
         actor = g.get('current_user')
         updated_staff = StaffService.update_staff(staff_id, data, actor_id=actor.id if actor else None)
@@ -99,6 +134,8 @@ class StaffDetail(Resource):
         """删除员工"""
         staff = StaffService.get_staff(staff_id)
         _enforce_staff_scope(staff)
+
+        _enforce_manageable(staff)
 
         actor = g.get('current_user')
         if actor and actor.id == staff.id:

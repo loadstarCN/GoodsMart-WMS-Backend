@@ -7,8 +7,9 @@ from extensions.error import (
     BadRequestException, ConflictException, ForbiddenException, NotFoundException,
 )
 from extensions.transaction import transactional
-from warehouse.common import require_positive_int, require_bulk_list, require_fields
+from warehouse.common import require_positive_int, require_bulk_list, require_fields, require_source_api_key
 from warehouse.inventory.services import InventoryService
+from warehouse.common.locks import lock_row
 
 from warehouse.goods.services import GoodsService
 from system.webhook.services import emit as webhook_emit
@@ -465,7 +466,7 @@ class DNService:
             remark=payload.get('remark'),
             is_active=True,
             created_by=created_by_id,
-            api_key_id=data.get('api_key_id'),
+            api_key_id=require_source_api_key(data.get('api_key_id'), company_id),
         )
         db.session.add(new_dn)
         db.session.flush()
@@ -504,7 +505,7 @@ class DNService:
         :raises: NotFound / ValueError
         """
 
-        dn = DNService._get_instance(dn_or_id)
+        dn = lock_row(DNService._get_instance(dn_or_id))
         if dn.status != 'pending':
             raise BadRequestException("Cannot update a non-pending DN", 16001)
 
@@ -552,7 +553,8 @@ class DNService:
         """
         删除指定的 DN（仅当其状态为 pending 时允许删除，或按实际业务修改）。
         """
-        dn = DNService._get_instance(dn_or_id)
+        # 先锁 DN 行并重读：与并发的 progress / cancel 串行
+        dn = lock_row(DNService._get_instance(dn_or_id))
         if dn.status != 'pending':
             raise BadRequestException("Cannot delete a non-pending DN", 16002)
 
@@ -573,7 +575,7 @@ class DNService:
         """
         将指定的 DN 标记为非活动状态（is_active=False）。
         """
-        dn = DNService._get_instance(dn_or_id)
+        dn = lock_row(DNService._get_instance(dn_or_id))
         dn.is_active = False
         db.session.add(dn)
         db.session.flush()
@@ -610,7 +612,7 @@ class DNService:
         在指定 DN 下创建一条 DNDetail（仅当 DN 状态为 pending 时）。
         同一商品在一张 DN 上只能有一行；数量不得超过排除本单预占后的可用量。
         """
-        dn = DNService.get_dn(dn_id)
+        dn = lock_row(DNService.get_dn(dn_id))
         if dn.status != 'pending':
             raise BadRequestException("Cannot add details to a non-pending DN", 16003)
 
@@ -647,7 +649,7 @@ class DNService:
         更新指定 DNDetail（仅当所属的 DN 状态为 pending 时）。
         只接受 goods_id / goods_code / quantity / remark；picked/packed/delivered_quantity 忽略。
         """
-        dn = DNService.get_dn(dn_id)
+        dn = lock_row(DNService.get_dn(dn_id))
         if dn.status != 'pending':
             raise BadRequestException("Cannot update details in a non-pending DN", 16004)
 
@@ -696,7 +698,7 @@ class DNService:
         """
         删除指定的 DNDetail（仅当其所属 DN 状态为 pending 时）。
         """
-        dn = DNService.get_dn(dn_id)
+        dn = lock_row(DNService.get_dn(dn_id))
         if dn.status != 'pending':
             raise BadRequestException("Cannot delete details from a non-pending DN", 16005)
 
@@ -719,7 +721,7 @@ class DNService:
         3. 原detail不在新数据中的自动删除
         每个商品变更后的计划量都要通过「排除本单预占后的可用量」校验。
         """
-        dn = DNService._get_instance(dn_or_id)
+        dn = lock_row(DNService._get_instance(dn_or_id))
 
         if dn.status != 'pending':
             raise BadRequestException("Cannot sync details in non-pending DN", 16006)
@@ -789,7 +791,8 @@ class DNService:
         """
         Mark a DN as 'in progress' (例如进行中)，仅当 DN 状态为 pending 时可变更为 in progress
         """
-        dn = DNService._get_instance(dn_or_id)
+        # 先锁 DN 行并重读状态：并发的重复提交在下面的状态检查处挡下（不会建两个拣货任务）
+        dn = lock_row(DNService._get_instance(dn_or_id))
         if dn.status != 'pending':
             raise BadRequestException("Cannot mark a DN as 'in progress' that is not in 'pending' status.", 16000)
 
@@ -827,7 +830,8 @@ class DNService:
         """
         Mark a DN as 'picked' (例如拣货操作)，仅当 DN 状态为 in_progress 时可变更为 picked
         """
-        dn = DNService._get_instance(dn_or_id)
+        # 锁 DN 行并重读状态（拣货完成已先锁过 DN，同一事务重复加锁无副作用）
+        dn = lock_row(DNService._get_instance(dn_or_id))
         if dn.status != 'in_progress':
             raise BadRequestException("Cannot pick a DN that is not in 'in_progress' status.", 16000)
 
@@ -852,7 +856,8 @@ class DNService:
         """
         Mark a DN as 'packed' (例如打包操作)，仅当 DN 状态为 picked 时可变更为 packed
         """
-        dn = DNService._get_instance(dn_or_id)
+        # 锁 DN 行并重读状态（打包完成已先锁过 DN，同一事务重复加锁无副作用）
+        dn = lock_row(DNService._get_instance(dn_or_id))
         if dn.status != 'picked':
             raise BadRequestException("Cannot pack a DN that is not in 'picked' status.", 16000)
 
@@ -860,8 +865,10 @@ class DNService:
         DNService._update_and_calculate_quantity(dn_or_id)
 
         for detail in dn.details:
-
-            InventoryService.dn_packed(detail.goods_id,dn.warehouse_id,detail.packed_quantity)
+            # 按实际打包量记 packed_stock（之后按此发货）；已拣未打包的差额由 dn_packed 退回 sorted_stock 待上架
+            InventoryService.dn_packed(
+                detail.goods_id, dn.warehouse_id, detail.packed_quantity or 0, detail.picked_quantity or 0
+            )
 
         # 创建发货任务
         from warehouse.delivery.services import DeliveryTaskService
@@ -871,11 +878,13 @@ class DNService:
 
     @staticmethod
     @transactional
-    def delivery_dn(dn_or_id:int | DN) -> DN:
+    def delivery_dn(dn_or_id:int | DN, delivery_task=None) -> DN:
         """
         Mark a DN as 'delivered' (例如发货操作)，仅当 DN 状态为 packed 时可变更为 delivered
+        - delivery_task：被完成的那条发货任务（完成发货时由调用方传入），dn.delivered 的 tracking_number 取它的运单号
         """
-        dn = DNService._get_instance(dn_or_id)
+        # 锁 DN 行并重读状态（完成发货已先锁过 DN，同一事务重复加锁无副作用）
+        dn = lock_row(DNService._get_instance(dn_or_id))
         if dn.status != 'packed':
             raise BadRequestException("Cannot ship a DN that is not in 'packed' status.", 16000)
 
@@ -885,12 +894,20 @@ class DNService:
         for detail in dn.details:
             InventoryService.dn_delivered(detail.goods_id,dn.warehouse_id,detail.delivered_quantity)
 
-        # 获取 tracking_number
-        from warehouse.delivery.models import DeliveryTask
-        delivery_task = DeliveryTask.query.filter(
-            DeliveryTask.dn_id == dn.id,
-            DeliveryTask.is_active == True,
-        ).first()
+        # tracking_number：取被完成的那条发货任务的运单号（调用方传入）；
+        # 没传（直接调用）时取最新一条已完成的有效发货任务，不再用无排序的 .first()（同一 DN 有多条任务时可能取错）
+        if delivery_task is None:
+            from warehouse.delivery.models import DeliveryTask
+            delivery_task = (
+                DeliveryTask.query
+                .filter(
+                    DeliveryTask.dn_id == dn.id,
+                    DeliveryTask.is_active == True,
+                    DeliveryTask.status.in_(('completed', 'signed')),
+                )
+                .order_by(DeliveryTask.id.desc())
+                .first()
+            )
         tracking_number = delivery_task.tracking_number if delivery_task else None
 
         payload = {
@@ -920,7 +937,8 @@ class DNService:
         Mark a DN as 'completed'.
         一般只有在 delivered 状态后才可变成 completed
         """
-        dn = DNService._get_instance(dn_or_id)
+        # 锁 DN 行并重读状态：并发的重复签收不会重复扣 delivered_stock
+        dn = lock_row(DNService._get_instance(dn_or_id))
         if dn.status != 'delivered':
             raise BadRequestException("Cannot complete a DN that is not in 'delivered' status.", 16000)
 
@@ -953,7 +971,8 @@ class DNService:
         参数可以是 DN 的 id（int）或 DN 实例。
         如果找不到 DN，则抛出 NotFound 异常。
         """
-        dn = DNService._get_instance(dn_or_id)
+        # 先锁 DN 行并重读状态：与并发的 progress / cancel 串行
+        dn = lock_row(DNService._get_instance(dn_or_id))
 
         # 判断是否为pending状态
         if dn.status != 'pending':
@@ -975,7 +994,8 @@ class DNService:
         - in_progress：拣货任务尚无任何批次 / 明细时允许取消，拣货任务一并停用
         - 其它状态：拣货已经发生，409
         """
-        dn = DNService._get_instance(dn_or_id)
+        # 先锁 DN 行并重读状态，再查拣货任务：拣货批次追加 / 完成同样先锁 DN，三者串行
+        dn = lock_row(DNService._get_instance(dn_or_id))
         if dn.status == 'pending':
             return DNService.close_dn(dn)
         if dn.status != 'in_progress':

@@ -381,9 +381,16 @@ DN 须为 `picked` 或 `packed`（否则 409 `16067`）。请求体 `{"packages"
 - 海外 DN 按写入前的已存数据检查：没有当前有效的 CI 或 PL → 409 `16069`
   `details {missing_documents: [...], outdated: false}`；单证已过期（箱子 / 快照 / 运单号 / 出口资料改过没重出）→ 409 `16069`
   `details {missing_documents: [], outdated: true}`。
-- 当前 CI 已印 AWB，请求又带了不同的运单号（忽略空白差异）→ 409 `16080`
-  `details {document_tracking_number, tracking_number}`：先保存运单号、重出单证再发货；相同则保持已存值。
+- 当前 CI 已印 AWB，完成后任务上的运单号（请求里有就用请求值，否则用已存值）与它不同（忽略空格 / 连字符差异）
+  → 409 `16080` `details {document_tracking_number, tracking_number}`：先保存运单号、重出单证再发货；相同则按 CI 上印的写法写入。
   CI 没印 AWB 时照常写入请求里的运单号。
+- 当前 CI 已印承运商，请求里的 `carrier_id` 会把它换掉（`null` 按回落到 DN 的承运商算，与单证取数一致）
+  → 409 `16092` `details {document_carrier, document_carrier_id, carrier_id}`。
+- 一张 DN 同时只允许一条未完成（`pending` / `in_progress`）的有效发货任务：`POST /warehouse/delivery/` 时已有 → 409 `16090`
+  `details {delivery_task_id, status}`；DN 已发货 → 409 `16065`。打包完成自动生成时已有手工建的任务 → 复用那条，不再生成第二条。
+- 海外 DN 的单证 / 自动运单只认当前发货任务（最新的有效任务）：对别的任务完成发货 / 保存运单号 / 修改 → 409 `16091`
+  `details {delivery_task_id, current_status}`。
+- `dn.delivered` 的 `tracking_number` 取被完成的那条任务的运单号。
 - DN 发货（`delivered` / `completed`）后，报关快照、箱子、单证全部锁定 → 409 `16065`。
 - 海外 DN 的 `dn.delivered` 追加 `customs_documents`（含 `download_path`）、`packages`、
   `invoice_total{currency, goods_value, freight, insurance, total}`；国内件 payload 不变。
@@ -456,8 +463,11 @@ declared_value_carriage, delivery_task_id, shipment, warnings[]}`：
   街道 `4-5-6 Sample-cho` / `Chuo-ku`、城市 `Osaka`、邮编 `6000000`。邮编取仓库 / 公司的 `zip_code`
   （日本地址也能从地址里认出，统一发 7 位数字）。收件人没有邮编时带空的 `postalCode`；美国 / 加拿大 / 波多黎各必须有两位州代码。
 - 有有效运单时发货任务的运单号锁定为该运单号：完成发货、保存运单号、修改发货任务传了别的号码 → 409 `16078`
-  （要换先取消运单；完成发货 / 修改任务时传空值视为不改）。完成发货 / 修改任务传的 `carrier_id` 与运单承运商
-  （按承运商 code）不同也 409 `16078`，`details` 另带请求里的 `carrier_id`；`carrier_id: null` 视为不改。有结果不明 / 进行中的建单记录时，保存运单号或修改发货任务
+  （要换先取消运单；完成发货 / 修改任务时传空值视为不改）。号码比对忽略空格 / 连字符，一致时入库存运单上的标准写法。
+  完成发货 / 修改任务 / 保存运单号传的 `carrier_id` 与运单承运商
+  （按承运商 code）不同也 409 `16078`，`details` 另带请求里的 `carrier_id`；`carrier_id: null` 视为不改。
+  本 DN 已取消（含补偿取消）的自动运单号不能再保存或用来完成发货 → 409 `16078`
+  `details {tracking_number: null, cancelled_tracking_number, carrier, status: "cancelled"}`。有结果不明 / 进行中的建单记录时，保存运单号或修改发货任务
   带了号码 → 409 `16079`（防止操作员又在 FedEx 网站手工建一张；清空照常）。
 - 有进行中 / 有效 / 结果不明的自动运单时：新建或删除该 DN 的发货任务 → 409 `16078`（新任务会成为当前发货任务、
   绕过运单号锁定；新建时带的运单号也按上面的规则校验）；改报关数据（`PUT /warehouse/dn/<id>/customs`）或箱子
@@ -517,7 +527,7 @@ declared_value_carriage, delivery_task_id, shipment, warnings[]}`：
 
 DN 发货前可取消（发货后 409 `16065`；没有有效运单 409 `16075`）。调 FedEx `PUT /ship/v1/shipments/cancel`
 （`DELETE_ALL_PACKAGES`；发件国用建单时记下的 `sender_country`，迁移前的老记录按建单同一口径推），FedEx 拒绝 → 502 `16073`
-带原因。成功后记录标 `cancelled`、发货任务上的运单号清空、面单作废（`void_reason: shipment_cancelled`）、CI / PL 去掉 AWB
+带原因。成功后记录标 `cancelled`、发货任务上的运单号清空（按忽略空格 / 连字符后的号码比）、面单作废（`void_reason: shipment_cancelled`）、CI / PL 去掉 AWB
 重新签发（条件不满足时作废）。只要求 FedEx 凭证齐全：公司后来被移出 `FEDEX_ALLOWED_COMPANY_IDS` 也能取消已建的运单。
 
 FedEx 回「已取消 / 查无此运单」视为取消成功（`reason: already_cancelled`），例如上次取消在 FedEx 成功了但本地写库失败，
@@ -596,7 +606,7 @@ stdout_logfile=/var/log/wms-api.out.log
 | 库存错误 | 15000-15999 | 400 | 库存相关错误 |
 | 状态错误 | 16000-16999 | 400 | 状态流转错误 |
 
-出口单证相关业务码：`14019` 出口资料文本超长、`14020` 国家代码不合法、`16063` 报关结构不合法、`16064` 报关行商品编码不在 DN 明细或重复、`16065` 已发货不可改（409）、`16066` 箱子数据不合法、`16067` 当前状态不能改箱子（409）、`16068` 单证条件不全（409，`details.problems`）、`16069` 发货前单证缺失或已过期（409，`details {missing_documents, outdated}`）、`16070` 不是海外单（409）、`16071` 单证不存在（404）。承运商运单（FedEx）：`16072` 建单前置条件不满足（409，`details.blockers`）、`16073` FedEx 返回错误（502，`details.errors` / `transaction_id`）、`16074` FedEx 超时（504）、`16075` 没有有效运单（409）、`16076` 有进行中 / 有效 / 结果不明的运单时不能改箱子或报关数据（409）、`16077` `label_format` 不合法（400）、`16078` 运单号 / 承运商与有效的自动运单不一致，或有自动运单时新建 / 删除发货任务（409）、`16079` 有结果不明 / 进行中的建单记录（409，`details.unresolved`）。完成发货：`16080` 运单号与当前 CI 上印的 AWB 不一致（409，`details {document_tracking_number, tracking_number}`）。错误响应可能带结构化的 `details`。
+出口单证相关业务码：`14019` 出口资料文本超长、`14020` 国家代码不合法、`16063` 报关结构不合法、`16064` 报关行商品编码不在 DN 明细或重复、`16065` 已发货不可改（409）、`16066` 箱子数据不合法、`16067` 当前状态不能改箱子（409）、`16068` 单证条件不全（409，`details.problems`）、`16069` 发货前单证缺失或已过期（409，`details {missing_documents, outdated}`）、`16070` 不是海外单（409）、`16071` 单证不存在（404）。承运商运单（FedEx）：`16072` 建单前置条件不满足（409，`details.blockers`）、`16073` FedEx 返回错误（502，`details.errors` / `transaction_id`）、`16074` FedEx 超时（504）、`16075` 没有有效运单（409）、`16076` 有进行中 / 有效 / 结果不明的运单时不能改箱子或报关数据（409）、`16077` `label_format` 不合法（400）、`16078` 运单号 / 承运商与有效的自动运单不一致，或有自动运单时新建 / 删除发货任务（409）、`16079` 有结果不明 / 进行中的建单记录（409，`details.unresolved`）。完成发货：`16080` 运单号与当前 CI 上印的 AWB 不一致（409，`details {document_tracking_number, tracking_number}`）、`16092` 承运商与当前 CI 上印的不一致（409，`details {document_carrier, document_carrier_id, carrier_id}`）。发货任务：`16090` DN 已有未完成的发货任务（409，`details {delivery_task_id, status}`）、`16091` 海外 DN 不是当前发货任务（409，`details {delivery_task_id, current_status}`）。错误响应可能带结构化的 `details`。
 
 ## 关联项目
 

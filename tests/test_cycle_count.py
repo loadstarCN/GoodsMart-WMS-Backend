@@ -183,7 +183,8 @@ def test_batch_save_rejects_negative_and_non_integer(client, access_token):
     """B-40：batch_save 负数 / 非整数 → 400"""
     with client.application.app_context():
         cycle = get_cyclecount_task()
-        detail = get_cyclecount_task_detail_by_task_id(cycle.id)
+        # 取未完成的明细：已完成明细不能再保存（B-61，409 16017）
+        detail = CycleCountTaskDetail.query.filter_by(task_id=cycle.id, status='pending').first()
         # 批量保存要求任务 in_progress
         CycleCountTaskService.process_task(cycle.id, get_admin_user().id)
         cycle_id, detail_id = cycle.id, detail.id

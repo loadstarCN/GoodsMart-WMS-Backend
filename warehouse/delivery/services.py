@@ -1,9 +1,12 @@
+import math
+
 from extensions.db import *
 from extensions.error import BadRequestException, ConflictException
 from extensions.transaction import transactional
 from warehouse.dn.models import DN, DNDetail
 from warehouse.goods.models import Goods
 from warehouse.common import require_positive_int, require_fields
+from warehouse.common.locks import lock_row
 from warehouse.dn.services import (
     DNService, pick_fields, parse_date_value, parse_datetime_value,
 )
@@ -19,9 +22,30 @@ DELIVERY_UPDATE_FIELDS = (
     'order_number', 'remark',
 )
 DELIVERY_CREATE_FIELDS = ('dn_id',) + DELIVERY_UPDATE_FIELDS
+# 未完成的发货任务：一张 DN 同时只允许一条（is_active 的）
+UNFINISHED_TASK_STATUSES = ('pending', 'in_progress')
 
 
 class DeliveryTaskService:
+
+    @staticmethod
+    def _parse_shipping_cost(cost):
+        """运费：数字或数字字符串（表单输入框提交的是字符串）；None / 空串 = 未填。
+        非数字、负数、NaN / Infinity → 400 16081。"""
+        if cost is None:
+            return None
+        if isinstance(cost, str):
+            cost = cost.strip()
+            if not cost:
+                return None
+            try:
+                cost = float(cost)
+            except ValueError:
+                raise BadRequestException("shipping_cost must be a non-negative number", 16081)
+        if isinstance(cost, bool) or not isinstance(cost, (int, float)) \
+                or not math.isfinite(cost) or cost < 0 or cost >= 1e10:
+            raise BadRequestException("shipping_cost must be a non-negative number", 16081)
+        return float(cost)
 
     @staticmethod
     def _normalize_payload(payload: dict, dn: DN):
@@ -32,10 +56,8 @@ class DeliveryTaskService:
         mode = payload.get('transportation_mode')
         if mode is not None and mode not in DeliveryTask.DELIVERY_TASK_TRANSPORTATION_MODES:
             raise BadRequestException(f"Invalid transportation_mode: {mode}", 16048)
-        cost = payload.get('shipping_cost')
-        if cost is not None:
-            if isinstance(cost, bool) or not isinstance(cost, (int, float)) or cost < 0:
-                raise BadRequestException("shipping_cost must be a non-negative number", 16033)
+        if 'shipping_cost' in payload:
+            payload['shipping_cost'] = DeliveryTaskService._parse_shipping_cost(payload['shipping_cost'])
         DNService.assert_company_master_data(
             dn.warehouse.company_id,
             recipient_id=payload.get('recipient_id'),
@@ -53,7 +75,9 @@ class DeliveryTaskService:
 
     @staticmethod
     def _guard_carrier_tracking(task: DeliveryTask, payload: dict):
-        """DN 有进行中 / 有效 / 结果不明的自动运单（承运商对接建的）时：
+        """请求里的运单号非空时都按自动运单校验（assert_tracking_matches）：本 DN 已取消（含补偿取消）的
+        自动运单号 → 409 16078（details.status = cancelled）；有效运单时换成运单上的标准写法。
+        DN 有进行中 / 有效 / 结果不明的自动运单（承运商对接建的）时：
         - 请求里的运单号为空视为不改；有效运单时与它不同 → 409 16078（要换运单号先取消自动运单）；
           进行中 / 结果不明时带了运单号 → 409 16079（防止在 FedEx 网站又手工建一张）
         - 有效运单时：请求里的 carrier_id 为 null 视为不改；承运商与运单的不同 → 409 16078
@@ -62,14 +86,14 @@ class DeliveryTaskService:
             return
         from warehouse.dn.carrier_services import CarrierShipmentService
         shipment = CarrierShipmentService.open_shipment(task.dn)
-        if shipment is None:
-            return
         if 'tracking_number' in payload:
             if not str(payload['tracking_number'] or '').strip():
-                payload.pop('tracking_number')
+                if shipment is not None:
+                    payload.pop('tracking_number')
             else:
-                CarrierShipmentService.assert_tracking_matches(task.dn, payload['tracking_number'])
-        if 'carrier_id' in payload and shipment.status == 'active':
+                payload['tracking_number'] = CarrierShipmentService.assert_tracking_matches(
+                    task.dn, payload['tracking_number'])
+        if shipment is not None and 'carrier_id' in payload and shipment.status == 'active':
             DeliveryTaskService._assert_shipment_carrier(shipment, payload)
 
     @staticmethod
@@ -113,21 +137,78 @@ class DeliveryTaskService:
         payload['tracking_number'] = tracking
 
     @staticmethod
-    def _guard_document_awb(ship_state: dict, payload: dict):
-        """海外件：当前有效 CI 已印 AWB 时，完成发货只能用这个号码（忽略空白差异）。
-        不同 → 409 16080（先保存运单号并重出单证）；相同 → 不改已存值（保持与 CI 一字不差）。
-        CI 没印 AWB 时照常写入请求里的号码。"""
+    def _guard_document_awb(ship_state: dict, payload: dict, task: DeliveryTask):
+        """海外件：当前有效 CI 已印 AWB 时，完成发货后任务上的运单号（请求里有就用请求值，否则用已存值）
+        必须是这个号码（按 normalize_tracking 比，忽略空格 / 连字符差异）。
+        不同 → 409 16080 {document_tracking_number, tracking_number}（先保存运单号并重出单证）；
+        相同 → 请求带了号码时按 CI 上印的写法写入（与 CI 一字不差）。CI 没印 AWB 时照常写入请求里的号码。"""
+        from warehouse.dn.carrier_services import normalize_tracking
         document_awb = ship_state.get('awb')
-        requested = payload.get('tracking_number')
-        if not document_awb or not requested:
+        if not document_awb:
             return
-        if ''.join(requested.split()) != ''.join(document_awb.split()):
+        final = payload.get('tracking_number') or task.tracking_number
+        if normalize_tracking(final) != normalize_tracking(document_awb):
             raise ConflictException(
-                f"The current commercial invoice shows AWB {document_awb} but the request has {requested}. "
-                "Save the tracking number and issue the documents again before shipping.", 16080,
-                details={'document_tracking_number': document_awb, 'tracking_number': requested},
+                f"The current commercial invoice shows AWB {document_awb} but the delivery would ship with "
+                f"{final or 'no tracking number'}. Save the tracking number and issue the documents again "
+                "before shipping.", 16080,
+                details={'document_tracking_number': document_awb, 'tracking_number': final},
             )
-        payload.pop('tracking_number')
+        if 'tracking_number' in payload:
+            payload['tracking_number'] = document_awb
+
+    @staticmethod
+    def _guard_document_carrier(ship_state: dict, payload: dict, task: DeliveryTask):
+        """海外件：当前有效 CI 已印承运商时，完成发货请求里的 carrier_id 不能换成别的承运商
+        （null = 清空任务上的承运商，CI 取数会回落到 DN 的承运商，按回落后的比）。
+        不同 → 409 16092 {document_carrier, document_carrier_id, carrier_id}（先改承运商并重出单证）。
+        不传 carrier_id、CI 没印承运商时不检查。"""
+        from warehouse.carrier.models import Carrier
+        document_carrier_id = ship_state.get('carrier_id')
+        if not document_carrier_id or 'carrier_id' not in payload:
+            return
+        requested = payload['carrier_id']
+        carrier = db.session.get(Carrier, requested) if requested is not None else task.dn.carrier
+        if carrier is None or carrier.id != document_carrier_id:
+            raise ConflictException(
+                f"The current commercial invoice shows carrier {ship_state.get('carrier')}; the carrier cannot be "
+                "changed when shipping. Save the carrier and issue the documents again before shipping.", 16092,
+                details={'document_carrier': ship_state.get('carrier'), 'document_carrier_id': document_carrier_id,
+                         'carrier_id': requested},
+            )
+
+    @staticmethod
+    def _unfinished_task(dn: DN):
+        """DN 上未完成（pending / in_progress）的有效发货任务（最新一条），没有返回 None。调用方应先锁 DN 行。"""
+        return (
+            DeliveryTask.query
+            .filter(
+                DeliveryTask.dn_id == dn.id,
+                DeliveryTask.is_active.is_(True),
+                DeliveryTask.status.in_(UNFINISHED_TASK_STATUSES),
+            )
+            .order_by(DeliveryTask.id.desc())
+            .first()
+        )
+
+    @staticmethod
+    def _assert_current_task(task: DeliveryTask):
+        """海外 DN（带报关快照）：单证（CI 上的 AWB / 承运商、过期判定）、自动运单都只认「当前发货任务」
+        （CustomsService._delivery_task：最新的有效任务）。对别的任务完成发货 / 存运单号 / 改任务会绕过
+        运单号锁定和单证校验 → 409 16091 {delivery_task_id: 当前任务 id, current_status}。
+        调用方应先锁 DN 行。国内件不检查。"""
+        from warehouse.dn.customs_services import CustomsService
+        dn = task.dn
+        if dn.customs is None:
+            return
+        current = CustomsService._delivery_task(dn)
+        if current is not None and current.id != task.id:
+            raise ConflictException(
+                f"Delivery task {task.id} is not the current delivery task of DN {dn.id} (current: {current.id}); "
+                "export documents and carrier shipments follow the current task only. "
+                "Use the current task instead.", 16091,
+                details={'delivery_task_id': current.id, 'current_status': current.status},
+            )
 
     @staticmethod
     def _get_instance(task_or_id: int | DeliveryTask) -> DeliveryTask:
@@ -139,6 +220,16 @@ class DeliveryTaskService:
         if isinstance(task_or_id, int):
             return DeliveryTaskService.get_task(task_or_id)
         return task_or_id
+
+    @staticmethod
+    def _lock(task_or_id: int | DeliveryTask) -> DeliveryTask:
+        """
+        先锁 DN 行（与 CustomsService._lock 同一把锁：改箱子 / 出单证 / 建运单都先锁它）、再锁任务行，
+        拿到锁后重读状态（全系统统一的加锁顺序：先父单据、后任务）。
+        """
+        task = DeliveryTaskService._get_instance(task_or_id)
+        lock_row(task.dn)
+        return lock_row(task)
 
     @staticmethod
     def list_tasks(filters: dict):
@@ -211,23 +302,39 @@ class DeliveryTaskService:
         创建新的 DeliveryTask。只接受白名单字段；status 固定 pending、is_active 固定 True。
         缺 dn_id / recipient_id / shipping_address / expected_shipping_date → 400。
         DN 有进行中 / 有效 / 结果不明的自动运单（承运商对接）时不能新建（新任务会成为当前发货任务，
-        绕过运单号锁定）→ 409 16078；带的运单号也按自动运单校验（结果不明 16079 / 不一致 16078）。
+        绕过运单号锁定）→ 409 16078；带的运单号也按自动运单校验（结果不明 16079 / 不一致或已取消 16078）。
+        一张 DN 同时只允许一条未完成（pending / in_progress）的有效发货任务：已有 → 409 16090
+        {delivery_task_id, status}；DN 已发货（delivered / completed）→ 409 16065。
         """
         from warehouse.dn.carrier_services import CarrierShipmentService
-        from warehouse.dn.customs_services import CustomsService
+        from warehouse.dn.customs_services import CustomsService, LOCKED_DN_STATUSES
 
         payload = pick_fields(data, DELIVERY_CREATE_FIELDS)
         require_fields(payload, 'dn_id', 'recipient_id', 'shipping_address', 'expected_shipping_date')
         dn_id = require_positive_int(payload['dn_id'], 'dn_id', 16044)
         dn = get_object_or_404(DN, dn_id)
-        # 先锁 DN 行：与自动建运单 / 取消串行
+        # 先锁 DN 行：与自动建运单 / 取消、打包完成自动生成发货任务、并发新建串行
         dn = CustomsService._lock(dn)
         payload = DeliveryTaskService._normalize_payload(payload, dn)
         DeliveryTaskService._assert_shipping_dates(
             payload['expected_shipping_date'], payload.get('actual_shipping_date')
         )
-        CarrierShipmentService.assert_tracking_matches(dn, payload.get('tracking_number'), allow_empty=True)
+        if 'tracking_number' in payload:
+            payload['tracking_number'] = CarrierShipmentService.assert_tracking_matches(
+                dn, payload['tracking_number'], allow_empty=True)
         CarrierShipmentService.assert_delivery_tasks_editable(dn, 'added')
+        # 已发货的 DN 不能再建：新任务会成为「当前发货任务」，单证 / 运单都改看它，而它永远完成不了
+        if dn.status in LOCKED_DN_STATUSES:
+            raise ConflictException(
+                f"DN {dn.id} has been shipped ({dn.status}); delivery tasks cannot be added.", 16065)
+        # 一张 DN 同时只允许一条未完成的有效发货任务（多条会绕过运单号锁定、CI 运单号校验和单证过期判定）
+        existing = DeliveryTaskService._unfinished_task(dn)
+        if existing is not None:
+            raise ConflictException(
+                f"DN {dn.id} already has an unfinished delivery task {existing.id} ({existing.status}); "
+                "only one unfinished delivery task is allowed per DN.", 16090,
+                details={'delivery_task_id': existing.id, 'status': existing.status},
+            )
 
         new_delivery = DeliveryTask(
             dn_id=dn_id,
@@ -263,22 +370,20 @@ class DeliveryTaskService:
         更新指定 DeliveryTask（completed / signed 后不可改）。
         只接受白名单字段：dn_id 不可改；status / is_active / created_by / *_at
         只经 process / complete / sign 流转，客户端传入一律忽略。
-        运单号：DN 的自动运单结果不明 / 进行中时不能存号码（409 16079）；有有效自动运单时只能是它的号码（16078）。
+        运单号：DN 的自动运单结果不明 / 进行中时不能存号码（409 16079）；有有效自动运单时只能是它的号码（16078，
+        入库存运单上的标准写法）；本 DN 已取消的自动运单号 → 16078。
+        海外 DN 只能改当前发货任务（CustomsService._delivery_task），别的任务 → 409 16091。
         """
-        from warehouse.dn.carrier_services import CarrierShipmentService
-        from warehouse.dn.customs_services import CustomsService
-
-        delivery = DeliveryTaskService.get_task(delivery_id)
+        # 先锁 DN 行、再锁任务行并重读，再查状态和自动运单：与完成发货、自动建运单 / 取消串行
+        delivery = DeliveryTaskService._lock(delivery_id)
 
         if delivery.status in ('completed', 'signed'):
            raise BadRequestException("Cannot update a completed or signed Delivery", 16023)
+        DeliveryTaskService._assert_current_task(delivery)
 
         payload = pick_fields(data, DELIVERY_UPDATE_FIELDS)
         payload = DeliveryTaskService._normalize_payload(payload, delivery.dn)
-        # 先锁 DN 行再查自动运单：与自动建运单 / 取消串行
-        CustomsService._lock(delivery.dn)
-        if 'tracking_number' in payload:
-            CarrierShipmentService.assert_tracking_matches(delivery.dn, payload['tracking_number'], allow_empty=True)
+        # 运单号 / 承运商按自动运单校验（含已取消的号码），通过时运单号换成运单上的标准写法
         DeliveryTaskService._guard_carrier_tracking(delivery, payload)
         DeliveryTaskService._assert_shipping_dates(
             payload.get('expected_shipping_date', delivery.expected_shipping_date),
@@ -306,16 +411,20 @@ class DeliveryTaskService:
         出单证（商业发票印 AWB No.）→ 完成发货。
         - 任务 pending / in_progress 可存；DN 已发货或任务已完成 → 409 16065
         - 已签发的出口单证不自动作废：运单号计入单证数据指纹，重新 issue 时升版本
-        - DN 有有效的自动运单（承运商对接）时，只能存它的号码（清空 / 改成别的 → 409 16078，先取消自动运单）
+        - DN 有有效的自动运单（承运商对接）时，只能存它的号码（清空 / 改成别的 → 409 16078，先取消自动运单）；
+          号码按规范化比对（忽略空格 / 连字符），入库统一存运单上的标准写法；承运商也不能换（16078）
         - DN 的自动运单结果不明 / 进行中时不能存号码（409 16079，防止又在承运商网站手工建一张）
+        - 本 DN 已取消（含补偿取消）的自动运单号不能再存 → 409 16078（details.status = cancelled）
+        - 海外 DN 只能存到当前发货任务（CustomsService._delivery_task）上，别的任务 → 409 16091
         """
-        from warehouse.dn.customs_services import CustomsService
+        from warehouse.dn.carrier_services import CarrierShipmentService
 
-        task = DeliveryTaskService._get_instance(task_or_id)
-        # 先锁 DN 行再查自动运单：与自动建运单 / 取消串行（建单流程里调用时 DN 已锁，重复加锁无妨）
-        CustomsService._lock(task.dn)
+        # 先锁 DN 行、再锁任务行并重读，再查状态和自动运单：与完成发货、自动建运单 / 取消串行
+        # （建单流程里调用时 DN 已锁，重复加锁无妨）
+        task = DeliveryTaskService._lock(task_or_id)
         if task.status in ('completed', 'signed') or task.dn.status in ('delivered', 'completed'):
             raise ConflictException("The shipment has been completed; tracking number is locked.", 16065)
+        DeliveryTaskService._assert_current_task(task)
 
         payload = pick_fields(data or {}, ('tracking_number', 'carrier_id'))
         if 'tracking_number' in payload:
@@ -326,12 +435,15 @@ class DeliveryTaskService:
             if tracking is not None and len(tracking) > 100:
                 raise BadRequestException("tracking_number must not exceed 100 characters", 40000,
                                           field='tracking_number')
-            from warehouse.dn.carrier_services import CarrierShipmentService
-            CarrierShipmentService.assert_tracking_matches(task.dn, tracking)
-            task.tracking_number = tracking
+            # 有有效自动运单时返回运单上的标准写法（「7946 0000 0001」也存成 794600000001）
+            task.tracking_number = CarrierShipmentService.assert_tracking_matches(task.dn, tracking)
         if payload.get('carrier_id') is not None:
             carrier_id = require_positive_int(payload['carrier_id'], 'carrier_id', 16044)
             DNService.assert_company_master_data(task.dn.warehouse.company_id, carrier_id=carrier_id)
+            # 有效自动运单期间不能换承运商（与修改任务 / 完成发货同口径，按承运商 code 比）→ 409 16078
+            shipment = CarrierShipmentService.active_shipment(task.dn)
+            if shipment is not None:
+                DeliveryTaskService._assert_shipment_carrier(shipment, {'carrier_id': carrier_id})
             task.carrier_id = carrier_id
         db.session.flush()
         return task
@@ -344,14 +456,12 @@ class DeliveryTaskService:
         DN 有进行中 / 有效 / 结果不明的自动运单时不能删（运单号在任务上，删了等于绕过锁定）→ 409 16078。
         """
         from warehouse.dn.carrier_services import CarrierShipmentService
-        from warehouse.dn.customs_services import CustomsService
 
-        delivery = DeliveryTaskService.get_task(delivery_id)
+        # 先锁 DN 行、再锁任务行并重读：与 process、自动建运单 / 取消串行
+        delivery = DeliveryTaskService._lock(delivery_id)
         if delivery.status != 'pending':
             raise BadRequestException("Cannot delete a non-pending Delivery", 16002)
-        # 先锁 DN 行：与自动建运单 / 取消串行
-        dn = CustomsService._lock(delivery.dn)
-        CarrierShipmentService.assert_delivery_tasks_editable(dn, 'deleted')
+        CarrierShipmentService.assert_delivery_tasks_editable(delivery.dn, 'deleted')
 
         db.session.delete(delivery)
         # db.session.commit()
@@ -405,7 +515,7 @@ class DeliveryTaskService:
         """
         将 DeliveryTask 从 pending 切换为 in_progress
         """
-        delivery = DeliveryTaskService._get_instance(task_or_id)
+        delivery = DeliveryTaskService._lock(task_or_id)
         if delivery.status != 'pending':
             raise BadRequestException("Cannot process a non-pending Delivery", 16007)
 
@@ -425,33 +535,46 @@ class DeliveryTaskService:
             "remark": "Delivery completed."
         }
         - tracking_number 为空串 / null / 不传 → 不改已存的运单号（国内件也一样）
+        - shipping_cost 可为数字或数字字符串；空串 / null → 不改已存值；非法 → 400 16081
         - 有有效的自动运单时运单号 / 承运商与运单不一致 → 409 16078
         - 海外件（DN 带报关快照）按写入前的已存状态检查单证：缺 CI / PL → 409 16069
           {missing_documents: [...], outdated: false}；已过期 → 409 16069 {missing_documents: [], outdated: true}
-        - 海外件当前 CI 已印 AWB、请求带了不同的运单号 → 409 16080 {document_tracking_number, tracking_number}；
-          CI 没印 AWB 时照常写入请求里的运单号
+        - 海外件当前 CI 已印 AWB、完成后任务上的运单号（请求值，没带则已存值）与它不同
+          → 409 16080 {document_tracking_number, tracking_number}；CI 没印 AWB 时照常写入请求里的运单号
+        - 海外件当前 CI 已印承运商、请求里的 carrier_id 换成别的 → 409 16092
+          {document_carrier, document_carrier_id, carrier_id}
+        - 海外件只能完成当前发货任务（CustomsService._delivery_task），别的任务 → 409 16091
+        - 本 DN 已取消（含补偿取消）的自动运单号 → 409 16078（details.status = cancelled）
         """
         from warehouse.dn.customs_services import CustomsService
         task = DeliveryTaskService._get_instance(task_or_id)
         # 先锁 DN 行（与改箱子 / 改报关快照 / 出单证 / 建运单串行），防止检查通过后单证被并发作废仍出货；
-        # 拿到锁后重读任务，并发的重复完成在下面的状态检查处挡下
+        # 再锁任务行并重读（先 DN 后任务），并发的重复完成在下面的状态检查处挡下
         CustomsService._lock(task.dn)
-        db.session.refresh(task)
+        lock_row(task)
         if task.status != 'in_progress':
             raise BadRequestException("Cannot complete a non-in-progress Delivery", 16008)
+        # 海外件：单证 / 自动运单只认当前发货任务，完成别的任务会绕过运单锁和单证校验 → 409 16091
+        DeliveryTaskService._assert_current_task(task)
 
         payload = pick_fields(data or {}, (
             'transportation_mode', 'carrier_id', 'tracking_number', 'shipping_cost', 'currency', 'remark',
         ))
         DeliveryTaskService._clean_complete_tracking(payload)
         payload = DeliveryTaskService._normalize_payload(payload, task.dn)
-        # 有有效的自动运单时，完成发货传了别的运单号 / 承运商 → 409 16078（相同或不传照常）
+        # 运费为空（null / 空串）与运单号一样视为不改已存值
+        if 'shipping_cost' in payload and payload['shipping_cost'] is None:
+            del payload['shipping_cost']
+        # 有有效的自动运单时，完成发货传了别的运单号 / 承运商 → 409 16078（相同或不传照常，相同时换成标准写法）；
+        # 本 DN 已取消的自动运单号 → 409 16078
         DeliveryTaskService._guard_carrier_tracking(task, payload)
         DeliveryTaskService._assert_shipping_dates(task.expected_shipping_date, datetime.now().date())
 
-        # 海外件：单证缺失 / 过期 → 409 16069（按写入前的状态）；CI 上的 AWB 与请求不同 → 409 16080
+        # 海外件：单证缺失 / 过期 → 409 16069（按写入前的状态）；完成后的运单号与 CI 上的 AWB 不同 → 409 16080；
+        # 请求里的承运商与 CI 上印的不同 → 409 16092
         ship_state = CustomsService.assert_ready_to_ship(task.dn)
-        DeliveryTaskService._guard_document_awb(ship_state, payload)
+        DeliveryTaskService._guard_document_awb(ship_state, payload, task)
+        DeliveryTaskService._guard_document_carrier(ship_state, payload, task)
 
         task = DeliveryTaskService._update_task_status(task, 'completed', operator_id)
 
@@ -461,8 +584,8 @@ class DeliveryTaskService:
             if field in payload:
                 setattr(task, field, payload[field])
 
-        # 若有需要在此更新库存或者做别的业务处理
-        DNService.delivery_dn(task.dn_id)
+        # 若有需要在此更新库存或者做别的业务处理；dn.delivered 的运单号取这条被完成的任务的
+        DNService.delivery_dn(task.dn_id, delivery_task=task)
 
         return task
 
@@ -476,7 +599,8 @@ class DeliveryTaskService:
             "signed_at": "2021-08-01"
         }
         """
-        task = DeliveryTaskService._get_instance(task_or_id)
+        # 先锁 DN、再锁任务并重读状态：并发的重复签收在这里挡下，不会重复完成 DN、重复扣 delivered_stock
+        task = DeliveryTaskService._lock(task_or_id)
 
         if task.status != 'completed':
             raise BadRequestException("Cannot sign a non-completed Delivery", 16024)
@@ -498,11 +622,18 @@ class DeliveryTaskService:
     @transactional
     def create_delivery_task_from_dn(dn_id: int, created_by_id: int) -> DeliveryTask:
         """
-        根据 DN 自动生成一个 DeliveryTask
+        根据 DN 自动生成一个 DeliveryTask（打包完成时调用）。
+        一张 DN 同时只允许一条未完成的有效发货任务：打包完成前已经手工建了（POST /delivery/）→ 复用那条，
+        不再生成第二条，也不报错（报错会让打包完成整体回滚、卡住流程）。
         """
-        dn = DNService.get_dn(dn_id)
+        # 先锁 DN 行再查已有任务：与手工新建（create_task 同样先锁 DN）串行，不会各建一条
+        dn = lock_row(DNService.get_dn(dn_id))
         if not dn.details:
             raise BadRequestException("DN has no details to create a Delivery.", 16016)
+
+        existing = DeliveryTaskService._unfinished_task(dn)
+        if existing is not None:
+            return existing
 
         transportation_mode = dn.transportation_mode
         if transportation_mode not in DeliveryTask.DELIVERY_TASK_TRANSPORTATION_MODES:

@@ -348,18 +348,32 @@ class InventoryService:
 
     @staticmethod
     @transactional
-    def dn_packed(goods_id: int, warehouse_id: int, quantity: int):
+    def dn_packed(goods_id: int, warehouse_id: int, quantity: int, picked_quantity: int | None = None):
         """
-        包装完成：拣货库存减少，配送库存增加
+        包装完成：拣货库存减少，包装库存增加
         :param goods_id: 关联的商品 ID
         :param warehouse_id: 仓库 ID
-        :param quantity: 包装数量
+        :param quantity: 实际包装数量
+        :param picked_quantity: 该 DN 该商品的已拣数量（缺省等于 quantity）
+        注意：quantity 可能小于 picked_quantity，表示少打包。与拣货缺货时 dn_picked 释放整笔预占对应，
+        打包完成时按已拣量整笔扣 picked_stock，未打包的差额退回 sorted_stock（待上架），之后走上架放回库位；
+        否则差额会永久留在 picked_stock 里。差额只在两个分量之间搬动，total_stock 不变。
         """
+        if picked_quantity is None:
+            picked_quantity = quantity
+        if quantity > picked_quantity:
+            raise BadRequestException(
+                f"Packed quantity exceeds picked quantity for goods {goods_id}: "
+                f"packed {quantity} > picked {picked_quantity}.",
+                16043
+            )
         inventory = InventoryService._get_for_update(goods_id, warehouse_id)
-        if inventory.picked_stock < quantity:
+        if inventory.picked_stock < picked_quantity:
             raise BadRequestException("Not enough pick stock.", 15009)
-        inventory.picked_stock -= quantity
+        inventory.picked_stock -= picked_quantity
         inventory.packed_stock += quantity
+        # 少打包的差额回到待上架区
+        inventory.sorted_stock += picked_quantity - quantity
         inventory.total_stock = InventoryService._calculate_total_stock(inventory)
         # db.session.commit()
 
