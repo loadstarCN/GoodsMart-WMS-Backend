@@ -700,6 +700,10 @@ def test_origin_country_endpoint_denied_without_permission(client, goods_id, com
 def test_origin_country_endpoint_company_scope(client, goods_id, company_ids):
     with client.application.app_context():
         other_company = _permission_key(company_ids[1], ['packing_edit'])
+        # 端点加了 @warehouse_required()（B-69）：公司级 Key 所在公司须有启用仓库，否则一律 403，
+        # 这里给 Company B 建一个仓库，才能分别验证「别家商品 403 / 不存在 404」
+        db.session.add(Warehouse(name='Warehouse of B', address='x', company_id=company_ids[1], created_by=1))
+        db.session.commit()
 
     response = client.put(f'/goods/{goods_id}/origin-country', headers={'X-API-KEY': other_company},
                           json={'origin_country': 'CN'})
@@ -720,8 +724,11 @@ def test_origin_country_endpoint_staff_role_with_packing_edit(client, goods_id):
         db.session.add(role)
         db.session.commit()
         token = create_access_token(identity=staff)
+        warehouse_id = staff.warehouses[0].id
 
-    response = client.put(f'/goods/{goods_id}/origin-country', headers=_auth(token),
+    # 端点加了 @warehouse_required()（B-69）：非公司管理员员工要带当前仓库（APP 每个请求都带）
+    response = client.put(f'/goods/{goods_id}/origin-country',
+                          headers={**_auth(token), 'X-WAREHOUSE-ID': str(warehouse_id)},
                           json={'origin_country': 'VN'})
     assert response.status_code == 200, response.get_json()
     assert response.get_json()['origin_country'] == 'VN'
@@ -738,9 +745,13 @@ def test_origin_country_endpoint_only_changes_origin_and_emits(client, access_to
     })
     assert response.status_code == 200, response.get_json()
     data = response.get_json()
+    # 响应改为精简模型（B-69）：只有 id / code / origin_country，不带库位库存
+    assert set(data) == {'id', 'code', 'origin_country'}
     assert data['origin_country'] == 'TH'
+    with client.application.app_context():
+        after = marshal(db.session.get(Goods, goods_id), goods_simple_model)
     for field in ('code', 'name', 'weight', 'length', 'width', 'height', 'manufacturer'):
-        assert data[field] == before[field], field
+        assert after[field] == before[field], field
 
     with client.application.app_context():
         events = _events(key_id)

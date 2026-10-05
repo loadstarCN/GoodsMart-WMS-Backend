@@ -1,5 +1,6 @@
 from extensions.db import *
 from extensions.transaction import transactional
+from warehouse.common.references import ensure_not_referenced
 from .models import Supplier
 
 class SupplierService:
@@ -89,8 +90,9 @@ class SupplierService:
     @transactional
     def delete_supplier(supplier_id: int):
         """
-        删除 Supplier
+        删除 Supplier：仍被 ASN 等引用时 409 44004（改用停用）
         """
         supplier = SupplierService.get_supplier(supplier_id)
+        ensure_not_referenced(Supplier, supplier.id, 'supplier')
         db.session.delete(supplier)
         # db.session.commit()

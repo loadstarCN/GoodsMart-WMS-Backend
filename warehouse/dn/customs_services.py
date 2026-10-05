@@ -135,6 +135,21 @@ def format_money(value, currency) -> str:
     return f"{_quantize_money(Decimal(str(value)), currency):,.{places}f}"
 
 
+def _line_unit_value(raw, currency):
+    """报关行的成交单价 → 按币种小数位量化后的 Decimal（发票上印的、算金额用的、提交 FedEx 的都是它）。
+    新数据解析时已拒绝超精度的单价（16063）；这里兜存量数据：超精度的按 ROUND_HALF_UP 量化
+    （量化后 ≤ 0 由 problems 报 UNIT_VALUE_MISSING），不是数字 / 溢出视为没有单价（None），不让 GET / 签发 500。"""
+    if raw is None or isinstance(raw, bool):
+        return None
+    try:
+        value = Decimal(str(raw).strip())
+        if not value.is_finite():
+            return None
+        return _quantize_money(value, currency)
+    except (InvalidOperation, ValueError, TypeError):
+        return None
+
+
 def format_hs_code(hs_code) -> str:
     """'950300' → '9503.00'；'9503000073' → '9503.00.0073'。"""
     digits = _HS_STRIP.sub('', str(hs_code or ''))
@@ -278,6 +293,8 @@ def parse_customs(raw, dn_goods_codes) -> dict:
     """校验并规范化报关快照。
 
     结构错误（customs 非对象、lines 非数组、行非对象、字段类型错误、超长）→ 400 16063（details.field）；
+    行的 unit_value 小数位超过币种的小数位（JPY 等无小数币种 0 位，其它 2 位；币种缺 / 不合法按 2 位）
+    → 400 16063（details {field, currency, max_decimal_places}）—— 发票上「单价 × 数量 = 金额」必须成立；
     行的 goods_code 不在 DN 明细里或重复 → 400 16064。缺字段 / 空值 / 单价 ≤0 等内容问题照收。
     """
     if not isinstance(raw, dict):
@@ -334,6 +351,13 @@ def parse_customs(raw, dn_goods_codes) -> dict:
             )
         seen.add(goods_code)
         unit_value = _opt_decimal(item.get('unit_value'), f'{prefix}.unit_value', maximum=MAX_LINE_VALUE)
+        places = _currency_places(result['currency'])
+        if unit_value is not None and unit_value != _quantize_money(unit_value, result['currency']):
+            field = f'{prefix}.unit_value'
+            raise BadRequestException(
+                f"{field} allows at most {places} decimal places for currency {result['currency'] or '(none)'}",
+                16063, field=field,
+                details={'field': field, 'currency': result['currency'], 'max_decimal_places': places})
         total_value = _opt_decimal(item.get('total_value'), f'{prefix}.total_value', maximum=MAX_LINE_VALUE)
         lines.append({
             'goods_code': goods_code,
@@ -606,13 +630,10 @@ class CustomsService:
         if _package_signature(dn.packages) == _package_signature(packages):
             return {'packages': CustomsService.packages_payload(dn), 'voided_documents': []}
 
-        # 已在承运商建了运单：箱数 / 重量 / 尺寸已随运单提交，先取消运单再改箱子
+        # 已在承运商建了运单（含进行中 / 结果不明 / 取消中）：箱数 / 重量 / 尺寸已随运单提交，先取消运单再改箱子
+        # → 409 16076 details {reason: CARRIER_SHIPMENT_OPEN, status, carrier, carrier_shipment}
         from .carrier_services import CarrierShipmentService
-        if CarrierShipmentService.has_active_shipment(dn):
-            raise ConflictException(
-                "Packages cannot be changed while an active carrier shipment exists; cancel the shipment first.",
-                16076,
-            )
+        CarrierShipmentService.assert_packages_editable(dn)
 
         # 先删后插：同一次 flush 里 UOW 会先 INSERT 再 DELETE，撞 (dn_id, package_no) 唯一约束
         for old in list(dn.packages):
@@ -750,11 +771,15 @@ class CustomsService:
             goods = row['goods']
             code = goods.code if goods else None
             line = customs_lines.get(code) or {}
-            unit_value = Decimal(str(line['unit_value'])) if line.get('unit_value') is not None else None
+            # 单价先按币种小数位量化，再乘数量：发票上印的「单价 × 数量」与「金额」一致，提交 FedEx 的 unitPrice 同值
+            unit_value = _line_unit_value(line.get('unit_value'), currency)
             packed = row['packed']
             amount = None
             if unit_value is not None:
-                amount = _quantize_money(unit_value * packed, currency)
+                try:
+                    amount = _quantize_money(unit_value * packed, currency)
+                except InvalidOperation:        # 存量数据溢出：按没有单价处理（UNIT_VALUE_MISSING）
+                    unit_value = None
             origin = _goods_origin(goods) if goods else None
             weight = Decimal(str(goods.weight)) if goods is not None and goods.weight is not None else None
             net_weight = (weight * packed).quantize(Decimal('0.001')) if weight is not None else None
@@ -1045,7 +1070,10 @@ class CustomsService:
     @transactional
     def issue_documents(dn: DN, user_id) -> tuple:
         """签发 CI + PL。返回 (http_status, {version, documents})：
-        201 新签发；200 单证数据未变，返回现有版本。条件不全 409 16068（details.problems）。"""
+        201 新签发；200 单证数据未变，返回现有版本。条件不全 409 16068（details.problems）。
+        有进行中 / 有效 / 结果不明 / 取消中的自动运单时，单证数据除 AWB 外必须与当前单证（即随运单提交给承运商的）
+        一致，否则 409 16076（details.reason = DOCUMENT_DATA_CHANGED）：例如建单后改了商品原产国、公司 / 仓库出口资料、
+        承运商 —— 先取消运单再重签。"""
         from .customs_documents import render_commercial_invoice, render_packing_list
 
         dn = CustomsService._lock(dn)
@@ -1064,6 +1092,7 @@ class CustomsService:
         data_sha256 = _data_hash(data)
 
         current = CustomsService.current_documents(dn)
+        CustomsService._assert_matches_carrier_shipment(dn, data, current)
         if all(t in current for t in DOC_TYPES) and all(current[t].data_sha256 == data_sha256 for t in DOC_TYPES):
             return 200, {
                 'version': current[DOC_CI].version,
@@ -1109,6 +1138,28 @@ class CustomsService:
         return 201, {'version': version, 'documents': [doc.to_meta() for doc in documents]}
 
     @staticmethod
+    def _assert_matches_carrier_shipment(dn: DN, data: dict, current: dict):
+        """有未结束的自动运单（pending / active / unknown / cancelling）时，新单证数据除 AWB 外须与当前单证一致：
+        当前单证就是建单时随运单（含 ETD）提交的那份（建单前签发，写库时只多了 AWB），数据变了说明与承运商那边的申报
+        不一致 → 409 16076（reason DOCUMENT_DATA_CHANGED）。比较时把新数据的 AWB 依次换成「没有」/ 运单号 /
+        发货任务上的号码算指纹，与当前单证的指纹比。没有当前单证（不该出现）时无从比较，放行。"""
+        from .carrier_services import CarrierShipmentService
+        record = CarrierShipmentService.open_shipment(dn)
+        if record is None:
+            return
+        baseline = {doc.data_sha256 for doc in current.values()}
+        if not baseline:
+            return
+        task = CustomsService._delivery_task(dn)
+        candidates = {None, record.tracking_number or None, (task.tracking_number if task else None) or None}
+        hashes = {_data_hash(dict(data, awb=awb)) for awb in candidates}
+        if baseline <= hashes:
+            return
+        raise CarrierShipmentService.open_shipment_conflict(
+            record, "Customs documents with different data (other than the AWB) cannot be issued",
+            reason='DOCUMENT_DATA_CHANGED')
+
+    @staticmethod
     def list_documents(dn: DN, status=None, doc_type=None) -> list:
         query = DNDocument.query.filter(DNDocument.dn_id == dn.id)
         if status:
@@ -1136,12 +1187,19 @@ class CustomsService:
         - 没有当前有效的 CI 或 PL → 409 16069，details {missing_documents: [...], outdated: false}
         - 有但已过期（数据指纹变了：箱子 / 快照 / 运单号 / 公司资料等改过没重出）
           → 409 16069，details {missing_documents: [], outdated: true}
+        - 自动运单进行中 / 结果不明 / 正在取消或取消结果不明（pending / unknown / cancelling）→ 409 16079
+          （details.unresolved）：FedEx 上可能有运单、或面单可能已作废，先处理（取消 / 确认作废）再发货。
+          请求里带不带运单号都拦（带了的在 assert_tracking_matches 已拦）。
         通过时返回 {'awb': 当前单证上印的运单号（没印为 None）,
                     'carrier_id' / 'carrier': CI 上印的承运商（与 _document_data 同一口径：当前发货任务的承运商，
                     没有则 DN 的；都没有为 None）}。
         """
         if dn.customs is None:
             return {}
+        from .carrier_services import CarrierShipmentService
+        unresolved = CarrierShipmentService.unresolved_shipment(dn)
+        if unresolved is not None:
+            raise CarrierShipmentService._unresolved_conflict(unresolved)
         current = CustomsService.current_documents(dn)
         missing = [t for t in DOC_TYPES if t not in current]
         if missing:

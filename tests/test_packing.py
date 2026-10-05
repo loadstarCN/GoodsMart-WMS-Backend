@@ -9,8 +9,10 @@ from .helpers import *
 
 def test_create_packing_task(client, access_token):
     """
-    测试创建 Packing Task (POST /packing/)
+    手工新建打包任务的接口已去掉（B-81）：POST /packing/ → 405，任务只由拣货完成时自动生成
     """
+    with client.application.app_context():
+        before = PackingTask.query.count()
     response = client.post(
         '/packing/',
         headers={'Authorization': f'Bearer {access_token}'},
@@ -20,9 +22,9 @@ def test_create_packing_task(client, access_token):
             "is_active": True,
         }
     )
-    assert response.status_code == 201
-    data = response.get_json()
-    assert data['status'] == "pending"
+    assert response.status_code == 405
+    with client.application.app_context():
+        assert PackingTask.query.count() == before
 
 
 def test_get_packing_tasks(client, access_token):
@@ -239,17 +241,14 @@ def test_packing_task_service_get_task(client):
 
 def test_packing_task_service_create_task(client):
     """
-    测试通过服务层创建一个新的 PackingTask
+    服务层不再提供 create_task（B-81）：打包任务只由拣货完成时 create_packing_task_from_dn 生成
     """
     with client.application.app_context():
         user = get_operator_user()
         dn =get_dn()
-        data = {
-            "dn_id": dn.id,
-            "status": "pending",
-            "is_active": True,
-        }
-        new_task = PackingTaskService.create_task(data, user.id)
+        assert not hasattr(PackingTaskService, 'create_task')
+        new_task = PackingTaskService.create_packing_task_from_dn(dn.id, user.id)
+        db.session.commit()
         assert new_task.id is not None
         # 检查其他关键字段
         assert new_task.status == "pending"

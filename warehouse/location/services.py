@@ -4,9 +4,50 @@ from extensions.db import *
 from extensions.error import BadRequestException, ConflictException
 from extensions.transaction import transactional
 from warehouse.common.locks import lock_row
+from warehouse.common.validation import optional_number
 from .models import Location
 
+# 库位尺寸 / 容量（Float 列）：空串 → null；必须 > 0（chk_dimension_positive 约束 width / depth / height）
+LOCATION_NUMBER_FIELDS = ('width', 'depth', 'height', 'capacity')
+
+
 class LocationService:
+
+    @staticmethod
+    def _clean_numbers(data: dict) -> dict:
+        """只处理请求里出现的尺寸字段：空串转 null，其余必须是 > 0 的数字，否则 400（16115）"""
+        return {
+            field: optional_number(data[field], field, positive=True)
+            for field in LOCATION_NUMBER_FIELDS if field in data
+        }
+
+    @staticmethod
+    def _history_counts(location_id: int) -> dict:
+        """统计引用该库位的历史记录（这些外键都是 RESTRICT：PG 上直接删会撞外键变成 500）。
+        数量为 0 的库位库存行不算历史，删库位时一并删掉。"""
+        from warehouse.adjustment.models import AdjustmentDetail
+        from warehouse.cyclecount.models import CycleCountTaskDetail
+        from warehouse.inventory_snapshot.models import InventorySnapshot
+        from warehouse.picking.models import PickingTaskDetail
+        from warehouse.putaway.models import PutawayRecord
+        from warehouse.removal.models import RemovalRecord
+        from warehouse.transfer.models import TransferRecord
+
+        counts = {}
+        for label, query in (
+            ('putaway_records', PutawayRecord.query.filter(PutawayRecord.location_id == location_id)),
+            ('removal_records', RemovalRecord.query.filter(RemovalRecord.location_id == location_id)),
+            ('transfer_records', TransferRecord.query.filter(or_(
+                TransferRecord.from_location_id == location_id, TransferRecord.to_location_id == location_id))),
+            ('picking_details', PickingTaskDetail.query.filter(PickingTaskDetail.location_id == location_id)),
+            ('cycle_count_details', CycleCountTaskDetail.query.filter(CycleCountTaskDetail.location_id == location_id)),
+            ('adjustment_details', AdjustmentDetail.query.filter(AdjustmentDetail.location_id == location_id)),
+            ('inventory_snapshots', InventorySnapshot.query.filter(InventorySnapshot.location_id == location_id)),
+        ):
+            count = query.order_by(None).count()
+            if count:
+                counts[label] = count
+        return counts
 
     @staticmethod
     def _stock_quantity(location_id: int) -> int:
@@ -96,17 +137,18 @@ class LocationService:
     @transactional
     def create_location(data: dict, created_by_id: int) -> Location:
         """
-        创建新库位
+        创建新库位（尺寸 / 容量：空串 → null，必须 > 0，否则 400 16115）
         """
+        numbers = LocationService._clean_numbers(data)
         new_location = Location(
             warehouse_id=data['warehouse_id'],
             code=data['code'],
             description=data.get('description'),
             location_type=data['location_type'],
-            width=data.get('width'),
-            depth=data.get('depth'),
-            height=data.get('height'),
-            capacity=data.get('capacity'),
+            width=numbers.get('width'),
+            depth=numbers.get('depth'),
+            height=numbers.get('height'),
+            capacity=numbers.get('capacity'),
             is_active=data.get('is_active', True),
             created_by=created_by_id
         )
@@ -123,6 +165,7 @@ class LocationService:
         """
         # 先锁库位行并重读：与并发的上架 / 移库入（同样先锁目标库位）串行，存量判断看到的是已提交的数量
         location = lock_row(LocationService.get_location(location_id))
+        numbers = LocationService._clean_numbers(data)
 
         deactivating = bool(location.is_active) and not data.get('is_active', location.is_active)
         changing_type = data.get('location_type', location.location_type) != location.location_type
@@ -134,10 +177,8 @@ class LocationService:
         location.code = data.get('code', location.code)
         location.description = data.get('description', location.description)
         location.location_type = data.get('location_type', location.location_type)
-        location.width = data.get('width', location.width)
-        location.depth = data.get('depth', location.depth)
-        location.height = data.get('height', location.height)
-        location.capacity = data.get('capacity', location.capacity)
+        for field, value in numbers.items():
+            setattr(location, field, value)
         location.is_active = data.get('is_active', location.is_active)
 
         # db.session.commit()
@@ -147,11 +188,24 @@ class LocationService:
     @transactional
     def delete_location(location_id: int):
         """
-        删除库位（硬删除）。库位上还有货时 409（16084）：
-        SQLite 不强制外键时货会凭空消失，PostgreSQL 上则撞 goods_locations 的 RESTRICT 外键变成 500
+        删除库位（硬删除）。
+        - 库位上还有货时 409（16084）：SQLite 不强制外键时货会凭空消失，PostgreSQL 上则撞 goods_locations 的 RESTRICT 外键变成 500
+        - 有上架 / 下架 / 移库 / 拣货 / 盘点 / 调整 / 库存快照等历史记录引用时 409（44009，
+          details {entity: 'location', id, references: {记录类型: 行数}}）：
+          这些外键都是 RESTRICT，PG 上直接删会变成 500；有历史的库位请改用停用
+        - 数量为 0 的库位库存行不是历史，随库位一并删除
         """
+        from warehouse.goods.models import GoodsLocation
         location = lock_row(LocationService.get_location(location_id))
         LocationService._assert_no_stock(location, 'delete it')
+        related = LocationService._history_counts(location.id)
+        if related:
+            detail = ', '.join(f"{k}: {v}" for k, v in related.items())
+            raise ConflictException(
+                f"Location {location.code} is referenced by history records ({detail}); deactivate it instead.",
+                44009, details={'entity': 'location', 'id': location.id, 'references': related}
+            )
+        GoodsLocation.query.filter(GoodsLocation.location_id == location.id).delete(synchronize_session='fetch')
         db.session.delete(location)
         # db.session.commit()
 

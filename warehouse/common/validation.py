@@ -3,6 +3,8 @@
 restx 的 expect(model) 没有开启 validate，所以 service 层必须自己把关；
 统一在这里做，避免各模块各写一套（并且都忘了 bool 是 int 的子类）。
 """
+import math
+
 from extensions.error import BadRequestException, ConflictException
 
 MAX_BULK_ITEMS = 500
@@ -38,6 +40,33 @@ def require_non_negative_int(value, field='quantity', code=16033, default=0):
     number = _to_int(value, field, code)
     if number < 0:
         raise BadRequestException(f"{field} must not be negative", code)
+    return number
+
+
+def optional_number(value, field, *, positive=False, code=16115):
+    """可空的数值字段（Float 列，如 ASN 明细 weight / volume、库位尺寸）：
+    - None / 空串 / 纯空白 → None（前端数值框填了又清空会以 "" 提交）
+    - 数字或数字字符串 → float
+    - bool、非数字、NaN / Infinity、负数 → 400；positive=True 时 0 也 400（库位尺寸撞 CHECK chk_dimension_positive）
+    PostgreSQL 的 double precision 列收到 "" 会报 invalid input syntax 变成 500，SQLite 测不出。"""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        value = value.strip()
+        if value == '':
+            return None
+    if isinstance(value, bool):
+        raise BadRequestException(f"{field} must be a number", code, field=field)
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        raise BadRequestException(f"{field} must be a number", code, field=field)
+    if not math.isfinite(number):
+        raise BadRequestException(f"{field} must be a finite number", code, field=field)
+    if positive and number <= 0:
+        raise BadRequestException(f"{field} must be greater than 0", code, field=field)
+    if number < 0:
+        raise BadRequestException(f"{field} must not be negative", code, field=field)
     return number
 
 

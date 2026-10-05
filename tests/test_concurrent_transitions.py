@@ -496,8 +496,9 @@ def test_cycle_count_complete_twice_logs_once(client, access_token):
     with client.application.app_context():
         task = CycleCountTask(task_name='B-50', warehouse_id=w['wh'], status='pending',
                               is_active=True, created_by=w['admin'])
+        # 已录入（operator_id 非空）：盘点完成要求每行都已录入（B-80）
         task.task_details.append(CycleCountTaskDetail(goods_id=w['goods'], location_id=w['std'],
-                                                      actual_quantity=0))
+                                                      actual_quantity=0, operator_id=w['admin']))
         db.session.add(task)
         db.session.commit()
         task_id = task.id

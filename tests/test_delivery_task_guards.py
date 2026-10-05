@@ -222,7 +222,8 @@ def test_compensated_cancelled_tracking_rejected(client, access_token, fedex, mo
     dn_id, task_id = _ready(client, access_token)
     monkeypatch.setattr(CarrierShipmentService, '_store_label',
                         staticmethod(lambda *a, **k: (_ for _ in ()).throw(RuntimeError('disk full'))))
-    assert _create(client, access_token, dn_id).status_code == 500
+    response = _create(client, access_token, dn_id)
+    assert response.status_code == 502 and response.get_json()['code'] == 16095     # 写库失败统一 502 16095
     assert [(r['status'], r['reason']) for r in _records(client, dn_id)] == [('cancelled', 'compensated')]
 
     response = _save_tracking(client, access_token, task_id, {'tracking_number': '794600000001'})

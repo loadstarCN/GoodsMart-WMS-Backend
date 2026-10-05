@@ -141,14 +141,14 @@ def _assert_all_forbidden(client, headers, ids):
         ('PUT', f'/delivery/{dl}/process/', None),
         ('PUT', f'/delivery/{dl}/complete/', {'tracking_number': 'x', 'shipping_cost': 1}),
         ('PUT', f'/delivery/{dl}/sign/', {'signed_at': '2026-01-01T00:00:00'}),
-        # POST 主单：把 Company A 的 DN 当外键
-        ('POST', '/picking/', {'dn_id': dn}),
-        ('POST', '/packing/', {'dn_id': dn}),
     ]
     for method, url, body in calls:
         response = client.open(url, method=method, headers=headers, json=body)
         assert response.status_code == 403, f"{method} {url} -> {response.status_code} {response.get_json()}"
         assert response.get_json()['code'] == 12001, f"{method} {url}"
+    # 手工新建拣货 / 打包任务的接口已去掉（B-81）：把 Company A 的 DN 当外键也建不了
+    for url in ('/picking/', '/packing/'):
+        assert client.post(url, headers=headers, json={'dn_id': dn}).status_code == 405, url
 
 
 def test_company_b_admin_is_forbidden_on_company_a_outbound(client):

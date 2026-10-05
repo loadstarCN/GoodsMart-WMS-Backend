@@ -48,7 +48,11 @@ class DNCustomsResource(Resource):
     def put(self, dn_id):
         """
         Replace the customs snapshot (not allowed after the DN has been shipped: 409 16065).
-        - Structure errors: 400 16063 (details.field) / 16064 (goods_code not in the DN or duplicated)
+        - Structure errors: 400 16063 (details.field) / 16064 (goods_code not in the DN or duplicated);
+          a unit_value with more decimal places than the currency allows (0 for JPY etc., otherwise 2)
+          is 400 16063 too (details {field, currency, max_decimal_places})
+        - While a carrier shipment is pending / active / unclear / being cancelled: 409 16076
+          (details {reason: CARRIER_SHIPMENT_OPEN, status, carrier, carrier_shipment {id, status, tracking_number}})
         - Incomplete content is accepted and reported in `problems`
         - If the content changed, current documents are voided (`voided_documents`)
         """
@@ -78,6 +82,8 @@ class DNPackagesResource(Resource):
         - 1 - 99 packages; package_no consecutive from 1 (auto-numbered when omitted)
         - gross_weight_kg 0.01 - 999.999 (3 decimals); length/width/height_mm integers 1 - 3000
         - Invalid data: 400 16066; wrong DN status: 409 16067; shipped: 409 16065
+        - While a carrier shipment is pending / active / unclear / being cancelled: 409 16076
+          (details {reason: CARRIER_SHIPMENT_OPEN, status, carrier, carrier_shipment {id, status, tracking_number}})
         - Changing packages voids issued customs documents (`voided_documents`)
         """
         dn = _owned_dn(dn_id)
@@ -96,6 +102,10 @@ class DNCustomsDocumentIssue(Resource):
         - 201: new version issued (previous version voided)
         - 200: data unchanged, the current version is returned
         - 409 16068: conditions not met (details.problems); 16070: not an export DN; 16065: shipped
+        - 409 16076: a carrier shipment is pending / active / unclear / being cancelled and the document data
+          differs (other than the AWB) from the current documents submitted with it - e.g. goods origin country,
+          exporter profile or carrier changed (details {reason: DOCUMENT_DATA_CHANGED, status, carrier,
+          carrier_shipment {id, status, tracking_number}}); cancel the shipment first
         """
         dn = _owned_dn(dn_id)
         status_code, payload = CustomsService.issue_documents(dn, require_actor_user_id())

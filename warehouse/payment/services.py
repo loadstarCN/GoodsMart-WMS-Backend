@@ -6,6 +6,7 @@ from warehouse.delivery.models import DeliveryTask
 from warehouse.dn.models import DN
 from warehouse.inventory.services import InventoryService
 from warehouse.common.locks import lock_row
+from warehouse.common.ownership import require_warehouse_scope
 from warehouse.warehouse.models import Warehouse
 from .models import Payment
 from datetime import datetime
@@ -19,6 +20,13 @@ class PaymentService:
         dn = delivery.dn if delivery else None
         warehouse = dn.warehouse if dn else None
         return warehouse.company_id if warehouse else None
+
+    @staticmethod
+    def get_payment_warehouse_id(payment: Payment):
+        """支付记录的归属仓库 = 发货单（DN）的仓库"""
+        delivery = payment.delivery
+        dn = delivery.dn if delivery else None
+        return dn.warehouse_id if dn else None
 
     @staticmethod
     def list_payments(filters: dict):
@@ -44,14 +52,20 @@ class PaymentService:
             # 否则按用户传入的值进行过滤
             query = query.filter(Payment.is_active == filters['is_active'])
 
-        # 公司隔离：沿 delivery → dn → warehouse 找到归属公司
-        if filters.get('company_id'):
+        # 公司 / 仓库隔离：沿 delivery → dn → warehouse 找到归属
+        scoped = filters.get('company_id') or filters.get('warehouse_id') or filters.get('warehouse_ids')
+        if scoped:
             query = (
                 query.join(DeliveryTask, Payment.delivery_id == DeliveryTask.id)
                      .join(DN, DeliveryTask.dn_id == DN.id)
                      .join(Warehouse, DN.warehouse_id == Warehouse.id)
-                     .filter(Warehouse.company_id == filters['company_id'])
             )
+        if filters.get('company_id'):
+            query = query.filter(Warehouse.company_id == filters['company_id'])
+        if filters.get('warehouse_id'):
+            query = query.filter(DN.warehouse_id == filters['warehouse_id'])
+        if filters.get('warehouse_ids'):
+            query = query.filter(DN.warehouse_id.in_(filters['warehouse_ids']))
 
         return query
 
@@ -80,6 +94,8 @@ class PaymentService:
         delivery_company_id = delivery.dn.warehouse.company_id if delivery.dn and delivery.dn.warehouse else None
         if actor_company_id is not None and delivery_company_id != actor_company_id:
             raise ForbiddenException("Permission denied: delivery belongs to another company", 12001)
+        # 仓库范围：发货单所在仓库必须在调用方可访问范围内（视图已过 @warehouse_required()）
+        require_warehouse_scope(delivery.dn.warehouse_id if delivery.dn else None, 'delivery')
         if carrier.company_id != delivery_company_id:
             raise BadRequestException("Carrier does not belong to the same company as the delivery", 16027)
 

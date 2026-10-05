@@ -1,6 +1,7 @@
 """DN 承运商运单接口（FedEx Ship API 自动建单 / 取消 / 确认作废结果不明的记录）。
 
 权限：读 = dn_read 或 packing_read；建单 / 取消 / 确认作废 = packing_edit 或 delivery_edit。
+取消 / 确认作废可带目标标识（tracking_number / unresolved_id），与当前记录不符 → 409 16093。
 面单 PDF 用单证下载接口 GET /warehouse/dn/<id>/customs-documents/<label_document_id>/file。
 """
 from flask import request
@@ -25,6 +26,16 @@ carrier_shipment_dismiss_model = api_ns.model('DNCarrierShipmentDismiss', {
         required=True,
         description='Must be true: the operator checked FedEx Ship Manager and the shipment does not exist '
                     '(or has been cancelled there)'),
+    'unresolved_id': fields.Integer(
+        description='Optional: id of the unresolved record the operator checked (GET unresolved.id). '
+                    'If it is no longer the current unresolved record → 409 16093 {expected, actual}'),
+})
+
+carrier_shipment_cancel_model = api_ns.model('DNCarrierShipmentCancel', {
+    'tracking_number': fields.String(
+        description='Optional: tracking number the operator wants to cancel (GET shipment.tracking_number / '
+                    'unresolved.tracking_number). Compared ignoring spaces / hyphens; if it is not the current '
+                    'shipment → 409 16093 {expected, actual}'),
 })
 
 _READ = ["all_access", "company_all_access", "dn_read", "packing_read"]
@@ -45,19 +56,26 @@ class DNCarrierShipmentResource(Resource):
         """
         Carrier (FedEx) shipment of an export DN:
         {enabled, carrier, can_create, blockers[{code, message, goods_code?, field?}],
-         unresolved: null | {id, status: pending|unknown, reason, tracking_number, transaction_id, created_at,
-         updated_at}, can_dismiss, etd_enabled, default_label_format,
+         unresolved: null | {id, status: pending|unknown|cancelling, reason, tracking_number, transaction_id,
+         created_at, updated_at}, can_dismiss, can_cancel, etd_enabled, default_label_format,
          label_formats{A4|THERMAL: {image_type, stock_type}}, declared_value_carriage, delivery_task_id,
-         shipment: null | {tracking_number, status: active|cancelled, reason, service_type, net_charge, currency,
-         label_format, image_type, label_document_id, label_download_path, label_file_name, label_content_type,
-         label_parts, sender_country, created_at, created_by, updated_at, cancelled_at, ...}, warnings[]}
+         shipment: null | {id, tracking_number, status: active|cancelling|cancelled, reason, service_type,
+         net_charge, currency, label_format, image_type, label_document_id, label_download_path, label_file_name,
+         label_content_type, label_parts, sender_country, created_at, created_by, updated_at, cancelled_at, ...},
+         warnings[]}
         - enabled: FedEx configured and the DN's company is in FEDEX_ALLOWED_COMPANY_IDS
         - can_create: no blockers and no unresolved record
-        - unresolved: the latest request whose result is not settled - pending = request in progress;
+        - unresolved: the latest record whose result is not settled - pending = request in progress;
           unknown = the shipment may exist on FedEx (reason timeout / connection_error / server_error /
-          bad_response / compensation_failed / interrupted, or stale = pending for longer than
-          FEDEX_PENDING_STALE_MINUTES)
-        - can_dismiss: unresolved.status == unknown
+          bad_response / compensation_failed / save_unconfirmed / interrupted, or stale = pending for longer than
+          FEDEX_PENDING_STALE_MINUTES); cancelling = the shipment is being cancelled (reason cancel_in_progress)
+          or the result of cancelling it is unclear (reason timeout / server_error / bad_response /
+          connection_error / save_failed / interrupted / stale). While it exists the DN cannot be shipped (16079).
+        - can_dismiss: unresolved.status == unknown, or cancelling whose cancellation is not in progress
+        - can_cancel: an active shipment, a cancelling one whose cancellation is not in progress, or an unknown
+          record with a tracking number (POST .../cancel); false after the DN is shipped
+        - shipment: the active / cancelling shipment, otherwise the latest cancelled one (same id as unresolved.id
+          while cancelling)
         """
         return CarrierShipmentService.status(_owned_dn(dn_id)), 200
 
@@ -79,9 +97,13 @@ class DNCarrierShipmentResource(Resource):
           (details.unresolved), the shipment may exist
         - 504 16074: FedEx timed out (details.maybe_processed / unresolved) or the time budget ran out before
           the request was sent (details.budget_exhausted)
-        - 500: saving failed after FedEx created the shipment; WMS cancelled it (record cancelled, reason
-          compensated) or, if cancelling failed, the record is unknown (reason compensation_failed) with the
-          tracking number
+        - 502 16095: FedEx created the shipment but saving it in WMS failed (including business errors such as
+          the DN being shipped meanwhile): details {tracking_number, transaction_id, error {code, message},
+          compensation {attempted, cancelled, cancel_transaction_id, error}, unresolved, maybe_processed}.
+          WMS re-reads the record first - if the save was in fact committed the shipment is kept (201);
+          otherwise it is cancelled in FedEx (record cancelled, reason compensated, unresolved null) or, if
+          cancelling failed / the save could not be verified, the record is unknown (reason compensation_failed /
+          save_unconfirmed) with the tracking number - cancel it again or dismiss it
         """
         dn = _owned_dn(dn_id)
         body = request.get_json(silent=True)
@@ -95,17 +117,28 @@ class DNCarrierShipmentCancel(Resource):
 
     @permission_required(_SHIP_EDIT)
     @warehouse_required()
+    @api_ns.expect(carrier_shipment_cancel_model)
     def post(self, dn_id):
         """
-        Cancel the active carrier shipment (DN not shipped yet).
-        Clears the tracking number on the delivery task, voids the label and re-issues CI / PL without the AWB.
-        Uses the ship-from country stored when the shipment was created. If FedEx answers that the shipment is
-        already cancelled / not found, it is marked cancelled (shipment.reason = already_cancelled).
-        - 409 16075: no active shipment; 16065: already shipped; 16072: FedEx not configured
-        - 502 16073: FedEx refused to cancel (reason in message / details)
+        Cancel the carrier shipment (DN not shipped yet): the active shipment, a shipment whose previous
+        cancellation had an unclear result (status cancelling), or an unknown record with a tracking number
+        (e.g. reason compensation_failed).
+        Body (optional): {"tracking_number": "..."} - the shipment the operator means; another one → 409 16093.
+        Three steps like creating: the shipment is marked `cancelling` and committed, FedEx is called without
+        holding the DN lock, then the result is saved. Uses the ship-from country stored at creation.
+        - 200: cancelled (same body as GET): tracking number cleared on the delivery task, label voided, CI / PL
+          re-issued without the AWB. FedEx answering already cancelled / not found also counts
+          (shipment.reason = already_cancelled)
+        - 409 16075: nothing to cancel (details.unresolved); 16093: not the shipment in the request;
+          16079: a cancellation is already in progress; 16065: already shipped; 16072: FedEx not configured
+        - 502 16073 / 504 16074: FedEx refused (the shipment stays active) or the result is unclear
+          (details.maybe_processed true; the record stays `cancelling`, shipping is blocked with 16079 until a
+          retry gets a clear answer; details.unresolved)
         """
         dn = _owned_dn(dn_id)
-        return CarrierShipmentService.cancel_shipment(dn, require_actor_user_id()), 200
+        body = request.get_json(silent=True)
+        tracking_number = body.get('tracking_number') if isinstance(body, dict) else None
+        return CarrierShipmentService.cancel_shipment(dn, require_actor_user_id(), tracking_number), 200
 
 
 @api_ns.doc(security="jsonWebToken")
@@ -117,15 +150,25 @@ class DNCarrierShipmentDismiss(Resource):
     @api_ns.expect(carrier_shipment_dismiss_model)
     def post(self, dn_id):
         """
-        Dismiss the carrier shipment request whose result is unclear (unresolved.status == unknown, including a
-        pending request older than FEDEX_PENDING_STALE_MINUTES) after checking FedEx Ship Manager: the shipment
-        does not exist there, or it has been cancelled there. FedEx is not called. Afterwards a new shipment can
-        be created (or a tracking number saved by hand).
-        Body: {"confirm": true} (anything else → 400 40000, field confirm)
-        - 200: same body as GET (the record becomes status dismissed with dismissed_at / dismissed_by)
-        - 409 16075: nothing to dismiss, or the request is still in progress (details.unresolved)
+        Dismiss the record whose result is unclear (can_dismiss: unresolved.status == unknown, including a
+        pending request older than FEDEX_PENDING_STALE_MINUTES, or cancelling whose cancellation is not in
+        progress) after checking FedEx Ship Manager. Afterwards a new shipment can be created (or a tracking
+        number saved by hand).
+        - Without a tracking number: FedEx is not called; the record becomes dismissed.
+        - With a tracking number: FedEx is asked to cancel it first (without holding the DN lock); only when
+          FedEx cancels it or answers already cancelled / not found is it dismissed (a cancelling shipment becomes
+          cancelled, with the label voided and the tracking number cleared). Otherwise 409 16094.
+        Body: {"confirm": true, "unresolved_id": <optional>} (confirm missing / not true → 400 40000, field
+        confirm; unresolved_id not a positive integer → 400 40000)
+        - 200: same body as GET (dismissed_at / dismissed_by, or cancelled_at / cancelled_by)
+        - 409 16075: nothing to dismiss, or a request / cancellation is still in progress (details.unresolved)
+        - 409 16093: unresolved_id is not the current unresolved record (details {expected, actual})
+        - 409 16094: FedEx did not confirm the cancellation (details {unresolved, tracking_number, result,
+          http_status, transaction_id, errors, alerts, maybe_processed})
+        - 409 16072: FedEx not configured (a record with a tracking number cannot be checked)
         """
         dn = _owned_dn(dn_id)
         body = request.get_json(silent=True)
         confirm = body.get('confirm') if isinstance(body, dict) else None
-        return CarrierShipmentService.dismiss(dn, require_actor_user_id(), confirm), 200
+        unresolved_id = body.get('unresolved_id') if isinstance(body, dict) else None
+        return CarrierShipmentService.dismiss(dn, require_actor_user_id(), confirm, unresolved_id), 200

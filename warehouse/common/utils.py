@@ -40,3 +40,21 @@ def add_warehouse_filter(filters: dict) -> dict:
                 raise ForbiddenException("No accessible warehouses", 12001)
             filters['warehouse_ids'] = [warehouse.id for warehouse in accessible_warehouses]
     return filters
+
+
+def delete_batch_with_details(task, batch, detail_model, collection: str = 'task_details'):
+    """删除分拣 / 拣货 / 打包任务的一个批次及其明细（调用方已按「父单据 → 任务行」加锁并检查过状态）。
+
+    批次 → 明细的 ORM 关系（backref 'details'）没有级联：直接 delete(batch) 时 ORM 会把明细的
+    batch_id 置空，撞 NOT NULL 变成 500。这里先删明细并 flush，再删批次；最后让任务上的明细 / 批次集合失效，
+    同一事务里之后读到的已分拣 / 已拣 / 已打包合计（计划量校验、响应里的汇总）都按删除后的数据重算。
+    """
+    from extensions.db import db
+
+    for detail in detail_model.query.filter(detail_model.batch_id == batch.id).all():
+        db.session.delete(detail)
+    db.session.flush()
+    db.session.expire(batch, ['details'])
+    db.session.delete(batch)
+    db.session.flush()
+    db.session.expire(task, [collection, 'batches'])

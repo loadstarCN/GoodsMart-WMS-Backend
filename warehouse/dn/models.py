@@ -481,25 +481,29 @@ class DNCarrierShipment(db.Model):
     - failed：承运商明确拒绝 / 请求没发出去，确定没有运单
     - unknown：结果不明（超时、连接中断、5xx、响应看不懂、自动取消没成功……），承运商那边可能有运单
     - dismissed：unknown（或卡住的 pending）经操作员确认承运商那边没有这张运单 / 已手工取消
-    一张 DN 同一时刻至多一条 pending / active / unknown（部分唯一索引兜底并发）。
+      （带运单号的须先经承运商确认已取消 / 查无此运单）
+    - cancelling：有效运单正在取消（reason cancel_in_progress），或取消结果不明（reason timeout / server_error /
+      bad_response / connection_error / save_failed / interrupted，过期的 cancel_in_progress 按 stale 对外）；
+      面单与运单号都还在，但不能发货，重试取消（或确认作废）后落到 cancelled，承运商明确拒绝取消则回到 active
+    一张 DN 同一时刻至多一条 pending / active / unknown / cancelling（部分唯一索引兜底并发）。
     主运单号同时存到发货任务的 tracking_number 上（走现有保存运单号的逻辑）。
     """
     __tablename__ = 'dn_carrier_shipments'
 
-    STATUSES = ('pending', 'active', 'cancelled', 'failed', 'unknown', 'dismissed')
-    OPEN_STATUSES = ('pending', 'active', 'unknown')        # 同一 DN 至多一条
-    UNRESOLVED_STATUSES = ('pending', 'unknown')
+    STATUSES = ('pending', 'active', 'cancelled', 'failed', 'unknown', 'dismissed', 'cancelling')
+    OPEN_STATUSES = ('pending', 'active', 'unknown', 'cancelling')        # 同一 DN 至多一条
+    UNRESOLVED_STATUSES = ('pending', 'unknown', 'cancelling')
 
     __table_args__ = (
         db.Index('idx_dn_carrier_shipment_dn', 'dn_id', 'status'),
-        # 同一 DN 至多一条进行中 / 有效 / 结果不明的运单（并发建单时数据库兜底）
+        # 同一 DN 至多一条进行中 / 有效 / 结果不明 / 取消中的运单（并发建单时数据库兜底）
         db.Index(
             'uq_dn_carrier_shipment_open', 'dn_id', unique=True,
-            postgresql_where=db.text("status IN ('pending','active','unknown')"),
-            sqlite_where=db.text("status IN ('pending','active','unknown')"),
+            postgresql_where=db.text("status IN ('pending','active','unknown','cancelling')"),
+            sqlite_where=db.text("status IN ('pending','active','unknown','cancelling')"),
         ),
         db.CheckConstraint(
-            "status IN ('pending','active','cancelled','failed','unknown','dismissed')",
+            "status IN ('pending','active','cancelled','failed','unknown','dismissed','cancelling')",
             name='chk_dn_carrier_shipment_status',
         ),
     )
@@ -517,10 +521,10 @@ class DNCarrierShipment(db.Model):
     package_tracking_numbers = db.Column(db.JSON, nullable=True, info={'description': '每箱运单号（按箱号）'})
     service_type = db.Column(db.String(50), nullable=True, info={'description': '服务类型'})
     status = db.Column(db.String(10), nullable=False, default='pending',
-                       info={'description': 'pending / active / cancelled / failed / unknown / dismissed'})
+                       info={'description': 'pending / active / cancelled / failed / unknown / dismissed / cancelling'})
     reason = db.Column(db.String(40), nullable=True,
                        info={'description': '状态原因（如 timeout / server_error / bad_response / compensation_failed / '
-                                            'rejected / compensated）'})
+                                            'rejected / compensated / cancel_in_progress / save_unconfirmed）'})
     error_message = db.Column(db.String(500), nullable=True, info={'description': '失败 / 结果不明时的错误摘要'})
     sender_country = db.Column(db.String(2), nullable=True,
                                info={'description': '建单时的发件国（取消时用同一个值）'})
@@ -543,7 +547,7 @@ class DNCarrierShipment(db.Model):
     etd_document_id = db.Column(db.String(100), nullable=True, info={'description': 'ETD 上传的 CI 文档 ID'})
     transaction_id = db.Column(db.String(100), nullable=True, info={'description': '建单请求的承运商 transactionId'})
     cancel_transaction_id = db.Column(db.String(100), nullable=True,
-                                      info={'description': '取消请求的承运商 transactionId'})
+                                      info={'description': '取消请求的承运商 transactionId（最近一次）'})
     created_by = db.Column(
         db.Integer,
         db.ForeignKey('users.id', ondelete='SET NULL'),

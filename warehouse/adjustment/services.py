@@ -60,6 +60,21 @@ class AdjustmentService:
 
         if filters.get('adjustment_reason'):
             query = query.filter(Adjustment.adjustment_reason.ilike(f"%{filters['adjustment_reason']}%"))
+        # keyword：调整单号（纯数字时）/ 调整原因 / 明细里的商品编码、商品名、库位编码（部分匹配）
+        if filters.get('keyword'):
+            from warehouse.goods.models import Goods
+            from warehouse.location.models import Location
+            keyword = str(filters['keyword']).strip()
+            pattern = f"%{keyword}%"
+            conditions = [
+                Adjustment.adjustment_reason.ilike(pattern),
+                Adjustment.details.any(AdjustmentDetail.goods.has(
+                    db.or_(Goods.code.ilike(pattern), Goods.name.ilike(pattern)))),
+                Adjustment.details.any(AdjustmentDetail.location.has(Location.code.ilike(pattern))),
+            ]
+            if keyword.isdigit():
+                conditions.append(Adjustment.id == int(keyword))
+            query = query.filter(db.or_(*conditions))
         if filters.get('status'):
             query = query.filter(Adjustment.status == filters['status'])
 
@@ -127,7 +142,7 @@ class AdjustmentService:
         :return: 更新后的 Adjustment 对象
         :raises ValueError: 如果 Adjustment 不处于 pending 状态
         """
-        adjustment = lock_row(AdjustmentService.get_adjustment(adjustment_id))
+        adjustment = AdjustmentService._assert_active(lock_row(AdjustmentService.get_adjustment(adjustment_id)))
         if adjustment.status != 'pending':
             raise BadRequestException("Cannot update a non-pending Adjustment", 16001)
 
@@ -144,7 +159,7 @@ class AdjustmentService:
         删除指定 Adjustment（仅当其状态为 pending 时）
         """
         # 先锁调整单行并重读：与并发的 approve 串行
-        adjustment = lock_row(AdjustmentService.get_adjustment(adjustment_id))
+        adjustment = AdjustmentService._assert_active(lock_row(AdjustmentService.get_adjustment(adjustment_id)))
         if adjustment.status != 'pending':
             raise BadRequestException("Cannot delete a non-pending Adjustment", 16002)
 
@@ -186,8 +201,20 @@ class AdjustmentService:
         return adjustment.details
 
     @staticmethod
+    def _assert_active(adjustment: Adjustment) -> Adjustment:
+        """已取消（is_active=False）的调整单拒绝一切操作 → 409 16111。
+        status 是数据库枚举（PG 上加枚举值的 ALTER TYPE 有事务限制），取消不新增状态，用 is_active=False 表示"""
+        if adjustment is not None and not adjustment.is_active:
+            raise ConflictException(
+                f"Adjustment {adjustment.id} has been cancelled; it can no longer be operated.",
+                16111, details={'adjustment_id': adjustment.id}
+            )
+        return adjustment
+
+    @staticmethod
     def _assert_details_editable(adjustment: Adjustment):
-        """审批（approved）之后明细冻结：增删改一律 409"""
+        """已取消的调整单 409 16111；审批（approved）之后明细冻结：增删改一律 409"""
+        AdjustmentService._assert_active(adjustment)
         if adjustment.status != 'pending':
             raise ConflictException(
                 f"Adjustment details are frozen once the adjustment is {adjustment.status}", 16039)
@@ -305,8 +332,8 @@ class AdjustmentService:
         """
         更新 Adjustment 的状态为 approved
         """
-        # 先锁调整单行并重读状态：与并发的重复审批 / 删除串行
-        adjustment = lock_row(AdjustmentService._get_instance(task_or_id))
+        # 先锁调整单行并重读状态：与并发的重复审批 / 删除 / 取消串行
+        adjustment = AdjustmentService._assert_active(lock_row(AdjustmentService._get_instance(task_or_id)))
         if adjustment.status != 'pending':
             raise BadRequestException("Cannot approve an Adjustment that is not pending", 16018)
         # 职责分离：创建人不能审批自己的调整单
@@ -319,22 +346,31 @@ class AdjustmentService:
     @transactional
     def complete_adjustment(task_or_id: int | Adjustment, operator_id: int) -> Adjustment:
         """
-        更新 Adjustment 的状态为 completed
+        更新 Adjustment 的状态为 completed，按明细的 adjustment_quantity（差值）调整库位库存
+        - 正向调整且目标库位还没有该商品的库位记录（如「在新库位发现 3 件」）→ 在锁下新建一行；
+          库位必须启用（与上架一致，停用 → 400 16085），该商品在仓库还没有库存记录时一并建
+        - 负向调整但库位记录不存在（审批后库位被清空）/ 明细没有库位 → 409 16113：
+          这张单完成不了，请取消（PUT /adjustment/<id>/cancel/）后按当前库存重新建单
+        - 差值为 0 的明细不动库存
         """
         # 先锁调整单行并重读状态（再锁库位 / 库存行）：并发的重复完成在这里挡下，库位数量不会调两次
-        adjustment = lock_row(AdjustmentService._get_instance(task_or_id))
+        adjustment = AdjustmentService._assert_active(lock_row(AdjustmentService._get_instance(task_or_id)))
         if adjustment.status != 'approved':
             raise BadRequestException("Cannot complete an Adjustment that is not approved", 16019)
 
         adjustment = AdjustmentService._update_adjustment_status(adjustment, 'completed',operator_id)
 
         # 修改库位信息（FOR UPDATE 读取，避免多 worker 并发下丢更新）
+        touched_goods_ids = []
         for detail in adjustment.details:
-            goods_location_record = lock_goods_location(detail.goods_id, detail.location_id)
-            if goods_location_record is None:
-                raise NotFoundException(f"GoodsLocation not found for goods_id={detail.goods_id} and location_id={detail.location_id}", 13003)
-            goods_location_record.quantity += detail.adjustment_quantity
-            
+            delta = detail.adjustment_quantity or 0
+            if delta == 0:
+                continue
+            if detail.goods_id not in touched_goods_ids:
+                touched_goods_ids.append(detail.goods_id)
+            goods_location_record = AdjustmentService._lock_or_create_goods_location(adjustment, detail)
+            goods_location_record.quantity += delta
+
             if goods_location_record.quantity < 0:
                 raise BadRequestException(f"Insufficient stock for goods_id={detail.goods_id} in location_id={detail.location_id}", 15002)
             elif goods_location_record.quantity == 0:
@@ -343,10 +379,69 @@ class AdjustmentService:
                 db.session.add(goods_location_record)
             db.session.flush()
 
-        # 更新库存
-        for detail in adjustment.details:
-            InventoryService.update_and_calculate_stock(detail.goods_id, adjustment.warehouse_id)
+        # 更新库存（只重算动过库位库存的商品）
+        for goods_id in touched_goods_ids:
+            InventoryService.update_and_calculate_stock(goods_id, adjustment.warehouse_id)
 
+        return adjustment
+
+    @staticmethod
+    def _lock_or_create_goods_location(adjustment: Adjustment, detail: AdjustmentDetail):
+        """完成调整时取明细对应的库位库存行（FOR UPDATE）；正向调整且不存在时在锁下新建（quantity 先记 0）"""
+        from warehouse.goods.models import GoodsLocation
+        from warehouse.inventory.models import Inventory
+        from warehouse.location.models import Location
+        from warehouse.location.services import LocationService
+
+        delta = detail.adjustment_quantity or 0
+        if detail.location_id is None:
+            raise ConflictException(
+                f"Adjustment detail {detail.id} has no location; this adjustment cannot be completed. "
+                f"Cancel it and create a new one with a location.",
+                16113, details={'detail_id': detail.id, 'goods_id': detail.goods_id, 'location_id': None,
+                                'adjustment_quantity': delta}
+            )
+        record = lock_goods_location(detail.goods_id, detail.location_id)
+        if record is not None:
+            return record
+        if delta < 0:
+            raise ConflictException(
+                f"Goods {detail.goods_id} has no stock in location {detail.location_id} any more, so it cannot be "
+                f"reduced by {-delta}; the stock changed after this adjustment was created. "
+                f"Cancel this adjustment and create a new one that matches the current stock.",
+                16113, details={'detail_id': detail.id, 'goods_id': detail.goods_id,
+                                'location_id': detail.location_id, 'adjustment_quantity': delta}
+            )
+        # 正向：与上架相同，先给库位行加共享锁再判断启用状态（与并发的停用串行），再在锁下新建库位库存行
+        LocationService.require_active_location(
+            lock_row(get_object_or_404(Location, detail.location_id), shared=True))
+        record = lock_goods_location(detail.goods_id, detail.location_id)
+        if record is None:
+            if db.session.get(Inventory, (detail.goods_id, adjustment.warehouse_id)) is None:
+                InventoryService.create_inventory({'goods_id': detail.goods_id, 'warehouse_id': adjustment.warehouse_id})
+            record = GoodsLocation(goods_id=detail.goods_id, location_id=detail.location_id, quantity=0)
+            db.session.add(record)
+        return record
+
+    @staticmethod
+    @transactional
+    def cancel_adjustment(task_or_id: int | Adjustment, operator_id: int) -> Adjustment:
+        """
+        取消调整单：pending / approved 都可取消，不动库存。
+        - status 列是数据库枚举，不新增 cancelled 状态：取消 = is_active=False，status 保持原值；
+          operator_id 记取消人、updated_at 即取消时间
+        - 已取消的调整单拒绝一切操作（16111）；已完成的不能取消（409 16112）
+        - 由盘点单生成的调整单取消后，同一盘点单可以重新生成（16086 只看启用中的调整单）
+        """
+        adjustment = AdjustmentService._assert_active(lock_row(AdjustmentService._get_instance(task_or_id)))
+        if adjustment.status not in ('pending', 'approved'):
+            raise ConflictException(
+                f"Cannot cancel an Adjustment in '{adjustment.status}' status.", 16112,
+                details={'adjustment_id': adjustment.id, 'status': adjustment.status}
+            )
+        adjustment.is_active = False
+        adjustment.operator_id = operator_id
+        db.session.flush()
         return adjustment
 
     @staticmethod
@@ -385,6 +480,8 @@ class AdjustmentService:
 
         adjustment_details = []
         for detail in task_details:
+            # 系统数 / 差异是录入实盘那一刻的值（盘点完成要求每行都已录入，见 CycleCountTaskService），
+            # 完成调整时按差值累加到当时的库位库存，盘点期间正常的出入库不会被算成差异
             system_quantity = detail.system_quantity or 0
             adjustment_detail = AdjustmentDetail(
                 goods_id=detail.goods_id,

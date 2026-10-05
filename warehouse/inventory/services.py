@@ -379,6 +379,30 @@ class InventoryService:
 
     @staticmethod
     @transactional
+    def dn_cancelled_after_picking(goods_id: int, warehouse_id: int, picked_quantity: int = 0, packed_quantity: int = 0):
+        """
+        取消已拣货 / 已打包（未发货）的 DN：货退回待上架（sorted_stock），之后走上架放回库位
+        :param picked_quantity: 还在 picked_stock 里的数量（DN 为 picked：该商品的已拣量）
+        :param packed_quantity: 还在 packed_stock 里的数量（DN 为 packed：该商品的已打包量；
+                                少打包的差额在打包完成时已退回 sorted_stock）
+        只在三个分量之间搬动，total_stock 不变；dn_stock 由调用方在 DN 关闭后重聚合
+        """
+        picked_quantity = picked_quantity or 0
+        packed_quantity = packed_quantity or 0
+        if picked_quantity <= 0 and packed_quantity <= 0:
+            return
+        inventory = InventoryService._get_for_update(goods_id, warehouse_id)
+        if inventory.picked_stock < picked_quantity:
+            raise BadRequestException("Not enough pick stock.", 15009)
+        if inventory.packed_stock < packed_quantity:
+            raise BadRequestException("Not enough packed stock.", 15010)
+        inventory.picked_stock -= picked_quantity
+        inventory.packed_stock -= packed_quantity
+        inventory.sorted_stock += picked_quantity + packed_quantity
+        inventory.total_stock = InventoryService._calculate_total_stock(inventory)
+
+    @staticmethod
+    @transactional
     def dn_delivered(goods_id: int, warehouse_id: int, quantity: int):
         """
         发货完成：配送库存减少

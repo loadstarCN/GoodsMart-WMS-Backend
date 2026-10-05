@@ -2,14 +2,24 @@ from extensions.error import BadRequestException, NotFoundException
 from .helpers import *
 from warehouse.sorting.services import SortingTaskService
 
+
+def _new_sorting_task(asn_id, user_id):
+    """直接写库造一个 pending 分拣任务（手工新建接口 / create_task 已去掉，任务只由 ASN 收货自动生成）"""
+    task = SortingTask(asn_id=asn_id, status='pending', is_active=True, created_by=user_id)
+    db.session.add(task)
+    db.session.commit()
+    return task
+
 # ---------------------------------------------------------
 # 测试视图层 (views.py) 逻辑的用例
 # ---------------------------------------------------------
 
 def test_create_sorting_task(client, access_token):
     """
-    测试创建 Sorting Task (POST /sorting/)
+    手工新建分拣任务的接口已去掉（B-81）：POST /sorting/ → 405，不会建任务
     """
+    with client.application.app_context():
+        before = SortingTask.query.count()
     response = client.post(
         '/sorting/',
         headers={'Authorization': f'Bearer {access_token}'},
@@ -19,9 +29,9 @@ def test_create_sorting_task(client, access_token):
             "is_active": True,
         }
     )
-    assert response.status_code == 201
-    data = response.get_json()
-    assert data['status'] == "pending"
+    assert response.status_code == 405
+    with client.application.app_context():
+        assert SortingTask.query.count() == before
 
 
 def test_get_sorting_tasks(client, access_token):
@@ -185,7 +195,7 @@ def test_get_sorting_task_detail_item(client, access_token):
     with client.application.app_context():
         # 1) 创建新的 in_progress Task + batch + detail
         user = get_operator_user()
-        new_task = SortingTaskService.create_task({"asn_id": 1}, user.id)
+        new_task = _new_sorting_task(1, user.id)
         # pending => in_progress
         SortingTaskService.process_task(new_task.id,user.id)
         new_batch = SortingTaskService.create_batch(new_task.id, {}, user.id)
@@ -221,7 +231,7 @@ def test_update_sorting_task_detail(client, access_token):
     with client.application.app_context():
         user = get_operator_user()
         # 创建新的 Task => in_progress => batch => detail
-        new_task = SortingTaskService.create_task({"asn_id": 1}, user.id)
+        new_task = _new_sorting_task(1, user.id)
         SortingTaskService.process_task(new_task.id,user.id)
         new_batch = SortingTaskService.create_batch(new_task.id, {}, user.id)
         detail_obj = SortingTaskService.create_task_detail(
@@ -256,7 +266,7 @@ def test_delete_sorting_task_detail(client, access_token):
     """
     with client.application.app_context():
         user = get_operator_user()
-        new_task = SortingTaskService.create_task({"asn_id": 1}, user.id)
+        new_task = _new_sorting_task(1, user.id)
         SortingTaskService.process_task(new_task.id,user.id)  # => in_progress
         new_batch = SortingTaskService.create_batch(new_task.id, {}, user.id)
         detail_obj = SortingTaskService.create_task_detail(
@@ -301,16 +311,12 @@ def test_sorting_task_service_get_task(client):
 
 def test_sorting_task_service_create_task(client):
     """
-    测试通过服务层创建一个新的 SortingTask
+    服务层不再提供 create_task（B-81）：分拣任务只由 ASN 收货时 create_sorting_task_from_asn 生成
     """
     with client.application.app_context():
-        user = get_operator_user()
-        data = {
-            "asn_id": 1,
-            "status": "pending",
-            "is_active": True,
-        }
-        new_task = SortingTaskService.create_task(data, user.id)
+        assert not hasattr(SortingTaskService, 'create_task')
+        new_task = SortingTaskService.create_sorting_task_from_asn(1)
+        db.session.commit()
         assert new_task.id is not None
         # 验证其他关键字段
         assert new_task.status == "pending"
@@ -354,7 +360,7 @@ def test_sorting_task_service_get_task_detail(client):
     with client.application.app_context():
         # 创建一个 in_progress Task + batch + detail
         user = get_operator_user()
-        new_task = SortingTaskService.create_task({"asn_id": 1}, user.id)
+        new_task = _new_sorting_task(1, user.id)
         SortingTaskService.process_task(new_task.id,user.id)
         new_batch = SortingTaskService.create_batch(new_task.id, {}, user.id)
         detail_obj = SortingTaskService.create_task_detail(
@@ -382,7 +388,7 @@ def test_sorting_task_service_create_task_detail(client):
     with client.application.app_context():
         user = get_operator_user()
         # 先创建 in_progress Task
-        new_task = SortingTaskService.create_task({"asn_id": 1}, user.id)
+        new_task = _new_sorting_task(1, user.id)
         SortingTaskService.process_task(new_task.id,user.id)
         # 创建 batch
         new_batch = SortingTaskService.create_batch(new_task.id, {}, user.id)
@@ -404,7 +410,7 @@ def test_sorting_task_service_update_task_detail(client):
     with client.application.app_context():
         user = get_operator_user()
         # 创建 in_progress Task + batch + detail
-        new_task = SortingTaskService.create_task({"asn_id": 1}, user.id)
+        new_task = _new_sorting_task(1, user.id)
         SortingTaskService.process_task(new_task.id,user.id)
         new_batch = SortingTaskService.create_batch(new_task.id, {}, user.id)
         detail_obj = SortingTaskService.create_task_detail(
@@ -442,7 +448,7 @@ def test_sorting_task_service_delete_task_detail(client):
     """
     with client.application.app_context():
         user = get_operator_user()
-        new_task = SortingTaskService.create_task({"asn_id": 1}, user.id)
+        new_task = _new_sorting_task(1, user.id)
         SortingTaskService.process_task(new_task.id,user.id)
         new_batch = SortingTaskService.create_batch(new_task.id, {}, user.id)
         detail_obj = SortingTaskService.create_task_detail(

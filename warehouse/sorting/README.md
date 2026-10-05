@@ -101,7 +101,7 @@ Sorting（分拣）模块负责管理货物分拣任务及其明细。分拣是�
 
 1. **SortingTask 列表**
    - **GET /sorting/tasks**：获取所有分拣任务。
-   - **POST /sorting/tasks**：创建新分拣任务。
+   - 没有手工新建接口（`POST /warehouse/sorting/` → 405）：分拣任务只在 ASN 收货时自动生成。
 
 2. **SortingTask 详情**
    - **GET /sorting/tasks/<task_id>**：获取特定分拣任务的详细信息。
@@ -117,7 +117,7 @@ Sorting（分拣）模块负责管理货物分拣任务及其明细。分拣是�
 ## 示例用例
 
 1. **创建分拣任务**
-   - 使用 **POST /sorting/tasks** 接口创建新任务，并指定关联的 ASN。
+   - ASN 收货（`PUT /warehouse/asn/<id>/receive/`）时自动生成该 ASN 的分拣任务。
 
 2. **执行分拣操作**
    - 更新 `SortingTaskDetail` 的 `sorted_quantity` 和 `damage_quantity` 字段，记录分拣进度。

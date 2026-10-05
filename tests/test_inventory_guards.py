@@ -462,9 +462,10 @@ def test_adjustment_from_same_cyclecount_only_once(client, access_token):
     w = _world(client)
     g = w['g1']
     _inbound(client, access_token, w, [(g, 10)], [(g, w['std1'], 10)])
-    task_id, d1, _ = _counting_task(client, w)
-    _ok(client.post(f'/cyclecount/{task_id}/details-batch-save/', json={'details': [{'id': d1, 'actual_quantity': 8}]},
-                    headers=_h(access_token)))
+    task_id, d1, d2 = _counting_task(client, w)
+    # 盘点完成要求每行都已录入（B-80）：第 2 行盘到 0 件也要明确提交
+    _ok(client.post(f'/cyclecount/{task_id}/details-batch-save/', json={'details': [
+        {'id': d1, 'actual_quantity': 8}, {'id': d2, 'actual_quantity': 0}]}, headers=_h(access_token)))
     _ok(client.put(f'/cyclecount/{task_id}/complete/', headers=_h(access_token)))
 
     url = f'/adjustment/create_adjustment_by_cyclecount/{task_id}'
@@ -522,10 +523,14 @@ def test_sorting_task_of_received_asn_cannot_be_deleted(client, access_token):
 
 
 def test_sorting_task_of_pending_asn_can_be_deleted(client, access_token):
-    """收货前手工建的分拣任务（ASN 仍 pending）照常可删"""
+    """收货前手工建的分拣任务（ASN 仍 pending；手工新建接口已去掉，这里直接写库模拟存量数据）照常可删"""
     w = _world(client)
     asn_id = _create_asn(client, access_token, w, [(w['g1'], 5)])
-    task_id = _ok(client.post('/sorting/', json={'asn_id': asn_id}, headers=_h(access_token)))['id']
+    with client.application.app_context():
+        task = SortingTask(asn_id=asn_id, status='pending', is_active=True, created_by=w['admin'])
+        db.session.add(task)
+        db.session.commit()
+        task_id = task.id
     _ok(client.delete(f'/sorting/{task_id}', headers=_h(access_token)))
     with client.application.app_context():
         assert db.session.get(SortingTask, task_id) is None

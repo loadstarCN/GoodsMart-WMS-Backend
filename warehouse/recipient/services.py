@@ -1,5 +1,6 @@
 from extensions.db import db, get_object_or_404
 from extensions.transaction import transactional
+from warehouse.common.references import ensure_not_referenced
 from .models import Recipient, RecipientExternalMapping
 
 class RecipientService:
@@ -173,8 +174,9 @@ class RecipientService:
     @transactional
     def delete_recipient(recipient_id: int, company_id: int | None = None):
         """
-        删除 Recipient
+        删除 Recipient：仍被 DN / 发货任务引用时 409 44004（改用停用）；外部编号映射随之级联删除
         """
         recipient = RecipientService.get_recipient(recipient_id, company_id)
+        ensure_not_referenced(Recipient, recipient.id, 'recipient')
         db.session.delete(recipient)
         # db.session.commit()

@@ -78,7 +78,9 @@ def _enforce_warehouse_requirement(force_warehouse=False):
         return
 
     user = g.current_user
-    user_roles = [getattr(role, "name", role) for role in getattr(user, "roles", [])]
+    # 只看生效中的角色：停用的 company_admin 角色不再给全公司仓库范围
+    roles = user.active_roles if hasattr(user, "active_roles") else getattr(user, "roles", [])
+    user_roles = [getattr(role, "name", role) for role in roles]
 
     # print("User type:", user.type)
     # print("User roles:", user_roles)

@@ -1,28 +1,250 @@
+# 后端部署：推送到 main 后 SSH 到服务器，在 /var/www/api_wms 上
+#   工作区检查 → 探测当前服务 → fetch + reset --keep → pip install → flask db upgrade → 权限种子 → pm2 restart → 健康探测
+#
+# 失败处理（B-71）：
+#   - fetch / reset、pip install、迁移任一步失败：代码回到部署前的提交（PREV），不重启，运行中的旧进程不受影响。
+#     迁移的事务性：migrations/env.py 没有开 transaction_per_migration（Flask-Migrate 也没传 configure_args），
+#     alembic 默认把本次要跑的整条迁移链包在一个事务里；PostgreSQL 的 DDL 是事务性的，任一迁移失败（含 lock_timeout）
+#     整体回滚，库停在部署前的版本，不会停在中间版本。前提是迁移里没有 COMMIT / autocommit_block / CREATE INDEX
+#     CONCURRENTLY 这类不能在事务里跑的语句（2026-10-05 核对过现有迁移，没有；新增这类迁移时要单独处理）。
+#   - 重启后健康探测失败：代码回到 PREV 并重启旧代码，数据库不回滚（向下迁移有丢数据风险），本次运行标记失败。
+#     这时库已是新结构、跑的是旧代码，所以迁移要保持「旧代码在新结构上也能跑」（先加列 / 加表，下个版本再删）。
+#
+# 需要确认（B-72）：pm2 的实际启动命令和端口不在仓库里。uwsgi.ini 是 uwsgi 协议的 socket 127.0.0.1:5005（curl 探测不了），
+# app.py 直接运行是 5002，README 写的 gunicorn 是 5000。默认按 5002，确认后在仓库 Settings → Secrets and variables →
+# Actions → Variables 里建 BACKEND_HEALTH_URL 覆盖（例如 http://127.0.0.1:5000/health），不用改本文件。
+# 每次部署开头会打印 pm2 里 wms-api 的脚本路径 / 参数 / 工作目录 / PORT，可据此确认。
 name: Deploy to Server
 
 on:
   push:
     branches: [main]
+  # 应急用：服务已经挂了（部署前探测不到）但需要靠部署修复时，在 Actions 页面手动运行并勾选 skip_precheck。
+  # 无论从哪个分支触发，服务器上部署的都是 origin/main；下面的 if 只允许在 main 上手动运行
+  workflow_dispatch:
+    inputs:
+      skip_precheck:
+        description: '跳过「部署前探测当前服务」（仅在服务已不可用、需要靠本次部署修复时使用）'
+        type: boolean
+        default: false
+
+concurrency:
+  group: deploy-backend
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  # 健康探测地址（在服务器上 curl，见文件头「需要确认」）
+  HEALTH_URL: ${{ vars.BACKEND_HEALTH_URL || 'http://127.0.0.1:5002/health' }}
+  # 重启后等待新进程通过探测的最长秒数
+  HEALTH_TIMEOUT: '90'
+  # 迁移 / 种子等锁的上限：碰上长事务时 15 秒后报错（整条迁移回滚），而不是无限期排队把全站请求堵在锁后面
+  LOCK_TIMEOUT: 15s
 
 jobs:
   deploy:
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    timeout-minutes: 40
     steps:
       - name: Deploy via SSH
-        uses: appleboy/ssh-action@v1
+        uses: appleboy/ssh-action@0ff4204d59e8e51228ff73bce53f80d53301dee2 # v1.2.5
+        env:
+          DEPLOY_SHA: ${{ github.sha }}
+          SKIP_PRECHECK: ${{ inputs.skip_precheck && 'yes' || 'no' }}
         with:
           host: ${{ secrets.SERVER_HOST }}
           username: ${{ secrets.SERVER_USER }}
           key: ${{ secrets.SERVER_SSH_KEY }}
+          # 远端脚本的总时长上限（默认 10 分钟，pip 安装 + 迁移可能更久；超时会断开 SSH，脚本可能停在中途）
+          command_timeout: 30m
+          envs: DEPLOY_SHA,SKIP_PRECHECK,HEALTH_URL,HEALTH_TIMEOUT,LOCK_TIMEOUT
           script: |
-            set -e
-            cd /var/www/api_wms
-            # 跟上远端 main：用 fetch + reset --keep 而不是 pull（2026-09-30 改写过历史，pull 会因分叉失败）；
-            # 服务器上有与本次更新冲突的本地改动时 --keep 会中止，不会覆盖
-            git fetch origin main
-            git reset --keep FETCH_HEAD
-            pip install -r requirements.txt -q
-            # 迁移 / 种子脚本只需要应用上下文，不要在这些一次性进程里启动调度器
-            FLASK_ENV=production SCHEDULER_ENABLED=False FLASK_APP=app:create_app flask db upgrade
-            FLASK_ENV=production SCHEDULER_ENABLED=False python seed_permissions.py
-            pm2 restart wms-api
+            set -u
+            APP_DIR=/var/www/api_wms
+            PM2_NAME=wms-api
+
+            say() { printf '[deploy] %s\n' "$*"; }
+
+            : "${HEALTH_URL:?未传入}" "${HEALTH_TIMEOUT:?未传入}" "${LOCK_TIMEOUT:?未传入}" "${DEPLOY_SHA:?未传入}" "${SKIP_PRECHECK:=no}"
+            cd "$APP_DIR" || { say "!!! 进入 $APP_DIR 失败"; exit 1; }
+            BODY_FILE=$(mktemp)
+            PM2_JSON=$(mktemp)
+            trap 'rm -f "$BODY_FILE" "$PM2_JSON"' EXIT
+
+            say "触发本次运行的提交：$DEPLOY_SHA"
+            say "健康探测地址：$HEALTH_URL"
+
+            # ---- pm2 进程信息（B-72：确认实际启动命令与端口）。只打印路径 / 参数 / 工作目录 / PORT，不打印其它环境变量
+            if pm2 jlist > "$PM2_JSON" 2>/dev/null; then
+              python - "$PM2_JSON" "$PM2_NAME" <<'PY' || say "（解析 pm2 jlist 失败，忽略）"
+            import json, sys
+            raw = open(sys.argv[1], encoding='utf-8', errors='replace').read()
+            start = raw.find('[{')  # pm2 可能先打印 [PM2] 开头的提示行
+            procs = json.loads(raw[start:]) if start >= 0 else []
+            found = False
+            for p in procs:
+                if p.get('name') != sys.argv[2]:
+                    continue
+                found = True
+                e = p.get('pm2_env') or {}
+                port = e.get('PORT') or (e.get('env') or {}).get('PORT')
+                print('[deploy] pm2 %s: status=%s exec=%s args=%s cwd=%s interpreter=%s exec_mode=%s PORT=%s' % (
+                    p.get('name'), e.get('status'), e.get('pm_exec_path'), e.get('args'), e.get('pm_cwd'),
+                    e.get('exec_interpreter'), e.get('exec_mode'), port))
+            if not found:
+                print('[deploy] pm2 里没有名为 %s 的进程' % sys.argv[2])
+            PY
+            else
+              say "（pm2 jlist 失败，忽略）"
+            fi
+
+            # ---- 1. 工作区必须干净：服务器上不应有手工改动；有就中止，什么都不动
+            DIRTY=$(git status --porcelain) || { say "!!! git status 失败"; exit 1; }
+            if [ -n "$DIRTY" ]; then
+              say "!!! 服务器工作区不干净，中止部署（代码、依赖、数据库、进程都没有改动）："
+              printf '%s\n' "$DIRTY"
+              say "    请在服务器上确认这些改动的来源：要保留的提交进仓库，不要的还原 / 删除，程序运行时写出的文件加进 .gitignore"
+              exit 1
+            fi
+            PREV=$(git rev-parse HEAD) || exit 1
+            PREV_SHORT=$(git rev-parse --short=7 HEAD)
+            say "部署前提交 PREV=$PREV"
+
+            # 探测：HTTP 200 且 {"status":"ok","commit":<期望短哈希>}
+            probe_health() {
+              expect=$1
+              deadline=$(( $(date +%s) + HEALTH_TIMEOUT ))
+              while :; do
+                code=$(curl -s -o "$BODY_FILE" -w '%{http_code}' -m 5 "$HEALTH_URL") || code=000
+                got=
+                if [ "$code" = 200 ]; then
+                  got=$(python -c 'import json,sys; d=json.load(open(sys.argv[1])); print("%s %s" % (d.get("status"), d.get("commit")))' "$BODY_FILE" 2>/dev/null)
+                  if [ "$got" = "ok $expect" ]; then
+                    say "健康探测通过：status=ok commit=$expect"
+                    return 0
+                  fi
+                fi
+                if [ "$(date +%s)" -ge "$deadline" ]; then
+                  say "!!! 健康探测失败（${HEALTH_TIMEOUT} 秒内未通过）：最后一次 HTTP $code，解析结果「$got」，期望「ok $expect」"
+                  say "    响应开头：$(head -c 300 "$BODY_FILE" | tr '\n' ' ')"
+                  return 1
+                fi
+                sleep 3
+              done
+            }
+
+            # 探测：只要求能返回 HTTP（任何状态码），用于还没有 /health 的旧代码
+            probe_alive() {
+              deadline=$(( $(date +%s) + HEALTH_TIMEOUT ))
+              while :; do
+                code=$(curl -s -o /dev/null -w '%{http_code}' -m 5 "$HEALTH_URL") || code=000
+                if [ "$code" != 000 ]; then
+                  say "服务有响应（HTTP $code）"
+                  return 0
+                fi
+                if [ "$(date +%s)" -ge "$deadline" ]; then
+                  say "!!! ${HEALTH_TIMEOUT} 秒内 $HEALTH_URL 没有任何 HTTP 响应"
+                  return 1
+                fi
+                sleep 3
+              done
+            }
+
+            # ---- 2. 部署前先确认探测地址能连上当前服务：端口配错时在改动任何东西之前就停下，
+            #         避免迁移已提交后因为探测地址不对而误判失败、把代码回滚到旧版本
+            if [ "$SKIP_PRECHECK" = yes ]; then
+              say "已按手动输入跳过部署前探测"
+            else
+              code=$(curl -s -o /dev/null -w '%{http_code}' -m 5 "$HEALTH_URL") || code=000
+              if [ "$code" = 000 ]; then
+                say "!!! 部署前探测：$HEALTH_URL 没有 HTTP 响应，中止部署（什么都没改）"
+                say "    可能是端口不对（见上面 pm2 的启动信息，设置仓库变量 BACKEND_HEALTH_URL），或者服务当前已经挂了"
+                say "    服务已挂、需要靠本次部署修复时：Actions → Deploy to Server → Run workflow，勾选 skip_precheck"
+                exit 1
+              fi
+              say "部署前探测：当前服务有响应（HTTP $code）"
+            fi
+
+            REQ_CHANGED=no
+            rollback_code() {
+              say "回滚代码到部署前的提交 $PREV（git reset --keep）"
+              if ! git reset --keep "$PREV"; then
+                say "!!! 代码回滚失败，服务器停在 $(git rev-parse --short=7 HEAD)，需要人工处理"
+                return 1
+              fi
+              if [ "$REQ_CHANGED" = yes ]; then
+                say "本次更新改了 requirements.txt，按部署前的版本重新安装依赖"
+                pip install -r requirements.txt -q || say "!!! 旧版本依赖重装失败，需要人工执行 pip install -r requirements.txt"
+              fi
+              return 0
+            }
+
+            # ---- 3. 跟上远端 main：用 fetch + reset --keep 而不是 pull（2026-09-30 改写过历史，pull 会因分叉失败）
+            if ! git fetch origin main; then
+              say "!!! git fetch 失败，中止（什么都没改）"
+              exit 1
+            fi
+            NEW=$(git rev-parse FETCH_HEAD)
+            say "目标提交 NEW=$NEW（origin/main 最新）"
+            if [ "$NEW" != "$DEPLOY_SHA" ]; then
+              say "注意：origin/main 最新提交与触发本次运行的提交不同（期间又有推送），部署的是 origin/main 最新"
+            fi
+            git diff --quiet "$PREV" "$NEW" -- requirements.txt || REQ_CHANGED=yes
+            if ! git reset --keep "$NEW"; then
+              say "!!! git reset --keep 失败"
+              rollback_code
+              exit 1
+            fi
+            NEW_SHORT=$(git rev-parse --short=7 HEAD)
+
+            # ---- 4. 依赖
+            if ! pip install -r requirements.txt -q; then
+              say "!!! pip install 失败：回滚代码，不重启（运行中的仍是旧进程）"
+              rollback_code
+              exit 1
+            fi
+
+            # ---- 5. 迁移：只需要应用上下文，不在一次性进程里启动调度器；PGOPTIONS 由 libpq（psycopg2）读取
+            say "数据库迁移（lock_timeout=$LOCK_TIMEOUT）"
+            if ! PGOPTIONS="-c lock_timeout=$LOCK_TIMEOUT" FLASK_ENV=production SCHEDULER_ENABLED=False FLASK_APP=app:create_app flask db upgrade; then
+              say "!!! 数据库迁移失败：回滚代码，不重启（运行中的仍是旧进程）"
+              say "    整条迁移链在同一个事务里，PostgreSQL 上会整体回滚。当前库版本（应仍是部署前的版本）："
+              FLASK_ENV=production SCHEDULER_ENABLED=False FLASK_APP=app:create_app flask db current 2>&1 | tail -n 3
+              rollback_code
+              exit 1
+            fi
+
+            # ---- 6. 权限种子。此时迁移已提交、库已是新结构：失败时仍按新代码重启（保持代码与库结构一致），最后标记失败
+            SEED_FAILED=no
+            if ! PGOPTIONS="-c lock_timeout=$LOCK_TIMEOUT" FLASK_ENV=production SCHEDULER_ENABLED=False python seed_permissions.py; then
+              SEED_FAILED=yes
+              say "!!! seed_permissions.py 失败（迁移已提交，继续用新代码重启；本次运行最后会标记失败）"
+            fi
+
+            # ---- 7. 重启 + 健康探测；失败回滚代码并重启旧代码，数据库不回滚
+            say "重启 $PM2_NAME"
+            RESTARTED=yes
+            pm2 restart "$PM2_NAME" || RESTARTED=no
+            if [ "$RESTARTED" = no ] || ! probe_health "$NEW_SHORT"; then
+              say "!!! 新版本 $NEW_SHORT 没有通过健康探测（pm2 restart 成功：$RESTARTED）"
+              say "    回滚代码到 $PREV_SHORT 并重启旧代码。数据库不回滚：迁移已提交，库是新结构"
+              rollback_code
+              pm2 restart "$PM2_NAME" || say "!!! 旧代码 pm2 restart 失败"
+              if git cat-file -e "$PREV:health.py" 2>/dev/null; then
+                probe_health "$PREV_SHORT" && say "旧版本 $PREV_SHORT 已恢复" || say "!!! 旧版本也没有通过健康探测，需要立即人工处理"
+              else
+                probe_alive && say "旧版本 $PREV_SHORT 已恢复响应（旧代码没有 /health，只确认了能响应）" || say "!!! 旧版本也没有响应，需要立即人工处理"
+              fi
+              say "    排查：在服务器上 pm2 logs $PM2_NAME --lines 200；FLASK_ENV=production SCHEDULER_ENABLED=False FLASK_APP=app:create_app flask db current"
+              exit 1
+            fi
+
+            if [ "$SEED_FAILED" = yes ]; then
+              say "!!! 新版本 $NEW_SHORT 已上线，但权限种子失败，请在服务器上手动补跑："
+              say "    cd $APP_DIR && FLASK_ENV=production SCHEDULER_ENABLED=False python seed_permissions.py"
+              exit 1
+            fi
+            say "部署完成：$PREV_SHORT → $NEW_SHORT"

@@ -44,7 +44,7 @@ Picking 模块用于管理仓库中的拣货任务及其详细记录，通过该
 | HTTP 方法 | 路由           | 功能                       | 权限              |
 |-----------|----------------|----------------------------|-------------------|
 | `GET`     | `/picking/`    | 获取所有拣货任务             | 需要登录           |
-| `POST`    | `/picking/`    | 创建新的拣货任务             | `admin` 或 `settings` |
+| `POST`    | `/picking/`    | 已去掉（405）：拣货任务只在 DN 开始处理时自动生成 | — |
 | `GET`     | `/picking/<id>`| 获取单个拣货任务详情          | `admin` 或 `settings` |
 | `PUT`     | `/picking/<id>`| 更新拣货任务信息             | `admin` 或 `settings` |
 | `DELETE`  | `/picking/<id>`| 删除拣货任务                 | `admin` 或 `settings` |

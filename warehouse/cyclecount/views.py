@@ -158,6 +158,8 @@ class CycleCountTaskComplete(Resource):
     def put(self, task_id):
         """
         Complete a specific Cycle Count Task
+        - every detail must have been counted (saved via details-batch-save, even with 0, or completed one by one)
+          → otherwise 409 16114 details {detail_ids}
         """
         operator_id = require_actor_user_id()
 
@@ -230,10 +232,12 @@ class CycleCountTaskDetailItem(Resource):
         Update a specific Cycle Count Task Detail
         """
         data = api_ns.payload
+        operator_id = require_actor_user_id()
         task = _get_owned_task(task_id)
         if 'location_id' in data:
             _assert_location_in_warehouse(task.warehouse_id, data['location_id'])
-        updated_detail = CycleCountTaskService.update_task_detail(task_id, detail_id, data)
+        # 给了 actual_quantity 即为录入：系统数取此刻的库位库存，operator_id 记当前操作人
+        updated_detail = CycleCountTaskService.update_task_detail(task_id, detail_id, data, operator_id)
 
         return updated_detail
 

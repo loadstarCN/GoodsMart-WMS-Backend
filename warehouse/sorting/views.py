@@ -60,19 +60,7 @@ class SortingTaskList(Resource):
         query = SortingTaskService.list_tasks(filters)
         return paginate(query, page, per_page),200
 
-    @permission_required(["all_access","company_all_access","sorting_edit"])
-    @warehouse_required()
-    @api_ns.expect(sorting_task_input_model)
-    @api_ns.marshal_with(sorting_task_model)
-    def post(self):
-        """
-        Create a new Sorting Task (status / is_active are ignored)
-        """
-        data = api_ns.payload
-        _owned_asn(data.get('asn_id'))
-        created_by = require_actor_user_id()
-        new_task = SortingTaskService.create_task(data, created_by)
-        return new_task, 201
+    # 没有 POST：分拣任务只在 ASN 收货时自动生成（create_sorting_task_from_asn），手工新建接口已去掉（405）
 
 
 @api_ns.doc(security="jsonWebToken")

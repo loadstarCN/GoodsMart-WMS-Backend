@@ -1,9 +1,7 @@
 from flask import g
 from flask_restx import Resource
-from extensions.error import BadRequestException
 from system.common import permission_required,paginate
-from warehouse.common import warehouse_required,add_warehouse_filter,get_warehouse_owned,require_positive_int, require_actor_user_id
-from warehouse.dn.models import DN
+from warehouse.common import warehouse_required,add_warehouse_filter,get_warehouse_owned, require_actor_user_id
 
 from .models import PickingTask
 from .schemas import (
@@ -55,21 +53,7 @@ class PickingTaskList(Resource):
         query = PickingTaskService.list_tasks(filters)
         return paginate(query, page, per_page)
 
-    @permission_required(["all_access","company_all_access","picking_edit"])
-    @warehouse_required()
-    @api_ns.expect(picking_task_input_model)
-    @api_ns.marshal_with(picking_task_model)
-    def post(self):
-        """
-        Create a new Picking Task (only `dn_id` is accepted; the DN must be accessible)
-        """
-        data = api_ns.payload
-        if not isinstance(data, dict):
-            raise BadRequestException("Request body must be a JSON object", 16015)
-        get_warehouse_owned(DN, require_positive_int(data.get('dn_id'), 'dn_id', 16044), what='DN')
-        created_by = require_actor_user_id()
-        new_task = PickingTaskService.create_task(data, created_by)
-        return new_task, 201
+    # 没有 POST：拣货任务只在 DN 开始处理时自动生成（create_picking_task_from_dn），手工新建接口已去掉（405）
 
 
 @api_ns.doc(security="jsonWebToken")

@@ -18,9 +18,11 @@ api_ns = Namespace(
 EVENT_TYPES = [
     'asn.received',
     'asn.completed',
+    'asn.cancelled',
     'dn.in_progress',
     'dn.delivered',
     'dn.completed',
+    'dn.cancelled',
     'goods.spec_updated',
 ]
 

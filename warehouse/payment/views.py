@@ -2,7 +2,9 @@ from flask import g
 from flask_restx import Resource,abort
 from system.common import permission_required,paginate
 from system.common.permissions import get_actor_company_id
-from warehouse.common import require_company_scope, require_actor_user_id
+from warehouse.common import (
+    require_company_scope, require_actor_user_id, require_warehouse_scope, warehouse_required, add_warehouse_filter,
+)
 
 from .schemas import (
     api_ns,
@@ -17,9 +19,11 @@ from .services import PaymentService
 
 
 def _get_owned_payment(payment_id: int):
-    """支付记录没有自己的 company_id，归属跟随发货单（delivery → dn → warehouse → company）"""
+    """支付记录没有自己的 company_id，归属跟随发货单（delivery → dn → warehouse → company）；
+    公司之外还要校验 DN 所在仓库在调用方可访问范围内（须在 @warehouse_required() 之后调用）"""
     payment = PaymentService.get_payment(payment_id)
     require_company_scope(PaymentService.get_payment_company_id(payment), 'payment')
+    require_warehouse_scope(PaymentService.get_payment_warehouse_id(payment), 'payment')
     return payment
 
 
@@ -28,6 +32,7 @@ def _get_owned_payment(payment_id: int):
 class PaymentList(Resource):
 
     @permission_required(["all_access","company_all_access","payment_read"])
+    @warehouse_required()
     @api_ns.expect(pagination_parser)
     @api_ns.marshal_with(pagination_model)
     def get(self):
@@ -46,11 +51,14 @@ class PaymentList(Resource):
             # 员工 / 公司级 API Key 只能看本公司的支付记录
             'company_id': get_actor_company_id(),
         }
+        # 再按调用方仓库范围过滤（DN 所在仓库）
+        filters = add_warehouse_filter(filters)
 
         query = PaymentService.list_payments(filters)
         return paginate(query, page, per_page)
 
     @permission_required(["all_access","company_all_access","payment_edit"])
+    @warehouse_required()
     @api_ns.expect(payment_input_model)
     @api_ns.marshal_with(payment_model)
     def post(self):
@@ -71,6 +79,7 @@ class PaymentList(Resource):
 class PaymentDetailView(Resource):
 
     @permission_required(["all_access","company_all_access","payment_read"])
+    @warehouse_required()
     @api_ns.marshal_with(payment_model)
     def get(self, payment_id):
         """
@@ -79,6 +88,7 @@ class PaymentDetailView(Resource):
         return _get_owned_payment(payment_id)
 
     @permission_required(["all_access","company_all_access","payment_edit"])
+    @warehouse_required()
     @api_ns.expect(payment_update_model)
     @api_ns.marshal_with(payment_model)
     def put(self, payment_id):
@@ -91,6 +101,7 @@ class PaymentDetailView(Resource):
         return updated_payment
 
     @permission_required(["all_access","company_all_access","payment_delete"])
+    @warehouse_required()
     def delete(self, payment_id):
         """
         删除指定的支付记录（仅限状态为 pending 时）
@@ -105,6 +116,7 @@ class PaymentDetailView(Resource):
 class PaymentProcess(Resource):
 
     @permission_required(["all_access","company_all_access","payment_edit"])
+    @warehouse_required()
     @api_ns.marshal_with(payment_model)
     def put(self, payment_id):
         """
@@ -120,6 +132,7 @@ class PaymentProcess(Resource):
 class PaymentCancel(Resource):
 
     @permission_required(["all_access","company_all_access","payment_edit"])
+    @warehouse_required()
     @api_ns.marshal_with(payment_model)
     def put(self, payment_id):
         """

@@ -184,10 +184,14 @@ class DNCancelResource(Resource):
     @api_ns.marshal_with(dn_model)
     def put(self, dn_id):
         """
-        Cancel a specific DN.
+        Cancel a specific DN (status becomes closed).
         - pending: same as close
-        - in_progress: allowed only if picking has not started (no batches); picking task is deactivated
-        - other statuses: 409
+        - in_progress: allowed only if picking has not started (no batches); picking task is deactivated (else 409 16053)
+        - picked / packed (not shipped yet): picked / packed goods go back to sorted_stock (to be put away);
+          picking / packing / delivery tasks are deactivated, issued export documents are voided.
+          An unfinished carrier shipment (pending / active / unknown / cancelling) → 409 16110: cancel it first
+        - delivered / completed / closed: 409 16052
+        - in_progress / picked / packed: emits dn.cancelled to the source API key
         """
         updated_dn = DNService.cancel_dn(_owned_dn(dn_id))
         return updated_dn, 200

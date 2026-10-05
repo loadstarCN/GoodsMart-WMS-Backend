@@ -4,6 +4,7 @@ from extensions.transaction import transactional
 from warehouse.staff.models import Staff
 from warehouse.staff.services import StaffService
 from warehouse.common.export_profile import WAREHOUSE_EXPORT_FIELDS, normalize_export_profile
+from warehouse.common.references import ensure_not_referenced
 from .models import Warehouse
 
 class WarehouseService:
@@ -138,8 +139,10 @@ class WarehouseService:
     @transactional
     def delete_warehouse(warehouse_id: int):
         """
-        删除 Warehouse
+        删除 Warehouse：仍有库位 / 库存 / 单据等引用时 409 44004（改用停用）。
+        员工的仓库分配（staff_warehouse）不算引用，删除时由 ORM 一并清掉。
         """
         warehouse = WarehouseService.get_warehouse(warehouse_id)
+        ensure_not_referenced(Warehouse, warehouse.id, 'warehouse', exclude=('staff_warehouse',))
         db.session.delete(warehouse)
         # db.session.commit()

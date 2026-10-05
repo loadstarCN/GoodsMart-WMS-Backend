@@ -659,7 +659,8 @@ def test_cancel_dn_in_progress_without_picking_batches(client, access_token):
 
 
 def test_cancel_dn_conflicts_once_picking_started(client, access_token):
-    """B-33：拣货任务已有批次 / 明细，或单据已过拣货阶段 → 409。"""
+    """B-33：拣货任务已有批次 / 明细 → 409 16053；已发货（delivered / completed）或已关闭 → 409 16052。
+    picked / packed（未发货）的 DN 可以取消，货退回待上架（B-83，见 test_process_guards.py）。"""
     headers = {'Authorization': f'Bearer {access_token}'}
     with client.application.app_context():
         dn3 = get_dn_by_id(3)                  # 种子：in_progress，拣货任务已有明细
@@ -670,24 +671,16 @@ def test_cancel_dn_conflicts_once_picking_started(client, access_token):
     assert response.status_code == 409
     assert response.get_json()['code'] == 16053
 
-    # picked 且已拣出货 → 16053（一件都没拣出的 picked DN 允许取消，见 test_task_lifecycle_rules.py）
     with client.application.app_context():
-        dn = get_dn()
-        dn.status = 'picked'
-        dn.details[0].picked_quantity = 1
-        db.session.commit()
-        dn_id = dn.id
-    response = client.put(f'/dn/{dn_id}/cancel/', headers=headers)
-    assert response.status_code == 409
-    assert response.get_json()['code'] == 16053
-
-    with client.application.app_context():
-        dn = get_dn_by_id(dn_id)
-        dn.status = 'packed'
-        db.session.commit()
-    response = client.put(f'/dn/{dn_id}/cancel/', headers=headers)
-    assert response.status_code == 409
-    assert response.get_json()['code'] == 16052
+        dn_id = get_dn().id
+    for status in ('delivered', 'completed', 'closed'):
+        with client.application.app_context():
+            dn = get_dn_by_id(dn_id)
+            dn.status = status
+            db.session.commit()
+        response = client.put(f'/dn/{dn_id}/cancel/', headers=headers)
+        assert response.status_code == 409, status
+        assert response.get_json()['code'] == 16052
 
 
 def test_duplicate_goods_validation(client):

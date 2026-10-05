@@ -201,15 +201,16 @@ def test_update_asn_ignores_status(client, access_token):
 
 
 def test_create_sorting_task_ignores_status(client, access_token):
+    """手工新建分拣任务的接口已去掉（B-81）：POST /sorting/ → 405，不会建出任何状态的任务"""
     with client.application.app_context():
         asn_id = get_asn().id
+        before = SortingTask.query.count()
 
     response = client.post('/sorting/', headers=_auth(access_token),
                            json={'asn_id': asn_id, 'status': 'completed', 'is_active': False})
-    assert response.status_code == 201, response.data
-    data = response.get_json()
-    assert data['status'] == 'pending'
-    assert data['is_active'] is True
+    assert response.status_code == 405, response.data
+    with client.application.app_context():
+        assert SortingTask.query.count() == before
 
 
 # ---------------------------------------------------------
@@ -272,8 +273,8 @@ def test_foreign_staff_cannot_touch_sorting_task(client, foreign):
     _assert_forbidden(client.get(f'/sorting/{task_id}/batches/', headers=headers))
     _assert_forbidden(client.post(f'/sorting/{task_id}/batches/', headers=headers, json={}))
     _assert_forbidden(client.get(f'/sorting/{task_id}/details/', headers=headers))
-    # body 里引用别家仓库的 ASN 也不行
-    _assert_forbidden(client.post('/sorting/', headers=headers, json={'asn_id': asn_id}))
+    # 手工新建接口已去掉（B-81）：引用别家仓库的 ASN 也建不了任务
+    assert client.post('/sorting/', headers=headers, json={'asn_id': asn_id}).status_code == 405
 
     with client.application.app_context():
         assert get_sorting_task_by_id(task_id) is not None
@@ -349,7 +350,10 @@ def test_sorting_detail_requires_batch_of_same_task(client, access_token):
 
     with client.application.app_context():
         user = get_operator_user()
-        other_task = SortingTaskService.create_task({'asn_id': get_asn().id}, user.id)
+        # 手工新建接口 / create_task 已去掉（B-81）：直接写库造同一 ASN 的另一个任务
+        other_task = SortingTask(asn_id=get_asn().id, status='pending', is_active=True, created_by=user.id)
+        db.session.add(other_task)
+        db.session.commit()
         SortingTaskService.process_task(other_task.id, user.id)
         other_batch_id = SortingTaskService.create_batch(other_task.id, {}, user.id).id
 

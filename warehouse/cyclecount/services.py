@@ -17,6 +17,28 @@ from datetime import datetime, timedelta
 
 class CycleCountTaskService:
 
+    # -------------------------------------------------------------------------
+    # 实盘录入（B-79 / B-80）
+    # - 系统数（system_quantity）在「录入实盘」时取当时的库位库存，差异按录入时算：盘点期间库位照常拣货 / 上架，
+    #   开始盘点时的快照到录入时已经过时（快照 100、期间拣走 20、实盘 80 → 旧逻辑按 −20 调成 60）
+    # - 录入 = 批量保存时明确提交的行（值和默认 0 相同也算）、单行完成、明细修改里给了 actual_quantity；
+    #   录入时写 operator_id。「已录入」= operator_id 非空或明细已完成，不加新列
+    # - 盘点完成前每条明细都必须已录入，否则 409 16114（未录入的明细实盘默认 0，会把库位清零）
+    # -------------------------------------------------------------------------
+    @staticmethod
+    def is_recorded(detail: CycleCountTaskDetail) -> bool:
+        return detail.status == 'completed' or detail.operator_id is not None
+
+    @staticmethod
+    def _record_actual(detail: CycleCountTaskDetail, actual_quantity: int, operator_id) -> CycleCountTaskDetail:
+        """录入实盘：系统数取录入此刻的库位库存，差异按此计算，记录录入人"""
+        system_quantity = GoodsLocationService.get_quantity(detail.goods_id, detail.location_id)
+        detail.actual_quantity = actual_quantity
+        detail.system_quantity = system_quantity
+        detail.difference = actual_quantity - system_quantity
+        detail.operator_id = operator_id
+        return detail
+
     @staticmethod
     def _get_instance(task_or_id: int | CycleCountTask) -> CycleCountTask:
         """
@@ -218,26 +240,32 @@ class CycleCountTaskService:
 
     @staticmethod
     @transactional
-    def update_task_detail(task_id: int, detail_id: int, data: dict) -> CycleCountTaskDetail:
+    def update_task_detail(task_id: int, detail_id: int, data: dict, operator_id: int | None = None) -> CycleCountTaskDetail:
         """
         更新指定 CycleCountTaskDetail（仅当所属的 CycleCountTask 为 pending）
+        - 给了 actual_quantity 即为录入：系统数取此刻的库位库存、重算差异、operator_id 记为当前操作人
+        - 只换了商品 / 库位（没给 actual_quantity）：之前的录入作废，需重新录入
         """
         task = lock_row(CycleCountTaskService.get_task(task_id))
         if task.status != 'pending':
             raise BadRequestException("Cannot update detail in a non-pending CycleCountTask", 16005)
 
-        detail = CycleCountTaskService.get_task_detail(task_id, detail_id)
+        detail = lock_row(CycleCountTaskService.get_task_detail(task_id, detail_id))
 
         # 白名单：goods_id / location_id / actual_quantity；
-        # status 与 operator_id 只由 complete / batch_save 流程写入，不接受客户端输入
+        # status 与 operator_id 不接受客户端输入（operator_id 取当前操作人）
         if data.get('goods_id') is not None:
             require_company_goods(data['goods_id'], task.warehouse.company_id)
+        old_key = (detail.goods_id, detail.location_id)
         detail.goods_id = data.get('goods_id', detail.goods_id)
         detail.location_id = data.get('location_id', detail.location_id)
         if 'actual_quantity' in data:
-            detail.actual_quantity = require_non_negative_int(data['actual_quantity'], 'actual_quantity')
-            if detail.system_quantity is not None:
-                detail.difference = detail.actual_quantity - detail.system_quantity
+            actual_quantity = require_non_negative_int(data['actual_quantity'], 'actual_quantity')
+            CycleCountTaskService._record_actual(detail, actual_quantity, operator_id)
+        elif (detail.goods_id, detail.location_id) != old_key:
+            detail.system_quantity = None
+            detail.difference = None
+            detail.operator_id = None
 
         # db.session.commit()
         return detail
@@ -277,8 +305,11 @@ class CycleCountTaskService:
         # 若 pending -> in_progress，则记录 started_at
         if old_status == 'pending' and new_status == 'in_progress':
             task.started_at = now
-            # 遍历task_detail，获取goodslocation的数量更新到task_detail中的system_quantity
+            # 未录入的明细先取当前库位库存展示（录入时会按录入那一刻重新取）；
+            # 开始前已录入（带系统数）的明细保留录入时的系统数与差异
             for detail in task.task_details:
+                if CycleCountTaskService.is_recorded(detail) and detail.system_quantity is not None:
+                    continue
                 goods_location = GoodsLocationService.get_quantity(detail.goods_id, detail.location_id)
                 detail.system_quantity = goods_location
                 # 计算差异
@@ -324,6 +355,15 @@ class CycleCountTaskService:
         task = lock_row(CycleCountTaskService._get_instance(task_or_id))
         if task.status != 'in_progress':
             raise BadRequestException("Cannot complete a non-in_progress CycleCountTask", 16008)
+
+        # 每条明细都必须已录入：未录入的实盘默认 0，生成的调整单会把库位清零（B-80）
+        unrecorded = sorted(d.id for d in task.task_details if not CycleCountTaskService.is_recorded(d))
+        if unrecorded:
+            raise ConflictException(
+                f"{len(unrecorded)} cycle count detail(s) have not been counted yet; "
+                f"save or complete them (a count of 0 must be submitted explicitly) before completing the task.",
+                16114, details={'detail_ids': unrecorded}
+            )
 
         return CycleCountTaskService._update_task_status(task, 'completed', operator_id)
 
@@ -379,6 +419,11 @@ class CycleCountTaskService:
         if detail.status == 'completed':
             raise ConflictException("Detail is already completed", 16017, details={'detail_ids': [detail.id]})
 
+        # 没录入过就直接完成 = 按当前实盘数（默认 0）录入：系统数取此刻的库位库存；
+        # 已录入的保留录入时的系统数与差异（实盘是在录入那一刻点的）
+        if not CycleCountTaskService.is_recorded(detail):
+            CycleCountTaskService._record_actual(detail, detail.actual_quantity or 0, operator_id)
+
         return CycleCountTaskService._update_task_detail_status(detail, 'completed', operator_id)
 
     @staticmethod
@@ -387,7 +432,9 @@ class CycleCountTaskService:
         """
         批量保存 CycleCountTaskDetail
         - 请求里含 completed 明细时整单拒绝（409 16017，details.detail_ids 列出这些明细），一行都不写
-        - 只改实盘数确有变化的行：operator_id / difference 只写到这些行，不再把整单的操作人改成当前用户
+        - 提交的行即为录入：系统数取此刻的库位库存、按录入时算差异、记 operator_id；
+          值和默认 0 相同（盘到 0 件）也算录入
+        - 已录入且值没变的行不动（保留原录入人与录入时的系统数）：别人打开页面后整单提交时不会改写已录入的行
         """
         task = lock_row(CycleCountTaskService.get_task(task_id))
         if task.status != 'in_progress':
@@ -409,14 +456,11 @@ class CycleCountTaskService:
                 "Cannot save completed CycleCountTask details", 16017, details={'detail_ids': completed_ids}
             )
 
-        # 2) 只写实盘数有变化的行
+        # 2) 录入：未录入过的行（即使值等于默认 0）与实盘数有变化的行
         for detail, actual_quantity in updates:
-            if detail.actual_quantity == actual_quantity:
+            if CycleCountTaskService.is_recorded(detail) and detail.actual_quantity == actual_quantity:
                 continue
-            detail.system_quantity = detail.system_quantity or 0  # 将 None 转为 0
-            detail.actual_quantity = actual_quantity
-            detail.operator_id = operator_id
-            detail.difference = detail.actual_quantity - detail.system_quantity
+            CycleCountTaskService._record_actual(detail, actual_quantity, operator_id)
 
         # db.session.commit()
         return task

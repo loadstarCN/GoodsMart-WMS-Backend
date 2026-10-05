@@ -9,8 +9,10 @@ from extensions.error import BadRequestException
 from extensions.transaction import transactional
 from system.webhook.services import emit_company_events
 from warehouse.common.countries import normalize_country, is_valid_country
+from warehouse.common.references import ensure_not_referenced
 from warehouse.location.models import Location
 from .models import Goods, GoodsLocation
+from .sanitize import sanitize_description
 
 # 同步给订阅方的商品规格：模型字段 → payload 键（单位写进键名：重量 kg、尺寸 mm）
 SPEC_FIELDS = (
@@ -39,6 +41,75 @@ def clean_origin_country(value, field='origin_country'):
         raise BadRequestException(f"Invalid {field}: '{value}' is not an ISO 3166-1 alpha-2 country code",
                                   10014, field)
     return code
+
+
+# ---------------------------------------------------------------------------
+# 商品数值字段校验（JSON 新建 / 修改与 CSV 导入共用）：必须是有限数，且在列的取值范围内。
+# NaN 进 PG numeric 后商品接口会输出非法 JSON、写 json 列的事件 payload 被拒；
+# Infinity / 超大值溢出 numeric(8,3) → 500。不合法 → 400 16100。
+# ---------------------------------------------------------------------------
+GOODS_NUMBER_INVALID = 16100
+# 字段 → (精度, 最小值, 最大值, 返回类型)；按模型列：weight Numeric(8,3)、尺寸 Integer（int4）、价格 Numeric(12,2)
+GOODS_NUMBER_RULES = {
+    'weight': (Decimal('0.001'), Decimal('0.001'), Decimal('99999.999'), Decimal),
+    'length': (Decimal('1'), 1, 2147483647, int),
+    'width': (Decimal('1'), 1, 2147483647, int),
+    'height': (Decimal('1'), 1, 2147483647, int),
+    'price': (Decimal('0.01'), Decimal('0'), Decimal('9999999999.99'), Decimal),
+    'discount_price': (Decimal('0.01'), Decimal('0'), Decimal('9999999999.99'), Decimal),
+}
+GOODS_NUMBER_FIELDS = tuple(GOODS_NUMBER_RULES)
+_GOODS_NUMBER_HINTS = {
+    'weight': 'a finite number greater than 0 and at most 99999.999 (kg)',
+    'length': 'a finite positive number of millimetres (at most 2147483647)',
+    'width': 'a finite positive number of millimetres (at most 2147483647)',
+    'height': 'a finite positive number of millimetres (at most 2147483647)',
+    'price': 'a finite number between 0 and 9999999999.99',
+    'discount_price': 'a finite number between 0 and 9999999999.99',
+}
+
+
+def goods_number_error(field, row=None):
+    prefix = f"Row {row}: " if row is not None else ''
+    details = {'field': field}
+    if row is not None:
+        details['row'] = row
+    return BadRequestException(f"{prefix}{field} must be {_GOODS_NUMBER_HINTS[field]}",
+                               GOODS_NUMBER_INVALID, field, details=details)
+
+
+def clean_goods_number(field, value, row=None):
+    """单个数值字段：None / 空串 → None（未录入）；其余转 Decimal，校验有限与范围，
+    按列精度四舍五入（重量 3 位小数、尺寸整数毫米、价格 2 位小数）后返回。
+
+    :param row: CSV 行号（报错信息与 details 里带上）
+    """
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
+    quantum, minimum, maximum, cast = GOODS_NUMBER_RULES[field]
+    if isinstance(value, bool):
+        raise goods_number_error(field, row)
+    try:
+        number = value if isinstance(value, Decimal) else Decimal(str(value).strip())
+    except (InvalidOperation, ValueError, TypeError):
+        raise goods_number_error(field, row)
+    if not number.is_finite():
+        raise goods_number_error(field, row)
+    try:
+        number = number.quantize(quantum, rounding=ROUND_HALF_UP)
+    except InvalidOperation:  # 位数超出 Decimal 上下文精度（极大的数）
+        raise goods_number_error(field, row)
+    if number < minimum or number > maximum:
+        raise goods_number_error(field, row)
+    return int(number) if cast is int else number
+
+
+def clean_goods_numbers(data: dict, row=None) -> dict:
+    """就地规范化 data 里出现的数值字段（没出现的不动），返回 data"""
+    for field in GOODS_NUMBER_FIELDS:
+        if field in data:
+            data[field] = clean_goods_number(field, data[field], row)
+    return data
 
 
 def resolve_spec_source(requested=None):
@@ -237,12 +308,15 @@ class GoodsService:
         # 假设 data['manufacturing_date'] = "2025-01-01"
         if 'manufacturing_date' in data and isinstance(data['manufacturing_date'], str):
             data['manufacturing_date'] = datetime.strptime(data['manufacturing_date'], '%Y-%m-%d').date()
-            
+        # 数值字段：有限、范围内（400 16100）
+        clean_goods_numbers(data)
+
         new_goods = Goods(
             code=data['code'],
             company_id=data['company_id'],
             name=data['name'],
-            description=data.get('description'),
+            # 富文本描述按白名单清洗（nh3）
+            description=sanitize_description(data.get('description')),
             unit=data.get('unit', 'pcs'),
             weight=data.get('weight'),
             length=data.get('length'),
@@ -298,10 +372,13 @@ class GoodsService:
         """
         goods = GoodsService.get_goods(goods_id)
         spec_before = goods_spec_snapshot(goods)
-        
+        # 数值字段：有限、范围内（400 16100）
+        clean_goods_numbers(data)
+
         goods.code = data.get('code', goods.code)
         goods.name = data.get('name', goods.name)
-        goods.description = data.get('description', goods.description)
+        if 'description' in data:
+            goods.description = sanitize_description(data['description'])
         goods.unit = data.get('unit', goods.unit)
         goods.weight = data.get('weight', goods.weight)
         goods.length = data.get('length', goods.length)
@@ -348,9 +425,11 @@ class GoodsService:
     @transactional
     def delete_goods(goods_id: int):
         """
-        删除指定的 Goods。
+        删除指定的 Goods：仍有库存 / 库位记录 / 单据明细引用时 409 44004（改用停用）。
+        库位记录（goods_locations）也算：storage_records 是 delete-orphan，直接删会把库存记录一并删掉。
         """
         goods = GoodsService.get_goods(goods_id)
+        ensure_not_referenced(Goods, goods.id, 'goods')
         db.session.delete(goods)
         # db.session.commit()
 
@@ -387,6 +466,9 @@ class GoodsService:
         spec_changes = []
 
         for goods_data in data:
+            # 富文本描述按白名单清洗（新建与 append / override 覆盖都用清洗后的值）
+            if 'description' in goods_data:
+                goods_data['description'] = sanitize_description(goods_data['description'])
             existing = existing_map.get((goods_data['code'], goods_data['company_id']))
 
             if not existing:

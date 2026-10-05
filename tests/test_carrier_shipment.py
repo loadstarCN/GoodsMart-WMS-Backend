@@ -749,7 +749,13 @@ def test_db_failure_after_create_cancels_shipment(client, access_token, fedex, m
     monkeypatch.setattr(CarrierShipmentService, '_store_label', staticmethod(broken))
 
     response = _create(client, access_token, dn_id)
-    assert response.status_code == 500
+    # 写库失败统一 502 16095：带补偿结果；已在 FedEx 取消 → unresolved 为 null
+    assert response.status_code == 502 and response.get_json()['code'] == 16095
+    details = response.get_json()['details']
+    assert details['unresolved'] is None and details['tracking_number'] == '794600000001'
+    assert details['compensation'] == {'attempted': True, 'cancelled': True,
+                                       'cancel_transaction_id': 'tx-cancel-0001', 'error': None}
+    assert details['error'] == {'code': None, 'message': 'RuntimeError'}
     cancels = fedex.of('/ship/v1/shipments/cancel')
     assert len(cancels) == 1
     assert cancels[0]['method'] == 'PUT'
@@ -777,7 +783,10 @@ def test_compensation_failure_records_unknown_with_tracking(client, access_token
     monkeypatch.setattr(CarrierShipmentService, '_store_label',
                         staticmethod(lambda *a, **k: (_ for _ in ()).throw(RuntimeError('disk full'))))
     fedex.set('/ship/v1/shipments/cancel', cancel_response)
-    assert _create(client, access_token, dn_id).status_code == 500
+    response = _create(client, access_token, dn_id)
+    assert response.status_code == 502 and response.get_json()['code'] == 16095
+    assert response.get_json()['details']['unresolved']['tracking_number'] == '794600000001'
+    assert response.get_json()['details']['compensation']['cancelled'] is False
 
     records = _records(client, dn_id)
     assert [(r['status'], r['reason'], r['tracking_number'], r['transaction_id']) for r in records] == [
@@ -801,7 +810,9 @@ def test_compensation_accepts_already_cancelled(client, access_token, fedex, mon
                         staticmethod(lambda *a, **k: (_ for _ in ()).throw(RuntimeError('disk full'))))
     fedex.set('/ship/v1/shipments/cancel', (404, {'transactionId': 'tx-c-404', 'errors': [
         {'code': 'TRACKING.TRACKINGNUMBER.NOTFOUND', 'message': 'Tracking number not found.'}]}))
-    assert _create(client, access_token, dn_id).status_code == 500
+    response = _create(client, access_token, dn_id)
+    assert response.status_code == 502 and response.get_json()['code'] == 16095
+    assert response.get_json()['details']['unresolved'] is None
     assert _states(client, dn_id) == [('cancelled', 'compensated', '794600000001')]
 
 
@@ -1379,12 +1390,12 @@ def test_cancel_retry_after_local_failure(client, access_token, fedex, monkeypat
     dn_id, task_id = _ready(client, access_token)
     created = _create(client, access_token, dn_id).get_json()['shipment']
 
-    # FedEx 取消成功，本地写库失败 → 回滚，记录仍 active
+    # FedEx 取消成功，本地写库失败 → 第 3 段回滚；第 1 段已提交的「取消中」留着（reason save_failed），拦发货
     original = CustomsService.issue_documents
     monkeypatch.setattr(CustomsService, 'issue_documents',
                         staticmethod(lambda *a, **k: (_ for _ in ()).throw(RuntimeError('db down'))))
     assert _cancel(client, access_token, dn_id).status_code == 500
-    assert _states(client, dn_id) == [('active', None, '794600000001')]
+    assert _states(client, dn_id) == [('cancelling', 'save_failed', '794600000001')]
     monkeypatch.setattr(CustomsService, 'issue_documents', staticmethod(original))
 
     # 再点取消：FedEx 回「已取消 / 查无此运单」→ 视为取消成功

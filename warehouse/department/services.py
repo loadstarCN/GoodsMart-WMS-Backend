@@ -1,5 +1,6 @@
 from extensions.db import *
 from extensions.transaction import transactional
+from warehouse.common.references import ensure_not_referenced
 from .models import Department
 
 class DepartmentService:
@@ -76,8 +77,9 @@ class DepartmentService:
     @transactional
     def delete_department(department_id: int):
         """
-        删除 Department
+        删除 Department：还有员工属于该部门时 409 44004（外键是 SET NULL，直接删会悄悄把员工的部门清空）
         """
         department = DepartmentService.get_department(department_id)
+        ensure_not_referenced(Department, department.id, 'department', include=('staff',))
         db.session.delete(department)
         # db.session.commit()

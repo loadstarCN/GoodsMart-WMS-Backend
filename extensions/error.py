@@ -1,12 +1,20 @@
 from flask_restx import ValidationError
+from sqlalchemy.exc import DataError, IntegrityError
 from werkzeug.exceptions import HTTPException
 
 # 业务码登记（出口单证 / 发货，完整列表见 README「Business codes」）：
+# 16063  400  报关快照结构不合法：details {field}；行的 unit_value 小数位超过币种小数位（JPY 等 0 位，其它 2 位）
+#             时另带 {currency, max_decimal_places}
 # 16069  409  海外件发货前单证不可用：details {missing_documents: [...], outdated: bool}
 #             （缺 CI / PL → missing_documents 非空、outdated false；已过期 → missing_documents []、outdated true）
+# 16076  409  有未结束的自动运单（pending / active / unknown / cancelling）时改箱子 / 改报关快照
+#             （reason CARRIER_SHIPMENT_OPEN），或签发除 AWB 外与当前单证不一致的单证（reason DOCUMENT_DATA_CHANGED）：
+#             details {reason, status, carrier, carrier_shipment: {id, status, tracking_number}}
 # 16078  409  有有效自动运单时运单号 / 承运商与运单不一致：details {tracking_number, carrier[, carrier_id]}；
 #             用了本 DN 已取消的自动运单号：details {tracking_number: null, cancelled_tracking_number, carrier,
 #             status: 'cancelled', record_status: 'cancelled' | 'dismissed'}（已确认作废的运单号同样拦）
+# 16079  409  自动运单进行中 / 结果不明 / 正在取消或取消结果不明（pending / unknown / cancelling）：不能建单、存运单号、
+#             完成发货（不带运单号也拦），也不能再点取消（取消进行中）：details {unresolved}
 # 16080  409  完成发货后的运单号与当前 CI 上印的 AWB 不一致（先保存运单号并重出单证）：
 #             details {document_tracking_number, tracking_number}
 # 16088  409  任务已停用（所属 DN / ASN 已取消），不能再操作：details {task_id}
@@ -16,6 +24,44 @@ from werkzeug.exceptions import HTTPException
 # 16091  409  海外 DN 只能对当前发货任务完成发货 / 存运单号 / 修改：details {delivery_task_id, current_status}
 # 16092  409  完成发货的承运商与当前 CI 上印的不一致（先改承运商并重出单证）：
 #             details {document_carrier, document_carrier_id, carrier_id}
+# 16093  409  取消运单 / 确认作废请求里带的目标与当前记录不符（页面上的记录已变，先重新读取）：
+#             details {expected: 请求里的值, actual: 服务端当前的值}；取消比 tracking_number（规范化后），
+#             确认作废比 unresolved_id（记录 id）
+# 16094  409  确认作废带运单号的记录时，FedEx 没有确认这张运单已取消 / 不存在（明确拒绝取消或结果不明），不能作废：
+#             details {unresolved, carrier, tracking_number, result: refused | unclear, http_status, transaction_id,
+#             errors, alerts, maybe_processed}
+# 16095  502  FedEx 已建好运单但 WMS 写库失败（含期间 DN 已发货等业务异常），已按补偿规则处理：
+#             details {carrier, action: 'create', tracking_number, transaction_id, error: {code, message},
+#             compensation: {attempted, cancelled, cancel_transaction_id, error}, unresolved, maybe_processed}
+#             （unresolved 为 null = 已在 FedEx 取消；否则为带运单号的结果不明记录，需重试取消 / 确认作废）
+#
+# 业务码登记（权限 / 平台 / 主数据）：
+# 16100  400  商品规格数值不合法：须为有限数；0 < weight ≤ 99999.999（kg，3 位小数）；
+#             length / width / height 为正整数毫米且 ≤ 2147483647；price / discount_price 为 0 ~ 9999999999.99。
+#             field = 字段名；details {field, row?}（row 只在 CSV 导入时有，为文件行号）
+# 16101  400  CSV 文件内商品编码重复：details {code, rows: [首次出现的行号, 重复的行号]}
+# 16102  400  数据库拒绝的数据值（DataError：超出列范围 / 类型不符等），只返回通用文案
+# 16103  400  不能分配已停用的角色（已持有的停用角色可以保留）：field = roles，details {roles: [...]}
+# 16104  403  只有公司管理员（company_all_access）或平台管理员能新建 / 删除仓库、修改仓库负责人（manager_id）
+# 16105  403  没有 company_all_access 的调用方只能新建 / 修改 / 删除绑定到自己的 API Key
+# 44004  409  主数据仍被单据 / 库存等记录引用，不能删除（请改用停用）：
+#             details {entity: supplier|carrier|recipient|goods|warehouse|department, id, references: {表名: 行数}}
+# 44005  409  与已有数据冲突（IntegrityError：唯一键重复 / 外键仍被引用等），只返回通用文案
+# API Key 所属公司停用 / 过期 → 401 11007、绑定用户停用或已删除 → 401 11006（与登录同码）
+#
+# 业务码登记（库存与作业流程）：
+# 16110  409  DN 有未结束的承运商自动运单（pending / active / unknown / cancelling），不能取消 DN：先在单证卡片取消运单。
+#             details {shipment_id, status, tracking_number}
+# 16111  409  调整单已取消（is_active=false），不能再做任何操作：details {adjustment_id}
+# 16112  409  调整单当前状态不能取消（只有 pending / approved 可取消）：details {adjustment_id, status}
+# 16113  409  调整单完成不了：负向调整的库位上已没有该商品的库存记录，或明细没有库位（请取消后按当前库存重新建单）：
+#             details {detail_id, goods_id, location_id, adjustment_quantity}
+# 16114  409  盘点单还有未录入的明细，不能完成（盘到 0 件也要明确提交）：details {detail_ids: [...]}
+# 16115  400  数值字段不合法（ASN 明细 weight / volume 须为 ≥ 0 的数；库位 width / depth / height / capacity 须 > 0；
+#             空串按 null 处理）：field = 字段名
+# 16116  409  分拣任务的 asn_id 不能改（会造成一张 ASN 两个分拣任务）：details {asn_id}
+# 44009  409  库位有历史记录（上架 / 下架 / 移库 / 拣货 / 盘点 / 调整 / 库存快照）引用，不能删除（请改用停用）：
+#             details {entity: 'location', id, references: {记录类型: 行数}}
 
 class APIException(Exception):
     """API异常基类"""
@@ -185,7 +231,30 @@ def register_error_handlers(app):
             }
         
         return response, 400
-    
+
+    def _db_error_response(error, status, code, message):
+        """数据库约束 / 数据值错误：先回滚（会话还要给请求日志用），只返回通用文案，不回显 SQL"""
+        try:
+            from extensions.db import db
+            db.session.rollback()
+        except Exception:  # pragma: no cover - 回滚失败不影响错误响应
+            pass
+        app.logger.warning(f"{type(error).__name__} mapped to {status}: {getattr(error, 'orig', error)!r}")
+        response = {"status": "error", "code": code, "message": message}
+        if app.config.get('FLASK_ENV') == 'development':
+            response["debug"] = {"exception": type(error).__name__}
+        return response, status
+
+    # 唯一键重复 / 外键仍被引用等（并发下没被前置检查拦住的情况）→ 409
+    @app.errorhandler(IntegrityError)
+    def handle_integrity_error(error):
+        return _db_error_response(error, 409, 44005, "The data conflicts with existing records")
+
+    # 超出列范围 / 数据库不接受的值 → 400
+    @app.errorhandler(DataError)
+    def handle_data_error(error):
+        return _db_error_response(error, 400, 16102, "Invalid data value")
+
     # 处理其他未捕获异常
     @app.errorhandler(Exception)
     def handle_unexpected_error(error):

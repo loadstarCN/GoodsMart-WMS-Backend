@@ -88,6 +88,13 @@ goods_origin_country_input_model = api_ns.model('GoodsOriginCountryInput', {
     'spec_source': input_fields['spec_source'],
 })
 
+# 只改原产国的响应：只回传改了什么，不带库位库存（仓库作业账号可能看不到其他仓库）
+goods_origin_country_model = api_ns.model('GoodsOriginCountry', {
+    'id': fields.Integer(readOnly=True, description='Goods ID'),
+    'code': fields.String(readOnly=True, description='Goods Code'),
+    'origin_country': fields.String(description='Country of origin (ISO 3166-1 alpha-2); null = not recorded'),
+})
+
 # -----------------------------
 # GoodsLocation 模型定义
 # -----------------------------

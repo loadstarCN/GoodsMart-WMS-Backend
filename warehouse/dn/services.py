@@ -989,27 +989,51 @@ class DNService:
     @transactional
     def cancel_dn(dn_or_id: int | DN) -> DN:
         """
-        取消 DN 并释放 dn_stock 预占：
-        - pending：等同 close
-        - in_progress：拣货任务尚无任何批次 / 明细时允许取消，拣货任务一并停用
-        - picked 且一件都没拣出（修复前允许拣货 0 件完成，之后打包永远完成不了）：允许取消，
-          拣货 / 打包任务一并停用；预占已在拣货完成时释放，没有库存要回滚
-        - 其它状态：拣货已经发生，409
+        取消 DN（状态改为 closed）：
+        - pending：等同 close，释放 dn_stock 预占
+        - in_progress：拣货任务尚无任何批次 / 明细时允许取消，拣货任务一并停用（已有进度 409 16053）
+        - picked / packed（已拣货 / 已打包、未发货）：货退回待上架，见 _cancel_after_picking
+        - delivered / completed / closed：409 16052
+        - in_progress / picked / packed 取消后推 dn.cancelled（来源系统此前收到过 dn.in_progress）
         """
-        # 先锁 DN 行并重读状态，再查拣货任务：拣货批次追加 / 完成同样先锁 DN，三者串行
+        # 先锁 DN 行并重读状态，再查 / 锁任务：拣货、打包、发货的批次追加 / 完成同样先锁 DN，彼此串行
         dn = lock_row(DNService._get_instance(dn_or_id))
         if dn.status == 'pending':
             return DNService.close_dn(dn)
-        if dn.status == 'picked':
-            return DNService._cancel_picked_nothing(dn)
-        if dn.status != 'in_progress':
+        previous_status = dn.status
+        if dn.status in ('picked', 'packed'):
+            dn = DNService._cancel_after_picking(dn)
+        elif dn.status == 'in_progress':
+            dn = DNService._cancel_before_picking(dn)
+        else:
             raise ConflictException(f"Cannot cancel a DN in '{dn.status}' status.", 16052)
 
+        webhook_emit('dn.cancelled', {
+            'dn_id': dn.id, 'status': 'closed', 'previous_status': previous_status,
+            'order_number': dn.order_number,
+            'details': [
+                {
+                    'goods_code': detail.goods.code if detail.goods else None,
+                    'planned_quantity': detail.quantity,
+                    'picked_quantity': detail.picked_quantity,
+                    'packed_quantity': detail.packed_quantity,
+                }
+                for detail in dn.details
+            ],
+        }, api_key_id=dn.api_key_id)
+        return dn
+
+    @staticmethod
+    def _active_tasks(model, dn: DN) -> list:
+        """DN 下启用中的任务，按 id 顺序逐行加锁（调用方已锁 DN：先父单据、后任务行）"""
+        tasks = model.query.filter(model.dn_id == dn.id, model.is_active.is_(True)).order_by(model.id).all()
+        return [lock_row(task) for task in tasks]
+
+    @staticmethod
+    def _cancel_before_picking(dn: DN) -> DN:
+        """cancel_dn 的 in_progress 分支（调用方已锁 DN）：拣货任务没有任何批次 / 明细时允许，释放预占"""
         from warehouse.picking.models import PickingTask
-        tasks = PickingTask.query.filter(
-            PickingTask.dn_id == dn.id,
-            PickingTask.is_active.is_(True),
-        ).all()
+        tasks = DNService._active_tasks(PickingTask, dn)
         for task in tasks:
             if task.status == 'completed' or task.batches or task.task_details:
                 raise ConflictException(
@@ -1027,21 +1051,68 @@ class DNService:
         return dn
 
     @staticmethod
-    def _cancel_picked_nothing(dn: DN) -> DN:
-        """cancel_dn 的 picked 分支（调用方已锁 DN）：只有一件都没拣出、打包也没开始时允许"""
+    def _open_carrier_shipment(dn: DN):
+        """未结束的承运商自动运单（模型 OPEN_STATUSES：进行中 / 有效 / 结果不明 / 取消中）"""
+        from .models import DNCarrierShipment
+        return (
+            DNCarrierShipment.query
+            .filter(DNCarrierShipment.dn_id == dn.id, DNCarrierShipment.status.in_(DNCarrierShipment.OPEN_STATUSES))
+            .order_by(DNCarrierShipment.id.desc())
+            .first()
+        )
+
+    @staticmethod
+    def _cancel_after_picking(dn: DN) -> DN:
+        """
+        cancel_dn 的 picked / packed 分支（调用方已锁 DN）：已拣 / 已打包、还没发货的货退回待上架（sorted_stock），
+        之后走上架放回库位。
+        - 有未结束的承运商自动运单（pending / active / unknown / 取消中）→ 409 16110：先在单证卡片取消运单
+        - 库存：picked → 已拣量从 picked_stock 退回 sorted_stock（打包任务进行中也一样，打包未完成不动库存）；
+          packed → 已打包量从 packed_stock 退回 sorted_stock（少打包的差额在打包完成时已退回）。total_stock 不变
+        - 拣货 / 打包 / 发货任务一并停用（之后对它们的任何操作 → 409 16088）
+        - 当前有效（issued）的出口单证一并作废（void_reason: dn_cancelled）
+        - DN 改为 closed，重算 dn_stock。DN 明细上的已拣 / 已打包量保留为历史
+        修复前允许「拣货 0 件完成」留下的 picked DN 也走这里：没有库存要退，只停用任务、关闭单据
+        """
+        from warehouse.delivery.models import DeliveryTask
         from warehouse.packing.models import PackingTask
         from warehouse.picking.models import PickingTask
-        if any((detail.picked_quantity or 0) > 0 for detail in dn.details):
-            raise ConflictException("Cannot cancel a DN whose picking has already started.", 16053)
-        packing_tasks = PackingTask.query.filter(
-            PackingTask.dn_id == dn.id, PackingTask.is_active.is_(True)).all()
-        if any(task.status != 'pending' or task.batches for task in packing_tasks):
-            raise ConflictException("Cannot cancel a DN whose packing has already started.", 16053)
-        picking_tasks = PickingTask.query.filter(
-            PickingTask.dn_id == dn.id, PickingTask.is_active.is_(True)).all()
-        for task in [*picking_tasks, *packing_tasks]:
+        from .models import DNDocument
+
+        shipment = DNService._open_carrier_shipment(dn)
+        if shipment is not None:
+            raise ConflictException(
+                f"DN {dn.id} has an unfinished carrier shipment ({shipment.status}); "
+                f"cancel the shipment on the documents card first.",
+                16110, details={'shipment_id': shipment.id, 'status': shipment.status,
+                                'tracking_number': shipment.tracking_number}
+            )
+
+        picking_tasks = DNService._active_tasks(PickingTask, dn)
+        packing_tasks = DNService._active_tasks(PackingTask, dn)
+        delivery_tasks = DNService._active_tasks(DeliveryTask, dn)
+        # 已完成发货的任务说明货已经发出（DN 应已是 delivered），按已发货处理
+        if any(task.status in ('completed', 'signed') for task in delivery_tasks):
+            raise ConflictException("Cannot cancel a DN that has already been shipped.", 16052)
+
+        for detail in dn.details:
+            if dn.status == 'picked':
+                InventoryService.dn_cancelled_after_picking(
+                    detail.goods_id, dn.warehouse_id, picked_quantity=detail.picked_quantity or 0)
+            else:
+                InventoryService.dn_cancelled_after_picking(
+                    detail.goods_id, dn.warehouse_id, packed_quantity=detail.packed_quantity or 0)
+
+        for task in [*picking_tasks, *packing_tasks, *delivery_tasks]:
             task.is_active = False
             db.session.add(task)
+
+        now = datetime.now()
+        for document in DNDocument.query.filter(DNDocument.dn_id == dn.id, DNDocument.status == 'issued').all():
+            document.status = 'void'
+            document.voided_at = now
+            document.void_reason = 'dn_cancelled'
+
         dn = DNService._update_dn_status(dn, "closed")
         for detail in dn.details:
             InventoryService.update_and_calculate_dn_stock(detail.goods_id, dn.warehouse_id)

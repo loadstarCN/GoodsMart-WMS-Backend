@@ -162,3 +162,19 @@ def test_dismissed_shipment_tracking_number_rejected(client, access_token):
     # 其它号码照常
     response = client.put(f'/delivery/{task_id}/tracking', json={'tracking_number': 'OTHER-1'}, headers=_h(access_token))
     assert response.status_code == 200, response.get_json()
+
+
+def test_sorting_task_asn_cannot_be_changed(client, access_token):
+    """B-112：把分拣任务挪到另一张 ASN 等于手工加任务 → 409 16116；原样提交照常"""
+    with client.application.app_context():
+        task = SortingTask.query.filter_by(status='pending').first()
+        task_id, asn_id = task.id, task.asn_id
+        other_asn_id = ASN.query.filter(ASN.id != asn_id).first().id
+
+    response = client.put(f'/sorting/{task_id}', headers=_h(access_token), json={'asn_id': other_asn_id})
+    assert response.status_code == 409, response.get_json()
+    assert response.get_json()['code'] == 16116
+    response = client.put(f'/sorting/{task_id}', headers=_h(access_token), json={'asn_id': asn_id})
+    assert response.status_code == 200, response.get_json()
+    with client.application.app_context():
+        assert db.session.get(SortingTask, task_id).asn_id == asn_id

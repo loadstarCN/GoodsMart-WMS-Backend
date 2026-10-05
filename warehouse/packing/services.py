@@ -9,7 +9,7 @@ from .models import (
     PackingTaskStatusLog
 )
 
-from warehouse.common import require_positive_int, require_bulk_list
+from warehouse.common import require_positive_int, require_bulk_list, delete_batch_with_details
 from warehouse.common.locks import lock_row
 from warehouse.common.validation import require_active_task
 from warehouse.dn.services import DNService, pick_fields, parse_datetime_value
@@ -91,26 +91,7 @@ class PackingTaskService:
 
         return query
 
-    @staticmethod
-    @transactional
-    def create_task(data: dict, created_by_id: int) -> PackingTask:
-        """
-        创建新的 Packing Task。只接受 dn_id；status 固定 pending、is_active 固定 True，
-        状态只能经 process / complete 流转。
-        """
-        payload = pick_fields(data, ('dn_id',))
-        dn_id = require_positive_int(payload.get('dn_id'), 'dn_id', 16044)
-        get_object_or_404(DN, dn_id)
-
-        new_task = PackingTask(
-            dn_id=dn_id,
-            status='pending',
-            is_active=True,
-            created_by=created_by_id
-        )
-        db.session.add(new_task)
-        # db.session.commit()
-        return new_task
+    # 没有 create_task：打包任务只由拣货完成时自动生成（create_packing_task_from_dn），手工新建接口已去掉
 
     @staticmethod
     def get_task(task_id: int) -> PackingTask:
@@ -377,14 +358,15 @@ class PackingTaskService:
         """
         删除指定的 PackingBatch
         - 仅当 PackingTask.status == 'in_progress' 时允许删除
-        - 若已产生明细（PackingTaskDetail），可视业务决定是否禁止删除或自动删除
+        - 批次下的明细一并删除（批次 → 明细的 ORM 关系没有级联，直接删批次会把明细 batch_id 置空撞 NOT NULL 变 500）
+        - 打包中的明细还没动库存（完成时才记 packed_stock），删掉后本任务的已打包量随之减少，无库存要回滚
         """
         task = PackingTaskService._lock(task_id)
         if task.status != 'in_progress':
             raise BadRequestException("Cannot delete a batch in a non-in_progress Packing Task", 16014)
 
         batch = PackingTaskService.get_batch(task_id, batch_id)
-        db.session.delete(batch)
+        delete_batch_with_details(task, batch, PackingTaskDetail, 'task_details')
         # db.session.commit()
 
     # -------------------------------------------------------------------------

@@ -21,6 +21,7 @@ from .schemas import (
     goods_location_model,
     goods_input_model,
     goods_origin_country_input_model,
+    goods_origin_country_model,
     goods_pagination_parser,
     goods_location_pagination_parser,
     goods_location_pagination_model,
@@ -29,18 +30,56 @@ from .schemas import (
     goods_bulk_upload_parser,
 )
 
-from .services import GoodsService, GoodsLocationService, clean_origin_country, resolve_spec_source
+from .services import (
+    GoodsService, GoodsLocationService, clean_origin_country, clean_goods_numbers, goods_number_error,
+    resolve_spec_source,
+)
 
 
 def _parse_csv_number(row, column, line_num):
-    """CSV 里的数值列：空值 → None；非数字 → 400（而不是 ValueError 变 500）"""
+    """CSV 里的数值列：空值 → None；非数字 → 400 10012；NaN / Infinity → 400 16100（带行号）"""
     raw = (row.get(column) or '').strip()
     if not raw:
         return None
     try:
-        return float(Decimal(raw))
+        number = Decimal(raw)
     except (InvalidOperation, ValueError):
         raise BadRequestException(f"Row {line_num}: invalid number for '{column}': {raw}", 10012)
+    if not number.is_finite():
+        raise goods_number_error(column, line_num)
+    return number
+
+
+class _GoodsOutput:
+    """序列化用的只读视图：storage_records 换成按仓库范围过滤后的列表，其余字段取自商品本身。
+
+    不能把过滤结果赋给 goods.storage_records：它是 lazy='dynamic' + delete-orphan 的关系，
+    赋值后 flush（PUT 请求的审计日志会 commit）就会 DELETE 被滤掉的其他仓库库位记录，
+    GET 虽然最后回滚，也会在请求期间锁住这些行（B-101）。
+    """
+
+    def __init__(self, goods, storage_records):
+        self._goods = goods
+        self.storage_records = storage_records
+
+    def __getattr__(self, name):
+        return getattr(self._goods, name)
+
+
+def _with_accessible_storage(goods):
+    """商品 + 调用方仓库范围内的库位记录（须在 @warehouse_required() 之后调用）"""
+    records = [
+        record for record in goods.storage_records if check_warehouse_access(record.location.warehouse_id)
+    ]
+    return _GoodsOutput(goods, records)
+
+
+def _require_goods_visible(goods_id):
+    """非公司管理员的员工：商品还必须在其可访问仓库里有库存记录，否则 404（与 GET 一致）"""
+    user = g.get('current_user')
+    if user is not None and user.type == 'staff' and not user.has_role('company_admin'):
+        if not check_goods_access(goods_id):
+            raise NotFoundException("Goods not found in the specified or accessible warehouse", 13003)
 
 
 def _parse_csv_origin_country(row, line_num):
@@ -124,19 +163,13 @@ class GoodsDetail(Resource):
         goods = get_company_owned(Goods, goods_id)
 
         # 非公司管理员的员工：商品还必须在其可访问仓库里有库存记录
-        user = g.get('current_user')
-        if user is not None and user.type == 'staff' and not user.has_role('company_admin'):
-            if not check_goods_access(goods_id):
-                raise NotFoundException("Goods not found in the specified or accessible warehouse",13003)
+        _require_goods_visible(goods_id)
 
-        # 过滤 storage_records，只保留满足仓库过滤要求的记录
-        goods.storage_records = [
-            record for record in goods.storage_records if check_warehouse_access(record.location.warehouse_id)
-        ]
-
-        return goods, 200
+        # storage_records 只输出调用方仓库范围内的记录（局部过滤，不改 ORM 关系）
+        return _with_accessible_storage(goods), 200
 
     @permission_required(["all_access","company_all_access","goods_edit"])
+    @warehouse_required()
     @api_ns.expect(goods_input_model)
     @api_ns.marshal_with(goods_model)
     def put(self, goods_id):
@@ -146,7 +179,9 @@ class GoodsDetail(Resource):
         # 归属公司不允许通过更新接口迁移
         data.pop('company_id', None)
         spec_source = resolve_spec_source(data.pop('spec_source', None))
-        return GoodsService.update_goods(goods_id, data, spec_source=spec_source)
+        goods = GoodsService.update_goods(goods_id, data, spec_source=spec_source)
+        # 响应里的库位记录同 GET：只给调用方仓库范围内的
+        return _with_accessible_storage(goods)
 
     @permission_required(["all_access","company_all_access","goods_delete"])
     def delete(self, goods_id):
@@ -163,12 +198,15 @@ class GoodsOriginCountry(Resource):
     # 最小权限：仓库作业账号（入库分拣 / 打包）看包装「MADE IN」录入原产国，
     # 不需要整条商品编辑权限（goods_edit）
     @permission_required(["all_access","company_all_access","goods_edit","sorting_edit","packing_edit"])
+    @warehouse_required()
     @api_ns.expect(goods_origin_country_input_model)
-    @api_ns.marshal_with(goods_model)
+    @api_ns.marshal_with(goods_origin_country_model)
     def put(self, goods_id):
-        """Update only the country of origin of a goods"""
-        # 归属校验与商品修改接口相同
+        """Update only the country of origin of a goods (response: id, code, origin_country)"""
+        # 归属校验：公司同商品修改接口；非公司管理员的员工还要求商品在其可访问仓库里有库存（同 GET，否则 404）。
+        # 响应只给 id / code / origin_country，不再带出其他仓库的库位库存
         get_company_owned(Goods, goods_id)
+        _require_goods_visible(goods_id)
         data = api_ns.payload
         if not isinstance(data, dict):
             raise BadRequestException("Request body must be a JSON object", 10014)
@@ -275,20 +313,34 @@ class GoodsBulkUpload(Resource):
             raise BadRequestException(f"Missing required columns: {', '.join(missing_columns)}", 10005)
 
         goods_data = []
+        first_rows = {}  # code → 首次出现的行号（同一文件里同一编码出现两次 → 400 16101，而不是撞唯一键 500）
         for row in reader:
             # 检查必填字段的值
             missing_values = [col for col in required_columns if not row.get(col)]
             if missing_values:
                 raise BadRequestException(f"Row {reader.line_num}: Missing values for {', '.join(missing_values)}", 10006)
 
-            # 数值列可缺省；非数字 → 400
             line_num = reader.line_num
-            price = _parse_csv_number(row, 'price', line_num)
-            discount_price = _parse_csv_number(row, 'discount_price', line_num)
+            code = row['code']
+            if code in first_rows:
+                raise BadRequestException(
+                    f"Row {line_num}: duplicate code '{code}' (first seen in row {first_rows[code]})", 16101,
+                    'code', details={'code': code, 'rows': [first_rows[code], line_num]},
+                )
+            first_rows[code] = line_num
+
+            # 数值列可缺省；非数字 → 400 10012；NaN / Infinity / 超出范围 → 400 16100（带行号）
+            numbers = {field: _parse_csv_number(row, field, line_num)
+                       for field in ('weight', 'length', 'width', 'height', 'price', 'discount_price')}
+            price = numbers['price']
+            discount_price = numbers['discount_price']
             if price is not None and price < 0:
                 raise BadRequestException(f"Row {line_num}: price must be >= 0", 10012)
             if discount_price is not None and (price is None or discount_price > price):
                 raise BadRequestException(f"Row {line_num}: discount_price must be <= price", 10012)
+            clean_goods_numbers(numbers, row=line_num)
+            price = numbers['price']
+            discount_price = numbers['discount_price']
 
             # 构建商品数据
             goods_data.append({
@@ -298,10 +350,10 @@ class GoodsBulkUpload(Resource):
 
                 # 计量维度
                 'unit': row.get('unit') or 'pcs',  # 默认单位为件
-                'weight': _parse_csv_number(row, 'weight', line_num),
-                'length': _parse_csv_number(row, 'length', line_num),
-                'width': _parse_csv_number(row, 'width', line_num),
-                'height': _parse_csv_number(row, 'height', line_num),
+                'weight': numbers['weight'],
+                'length': numbers['length'],
+                'width': numbers['width'],
+                'height': numbers['height'],
                 'origin_country': _parse_csv_origin_country(row, line_num),
 
                 # 品牌信息
@@ -325,7 +377,7 @@ class GoodsBulkUpload(Resource):
                 'expiration_date': parse_date(row.get('expiration_date')),
                 'production_date': parse_date(row.get('production_date')),
 
-                # 描述信息
+                # 描述信息（入库前在 service 里按白名单清洗）
                 'description': row.get('description'),
 
                 # 系统字段

@@ -264,11 +264,23 @@ def test_same_carrier_code_accepted(client, access_token, fedex):
     # 自动运单的承运商按 code 比：改任务照常（16078 不拦）
     response = client.put(f'/delivery/{task_id}', json={'carrier_id': other_fedex}, headers=_h(access_token))
     assert response.status_code == 200, response.get_json()
-    # 但 CI 上印的还是原承运商：B-67 起完成发货要求与 CI 一致，先重出单证再发货
-    assert _issue(client, access_token, dn_id).status_code == 201
+    # 但 CI 上印的承运商名称随之变了：运单有效期间不能重签与运单（含 ETD 上传的 CI）不一致的单证
+    # （B-66 → 409 16076 DOCUMENT_DATA_CHANGED），当前 CI 也就过期了，不能照此发货（16069）
+    response = _issue(client, access_token, dn_id)
+    assert response.status_code == 409 and response.get_json()['code'] == 16076
+    details = response.get_json()['details']
+    assert details['reason'] == 'DOCUMENT_DATA_CHANGED' and details['carrier_shipment']['status'] == 'active'
     response = _ship(client, access_token, task_id, carrier_id=other_fedex)
+    assert response.status_code == 409 and response.get_json()['code'] == 16069
+    # 改回原承运商后 CI 不再过期，照常发货
+    with client.application.app_context():
+        original_id = get_carrier().id
+    response = client.put(f'/delivery/{task_id}', json={'carrier_id': original_id}, headers=_h(access_token))
     assert response.status_code == 200, response.get_json()
-    assert response.get_json()['carrier_id'] == other_fedex
+    response = client.put(f'/delivery/{task_id}/complete/', json={'carrier_id': original_id},
+                          headers=_h(access_token))
+    assert response.status_code == 200, response.get_json()
+    assert response.get_json()['carrier_id'] == original_id
 
 
 def test_carrier_change_allowed_without_shipment(client, access_token):

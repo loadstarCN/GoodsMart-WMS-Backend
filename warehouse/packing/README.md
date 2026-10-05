@@ -47,7 +47,7 @@ Packing 模块用于管理仓库出库的打包任务和明细记录。通过该
 | HTTP 方法 | 路由               | 功能                | 权限              |
 |-----------|--------------------|---------------------|-------------------|
 | `GET`     | `/packing/tasks`   | 获取所有打包任务     | 需要登录           |
-| `POST`    | `/packing/tasks`   | 创建新的打包任务     | `admin` 或 `settings` |
+| `POST`    | `/packing/`        | 已去掉（405）：打包任务只在拣货完成时自动生成 | — |
 | `GET`     | `/packing/tasks/<id>` | 获取单个打包任务详情 | `admin` 或 `settings` |
 | `PUT`     | `/packing/tasks/<id>` | 更新打包任务         | `admin` 或 `settings` |
 | `DELETE`  | `/packing/tasks/<id>` | 删除打包任务         | `admin` 或 `settings` |

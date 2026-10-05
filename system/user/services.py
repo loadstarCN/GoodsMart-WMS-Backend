@@ -202,7 +202,7 @@ class UserService:
             user.is_active = is_active
 
         if 'roles' in data:
-            user.roles = RoleService.resolve_assignable_roles(data['roles'])
+            user.roles = RoleService.resolve_assignable_roles(data['roles'], current_roles=user.roles)
 
         if data.get('password'):
             user.set_password(data.get('password'))
@@ -355,11 +355,15 @@ class RoleService:
         return role
 
     @staticmethod
-    def resolve_assignable_roles(role_names, actor=None):
+    def resolve_assignable_roles(role_names, actor=None, current_roles=None):
         """按名字解析角色，并校验调用方有资格授予这些角色。
 
         规则与 API Key 权限一致：超管随意；其他人不得授予含平台专属权限的角色，
         也不得授予自己没有的权限（持 company_all_access 视为拥有全部公司范围权限）。
+        停用的角色不能新分配（400 16103）；目标原本就持有的停用角色可以原样保留
+        （编辑页会把已有角色整组提交回来，不能因此无法保存）。
+
+        :param current_roles: 目标用户当前持有的角色（新建时为 None）
         """
         if not role_names:
             return []
@@ -368,6 +372,12 @@ class RoleService:
         missing = set(names) - {r.name for r in roles}
         if missing:
             raise BadRequestException(f"Unknown roles: {', '.join(sorted(missing))}", 14014)
+
+        held = {r.id for r in (current_roles or [])}
+        inactive = sorted(r.name for r in roles if r.is_active is False and r.id not in held)
+        if inactive:
+            raise BadRequestException(f"Inactive roles cannot be assigned: {', '.join(inactive)}", 16103,
+                                      'roles', details={'roles': inactive})
 
         actor = actor or get_actor_context()
         for role in roles:

@@ -156,32 +156,43 @@ class User(db.Model):
     }
 
     
+    @property
+    def active_roles(self):
+        """生效中的角色：停用（is_active=False）的角色既不授予权限，也不算持有该角色。
+        roles 关系本身保留全部分配（含停用的），供用户 / 员工管理页显示与编辑。"""
+        return [role for role in self.roles if role.is_active is not False]
+
+    def active_permission_names(self) -> set:
+        """生效角色的权限名集合（鉴权统一用这个，不要直接遍历 self.roles）"""
+        return {p.name for role in self.active_roles for p in role.permissions}
+
     def to_dict(self):
         return {
             "id": self.id,
             "user_name": self.user_name,
             "avatar": self.avatar,
             "email": self.email,
-            "roles": [role.name for role in self.roles],
+            # 登录 / 刷新返回的是生效中的角色
+            "roles": [role.name for role in self.active_roles],
             "type": self.type,
             "is_active": self.is_active,
         }
 
     def get_roles(self):
-        """返回用户所有角色"""
-        return [role.name for role in self.roles]
+        """返回用户生效中的角色名"""
+        return [role.name for role in self.active_roles]
 
-    # 检查是否拥有指定角色
+    # 检查是否拥有指定角色（停用的角色不算）
     def has_role(self, role_name):
-        return role_name in {role.name for role in self.roles}
+        return role_name in {role.name for role in self.active_roles}
 
     def get_permissions(self):
-        """返回用户所有角色的权限"""
-        return [permission.name for role in self.roles for permission in role.permissions]
-    
+        """返回用户生效角色的权限"""
+        return sorted(self.active_permission_names())
+
     def has_permission(self, permission_name):
-        """缓存优化版权限检查"""
-        return permission_name in {p.name for role in self.roles for p in role.permissions}
+        """权限检查（只看生效中的角色）"""
+        return permission_name in self.active_permission_names()
 
     @property
     def company_name(self):

@@ -88,8 +88,12 @@ def test_delete_goods_dependency_error(client, access_token):
             headers={'Authorization': f'Bearer {access_token}'}
         )
         
-        # 验证响应状态码
-        assert response.status_code == 500  # 内部服务器错误
+        # 仍有库存 / 单据引用：409 44004（B-84，以前撞外键约束兜成 500）
+        assert response.status_code == 409
+        body = response.get_json()
+        assert body['code'] == 44004
+        assert body['details']['entity'] == 'goods'
+        assert body['details']['references']['inventory'] >= 1
         
 
 def test_get_goods_locations(client, access_token):

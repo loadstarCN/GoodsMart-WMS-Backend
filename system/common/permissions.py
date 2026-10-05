@@ -22,11 +22,11 @@ PLATFORM_ONLY_PERMISSIONS = frozenset({
 def get_actor_context():
     """返回当前调用方的 (is_super, permissions, company_id)，兼容 JWT 用户与 API Key 两种路径。
 
-    - JWT 用户：权限来自角色；company_id 仅 staff 有
+    - JWT 用户：权限来自生效中的角色（停用的角色不算）；company_id 仅 staff 有
     - API Key：权限来自 key.permissions；company_id 取 key 绑定值，未绑定时退回绑定用户的公司
     """
     if current_user:
-        perms = {p.name for role in current_user.roles for p in role.permissions}
+        perms = current_user.active_permission_names()
         return 'all_access' in perms, perms, getattr(current_user, 'company_id', None)
 
     system = getattr(g, 'current_system', None)
@@ -71,7 +71,7 @@ def role_required(required_roles):
             if not current_user:
                 raise NotFoundException("User not found", 13002)
 
-            user_roles = [role.name for role in current_user.roles]
+            user_roles = [role.name for role in current_user.active_roles]
             if not any(role in user_roles for role in required_roles):
                 raise ForbiddenException("Access denied: insufficient role", 12001)
 
@@ -103,8 +103,8 @@ def permission_required(required_permissions):
 
             # 如果当前有通过 JWT 认证的用户
             if current_user:
-                # 从用户的所有角色中收集权限
-                user_permissions = {perm.name for role in current_user.roles for perm in role.permissions}
+                # 从用户生效中的角色收集权限（停用的角色不授予任何权限）
+                user_permissions = current_user.active_permission_names()
                 # 只要任意一个权限满足即可
                 if not any(permission in user_permissions for permission in required_permissions):
                     raise ForbiddenException("Permission denied", 12001)

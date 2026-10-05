@@ -59,15 +59,21 @@ def test_update_carrier(client, access_token):
 
 
 def test_delete_carrier(client, access_token):
+    # 夹具里的承运商被 ASN / DN / 发货任务引用：409 44004（B-84，SQLite 不查外键所以以前能删掉）
     with client.application.app_context():
-        carrier = get_carrier()
-        response = client.delete(f'/carrier/{carrier.id}', headers={
-            'Authorization': f'Bearer {access_token}'
-        })
-        assert response.status_code == 200
-        data = response.get_json()
-        assert data['message'] == 'Carrier deleted successfully'
+        carrier_id = get_carrier().id
+    response = client.delete(f'/carrier/{carrier_id}', headers={'Authorization': f'Bearer {access_token}'})
+    assert response.status_code == 409
+    assert response.get_json()['code'] == 44004
+    assert response.get_json()['details']['entity'] == 'carrier'
 
-        # Ensure the carrier is deleted
-        deleted_carrier = get_carrier_by_id(carrier.id)
-        assert deleted_carrier is None
+    # 没被引用的承运商照常删除
+    response = client.post('/carrier/', headers={'Authorization': f'Bearer {access_token}'},
+                           json={'name': 'Carrier Unused', 'company_id': 1})
+    assert response.status_code == 201
+    unused_id = response.get_json()['id']
+    response = client.delete(f'/carrier/{unused_id}', headers={'Authorization': f'Bearer {access_token}'})
+    assert response.status_code == 200
+    assert response.get_json()['message'] == 'Carrier deleted successfully'
+    with client.application.app_context():
+        assert get_carrier_by_id(unused_id) is None

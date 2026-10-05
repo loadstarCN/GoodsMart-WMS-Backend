@@ -9,8 +9,10 @@ from extensions.error import BadRequestException
 
 def test_create_picking_task(client, access_token):
     """
-    测试创建 Picking Task (POST /picking/)
+    手工新建拣货任务的接口已去掉（B-81）：POST /picking/ → 405，任务只由 DN 开始处理时自动生成
     """
+    with client.application.app_context():
+        before = PickingTask.query.count()
     response = client.post(
         '/picking/',
         headers={'Authorization': f'Bearer {access_token}'},
@@ -20,10 +22,9 @@ def test_create_picking_task(client, access_token):
             "is_active": True,
         }
     )
-    assert response.status_code == 201
-    data = response.get_json()
-    # 检查返回数据中的关键字段
-    assert data['status'] == "pending"
+    assert response.status_code == 405
+    with client.application.app_context():
+        assert PickingTask.query.count() == before
 
 
 def test_get_picking_tasks(client, access_token):
@@ -86,12 +87,10 @@ def test_update_picking_task(client, access_token):
 
 
 def test_create_picking_task_requires_dn_id(client, access_token):
-    """B-18：缺 dn_id → 400；DN 不存在 → 404"""
+    """B-18 的入参校验随接口一起去掉（B-81）：任何请求体都是 405"""
     headers = {'Authorization': f'Bearer {access_token}'}
-    assert client.post('/picking/', headers=headers, json={"status": "pending"}).status_code == 400
-    assert client.post('/picking/', headers=headers, json={"dn_id": "abc"}).status_code == 400
-    assert client.post('/picking/', headers=headers, json={"dn_id": True}).status_code == 400
-    assert client.post('/picking/', headers=headers, json={"dn_id": 99999}).status_code == 404
+    for body in ({"status": "pending"}, {"dn_id": "abc"}, {"dn_id": True}, {"dn_id": 99999}):
+        assert client.post('/picking/', headers=headers, json=body).status_code == 405
 
 
 def test_post_picking_detail_endpoint_removed(client, access_token):
@@ -142,17 +141,14 @@ def test_picking_task_service_get_task(client):
 
 def test_picking_task_service_create_task(client):
     """
-    测试通过服务层创建一个新的 PickingTask
+    服务层不再提供 create_task（B-81）：拣货任务只由 DN 开始处理时 create_picking_task_from_dn 生成
     """
     with client.application.app_context():
         user = get_operator_user()
         dn = get_dn()
-        data = {
-            "dn_id": dn.id,
-            "status": "pending",
-            "is_active": True,
-        }
-        new_task = PickingTaskService.create_task(data, user.id)
+        assert not hasattr(PickingTaskService, 'create_task')
+        new_task = PickingTaskService.create_picking_task_from_dn(dn.id, user.id)
+        db.session.commit()
         assert new_task.id is not None
         # 检查返回数据中的关键字段
         assert new_task.status == "pending"

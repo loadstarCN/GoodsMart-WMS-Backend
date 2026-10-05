@@ -5,7 +5,7 @@ from sqlalchemy.orm import selectinload
 from extensions.db import *
 from extensions.error import BadRequestException, ConflictException, ForbiddenException, NotFoundException
 from extensions.transaction import transactional
-from warehouse.common import require_positive_int, require_fields, require_source_api_key
+from warehouse.common import require_positive_int, require_fields, require_source_api_key, optional_number
 from warehouse.carrier.models import Carrier
 from warehouse.goods.models import Goods
 from warehouse.goods.services import GoodsService, goods_spec_snapshot
@@ -116,9 +116,12 @@ class ASNService:
             payload['goods_id'] = ASNService._resolve_goods_id(item, company_id)
         if require_quantity or 'quantity' in item:
             payload['quantity'] = require_positive_int(item.get('quantity'), 'quantity')
-        for field in ('weight', 'volume', 'remark'):
+        for field in ('weight', 'volume'):
             if field in item:
-                payload[field] = item[field]
+                # 空串 → null；非数字 / 负数 → 400 16115（PG 的 Float 列收到 "" 会 500）
+                payload[field] = optional_number(item[field], field)
+        if 'remark' in item:
+            payload['remark'] = item['remark']
         return payload
 
     @staticmethod
@@ -538,9 +541,11 @@ class ASNService:
                 detail = existing_details[detail_id]
                 if 'quantity' in item:
                     detail.quantity = require_positive_int(item.get('quantity'), 'quantity')
-                for field in ('weight', 'volume', 'remark'):
+                for field in ('weight', 'volume'):
                     if field in item:
-                        setattr(detail, field, item[field])
+                        setattr(detail, field, optional_number(item[field], field))
+                if 'remark' in item:
+                    detail.remark = item['remark']
                 db.session.add(detail)
                 new_detail_ids.add(detail_id)
             else:

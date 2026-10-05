@@ -182,6 +182,7 @@ cycle_count_pagination_parser.add_argument('is_active', type=inputs.boolean, loc
 cycle_count_pagination_parser.add_argument('scheduled_start_date', type=inputs.datetime_from_iso8601, location='args',help='Scheduled date/time start')
 cycle_count_pagination_parser.add_argument('scheduled_end_date', type=inputs.datetime_from_iso8601, location='args',help='Scheduled date/time end')
 cycle_count_pagination_parser.add_argument('warehouse_id', type=int, location='args',help='Warehouse ID')
+cycle_count_pagination_parser.add_argument('keyword', type=str, location='args', help='Search by task id, task name, or exact goods / location code in its details')
 
 # 根据 goods 和 location 查询 Cycle Count Task Detail 列表
 cycle_count_detail_pagination_parser = pagination_parser.copy()

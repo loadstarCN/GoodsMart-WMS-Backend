@@ -198,6 +198,26 @@ GoodsMart-WMS-Backend/
 - 库存移除
 - 库存快照（每日定时）
 
+### 作业流程规则
+- 分拣 / 拣货 / 打包 / 发货任务只由单据流转自动生成（ASN 收货 → 分拣；DN 开始处理 → 拣货；拣货完成 → 打包；打包完成 → 发货），
+  没有手工新建接口：`POST /warehouse/sorting/`、`/picking/`、`/packing/`、`/delivery/` → 405。
+- 删除分拣 / 拣货 / 打包批次（任务 `in_progress` 时）连同批次下的明细一起删除。
+- DN 取消（`PUT /warehouse/dn/<id>/cancel/`）：`pending` 等同关闭；`in_progress` 须拣货尚未开始（否则 409 `16053`）；
+  `picked` / `packed`（未发货）可取消，已拣 / 已打包的货退回待上架（`sorted_stock`，`total_stock` 不变），拣货 / 打包 / 发货任务停用，
+  有效的出口单证作废（`void_reason: dn_cancelled`）；有未结束的承运商自动运单（进行中 / 有效 / 结果不明 / 取消中）→ 409 `16110`，
+  先在单证卡片取消运单；`delivered` / `completed` / `closed` → 409 `16052`。`in_progress` / `picked` / `packed` 取消后推 `dn.cancelled`。
+- 调整单取消（`PUT /warehouse/adjustment/<id>/cancel/`，需要 `adjustment_approve`）：`pending` / `approved` 可取消，库存不动；
+  取消后 `is_active=false`、`status` 保持原值（`operator_id` 为取消人），之后的一切操作 → 409 `16111`；已完成 → 409 `16112`。
+  由盘点单生成的调整单取消后，同一盘点单可以重新生成。完成调整时：正向调整的库位还没有该商品的记录 → 新建（库位须启用）；
+  负向调整但库位上已没有该商品的记录 → 409 `16113`（请取消后按当前库存重新建单）。
+- 盘点：实盘录入时（批量保存提交的行、单行完成、明细修改给了 `actual_quantity`）取当时的库位库存作系统数并计算差异，
+  调整单按录入时的系统数生成；盘点完成前每条明细都必须已录入（盘到 0 件也要明确提交）→ 否则 409 `16114` `details {detail_ids}`。
+- 库位有上架 / 下架 / 移库 / 拣货 / 盘点 / 调整 / 库存快照等历史记录时不能删除 → 409 `44009`
+  `details {entity: "location", id, references}`，请改用停用；库位上还有货仍是 409 `16084`。
+- 数值字段：ASN 明细 `weight` / `volume`、库位 `width` / `depth` / `height` / `capacity` 空串按 null 处理；
+  非数字、负数（库位尺寸 ≤ 0）→ 400 `16115`。
+- 盘点单 / 调整单列表支持 `keyword`：盘点单按单号、任务名、明细商品 / 库位编码；调整单按单号、调整原因、明细商品编码 / 名称、库位编码。
+
 ## Webhook 集成
 
 WMS 通过 Webhook 向外部系统推送事件通知，使用 HMAC-SHA256 签名验证。
@@ -208,9 +228,11 @@ WMS 通过 Webhook 向外部系统推送事件通知，使用 HMAC-SHA256 签名
 |------|----------|
 | `asn.received` | ASN 标记为已收货 |
 | `asn.completed` | ASN 完成（含实际数量） |
+| `asn.cancelled` | 已收货（未分拣）的 ASN 被取消 |
 | `dn.in_progress` | DN 开始处理 |
 | `dn.delivered` | DN 已发货（含运单号） |
 | `dn.completed` | DN 完成 |
+| `dn.cancelled` | 开始处理后（`in_progress` / `picked` / `packed`）的 DN 被取消（含 `previous_status` 与各商品已拣 / 已打包量） |
 | `goods.spec_updated` | 商品重量 / 尺寸 / 原产国变更（按公司广播，需订阅，见下文） |
 
 单据类事件（`asn.*`、`dn.*`）只推给创建该单据的 API Key。`asn.completed` 明细另带商品主数据：
@@ -274,6 +296,8 @@ payload 是当前值的完整快照（`null` = 未录入）：
 没有默认值。`GET /warehouse/goods/?origin_missing=true` 列出未录入原产国的商品。
 仓库作业账号可用 `PUT /warehouse/goods/<id>/origin-country`（`{"origin_country": "CN" | "" | null, "spec_source"?: ...}`）
 只改原产国，需要 `goods_edit`、`sorting_edit`、`packing_edit` 任一权限，同样触发 `goods.spec_updated`。
+它与 `GET /warehouse/goods/<id>` 一样受仓库范围限制（非公司管理员员工须带 `X-WAREHOUSE-ID`，且商品在该仓库有库存，
+否则 404 `13003`），响应只有 `{id, code, origin_country}`。
 CSV 导入支持可选的 `origin_country` 列（已有商品：`append` 只补空白，`override` 只用非空值覆盖）。
 
 ## 库存快照
@@ -322,6 +346,10 @@ Authorization: Bearer <token>
 - 结构错误拒绝：`customs` 非对象、`lines` 非数组、字段类型错误、数值超上限 → 400 `16063`（`details.field`）；
   行的 `goods_code` 不在 DN 明细或重复 → 400 `16064`。上限：`unit_value` / `total_value` 绝对值 ≤ 1,000,000,000,000；
   `freight_charge` / `insurance_charge` / `declared_value_carriage` / 行 `quantity` ≤ 2,147,483,647（数据库 INTEGER）。
+  行的 `unit_value` 小数位超过币种小数位（JPY / KRW / VND / CLP / ISK / PYG / UGX / XAF / XOF 为 0 位，其它 2 位；
+  币种缺失也按 2 位）→ 400 `16063` `details {field, currency, max_decimal_places}`，保证 CI 上「单价 × 数量 = 金额」。
+  规则上线前存下的超精度单价，在报关视图、CI、FedEx 请求里一律先按币种小数位四舍五入再算金额；量化后为 0 的报
+  `UNIT_VALUE_MISSING`。
 - `freight_charge` / `insurance_charge` / `declared_value_carriage` 只收整数（列是 INTEGER），USD 等带分的币种也不收小数。
 - 内容不全照收，缺什么在 `problems` 里列出。
 - `invoice_number` 缺省用 DN 的 `order_number`；发票数量一律取**已打包数量**（金额 = 单价 × 已打包数量，
@@ -369,6 +397,9 @@ DN 须为 `picked` 或 `packed`（否则 409 `16067`）。请求体 `{"packages"
   （`details.problems`）；不是海外单 409 `16070`。
 - CI 与 PL 成对签发并存库（`dn_documents`），生成即定稿。数据未变再次签发 → 返回现有版本（200）；
   数据变了（含运单号 AWB）→ 旧版作废、版本 +1（201）。
+- 有进行中 / 有效 / 结果不明 / 取消中的自动运单时，当前单证就是随运单提交的那份：要签发的单证数据除 AWB 外有变化
+  （例如商品原产国、公司 / 仓库出口资料、承运商改了）→ 409 `16076` `details {reason: "DOCUMENT_DATA_CHANGED", status,
+  carrier, carrier_shipment: {id, status, tracking_number}}`，先取消运单。
 - `file` 以 `application/pdf` inline 返回，响应头 `X-Content-SHA256`。
 - 发货任务已有运单号时 CI 印 AWB No.。发货前用 `PUT /warehouse/delivery/<task_id>/tracking`
   `{"tracking_number": "...", "carrier_id": 1}` 保存（权限 `delivery_edit`，发货后 409 `16065`），再重新签发；
@@ -381,6 +412,8 @@ DN 须为 `picked` 或 `packed`（否则 409 `16067`）。请求体 `{"packages"
 - 海外 DN 按写入前的已存数据检查：没有当前有效的 CI 或 PL → 409 `16069`
   `details {missing_documents: [...], outdated: false}`；单证已过期（箱子 / 快照 / 运单号 / 出口资料改过没重出）→ 409 `16069`
   `details {missing_documents: [], outdated: true}`。
+- DN 的自动运单进行中 / 结果不明，或正在取消 / 取消结果不明（`pending` / `unknown` / `cancelling`）时，带不带运单号都不能
+  完成发货 → 409 `16079`（`details.unresolved`），先处理（取消 / 确认作废）。
 - 当前 CI 已印 AWB，完成后任务上的运单号（请求里有就用请求值，否则用已存值）与它不同（忽略空格 / 连字符差异）
   → 409 `16080` `details {document_tracking_number, tracking_number}`：先保存运单号、重出单证再发货；相同则按 CI 上印的写法写入。
   CI 没印 AWB 时照常写入请求里的运单号。
@@ -416,15 +449,17 @@ DN 须为 `picked` 或 `packed`（否则 409 `16067`）。请求体 `{"packages"
 | `POST` | `/warehouse/dn/<id>/carrier-shipment/dismiss` | `packing_edit` / `delivery_edit` |
 
 `GET` 返回 `{enabled, carrier: "fedex", can_create, blockers[{code, message, goods_code?, field?}], unresolved,
-can_dismiss, etd_enabled, default_label_format, label_formats{A4|THERMAL: {image_type, stock_type}},
+can_dismiss, can_cancel, etd_enabled, default_label_format, label_formats{A4|THERMAL: {image_type, stock_type}},
 declared_value_carriage, delivery_task_id, shipment, warnings[]}`：
 
 - `enabled`：FedEx 已配置**且** DN 所属公司在 `FEDEX_ALLOWED_COMPANY_IDS` 里。
 - `can_create`：没有 blockers **且** `unresolved` 为 `null`。
-- `unresolved`：结果还没定的建单请求，没有为 `null`：`{id, status: "pending" | "unknown", reason, tracking_number,
-  transaction_id, created_at, updated_at}`（见下文「建单记录与结果不明」）。
-- `can_dismiss`：`unresolved.status` 为 `unknown` 时 `true`。
-- `shipment`：有效运单，没有则最近一张已取消的运单，都没有为 `null`；含 `status`（`active` / `cancelled`）、`reason`、
+- `unresolved`：结果还没定的记录，没有为 `null`：`{id, status: "pending" | "unknown" | "cancelling", reason,
+  tracking_number, transaction_id, created_at, updated_at}`（见下文「建单记录与结果不明」）。
+- `can_dismiss`：`unresolved.status` 为 `unknown`，或为 `cancelling` 且没有取消请求正在进行时 `true`。
+- `can_cancel`：有效运单、没有取消请求正在进行的 `cancelling`、带运单号的 `unknown` 记录为 `true`；DN 已发货为 `false`。
+- `shipment`：有效（或取消中）的运单，没有则最近一张已取消的运单，都没有为 `null`；含 `id`、`status`（`active` /
+  `cancelling` / `cancelled`）、`reason`、
   `sender_country`、`label_format`、`image_type`、`label_stock_type`、`label_file_name`、`label_content_type`、
   `label_parts[]`（面单存档里各文档的来源、箱号、类型、页数、是否存入）、`updated_at` 等。
 
@@ -468,15 +503,17 @@ declared_value_carriage, delivery_task_id, shipment, warnings[]}`：
   （按承运商 code）不同也 409 `16078`，`details` 另带请求里的 `carrier_id`；`carrier_id: null` 视为不改。
   本 DN 已取消（含补偿取消）的自动运单号不能再保存或用来完成发货 → 409 `16078`
   `details {tracking_number: null, cancelled_tracking_number, carrier, status: "cancelled"}`。有结果不明 / 进行中的建单记录时，保存运单号或修改发货任务
-  带了号码 → 409 `16079`（防止操作员又在 FedEx 网站手工建一张；清空照常）。
-- 有进行中 / 有效 / 结果不明的自动运单时：新建或删除该 DN 的发货任务 → 409 `16078`（新任务会成为当前发货任务、
+  带了号码 → 409 `16079`（防止操作员又在 FedEx 网站手工建一张；清空照常）。运单取消中（`cancelling`）时保存运单号
+  （含同一个号码）或清空都 409 `16079`（修改任务时传空值视为不改）。
+- 有进行中 / 有效 / 结果不明 / 取消中的自动运单时：新建或删除该 DN 的发货任务 → 409 `16078`（新任务会成为当前发货任务、
   绕过运单号锁定；新建时带的运单号也按上面的规则校验）；改报关数据（`PUT /warehouse/dn/<id>/customs`）或箱子
-  → 409 `16076`（数据已随运单提交；报关的 `details: {reason: "CARRIER_SHIPMENT_OPEN", carrier, carrier_shipment:
-  {id, status, tracking_number}}`）。先取消运单，结果不明的先确认作废。上述检查前都先锁 DN 行，与建单 / 取消串行。
+  → 409 `16076`（数据已随运单提交；`details: {reason: "CARRIER_SHIPMENT_OPEN", status, carrier, carrier_shipment:
+  {id, status, tracking_number}}`）；签发数据有变化的单证 → 409 `16076`（`reason: "DOCUMENT_DATA_CHANGED"`，见「出口单证」）。
+  先取消运单，结果不明的先处理。上述检查前都先锁 DN 行，与建单 / 取消串行。
 - 商品重量：有单件重量的 = 单件重量 × 已打包数量；没有的分摊「总毛重 − 已知重量」（不为正时按数量占比分摊总毛重）。
 - **分三段，调 FedEx 时不占 DN 行锁、也不开着数据库事务**：
   1. 锁 DN、检查前置条件、必要时签发 CI / PL，插一条 `pending` 的 `dn_carrier_shipments` 记录并提交
-     （部分唯一索引保证同一 DN 至多一条 `pending` / `active` / `unknown`）；
+     （部分唯一索引保证同一 DN 至多一条 `pending` / `active` / `unknown` / `cancelling`）；
   2. （ETD 时先上传 CI）调 FedEx 建单。整个建单受 `FEDEX_CREATE_BUDGET_SECONDS`（默认 90 秒）总时限约束：
      每次请求（OAuth / ETD 上传 / 建单）的连接 / 读取超时按剩余时间收缩，剩余不足 5 秒就不发下一个请求
      （→ 504 `16074`，`details.budget_exhausted: true`，记录 `failed`），避免 worker 超时被杀；
@@ -493,9 +530,13 @@ declared_value_carriage, delivery_task_id, shipment, warnings[]}`：
     记录 `unknown`（`reason`: `timeout` / `connection_error` / `server_error` / `bad_response`），`maybe_processed: true`，
     `details.unresolved` 为该记录。FedEx 侧可能已建单：先去 FedEx Ship Manager 确认，有就在那边取消，再确认作废（见下）。
   - 响应解析不了但能找到运单号：按写库失败处理（取消该运单）。
-- **FedEx 建单成功但写库失败**（500）：WMS 调 FedEx 取消该运单（补偿），结果单独提交到记录（原事务回滚后仍留痕）：
-  FedEx 确认取消（或回「已取消 / 查无此运单」）→ `cancelled`（`reason: compensated`）；取消失败 / 未确认
-  → `unknown`（`reason: compensation_failed`，带 `tracking_number`），要人工在 FedEx 取消后确认作废。
+- **FedEx 建单成功但写库失败**（502 `16095`，期间 DN 被发货等业务异常也一样；`details {tracking_number, transaction_id,
+  error: {code, message}, compensation: {attempted, cancelled, cancel_transaction_id, error}, unresolved,
+  maybe_processed}`）：WMS 先另开事务重读记录——已是 `active` 且运单号相同（提交其实成功、只是调用方收到了异常）→ 保留运单、
+  按成功返回（201）；读不到记录 → **不取消**，记录落 `unknown`（`reason: save_unconfirmed`，带 `tracking_number`）；
+  确实没写进去 → 调 FedEx 取消该运单（补偿），结果单独提交到记录（原事务回滚后仍留痕）：FedEx 确认取消（或回「已取消 /
+  查无此运单」）→ `cancelled`（`reason: compensated`，`details.unresolved` 为 null）；取消失败 / 未确认 → `unknown`
+  （`reason: compensation_failed`，带 `tracking_number`），再点取消（`POST …/cancel`）或确认作废。
 - 已签发的 CI / PL 随第 1 段提交：FedEx 失败时照常有效（不再回滚）。
 - 面单用 `GET /warehouse/dn/<id>/customs-documents/<label_document_id>/file` 下载（PDF inline，ZPL / EPL 作为附件）；面单不参与「必须有有效 CI + PL」
   的发货拦截。
@@ -508,27 +549,60 @@ declared_value_carriage, delivery_task_id, shipment, warnings[]}`：
 |----------|------|
 | `pending` | 正在请求 FedEx |
 | `active` | 有效运单 |
+| `cancelling` | 有效运单正在取消（`reason: cancel_in_progress`），或取消结果不明（`reason`: `timeout` / `connection_error` / `server_error` / `bad_response` / `save_failed` / `interrupted`；`cancel_in_progress` 超过 `FEDEX_PENDING_STALE_MINUTES` 按 `stale`）。运单号与面单都还在，不能发货 |
 | `cancelled` | 已取消（手工取消；或写库失败后自动取消，`reason: compensated`；FedEx 回已取消，`reason: already_cancelled`） |
 | `failed` | FedEx 明确拒绝 / 请求没发出去，确定没有运单（`reason`: `rejected` / `not_sent` / `etd_upload_failed` / `budget_exhausted` / `interrupted`） |
-| `unknown` | 结果不明，FedEx 侧可能有运单（`reason`: `timeout` / `connection_error` / `server_error` / `bad_response` / `compensation_failed` / `interrupted`） |
-| `dismissed` | 操作员确认 FedEx 上没有这张运单（或已手工取消） |
+| `unknown` | 结果不明，FedEx 侧可能有运单（`reason`: `timeout` / `connection_error` / `server_error` / `bad_response` / `compensation_failed` / `save_unconfirmed` / `interrupted`） |
+| `dismissed` | 操作员确认 FedEx 上没有这张运单（或已手工取消）；带运单号的须 FedEx 确认已取消 / 查无此运单 |
 
 - `pending` 超过 `FEDEX_PENDING_STALE_MINUTES`（默认 10 分钟；实际不短于建单总时限 + 75 秒）读取时按
   `unknown`（`reason: stale`）处理（例如 worker 被杀）。worker 超时被杀（gunicorn 抛 `SystemExit`）时也会尽力把记录落成
   `unknown` / `failed`（`reason: interrupted`）。
-- 有 `unresolved`（`pending` / `unknown`）时：不能建单（409 `16079`）、不能存 / 改运单号（409 `16079`）、
-  不能改报关数据 / 箱子（409 `16076`）、不能新建 / 删除发货任务（409 `16078`）。
-- **确认作废**：`POST /warehouse/dn/<id>/carrier-shipment/dismiss`，请求体 `{"confirm": true}`（缺或不是 `true` → 400，
-  `field: confirm`）。只处理 `unresolved.status == "unknown"`（含过期的 `pending`）的记录 → `dismissed`，记
-  `dismissed_by` / `dismissed_at`；不调 FedEx；返回与 `GET` 同形。没有可确认作废的（或请求还在进行中）→ 409 `16075`
-  （`details.unresolved`）。之后可以重新建单或手工存运单号。
+- 有 `unresolved`（`pending` / `unknown` / `cancelling`）时：不能建单（409 `16079`）、不能存 / 改运单号（409 `16079`）、
+  不能完成发货（409 `16079`）、不能改报关数据 / 箱子、不能签发数据有变化的单证（409 `16076`）、不能新建 / 删除发货任务
+  （409 `16078`）。
+- 带运单号的 `unknown`（例如 `compensation_failed`）可以 `POST …/cancel` 重试取消（规则同「取消」，成功后为 `cancelled`）。
+- **确认作废**：`POST /warehouse/dn/<id>/carrier-shipment/dismiss`，请求体 `{"confirm": true, "unresolved_id": <id>}`
+  （`confirm` 缺或不是 `true` → 400，`field: confirm`；`unresolved_id` 可不带，不是正整数 → 400）。只在 `can_dismiss`
+  时可用：`unresolved.status == "unknown"`（含过期的 `pending`），或 `cancelling` 且没有取消请求正在进行。
+  - 没有运单号：不调 FedEx → `dismissed`，记 `dismissed_by` / `dismissed_at`。
+  - 带运单号（FedEx 上可能真有这张运单）：先向 FedEx 取消（三段，调 FedEx 时不占 DN 行锁），FedEx 取消成功或回「已取消 /
+    查无此运单」才作废：`unknown` → `dismissed`（记 `cancel_transaction_id`），`cancelling` → `cancelled`（面单作废、
+    运单号清掉、CI / PL 重签）；否则 409 `16094` `details {unresolved, carrier, tracking_number, result: refused |
+    unclear, http_status, transaction_id, errors, alerts, maybe_processed}`，先在 FedEx Ship Manager 处理。
+    FedEx 未配置 → 409 `16072`。
+  - 带了 `unresolved_id` 但不是当前结果不明的记录 → 409 `16093` `details {expected, actual}`（`expected` 为请求里的 id，
+    `actual` 为当前记录的 id）。
+  - 返回与 `GET` 同形。没有可确认作废的（或请求 / 取消还在进行中）→ 409 `16075`（`details.unresolved`）。之后可以重新建单
+    或手工存运单号。
 
 ### 取消
 
-DN 发货前可取消（发货后 409 `16065`；没有有效运单 409 `16075`）。调 FedEx `PUT /ship/v1/shipments/cancel`
-（`DELETE_ALL_PACKAGES`；发件国用建单时记下的 `sender_country`，迁移前的老记录按建单同一口径推），FedEx 拒绝 → 502 `16073`
-带原因。成功后记录标 `cancelled`、发货任务上的运单号清空（按忽略空格 / 连字符后的号码比）、面单作废（`void_reason: shipment_cancelled`）、CI / PL 去掉 AWB
-重新签发（条件不满足时作废）。只要求 FedEx 凭证齐全：公司后来被移出 `FEDEX_ALLOWED_COMPANY_IDS` 也能取消已建的运单。
+`POST /warehouse/dn/<id>/carrier-shipment/cancel`，请求体可带 `{"tracking_number": "..."}`（操作员看到的、要取消的运单号，
+即 `shipment.tracking_number` / `unresolved.tracking_number`）：忽略空格 / 连字符后与当前运单不同 → 409 `16093`
+`details {expected, actual}`（`expected` 为请求里的号码，`actual` 为当前的号码）；不是字符串 → 400；不带照旧。
+
+DN 发货前可取消（发货后 409 `16065`；没有可取消的 409 `16075`，`details.unresolved`），对象是有效运单、`cancelling`
+（重试）或带运单号的 `unknown` 记录。调 FedEx `PUT /ship/v1/shipments/cancel`（`DELETE_ALL_PACKAGES`；发件国用建单时记下的
+`sender_country`，迁移前的老记录按建单同一口径推）。与建单一样**分三段，调 FedEx 时不占 DN 行锁、也不开着事务**
+（受 `FEDEX_CREATE_BUDGET_SECONDS` 约束）：
+
+1. 锁 DN，把运单标 `cancelling`（`reason: cancel_in_progress`）并提交——此后不能发货、不能改运单号（409 `16079`），
+   再点取消 → 409 `16079`；
+2. 调 FedEx；
+3. 锁 DN 落结果：
+   - 已取消（`cancelledShipment: true`，或 FedEx 回「已取消 / 查无此运单」）→ `cancelled`、发货任务上的运单号清空（按忽略
+     空格 / 连字符后的号码比）、面单作废（`void_reason: shipment_cancelled`）、CI / PL 去掉 AWB 重新签发（条件不满足时作废）；
+     `unknown` 记录同样落 `cancelled`；
+   - FedEx 明确拒绝（4xx、`cancelledShipment: false`）或请求没发出去 → 回到 `active`（`unknown` 记录仍是 `unknown`），
+     502 `16073` / 504 `16074` 带原因；
+   - 结果不明（读超时、连接中断、5xx、响应看不懂、HTTP 200 但**没有** `cancelledShipment`）→ 记录停在 `cancelling` 并记原因
+     （`timeout` / `server_error` / `bad_response` / `connection_error`），502 `16073` / 504 `16074`，`details.maybe_processed:
+     true`、`details.unresolved`。发货一直拦着，重试取消（或在 FedEx Ship Manager 核对后确认作废）直到 FedEx 给出明确结果。
+
+第 3 段写库失败或 worker 被杀时，记录停在 `cancelling`（`reason: save_failed` / `interrupted`；`cancel_in_progress` 超过
+`FEDEX_PENDING_STALE_MINUTES` 按 `stale`），可以马上再点取消。只要求 FedEx 凭证齐全：公司后来被移出
+`FEDEX_ALLOWED_COMPANY_IDS` 也能取消已建的运单。
 
 FedEx 回「已取消 / 查无此运单」视为取消成功（`reason: already_cancelled`），例如上次取消在 FedEx 成功了但本地写库失败，
 再点一次取消就能收口。依据：FedEx Ship API 公开文档没有单列这两种情况的错误码，本仓库也未在 sandbox 实测，所以只按错误码
@@ -574,6 +648,16 @@ python scripts/fedex_sandbox_smoke.py [--label-format A4|THERMAL|both] [--packag
 
 ## 部署
 
+### 生产自动部署（GitHub Actions）
+
+推送到 `main` 触发 `.github/workflows/deploy.yml`（同一时间只跑一个，`concurrency: deploy-backend`）：
+
+1. 服务器工作区不干净（`git status --porcelain` 非空）→ 中止，什么都不动；部署前先探测一次当前服务，完全没有 HTTP 响应也中止（手动触发时可勾选 `skip_precheck` 跳过）
+2. 记下部署前的提交，`fetch` + `reset --keep` → `pip install` → `flask db upgrade`（`lock_timeout=15s`），任一步失败都回到部署前的提交、不重启。迁移整条链在一个事务里，PostgreSQL 上失败会整体回滚
+3. 重启后探测 `GET /health`（不鉴权、不查库，返回 `{status, commit}`），要求 `commit` 等于新的短哈希；失败就回滚代码、重启旧代码（**数据库不回滚**，所以迁移要保持旧代码也能跑：先加后删）
+
+探测地址默认 `http://127.0.0.1:5002/health`，用仓库变量 `BACKEND_HEALTH_URL` 覆盖。pm2 进程要能运行 `git`（`/health` 取 commit），否则返回 `unknown`、部署被判失败。
+
 ### 生产环境（Gunicorn）
 
 ```bash
@@ -606,7 +690,11 @@ stdout_logfile=/var/log/wms-api.out.log
 | 库存错误 | 15000-15999 | 400 | 库存相关错误 |
 | 状态错误 | 16000-16999 | 400 | 状态流转错误 |
 
-出口单证相关业务码：`14019` 出口资料文本超长、`14020` 国家代码不合法、`16063` 报关结构不合法、`16064` 报关行商品编码不在 DN 明细或重复、`16065` 已发货不可改（409）、`16066` 箱子数据不合法、`16067` 当前状态不能改箱子（409）、`16068` 单证条件不全（409，`details.problems`）、`16069` 发货前单证缺失或已过期（409，`details {missing_documents, outdated}`）、`16070` 不是海外单（409）、`16071` 单证不存在（404）。承运商运单（FedEx）：`16072` 建单前置条件不满足（409，`details.blockers`）、`16073` FedEx 返回错误（502，`details.errors` / `transaction_id`）、`16074` FedEx 超时（504）、`16075` 没有有效运单（409）、`16076` 有进行中 / 有效 / 结果不明的运单时不能改箱子或报关数据（409）、`16077` `label_format` 不合法（400）、`16078` 运单号 / 承运商与有效的自动运单不一致，或有自动运单时新建 / 删除发货任务（409）、`16079` 有结果不明 / 进行中的建单记录（409，`details.unresolved`）。完成发货：`16080` 运单号与当前 CI 上印的 AWB 不一致（409，`details {document_tracking_number, tracking_number}`）、`16092` 承运商与当前 CI 上印的不一致（409，`details {document_carrier, document_carrier_id, carrier_id}`）。发货任务：`16090` DN 已有未完成的发货任务（409，`details {delivery_task_id, status}`）、`16091` 海外 DN 不是当前发货任务（409，`details {delivery_task_id, current_status}`）。错误响应可能带结构化的 `details`。
+出口单证相关业务码：`14019` 出口资料文本超长、`14020` 国家代码不合法、`16063` 报关结构不合法、`16064` 报关行商品编码不在 DN 明细或重复、`16065` 已发货不可改（409）、`16066` 箱子数据不合法、`16067` 当前状态不能改箱子（409）、`16068` 单证条件不全（409，`details.problems`）、`16069` 发货前单证缺失或已过期（409，`details {missing_documents, outdated}`）、`16070` 不是海外单（409）、`16071` 单证不存在（404）。承运商运单（FedEx）：`16072` 建单前置条件不满足（409，`details.blockers`）、`16073` FedEx 返回错误（502，`details.errors` / `transaction_id`）、`16074` FedEx 超时（504）、`16075` 没有可取消 / 可确认作废的运单记录（409，`details.unresolved`）、`16076` 有进行中 / 有效 / 结果不明 / 取消中的运单时不能改箱子或报关数据，也不能签发数据有变化的单证（409，`details {reason: CARRIER_SHIPMENT_OPEN | DOCUMENT_DATA_CHANGED, status, carrier, carrier_shipment {id, status, tracking_number}}`）、`16077` `label_format` 不合法（400）、`16078` 运单号 / 承运商与有效的自动运单不一致，或有自动运单时新建 / 删除发货任务（409）、`16079` 有结果不明 / 进行中的建单记录，或运单正在取消 / 取消结果不明——不能建单、存运单号、发货（409，`details.unresolved`）、`16093` 取消 / 确认作废请求里的目标与当前记录不符（409，`details {expected, actual}`）、`16094` 确认作废带运单号的记录时 FedEx 没有确认已取消 / 不存在（409）、`16095` FedEx 已建好运单但 WMS 写库失败，已补偿处理（502，`details {error, compensation, unresolved, …}`）。完成发货：`16080` 运单号与当前 CI 上印的 AWB 不一致（409，`details {document_tracking_number, tracking_number}`）、`16092` 承运商与当前 CI 上印的不一致（409，`details {document_carrier, document_carrier_id, carrier_id}`）。发货任务：`16090` DN 已有未完成的发货任务（409，`details {delivery_task_id, status}`）、`16091` 海外 DN 不是当前发货任务（409，`details {delivery_task_id, current_status}`）。错误响应可能带结构化的 `details`。
+
+作业流程（见上文「作业流程规则」）：`16110` DN 有未结束的承运商运单，请先取消运单（409）、`16111` 调整单已取消（409）、`16112` 调整单当前状态不能取消（409）、`16113` 调整明细无法执行：库位上已没有该商品 / 明细没有库位（409）、`16114` 盘点单有未录入的明细（409，`details.detail_ids`）、`16115` 数值字段不合法（400，`field`）、`16116` 分拣任务的 ASN 不能改（409）、`44009` 库位有历史记录，请改用停用（409）。任务：`16088` 任务已停用（所属 DN / ASN 已取消，409）、`16089` 拣货一件都没拣不能完成（409）。
+
+主数据与权限：`16100` 商品数值不合法（400）、`16101` CSV 内商品编码重复（400，带行号）、`16102` 数据值不合法（400）、`16103` 不能分配已停用的角色（400）、`16104` 只有公司管理员能新建 / 删除仓库或更换负责人（403）、`16105` 没有公司管理权限时只能管理绑定自己的 API Key（403）、`44004` 被单据或库存引用的主数据不能删除，请改用停用（409，`details {entity, id, references}`）、`44005` 与已有数据冲突（409）。
 
 ## 关联项目
 

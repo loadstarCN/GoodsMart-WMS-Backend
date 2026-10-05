@@ -178,7 +178,7 @@ class StaffService:
             revoke = True
 
         if 'roles' in data:
-            staff.roles = RoleService.resolve_assignable_roles(data['roles'])
+            staff.roles = RoleService.resolve_assignable_roles(data['roles'], current_roles=staff.roles)
 
         # 更新与 Warehouse 的多对多关联
         if 'warehouse_ids' in data:

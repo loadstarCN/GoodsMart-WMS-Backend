@@ -121,6 +121,7 @@ adjustment_pagination_parser.add_argument('is_active', type=inputs.boolean, loca
 adjustment_pagination_parser.add_argument('created_by', type=int, location='args', help='Filter by creator ID')
 adjustment_pagination_parser.add_argument('warehouse_id', type=int, location='args', help='Filter by warehouse ID')
 adjustment_pagination_parser.add_argument('adjustment_reason', type=str, location='args', help='Filter by adjustment reason')
+adjustment_pagination_parser.add_argument('keyword', type=str, location='args', help='Search by adjustment id, reason, goods code / name or location code in its details')
 
 # 根据 goods 和 location 查询 Adjustment Detail 列表
 adjustment_detail_pagination_parser = pagination_parser.copy()

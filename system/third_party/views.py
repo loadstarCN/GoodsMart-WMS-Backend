@@ -1,6 +1,7 @@
+from flask import g
 from flask_restx import Resource
 from system.common import paginate, permission_required
-from system.common.permissions import get_actor_context
+from system.common.permissions import assert_grantable_permissions, get_actor_context
 from extensions.error import ForbiddenException
 from .schemas import api_ns, api_key_model, api_key_created_model, api_key_create_model, pagination_parser, api_key_pagination_model
 from .services import APIKeyService
@@ -31,6 +32,31 @@ def _enforce_company_scope(api_key):
     company_id = _require_company_scope()
     if company_id is not None and api_key.company_id != company_id:
         raise ForbiddenException("Permission denied: cannot access API keys of other companies", 12001)
+
+
+def _restricted_key_owner_id():
+    """API Key 写操作的范围规则（B-75）：
+
+    - 平台管理员（all_access）或持 company_all_access：可以新建 / 修改 / 删除本公司任意 Key，返回 None；
+    - 其他人（只有 api_keys_edit / api_keys_delete 的员工、绑定员工的 Key）：只能操作绑定到自己的 Key，
+      且 Key 的权限必须是自己权限的子集（assert_grantable_permissions）。返回调用方用户 id。
+      未绑定用户的 Key 覆盖全公司仓库，让他们建 / 改会把自己的仓库范围扩大到全公司。
+    - 没有用户身份（未绑定用户、也没有 company_all_access 的 Key）→ 403 16105。
+    """
+    is_super, perms, _ = get_actor_context()
+    if is_super or 'company_all_access' in perms:
+        return None
+    actor = g.get('current_user')
+    if actor is None:
+        raise ForbiddenException("Only API keys bound to yourself can be managed without company_all_access",
+                                 16105)
+    return actor.id
+
+
+def _require_own_key(owner_id, user_id):
+    if owner_id is not None and user_id != owner_id:
+        raise ForbiddenException("Only API keys bound to yourself can be managed without company_all_access",
+                                 16105, 'user_id')
 
 
 @api_ns.doc(security="jsonWebToken")
@@ -72,6 +98,14 @@ class APIKeyList(Resource):
         if company_id is not None:
             data['company_id'] = company_id
 
+        # 没有 company_all_access：不传 user_id 时自动绑定到自己（Web 管理端新建时不传 user_id），
+        # 传了别人 → 403 16105
+        owner_id = _restricted_key_owner_id()
+        if owner_id is not None:
+            if data.get('user_id') is None:
+                data['user_id'] = owner_id
+            _require_own_key(owner_id, data.get('user_id'))
+
         new_api_key = APIKeyService.create_api_key(data)
         return new_api_key, 201
 
@@ -97,6 +131,15 @@ class APIKeyDetail(Resource):
 
         data = api_ns.payload
         data.pop('company_id', None)
+        # 没有 company_all_access：只能改绑定到自己的 Key，不能改绑 / 解绑；
+        # 改完后的权限也必须在自己权限之内（没传 permissions 时校验现有权限）
+        owner_id = _restricted_key_owner_id()
+        if owner_id is not None:
+            _require_own_key(owner_id, api_key.user_id)
+            if 'user_id' in data:
+                _require_own_key(owner_id, data.get('user_id'))
+            if 'permissions' not in data:
+                assert_grantable_permissions(api_key.permissions or [])
         updated_api_key = APIKeyService.update_api_key(api_key_id, data)
         return updated_api_key
 
@@ -105,6 +148,7 @@ class APIKeyDetail(Resource):
         """删除 API Key"""
         api_key = APIKeyService.get_api_key(api_key_id)
         _enforce_company_scope(api_key)
+        _require_own_key(_restricted_key_owner_id(), api_key.user_id)
 
         APIKeyService.delete_api_key(api_key_id)
         return {"message": "API key deleted successfully"}, 200

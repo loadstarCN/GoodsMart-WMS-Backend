@@ -1,5 +1,6 @@
 from flask import g
 from flask_restx import Resource, marshal
+from flask_jwt_extended import jwt_required
 from extensions import oss
 from extensions.error import BadRequestException, ForbiddenException, UnauthorizedException
 from system.common import paginate, permission_required
@@ -32,6 +33,7 @@ def _enforce_manageable(staff=None, warehouse_ids=None):
     """非平台管理员只能管理「权限与仓库范围都不超出自己」的员工，
     防止只有 staff_edit 的员工改 company_admin 的密码 / 角色或删掉他，或把自己的仓库范围扩大到全公司。"""
     if staff is not None:
+        # 这里有意连停用的角色也算上：角色重新启用后目标就会拿回这些权限，按最高的算才不会被越权管理
         target_perms = {p.name for role in staff.roles for p in role.permissions}
         try:
             assert_grantable_permissions(target_perms)
@@ -150,10 +152,14 @@ class StaffDetail(Resource):
 @api_ns.route('/current')
 class StaffCurrent(Resource):
 
-    @permission_required(["all_access", "company_all_access", "staff_read"])
+    # 只要求登录：取的是自己的信息。以前要 staff_read，没有它的角色拿不到自己的仓库列表，选不了仓库
+    @jwt_required()
     @api_ns.response(200, 'Success', staff_model)
     def get(self):
-        """获取当前员工信息及其可访问仓库（登录后选仓前调用，不要求 X-WAREHOUSE-ID）"""
+        """获取当前员工信息、可访问仓库与生效权限（登录后选仓前调用，不要求 X-WAREHOUSE-ID）
+        - permissions：启用中角色的权限名（去重、排序），前端据此显示菜单与按钮（鉴权仍以后端为准）
+        - is_company_admin：启用中的角色含 company_admin
+        """
         user = g.get('current_user')
         if not user:
             raise UnauthorizedException("No current user found", 11004)
@@ -164,6 +170,8 @@ class StaffCurrent(Resource):
         data = marshal(staff, staff_model)
         # 可访问仓库按角色计算，不修改 ORM 关系（避免把可访问列表当成归属关系写回）
         data['warehouses'] = marshal(StaffService.accessible_warehouses(staff), warehouse_model)
+        data['permissions'] = sorted(staff.active_permission_names())
+        data['is_company_admin'] = staff.has_role('company_admin')
         return data, 200
 
 

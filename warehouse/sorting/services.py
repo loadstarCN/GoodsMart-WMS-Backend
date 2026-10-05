@@ -5,7 +5,7 @@ from sqlalchemy.orm import joinedload, selectinload
 from extensions.db import *
 from extensions.error import BadRequestException, ConflictException, NotFoundException
 from extensions.transaction import transactional
-from warehouse.common import require_non_negative_int, require_fields
+from warehouse.common import require_non_negative_int, require_fields, delete_batch_with_details
 from warehouse.common.locks import lock_row
 from warehouse.common.validation import require_active_task
 from warehouse.asn.models import ASN
@@ -217,26 +217,7 @@ class SortingTaskService:
         """
         return get_object_or_404(SortingTask, task_id)
 
-    @staticmethod
-    @transactional
-    def create_task(data: dict, created_by_id: int) -> SortingTask:
-        """
-        创建新的 Sorting Task。只接受 asn_id；status 固定 pending、is_active 固定 True。
-        """
-        require_fields(data, 'asn_id')
-        asn_id = data['asn_id']
-        ASNService.get_asn(asn_id)  # 不存在 404
-
-        new_task = SortingTask(
-            asn_id=asn_id,
-            status='pending',
-            is_active=True,
-            created_by=created_by_id
-        )
-        db.session.add(new_task)
-        db.session.flush()
-        # db.session.commit()
-        return new_task
+    # 没有 create_task：分拣任务只由 ASN 收货时自动生成（create_sorting_task_from_asn），手工新建接口已去掉
 
 
     @staticmethod
@@ -244,15 +225,18 @@ class SortingTaskService:
     def update_task(task_or_id: int | SortingTask, data: dict) -> SortingTask:
         """
         更新指定 SortingTask（仅当其 status 为 pending 时）。
-        只允许改 asn_id；status / is_active 只能经 process / complete 或 ASN cancel 变更。
+        asn_id 不能改（409 16116）：把任务挪到另一张 ASN 等于手工给它加一个分拣任务（B-81 已去掉手工新建），
+        会造成一张 ASN 两个分拣任务；原样提交照常。status / is_active 只能经 process / complete 或 ASN cancel 变更。
         """
         task = SortingTaskService._lock(task_or_id)
         if task.status != 'pending':
             raise BadRequestException("Cannot update a non-pending Sorting Task", 16001)
 
-        if data.get('asn_id'):
-            ASNService.get_asn(data['asn_id'])  # 不存在 404
-            task.asn_id = data['asn_id']
+        if data.get('asn_id') is not None and data['asn_id'] != task.asn_id:
+            raise ConflictException(
+                f"The ASN of Sorting Task {task.id} cannot be changed (it belongs to ASN {task.asn_id}).", 16116,
+                details={'asn_id': task.asn_id},
+            )
 
         db.session.add(task)
         db.session.flush()
@@ -508,14 +492,15 @@ class SortingTaskService:
         """
         删除指定的 SortingBatch
         - 仅当 SortingTask 处于 in_progress 时允许删除
-        - 批次下的 SortingTaskDetail 随之级联删除
+        - 批次下的 SortingTaskDetail 一并删除（批次 → 明细的 ORM 关系没有级联，直接删批次会把明细 batch_id 置空撞 NOT NULL 变 500）
+        - 分拣中的明细还没动库存（完成时才记 sorted_stock），删掉后 ASN 的累计分拣量随之减少，无库存要回滚
         """
         task = SortingTaskService._lock(task_or_id)
         if task.status != 'in_progress':
             raise BadRequestException("Cannot delete a batch in a non-in-progress Sorting Task", 16014)
 
         batch = SortingTaskService.get_batch(task.id, batch_id)
-        db.session.delete(batch)
+        delete_batch_with_details(task, batch, SortingTaskDetail, 'task_details')
         # db.session.commit()
 
 

@@ -200,6 +200,35 @@ GoodsMart-WMS-Backend/
 - Stock removal
 - Inventory snapshots (daily scheduled)
 
+### Process rules
+- Sorting / picking / packing / delivery tasks are created only by the document flow (ASN received → sorting; DN in
+  progress → picking; picking completed → packing; packing completed → delivery). There is no endpoint to create one by
+  hand: `POST /warehouse/sorting/`, `/picking/`, `/packing/`, `/delivery/` → 405.
+- Deleting a sorting / picking / packing batch (task `in_progress`) also deletes the details in it.
+- Cancelling a DN (`PUT /warehouse/dn/<id>/cancel/`): `pending` = close; `in_progress` only while picking has not
+  started (else 409 `16053`); `picked` / `packed` (not shipped) can be cancelled — the picked / packed goods go back to
+  `sorted_stock` to be put away (`total_stock` unchanged), the picking / packing / delivery tasks are deactivated and
+  the issued export documents are voided (`void_reason: dn_cancelled`); an unfinished carrier shipment (pending /
+  active / unknown / cancelling) → 409 `16110` (cancel it on the documents card first); `delivered` / `completed` /
+  `closed` → 409 `16052`. Cancelling an `in_progress` / `picked` / `packed` DN emits `dn.cancelled`.
+- Cancelling an adjustment (`PUT /warehouse/adjustment/<id>/cancel/`, requires `adjustment_approve`): `pending` /
+  `approved` can be cancelled, stock is not touched; it becomes `is_active=false` with its `status` unchanged
+  (`operator_id` = who cancelled) and any further operation → 409 `16111`; `completed` → 409 `16112`. After an
+  adjustment created from a cycle count is cancelled, a new one can be created from the same cycle count. Completing
+  an adjustment creates the goods-location record for a positive line whose location has none (the location must be
+  active); a negative line whose location no longer holds the goods → 409 `16113` (cancel it and create a new one).
+- Cycle counts: the system quantity is taken when the count is entered (rows submitted to `details-batch-save`, a
+  detail completed one by one, or `actual_quantity` given when updating a detail) and the difference is computed
+  against it; adjustments use these quantities. Every detail must be counted before the task is completed (a count of
+  0 must be submitted explicitly) → otherwise 409 `16114` `details {detail_ids}`.
+- A location referenced by history records (putaway / removal / transfer / picking / cycle count / adjustment /
+  inventory snapshot) cannot be deleted → 409 `44009` `details {entity: "location", id, references}`; deactivate it
+  instead. A location that still holds stock is still 409 `16084`.
+- Numeric fields: ASN detail `weight` / `volume` and location `width` / `depth` / `height` / `capacity` treat an empty
+  string as null; a non-number or a negative value (≤ 0 for location dimensions) → 400 `16115`.
+- Cycle count and adjustment lists accept `keyword`: cycle counts by id, task name, goods / location code of a detail;
+  adjustments by id, reason, goods code / name or location code of a detail.
+
 ## Webhook Integration
 
 WMS pushes event notifications to external systems via Webhook with HMAC-SHA256 signature verification.
@@ -210,9 +239,11 @@ WMS pushes event notifications to external systems via Webhook with HMAC-SHA256 
 |-------|---------|
 | `asn.received` | ASN marked as received |
 | `asn.completed` | ASN completed with actual quantities |
+| `asn.cancelled` | A received (not yet sorted) ASN was cancelled |
 | `dn.in_progress` | DN processing started |
 | `dn.delivered` | DN delivered (includes tracking number) |
 | `dn.completed` | DN completed |
+| `dn.cancelled` | A DN was cancelled after processing started (`in_progress` / `picked` / `packed`; includes `previous_status` and the picked / packed quantity per goods) |
 | `goods.spec_updated` | Goods weight / dimensions / country of origin changed (company-wide, subscription required — see below) |
 
 Document events (`asn.*`, `dn.*`) are sent only to the API Key that created the document.
@@ -280,6 +311,9 @@ anything else → 400 `10014`). There is no default value. `GET /warehouse/goods
 lists goods without it. Warehouse operators can set only the origin with
 `PUT /warehouse/goods/<id>/origin-country` (`{"origin_country": "CN" | "" | null, "spec_source"?: ...}`),
 which requires any of `goods_edit`, `sorting_edit` or `packing_edit` and also emits `goods.spec_updated`.
+It is warehouse-scoped like `GET /warehouse/goods/<id>` (staff other than company admins must send
+`X-WAREHOUSE-ID`, and the goods must have stock in that warehouse, else 404 `13003`) and returns only
+`{id, code, origin_country}`.
 The CSV import accepts an optional `origin_country` column (for existing goods,
 `append` only fills empty values and `override` only overwrites with non-empty values).
 
@@ -341,7 +375,11 @@ country; neither set → `EXPORTER_PROFILE_INCOMPLETE`).
   the limit → 400 `16063` (`details.field`); a line whose `goods_code` is not in the DN details or is duplicated
   → 400 `16064`. Limits: `unit_value` / `total_value` at most 1,000,000,000,000 in absolute value;
   `freight_charge` / `insurance_charge` / `declared_value_carriage` / line `quantity` at most 2,147,483,647
-  (database INTEGER).
+  (database INTEGER). A line `unit_value` with more decimal places than the currency allows (0 for JPY / KRW / VND /
+  CLP / ISK / PYG / UGX / XAF / XOF, otherwise 2; also 2 when the currency is missing) → 400 `16063`
+  `details {field, currency, max_decimal_places}`, so that unit value × quantity = amount on the CI. Snapshots stored
+  before this rule are rounded to the currency's decimal places (half up) before the amount is calculated — in the
+  view, on the CI and in the FedEx request; a unit value that rounds to 0 is reported as `UNIT_VALUE_MISSING`.
 - `freight_charge`, `insurance_charge` and `declared_value_carriage` are stored as integers, so amounts with cents
   (USD etc.) are rejected as well.
 - Incomplete content is accepted and reported as `problems` (see below).
@@ -407,6 +445,10 @@ the issued documents (`void_reason: packages_changed`).
 - The CI and PL are issued together and stored in the database (`dn_documents`), final once generated.
   Issuing again with unchanged data returns the current version (200); if the data changed (including the
   AWB / tracking number) the old version is voided and a new version is issued (201).
+- While a carrier shipment is pending / active / unclear / being cancelled, the current documents are what was
+  submitted with it: issuing documents whose data differs other than the AWB (e.g. the goods' country of origin, the
+  exporter profile or the carrier changed) → 409 `16076` `details {reason: "DOCUMENT_DATA_CHANGED", status, carrier,
+  carrier_shipment: {id, status, tracking_number}}`. Cancel the shipment first.
 - `file` returns `application/pdf` inline with the header `X-Content-SHA256`.
 - The CI prints the AWB number when the delivery task already has a tracking number. Save it before
   shipping with `PUT /warehouse/delivery/<task_id>/tracking` `{ "tracking_number": "...", "carrier_id": 1 }`
@@ -422,6 +464,9 @@ the issued documents (`void_reason: packages_changed`).
   `details {missing_documents: [...], outdated: false}`; documents out of date (packages / customs data /
   tracking number / exporter profile changed without re-issuing) → 409 `16069`
   `details {missing_documents: [], outdated: true}`.
+- While the DN has a carrier shipment request in progress or with an unclear result, or a shipment being cancelled /
+  whose cancellation is unclear (`pending` / `unknown` / `cancelling`), completion → 409 `16079`
+  (`details.unresolved`) with or without a tracking number: resolve it first (cancel / dismiss).
 - If the current CI prints an AWB and the tracking number the task would ship with (the given one, else the saved
   one) differs (ignoring spaces / hyphens) → 409 `16080` `details {document_tracking_number, tracking_number}`: save
   the tracking number and issue the documents again first. A matching number is stored exactly as printed on the CI.
@@ -468,16 +513,19 @@ number by hand (`PUT /warehouse/delivery/<task_id>/tracking`) remains the fallba
 | `POST` | `/warehouse/dn/<id>/carrier-shipment/dismiss` | `packing_edit` / `delivery_edit` |
 
 `GET` returns `{enabled, carrier: "fedex", can_create, blockers[{code, message, goods_code?, field?}], unresolved,
-can_dismiss, etd_enabled, default_label_format, label_formats{A4|THERMAL: {image_type, stock_type}},
+can_dismiss, can_cancel, etd_enabled, default_label_format, label_formats{A4|THERMAL: {image_type, stock_type}},
 declared_value_carriage, delivery_task_id, shipment, warnings[]}`:
 
 - `enabled`: FedEx is configured **and** the DN's company is listed in `FEDEX_ALLOWED_COMPANY_IDS`.
 - `can_create`: no blockers **and** `unresolved` is `null`.
-- `unresolved`: the shipment request whose result is not settled yet, or `null`: `{id, status: "pending" | "unknown",
-  reason, tracking_number, transaction_id, created_at, updated_at}` (see *Shipment records and unclear results*).
-- `can_dismiss`: `true` when `unresolved.status` is `unknown`.
-- `shipment`: the active shipment, otherwise the latest cancelled one, otherwise `null`:
-  `{tracking_number, package_tracking_numbers, status: active|cancelled, reason, service_type, ship_date,
+- `unresolved`: the record whose result is not settled yet, or `null`: `{id, status: "pending" | "unknown" |
+  "cancelling", reason, tracking_number, transaction_id, created_at, updated_at}` (see *Shipment records and unclear
+  results*).
+- `can_dismiss`: `true` when `unresolved.status` is `unknown`, or `cancelling` while no cancellation is in progress.
+- `can_cancel`: `true` for an active shipment, a `cancelling` one while no cancellation is in progress, or an `unknown`
+  record with a tracking number; `false` after the DN is shipped.
+- `shipment`: the active (or `cancelling`) shipment, otherwise the latest cancelled one, otherwise `null`:
+  `{id, tracking_number, package_tracking_numbers, status: active|cancelling|cancelled, reason, service_type, ship_date,
   package_count, net_charge, currency, declared_value, label_format, image_type, label_stock_type, label_document_id,
   label_download_path, label_file_name, label_content_type, label_parts[], etd_document_id, transaction_id,
   sender_country, created_at, created_by, updated_at, cancelled_at, cancelled_by, dismissed_at, dismissed_by}`.
@@ -541,18 +589,21 @@ Each format's image type (`PDF` / `PNG` / `ZPLII` / `EPL2`) and stock can be ove
   `details {tracking_number: null, cancelled_tracking_number, carrier, status: "cancelled"}`.
   While a request is pending or its result is unclear, saving a
   tracking number or updating the task with one → 409 `16079` (so that nobody books a second shipment by hand;
-  clearing is allowed).
-- While a shipment is pending, active or unclear: adding or deleting a delivery task of the DN → 409 `16078` (a new
-  task would become the current one and bypass the tracking lock; a tracking number given on creation is checked as
-  above); changing the customs data (`PUT /warehouse/dn/<id>/customs`) or the packages → 409 `16076` (the data was
-  submitted with the shipment; for customs `details: {reason: "CARRIER_SHIPMENT_OPEN", carrier, carrier_shipment:
-  {id, status, tracking_number}}`). Cancel the shipment first, or dismiss an unclear one. All these checks lock the
-  DN row first, so they are serialized with creating / cancelling.
+  clearing is allowed). While a shipment is `cancelling`, saving any tracking number (the same one included) or
+  clearing it → 409 `16079` (an empty value on update means "unchanged").
+- While a shipment is pending, active, unclear or being cancelled: adding or deleting a delivery task of the DN → 409
+  `16078` (a new task would become the current one and bypass the tracking lock; a tracking number given on creation
+  is checked as above); changing the customs data (`PUT /warehouse/dn/<id>/customs`) or the packages → 409 `16076`
+  (the data was submitted with the shipment; `details: {reason: "CARRIER_SHIPMENT_OPEN", status, carrier,
+  carrier_shipment: {id, status, tracking_number}}`); issuing documents with different data → 409 `16076`
+  (`reason: "DOCUMENT_DATA_CHANGED"`, see *Documents*). Cancel the shipment first, or resolve an unclear one. All these
+  checks lock the DN row first, so they are serialized with creating / cancelling.
 - Commodity weight: goods with a unit weight → unit weight × packed quantity; goods without one share the rest of
   the total gross weight (or, if nothing is left, the gross weight by quantity).
 - **Three steps; no DN row lock and no open database transaction while waiting for FedEx**:
   1. lock the DN, check the preconditions, issue the CI / PL if needed, insert a `pending` `dn_carrier_shipments`
-     record and commit (a partial unique index allows at most one `pending` / `active` / `unknown` record per DN);
+     record and commit (a partial unique index allows at most one `pending` / `active` / `unknown` / `cancelling`
+     record per DN);
   2. (with ETD, upload the CI first) create the shipment in FedEx. The whole creation is limited to
      `FEDEX_CREATE_BUDGET_SECONDS` (default 90): the connect / read timeout of every request (OAuth / ETD upload /
      shipment) is shrunk to the time left, and with less than 5 seconds left the next request is not sent
@@ -576,11 +627,16 @@ Each format's image type (`PDF` / `PNG` / `ZPLII` / `EPL2`) and stock can be ove
     exist on the FedEx side: check FedEx Ship Manager, cancel it there if it exists, then dismiss the record (below).
   - an unparsable response that still names a tracking number is handled like a save failure (the shipment is
     cancelled).
-- **Saving fails after FedEx created the shipment** (500): WMS cancels the shipment in FedEx (compensation) and
-  commits the outcome on the record separately (kept although the main transaction rolled back): cancellation
-  confirmed (or FedEx answers "already cancelled / not found") → `cancelled` (`reason: compensated`); cancellation
-  failed / not confirmed → `unknown` (`reason: compensation_failed`, with `tracking_number`) — cancel it in FedEx
-  Ship Manager, then dismiss the record.
+- **Saving fails after FedEx created the shipment** (502 `16095`, also for business errors such as the DN being
+  shipped meanwhile; `details {tracking_number, transaction_id, error: {code, message}, compensation: {attempted,
+  cancelled, cancel_transaction_id, error}, unresolved, maybe_processed}`): WMS first re-reads the record in a new
+  transaction. If it is already `active` with the same tracking number (the commit went through but the caller saw an
+  error) the shipment is kept and the request succeeds (201). If the record cannot be read, the shipment is **not**
+  cancelled and the record becomes `unknown` (`reason: save_unconfirmed`, with `tracking_number`). Otherwise WMS
+  cancels the shipment in FedEx (compensation) and commits the outcome on the record separately (kept although the
+  main transaction rolled back): cancellation confirmed (or FedEx answers "already cancelled / not found") →
+  `cancelled` (`reason: compensated`, `details.unresolved` null); cancellation failed / not confirmed → `unknown`
+  (`reason: compensation_failed`, with `tracking_number`) — cancel it again (`POST …/cancel`) or dismiss it.
 - CI / PL issued in step 1 are committed with the `pending` record and stay valid when FedEx fails.
 - The label is downloaded with `GET /warehouse/dn/<id>/customs-documents/<label_document_id>/file` (PDF inline,
   ZPL / EPL as attachment). Labels
@@ -594,32 +650,70 @@ Every shipment request leaves a record in `dn_carrier_shipments`:
 |----------|---------|
 | `pending` | FedEx request in progress |
 | `active` | Active shipment |
+| `cancelling` | The active shipment is being cancelled (`reason: cancel_in_progress`) or the result of cancelling it is unclear (`reason`: `timeout` / `connection_error` / `server_error` / `bad_response` / `save_failed` / `interrupted`; `stale` = `cancel_in_progress` older than `FEDEX_PENDING_STALE_MINUTES`). Tracking number and label are kept; the DN cannot be shipped |
 | `cancelled` | Cancelled (by the user; automatically after a save failure, `reason: compensated`; FedEx answered already cancelled, `reason: already_cancelled`) |
 | `failed` | Rejected by FedEx / not sent — no shipment exists (`reason`: `rejected` / `not_sent` / `etd_upload_failed` / `budget_exhausted` / `interrupted`) |
-| `unknown` | Unclear result — the shipment may exist in FedEx (`reason`: `timeout` / `connection_error` / `server_error` / `bad_response` / `compensation_failed` / `interrupted`) |
-| `dismissed` | The operator confirmed that FedEx has no such shipment (or cancelled it there) |
+| `unknown` | Unclear result — the shipment may exist in FedEx (`reason`: `timeout` / `connection_error` / `server_error` / `bad_response` / `compensation_failed` / `save_unconfirmed` / `interrupted`) |
+| `dismissed` | The operator confirmed that FedEx has no such shipment (or cancelled it there); records with a tracking number only after FedEx confirmed it is cancelled / not found |
 
 - A `pending` record older than `FEDEX_PENDING_STALE_MINUTES` (default 10; never shorter than the creation budget +
   75 s) is reported as `unknown` with `reason: stale` (e.g. the worker was killed). When the worker is killed by a
   timeout (gunicorn raises `SystemExit`) WMS also tries to record `unknown` / `failed` with `reason: interrupted`.
-- While `unresolved` (`pending` / `unknown`) exists: no new shipment (409 `16079`), no tracking number can be saved
-  (409 `16079`), customs data / packages are locked (409 `16076`), delivery tasks cannot be added / deleted
-  (409 `16078`).
-- **Dismiss**: `POST /warehouse/dn/<id>/carrier-shipment/dismiss` with `{"confirm": true}` (missing or not `true` →
-  400, `field: confirm`). Only a record with `unresolved.status == "unknown"` (including a stale `pending`) → `dismissed`
-  with `dismissed_by` / `dismissed_at`; FedEx is not called; the response has the same shape as `GET`. Nothing to
-  dismiss (or the request is still in progress) → 409 `16075` (`details.unresolved`). Afterwards a shipment can be
-  created again or a tracking number saved by hand.
+- While `unresolved` (`pending` / `unknown` / `cancelling`) exists: no new shipment (409 `16079`), no tracking number
+  can be saved (409 `16079`), the DN cannot be shipped (409 `16079`), customs data / packages / documents with
+  different data are locked (409 `16076`), delivery tasks cannot be added / deleted (409 `16078`).
+- An `unknown` record **with** a tracking number (e.g. `compensation_failed`) can be cancelled with
+  `POST …/cancel` (same rules as *Cancelling*; on success it becomes `cancelled`).
+- **Dismiss**: `POST /warehouse/dn/<id>/carrier-shipment/dismiss` with `{"confirm": true, "unresolved_id": <id>}`
+  (`confirm` missing or not `true` → 400, `field: confirm`; `unresolved_id` optional, not a positive integer → 400).
+  Only when `can_dismiss`: `unresolved.status == "unknown"` (including a stale `pending`), or `cancelling` while no
+  cancellation is in progress.
+  - Without a tracking number: FedEx is not called → `dismissed` with `dismissed_by` / `dismissed_at`.
+  - With a tracking number the shipment may really exist, so FedEx is asked to cancel it first (three steps, no DN
+    lock while calling FedEx). Only when FedEx cancels it or answers already cancelled / not found: `unknown` →
+    `dismissed` (`cancel_transaction_id` recorded), `cancelling` → `cancelled` (label voided, tracking number
+    cleared, CI / PL re-issued). Otherwise → 409 `16094` `details {unresolved, carrier, tracking_number, result:
+    refused | unclear, http_status, transaction_id, errors, alerts, maybe_processed}`; cancel it in FedEx Ship
+    Manager first. FedEx not configured → 409 `16072`.
+  - `unresolved_id` given but not the current unresolved record → 409 `16093` `details {expected, actual}`
+    (`expected` = the id in the request, `actual` = the current record's id).
+  - The response has the same shape as `GET`. Nothing to dismiss (or the request / cancellation is still in progress)
+    → 409 `16075` (`details.unresolved`). Afterwards a shipment can be created again or a tracking number saved by
+    hand.
 
 ### Cancelling
 
-Allowed until the DN is shipped (409 `16065` afterwards; 409 `16075` without an active shipment). FedEx
+`POST /warehouse/dn/<id>/carrier-shipment/cancel`, optional body `{"tracking_number": "..."}` — the shipment the
+operator means (`shipment.tracking_number` / `unresolved.tracking_number`); compared ignoring spaces / hyphens, a
+different current shipment → 409 `16093` `details {expected, actual}` (`expected` = the number in the request,
+`actual` = the current one); not a string → 400. Without it the call works as before.
+
+Allowed until the DN is shipped (409 `16065` afterwards; 409 `16075` with nothing to cancel, `details.unresolved`)
+for an active shipment, a `cancelling` one (retry) or an `unknown` record with a tracking number. FedEx
 `PUT /ship/v1/shipments/cancel` (`DELETE_ALL_PACKAGES`; the ship-from country is the `sender_country` stored when the
-shipment was created — records from before the migration derive it the same way as creation); if FedEx refuses →
-502 `16073` with the reason. On success the record is marked `cancelled`, the tracking number on the delivery task is
-cleared (compared ignoring spaces / hyphens), the label is voided (`void_reason: shipment_cancelled`) and the CI / PL are re-issued without the AWB
-(voided if they can no longer be issued). Only the FedEx credentials are required: a shipment can still be cancelled
-after its company was removed from `FEDEX_ALLOWED_COMPANY_IDS`.
+shipment was created — records from before the migration derive it the same way as creation). Like creating, in
+**three steps, without the DN row lock or an open transaction while waiting for FedEx** (limited to
+`FEDEX_CREATE_BUDGET_SECONDS`):
+
+1. lock the DN, mark the shipment `cancelling` (`reason: cancel_in_progress`) and commit — from now on the DN cannot be
+   shipped and the tracking number cannot be changed (409 `16079`); another cancel request → 409 `16079`;
+2. call FedEx;
+3. lock the DN and save the result:
+   - cancelled (`cancelledShipment: true`, or FedEx answers already cancelled / not found) → `cancelled`, the tracking
+     number on the delivery task is cleared (compared ignoring spaces / hyphens), the label is voided
+     (`void_reason: shipment_cancelled`) and the CI / PL are re-issued without the AWB (voided if they can no longer be
+     issued). An `unknown` record becomes `cancelled` as well;
+   - FedEx refused (4xx, `cancelledShipment: false`) or the request was not sent → back to `active` (an `unknown`
+     record stays `unknown`), 502 `16073` / 504 `16074` with the reason;
+   - unclear (read timeout, connection lost, 5xx, broken response, or HTTP 200 **without** `cancelledShipment`) → the
+     record stays `cancelling` with the reason (`timeout` / `server_error` / `bad_response` / `connection_error`),
+     502 `16073` / 504 `16074` with `details.maybe_processed: true` and `details.unresolved`. Shipping stays blocked;
+     cancel again (or dismiss after checking FedEx Ship Manager) until FedEx gives a clear answer.
+
+If saving step 3 fails or the worker is killed, the record stays `cancelling` (`reason: save_failed` /
+`interrupted`; a `cancel_in_progress` older than `FEDEX_PENDING_STALE_MINUTES` is reported as `stale`) and can be
+cancelled again right away. Only the FedEx credentials are required: a shipment can still be cancelled after its
+company was removed from `FEDEX_ALLOWED_COMPANY_IDS`.
 
 If FedEx answers that the shipment is already cancelled / not found, it is treated as cancelled
 (`reason: already_cancelled`) — e.g. the previous cancellation succeeded in FedEx but saving it in WMS failed; cancelling
@@ -670,6 +764,16 @@ approval switch `FEDEX_API_BASE` and the credentials to production.
 
 ## Deployment
 
+### Automatic production deploy (GitHub Actions)
+
+Pushing to `main` runs `.github/workflows/deploy.yml` (one at a time, `concurrency: deploy-backend`):
+
+1. A dirty server work tree (`git status --porcelain` not empty) aborts the deploy without touching anything; the current service is probed first and the deploy also aborts if it gives no HTTP response at all (a manual run can tick `skip_precheck`)
+2. The commit before the deploy is recorded; `fetch` + `reset --keep` → `pip install` → `flask db upgrade` (`lock_timeout=15s`). Any failure returns to that commit without restarting. The whole migration chain runs in one transaction, so a failure on PostgreSQL rolls it back
+3. After the restart `GET /health` (no auth, no database; returns `{status, commit}`) must report the new short hash; otherwise the code is rolled back and the old code restarted (**the database is not rolled back**, so migrations must keep the previous code working: add first, remove later)
+
+The probe URL defaults to `http://127.0.0.1:5002/health`; override it with the repository variable `BACKEND_HEALTH_URL`. The pm2 process must be able to run `git` (`/health` reads the commit), otherwise it reports `unknown` and the deploy is treated as failed.
+
 ### Production (Gunicorn)
 
 ```bash
@@ -702,7 +806,11 @@ stdout_logfile=/var/log/wms-api.out.log
 | Inventory | 15000-15999 | 400 | Stock-related errors |
 | State | 16000-16999 | 400 | State transition errors |
 
-Business codes of the export-document features: `14019` export profile text too long, `14020` invalid country code, `16063` customs structure invalid, `16064` customs line goods code not in the DN / duplicated, `16065` shipped — customs data / packages / documents locked (409), `16066` invalid packages, `16067` packages cannot be edited in the current DN status (409), `16068` documents cannot be issued yet (409, `details.problems`), `16069` documents missing or out of date before shipping (409, `details {missing_documents, outdated}`), `16070` not an export DN (409), `16071` document not found (404). Carrier shipments (FedEx): `16072` preconditions not met (409, `details.blockers`), `16073` FedEx returned an error (502, `details.errors` / `transaction_id`), `16074` FedEx timed out (504), `16075` no active carrier shipment (409), `16076` packages / customs data cannot be changed while a carrier shipment is pending, active or unclear (409), `16077` invalid `label_format` (400), `16078` tracking number / carrier differs from the active carrier shipment, or a delivery task is added / deleted while a carrier shipment exists (409), `16079` a carrier shipment request is pending or its result is unclear (409, `details.unresolved`). Delivery completion: `16080` tracking number differs from the AWB printed on the current CI (409, `details {document_tracking_number, tracking_number}`), `16092` carrier differs from the one printed on the current CI (409, `details {document_carrier, document_carrier_id, carrier_id}`). Delivery tasks: `16090` the DN already has an unfinished delivery task (409, `details {delivery_task_id, status}`), `16091` export DN — not the current delivery task (409, `details {delivery_task_id, current_status}`). Errors may carry a structured `details` object.
+Business codes of the export-document features: `14019` export profile text too long, `14020` invalid country code, `16063` customs structure invalid, `16064` customs line goods code not in the DN / duplicated, `16065` shipped — customs data / packages / documents locked (409), `16066` invalid packages, `16067` packages cannot be edited in the current DN status (409), `16068` documents cannot be issued yet (409, `details.problems`), `16069` documents missing or out of date before shipping (409, `details {missing_documents, outdated}`), `16070` not an export DN (409), `16071` document not found (404). Carrier shipments (FedEx): `16072` preconditions not met (409, `details.blockers`), `16073` FedEx returned an error (502, `details.errors` / `transaction_id`), `16074` FedEx timed out (504), `16075` no carrier shipment to cancel / dismiss (409, `details.unresolved`), `16076` packages / customs data cannot be changed, or documents with different data cannot be issued, while a carrier shipment is pending, active, unclear or being cancelled (409, `details {reason: CARRIER_SHIPMENT_OPEN | DOCUMENT_DATA_CHANGED, status, carrier, carrier_shipment {id, status, tracking_number}}`), `16077` invalid `label_format` (400), `16078` tracking number / carrier differs from the active carrier shipment, or a delivery task is added / deleted while a carrier shipment exists (409), `16079` a carrier shipment request is pending or its result is unclear, or the shipment is being cancelled / the cancellation is unclear — no new shipment, tracking number or shipping (409, `details.unresolved`), `16093` the shipment / record named in a cancel / dismiss request is not the current one (409, `details {expected, actual}`), `16094` dismissing a record with a tracking number: FedEx did not confirm it is cancelled / not found (409), `16095` FedEx created the shipment but saving it in WMS failed; compensated (502, `details {error, compensation, unresolved, …}`). Delivery completion: `16080` tracking number differs from the AWB printed on the current CI (409, `details {document_tracking_number, tracking_number}`), `16092` carrier differs from the one printed on the current CI (409, `details {document_carrier, document_carrier_id, carrier_id}`). Delivery tasks: `16090` the DN already has an unfinished delivery task (409, `details {delivery_task_id, status}`), `16091` export DN — not the current delivery task (409, `details {delivery_task_id, current_status}`). Errors may carry a structured `details` object.
+
+Process rules (see "Process rules" above): `16110` DN has an unfinished carrier shipment — cancel it first (409), `16111` adjustment cancelled (409), `16112` adjustment cannot be cancelled in its status (409), `16113` adjustment line cannot be applied — the location no longer holds the goods / no location (409), `16114` cycle count has uncounted details (409, `details.detail_ids`), `16115` invalid numeric field (400, `field`), `16116` the ASN of a sorting task cannot be changed (409), `44009` location has history records — deactivate it instead (409). Tasks: `16088` the task is deactivated (its DN / ASN was cancelled, 409), `16089` a picking task with nothing picked cannot be completed (409).
+
+Master data and permissions: `16100` invalid goods value (400), `16101` duplicate goods code in the CSV (400, with row numbers), `16102` invalid data value (400), `16103` inactive roles cannot be assigned (400), `16104` only company administrators can create / delete warehouses or change the manager (403), `16105` without company_all_access only API keys bound to yourself can be managed (403), `44004` master data referenced by documents or stock cannot be deleted — deactivate it instead (409, `details {entity, id, references}`), `44005` conflicts with existing data (409).
 
 ## Related Projects
 

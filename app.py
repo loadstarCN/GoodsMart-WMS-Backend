@@ -7,6 +7,7 @@ from extensions.jwt import register_jwt_callbacks
 from system import blueprint as system_api
 from tasks import blueprint as task_api
 from warehouse import blueprint as warehouse_api
+from health import blueprint as health_api
 from system.third_party.utils import validate_jwt_and_api_key
 from system.logs.utils import before_request_logging, after_request_logging
 from system.limiter.utils import initialize_ip_lists,check_ip
@@ -87,6 +88,8 @@ def create_app():
     app.register_blueprint(system_api, url_prefix='/system')
     app.register_blueprint(task_api, url_prefix='/tasks')
     app.register_blueprint(warehouse_api, url_prefix='/warehouse')
+    # GET /health：部署流水线重启后的健康探测（不鉴权、不查库，只返回 status 与 git 短哈希）
+    app.register_blueprint(health_api)
 
     # 注册 CLI 命令
     from system.webhook.commands import webhook_cli

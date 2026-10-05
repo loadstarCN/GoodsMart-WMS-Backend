@@ -1,8 +1,6 @@
 from flask import g
 from flask_restx import Resource
-from extensions.error import BadRequestException
-from warehouse.common import warehouse_required,add_warehouse_filter,get_warehouse_owned,require_positive_int, require_actor_user_id
-from warehouse.dn.models import DN
+from warehouse.common import warehouse_required,add_warehouse_filter,get_warehouse_owned, require_actor_user_id
 from .models import PackingTask
 from .schemas import (
     api_ns,
@@ -54,21 +52,7 @@ class PackingTaskList(Resource):
         query = PackingTaskService.list_tasks(filters)
         return paginate(query, page, per_page)
 
-    @permission_required(["all_access","company_all_access","packing_edit"])
-    @warehouse_required()
-    @api_ns.expect(packing_task_input_model)
-    @api_ns.marshal_with(packing_task_model)
-    def post(self):
-        """
-        创建一个新的打包任务（只接受 dn_id；DN 必须在可访问仓库内）
-        """
-        data = api_ns.payload
-        if not isinstance(data, dict):
-            raise BadRequestException("Request body must be a JSON object", 16015)
-        get_warehouse_owned(DN, require_positive_int(data.get('dn_id'), 'dn_id', 16044), what='DN')
-        created_by = require_actor_user_id()
-        new_task = PackingTaskService.create_task(data, created_by)
-        return new_task, 201
+    # 没有 POST：打包任务只在拣货完成时自动生成（create_packing_task_from_dn），手工新建接口已去掉（405）
 
 
 @api_ns.doc(security="jsonWebToken")

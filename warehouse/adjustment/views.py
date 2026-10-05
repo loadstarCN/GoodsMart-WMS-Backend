@@ -60,7 +60,8 @@ class AdjustmentList(Resource):
             'status': args.get('status'),
             'is_active': args.get('is_active'),
             'created_by': args.get('created_by'),
-            'warehouse_id': args.get('warehouse_id')
+            'warehouse_id': args.get('warehouse_id'),
+            'keyword': args.get('keyword'),
         }
         filters = add_warehouse_filter(filters)
 
@@ -161,6 +162,26 @@ class AdjustmentApprove(Resource):
         updated_adjustment = AdjustmentService.approve_adjustment(adjustment,operator_id)
 
         return updated_adjustment
+
+@api_ns.doc(security="jsonWebToken")
+@api_ns.route('/<int:adjustment_id>/cancel/')
+class AdjustmentCancel(Resource):
+
+    # 取消 = 驳回 / 撤回一个待审批或已审批的调整决定，与审批同级：需要 adjustment_approve。
+    # 只有 adjustment_edit 的操作员仍可删除自己 pending 的单（adjustment_delete），已审批的单要由审批人撤回
+    @permission_required(["all_access","company_all_access","adjustment_approve"])
+    @warehouse_required()
+    @api_ns.marshal_with(adjustment_model)
+    def put(self, adjustment_id):
+        """
+        Cancel a pending / approved Adjustment (is_active becomes false; stock is not touched)
+        - completed → 409 16112; already cancelled → 409 16111
+        - an adjustment created from a cycle count can be generated again after it is cancelled
+        """
+        operator_id = require_actor_user_id()
+        adjustment = _get_owned_adjustment(adjustment_id)
+        return AdjustmentService.cancel_adjustment(adjustment, operator_id)
+
 
 @api_ns.doc(security="jsonWebToken")
 @api_ns.route('/create_adjustment_by_cyclecount/<int:cyclecount_id>')
