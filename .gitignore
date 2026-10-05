@@ -212,3 +212,7 @@ __marimo__/
 
 # 允许其他子目录中的 logs 目录
 !*/logs/
+
+# 运行时文件 / 服务器上的 .env 备份（不进仓库）
+.scheduler.lock
+.env.bak*

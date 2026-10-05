@@ -101,13 +101,19 @@ jobs:
               say "（pm2 jlist 失败，忽略）"
             fi
 
-            # ---- 1. 工作区必须干净：服务器上不应有手工改动；有就中止，什么都不动
-            DIRTY=$(git status --porcelain) || { say "!!! git status 失败"; exit 1; }
+            # ---- 1. 已跟踪文件不能有手工改动：有就中止，什么都不动。
+            #         未跟踪文件（.env 备份、调度器锁文件等）不影响 reset --keep，只打印出来提醒
+            DIRTY=$(git status --porcelain --untracked-files=no) || { say "!!! git status 失败"; exit 1; }
             if [ -n "$DIRTY" ]; then
-              say "!!! 服务器工作区不干净，中止部署（代码、依赖、数据库、进程都没有改动）："
+              say "!!! 服务器上的已跟踪文件有改动，中止部署（代码、依赖、数据库、进程都没有改动）："
               printf '%s\n' "$DIRTY"
-              say "    请在服务器上确认这些改动的来源：要保留的提交进仓库，不要的还原 / 删除，程序运行时写出的文件加进 .gitignore"
+              say "    请在服务器上确认这些改动的来源：要保留的提交进仓库，不要的还原"
               exit 1
+            fi
+            UNTRACKED=$(git status --porcelain --untracked-files=normal | grep '^??' || true)
+            if [ -n "$UNTRACKED" ]; then
+              say "提示：服务器工作区有未跟踪文件（不影响部署；不需要的请移出仓库目录，运行时文件加进 .gitignore）："
+              printf '%s\n' "$UNTRACKED"
             fi
             PREV=$(git rev-parse HEAD) || exit 1
             PREV_SHORT=$(git rev-parse --short=7 HEAD)
