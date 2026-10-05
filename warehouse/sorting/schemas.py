@@ -49,6 +49,11 @@ sorting_task_detail_for_batch_model = api_ns.model('SortingTaskDetailForBatch', 
 sorting_batch_model = api_ns.model('SortingBatch', {
     'id': fields.Integer(readOnly=True, description='Sorting Batch ID'),
     'sorting_task_id': fields.Integer(readOnly=True, description='Associated Sorting Task ID'),
+    'client_batch_id': fields.String(
+        max_length=64,
+        description='Optional client-generated id of this submission (1-64 chars, create only). Re-submitting the '
+                    'same id for the same task with the same details returns the existing batch (200); '
+                    'different details -> 409 16121'),
     'operator_id': fields.Integer(readOnly=True, description='Operator who performed the sorting batch'),
     'operation_time': fields.DateTime(description='Time of the sorting batch'),
     'remark': fields.String(description='Remark for the sorting batch'),
@@ -172,5 +177,4 @@ pagination_model = create_pagination_model(api_ns, sorting_task_base_model)
 
 sorting_monthly_stats_parser =  reqparse.RequestParser()
 sorting_monthly_stats_parser.add_argument('months', type=int, help='Number of months to look back', default=6)
-sorting_monthly_stats_parser.add_argument('sorting_type', type=str, help='Filter by Sorting type', choices=SortingTask.SORTING_TASK_STATUSES)
 sorting_monthly_stats_parser.add_argument('warehouse_id', type=int, help='Filter by Warehouse ID')

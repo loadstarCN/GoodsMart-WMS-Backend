@@ -1,5 +1,14 @@
 from extensions.db import *
 
+
+def _user_ref(user_id):
+    """签发人 / 建单人等：{id, user_name}，前端显示用户名而不是裸 id（用户已删除时为 None）"""
+    if user_id is None:
+        return None
+    from system.user.models import User
+    user = db.session.get(User, user_id)
+    return {'id': user.id, 'user_name': user.user_name} if user else None
+
 class DN(db.Model):
     """发货单主表
     
@@ -463,6 +472,7 @@ class DNDocument(db.Model):
             'invoice_date': self.invoice_date.isoformat() if self.invoice_date else None,
             'issued_at': self.issued_at.isoformat() if self.issued_at else None,
             'issued_by': self.issued_by,
+            'issued_by_user': _user_ref(self.issued_by),
             'status': self.status,
             'sha256': self.sha256,
             'size_bytes': self.size_bytes,
@@ -611,6 +621,7 @@ class DNCarrierShipment(db.Model):
             'sender_country': self.sender_country,
             'created_at': self.created_at.isoformat() if self.created_at else None,
             'created_by': self.created_by,
+            'created_by_user': _user_ref(self.created_by),
             'updated_at': self.updated_at.isoformat() if self.updated_at else None,
             'cancelled_at': self.cancelled_at.isoformat() if self.cancelled_at else None,
             'cancelled_by': self.cancelled_by,

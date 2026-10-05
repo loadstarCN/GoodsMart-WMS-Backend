@@ -1,7 +1,7 @@
 from flask import Flask
 from flask_cors import CORS
 from werkzeug.middleware.proxy_fix import ProxyFix
-from config import Config,DevelopmentConfig, TestingConfig, ProductionConfig
+from config import Config, DevelopmentConfig, TestingConfig, ProductionConfig, check_runtime_config
 from extensions import db, jwt, migrate,redis_client,error,oss,cache,limit_init_app
 from extensions.jwt import register_jwt_callbacks
 from system import blueprint as system_api
@@ -14,29 +14,17 @@ from system.limiter.utils import initialize_ip_lists,check_ip
 
 import os
 
-_INSECURE_JWT_SECRETS = {'super-secret-jwt', 'your_secure_random_jwt_secret_key_here', ''}
-
 
 def _validate_production_config(app):
-    """生产环境启动前检查：密钥 / 数据库漏配直接拒绝启动，而不是带着默认值静默运行"""
-    if Config.FLASK_ENV != 'production':
-        return
-    problems = []
-    secret = app.config.get('JWT_SECRET_KEY') or ''
-    if secret in _INSECURE_JWT_SECRETS or len(secret) < 32:
-        problems.append('JWT_SECRET_KEY must be a random string of at least 32 characters')
-    if str(app.config.get('SQLALCHEMY_DATABASE_URI', '')).startswith('sqlite'):
-        problems.append('SQLALCHEMY_DATABASE_URI must point to the production database (sqlite is not allowed)')
-    if problems:
-        raise RuntimeError('Refusing to start in production: ' + '; '.join(problems))
-    if app.config.get('CORS_ORIGINS') == '*':
-        app.logger.warning('CORS_ORIGINS is "*" in production; set it to the admin/app domains')
+    """启动前检查（见 config.check_runtime_config）：生产环境密钥 / 数据库 / SETTINGS_ENCRYPTION_KEY 漏配直接拒绝启动；
+    没设 FLASK_ENV 却连着非 sqlite 数据库时打醒目 warning"""
+    check_runtime_config(app.config, app.logger)
 
 
 def create_app():
     app = Flask(__name__)
 
-    # 根据 FLASK_ENV 环境变量动态加载配置
+    # 根据 FLASK_ENV 环境变量动态加载配置（Config.FLASK_ENV 已去空白、转小写）
     if Config.FLASK_ENV == 'production':
         app.config.from_object(ProductionConfig)
     elif Config.FLASK_ENV == 'testing':

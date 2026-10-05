@@ -260,7 +260,9 @@ class AdjustmentDetailItem(Resource):
         adjustment = _get_owned_adjustment(adjustment_id)
         if 'location_id' in data:
             _assert_location_in_warehouse(adjustment.warehouse_id, data['location_id'])
-        updated_detail = AdjustmentService.update_adjustment_detail(adjustment_id, detail_id, data)
+        # 修改人记到 details_modified_by：之后他不能审批这张单（B-105，409 16122）
+        updated_detail = AdjustmentService.update_adjustment_detail(
+            adjustment_id, detail_id, data, operator_id=require_actor_user_id())
 
         return updated_detail
 
@@ -271,7 +273,7 @@ class AdjustmentDetailItem(Resource):
         Delete a specific Adjustment Detail
         """
         _get_owned_adjustment(adjustment_id)
-        AdjustmentService.delete_adjustment_detail(adjustment_id, detail_id)
+        AdjustmentService.delete_adjustment_detail(adjustment_id, detail_id, operator_id=require_actor_user_id())
 
         return {"message": "Adjustment Detail deleted successfully"}, 200
 

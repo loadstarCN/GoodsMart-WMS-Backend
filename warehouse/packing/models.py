@@ -184,6 +184,8 @@ class PackingBatch(db.Model):
     
     __table_args__ = (
         db.Index('idx_packing_batch_operator', 'operator_id', 'operation_time'),  # 操作审计
+        # 同一任务内 client_batch_id 唯一（NULL 不参与）：批次追加幂等的兜底（B-102）
+        db.UniqueConstraint('packing_task_id', 'client_batch_id', name='uq_packing_batches_task_client_batch_id'),
     )
 
     id = db.Column(db.Integer, primary_key=True)
@@ -192,6 +194,11 @@ class PackingBatch(db.Model):
         db.ForeignKey('packing_tasks.id', ondelete='CASCADE'),
         nullable=False,
         info={'description': '主任务ID'}
+    )
+    client_batch_id = db.Column(
+        db.String(64),
+        nullable=True,
+        info={'description': '前端生成的批次提交标识（1~64 字符，可空）：同一任务内重复提交同一个 id 不重复记数'}
     )
     operator_id = db.Column(
         db.Integer,

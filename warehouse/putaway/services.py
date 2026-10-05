@@ -1,9 +1,12 @@
 from sqlalchemy import or_
 from extensions.db import *
 from extensions.transaction import transactional
-from warehouse.common import require_positive_int, require_bulk_list, require_fields, lock_goods_location
+from warehouse.common import (
+    require_positive_int, require_bulk_list, require_fields, lock_inventory_rows, lock_or_create_goods_location,
+    lock_stock_for_bulk,
+)
 from warehouse.common.locks import lock_row
-from warehouse.goods.models import Goods, GoodsLocation
+from warehouse.goods.models import Goods
 from warehouse.inventory.services import InventoryService
 from warehouse.location.models import Location
 from warehouse.location.services import LocationService
@@ -102,18 +105,11 @@ class PutawayService:
         db.session.add(new_record)
         db.session.flush()
 
-        # 读改写商品库位记录全程持锁（SELECT ... FOR UPDATE）
-        goods_location_record = lock_goods_location(goods_id, location_id)
-        if goods_location_record is None:
-            # 创建新的库存信息
-            goods_location_record = GoodsLocation(
-                goods_id=goods_id,
-                location_id=location_id,
-                quantity=quantity,
-            )
-        else:
-            # 更新库存信息
-            goods_location_record.quantity += quantity
+        # 加锁顺序（B-103）：库存行先于库位库存行
+        lock_inventory_rows([goods_id], location.warehouse_id)
+        # 读改写商品库位记录全程持锁（SELECT ... FOR UPDATE）；没有就新建（savepoint 兜底并发首次上架，B-107）
+        goods_location_record, _ = lock_or_create_goods_location(goods_id, location_id)
+        goods_location_record.quantity += quantity
 
         db.session.add(goods_location_record)
         db.session.flush()
@@ -141,6 +137,10 @@ class PutawayService:
         :return: 创建成功的 PutawayRecord 实例列表
         """
         require_bulk_list(data_list, 'records')
+        # 逐条处理前按统一顺序锁齐全部库存行与库位库存行（B-103）：两批商品 / 库位顺序相反时不再互相等待
+        lock_stock_for_bulk(
+            (data.get('goods_id'), data.get('location_id')) for data in data_list if isinstance(data, dict)
+        )
         new_records = []
         for data in data_list:
             new_record = PutawayService.create_putaway_record(data, created_by_id)

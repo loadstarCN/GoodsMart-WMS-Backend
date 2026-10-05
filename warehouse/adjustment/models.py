@@ -69,6 +69,12 @@ class Adjustment(db.Model):
         nullable=True,
         info={'description': '操作人ID'}
     )
+    details_modified_by = db.Column(
+        db.Integer,
+        db.ForeignKey('users.id', name='fk_adjustments_details_modified_by', ondelete='RESTRICT'),
+        nullable=True,
+        info={'description': '最后增 / 改 / 删明细的人（审批人不能是他，职责分离 B-105）；存量调整单为 NULL'}
+    )
     created_at = db.Column(
         db.DateTime,
         default=db.func.now(),

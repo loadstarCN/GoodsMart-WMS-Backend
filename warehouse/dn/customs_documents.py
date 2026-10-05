@@ -20,8 +20,19 @@ from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.cidfonts import UnicodeCIDFont
 from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.platypus import KeepTogether, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+from reportlab.platypus.doctemplate import LayoutError
 
 logger = logging.getLogger(__name__)
+
+
+class DocumentLayoutError(Exception):
+    """单证排不下（某个不能跨页拆分的块比一页还高，最常见的是收件人各字段都很长）。
+    签发接口据此返回 409 16117，而不是让 reportlab 的 LayoutError 变成 500。"""
+
+    def __init__(self, title: str, detail: str):
+        super().__init__(f"{title}: {detail}")
+        self.title = title
+        self.detail = detail
 
 CID_FALLBACK_FONT = 'HeiseiKakuGo-W5'
 PAGE_WIDTH, PAGE_HEIGHT = A4
@@ -268,7 +279,10 @@ def _build(story, title, author, footer) -> bytes:
         title=title, author=author or '', subject=title, creator='WMS customs documents',
         invariant=1,
     )
-    doc.build(story, onFirstPage=footer, onLaterPages=footer)
+    try:
+        doc.build(story, onFirstPage=footer, onLaterPages=footer)
+    except LayoutError as exc:
+        raise DocumentLayoutError(title, str(exc)[:300]) from exc
     return buffer.getvalue()
 
 

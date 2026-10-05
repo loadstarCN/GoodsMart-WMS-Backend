@@ -10,7 +10,7 @@ from warehouse.carrier.models import Carrier
 from warehouse.goods.models import Goods
 from warehouse.goods.services import GoodsService, goods_spec_snapshot
 from warehouse.inventory.services import InventoryService
-from warehouse.common.locks import lock_row
+from warehouse.common.locks import lock_row, lock_inventory_rows, lock_order_key
 from warehouse.supplier.models import Supplier
 from warehouse.warehouse.models import Warehouse
 from system.webhook.services import emit as webhook_emit
@@ -139,12 +139,14 @@ class ASNService:
 
     @staticmethod
     def _ensure_inventory(goods_id: int, warehouse_id: int):
-        """明细涉及的商品在该仓库必须有库存记录，没有则创建"""
-        try:
-            InventoryService.get_inventory(goods_id, warehouse_id)
-        except NotFoundException:
-            InventoryService.create_inventory({"goods_id": goods_id, "warehouse_id": warehouse_id})
-            db.session.flush()
+        """明细涉及的商品在该仓库必须有库存记录，没有则创建。
+        并发建单时同一新商品撞主键不再 500：见 InventoryService.ensure_inventory（savepoint + 重读，B-107）"""
+        InventoryService.ensure_inventory(goods_id, warehouse_id)
+
+    @staticmethod
+    def _lock_inventories(asn: ASN):
+        """多商品操作动库存前，按 goods_id 升序一次锁齐本单涉及的库存行（B-103，加锁顺序见 common/locks.py）"""
+        lock_inventory_rows([d.goods_id for d in asn.details], asn.warehouse_id)
 
     @staticmethod
     @transactional
@@ -345,16 +347,20 @@ class ASNService:
         if not isinstance(details_data, list):
             raise BadRequestException("'details' must be a list", 16015)
 
-        # 创建 ASN 明细（如果有）
+        # 创建 ASN 明细（如果有）：明细按请求顺序落库
+        goods_ids = []
         for detail in details_data:
             payload = ASNService._detail_payload(detail, company_id)
             new_detail = ASNDetail(asn_id=new_asn.id, created_by=created_by_id, **payload)
             db.session.add(new_detail)
             db.session.flush()
+            goods_ids.append(new_detail.goods_id)
 
-            ASNService._ensure_inventory(new_detail.goods_id, new_asn.warehouse_id)
+        # 建库存行 / 重算 ASN 库存按 goods_id 升序逐个加锁（B-103：两张商品顺序相反的 ASN 并发创建不再死锁）
+        for goods_id in sorted(set(goods_ids), key=lock_order_key):
+            ASNService._ensure_inventory(goods_id, new_asn.warehouse_id)
             # 重新计算库存
-            InventoryService.update_and_calculate_asn_stock(new_detail.goods_id, new_asn.warehouse_id)
+            InventoryService.update_and_calculate_asn_stock(goods_id, new_asn.warehouse_id)
 
         ASNService._assert_no_duplicate_goods(new_asn.id)
         # db.session.commit()
@@ -412,10 +418,11 @@ class ASNService:
         if asn.status != 'pending':
             raise BadRequestException("Cannot delete a non-pending ASN", 16002)
 
-        goods_ids = [detail.goods_id for detail in asn.details]
+        goods_ids = sorted({detail.goods_id for detail in asn.details}, key=lock_order_key)
         warehouse_id = asn.warehouse_id
         db.session.delete(asn)
         db.session.flush()
+        # 按 goods_id 升序逐个加锁重算（B-103）
         for goods_id in goods_ids:
             InventoryService.update_and_calculate_asn_stock(goods_id, warehouse_id)
 
@@ -428,6 +435,7 @@ class ASNService:
         将指定 ASN 标记为非活动状态。
         """
         asn = lock_row(ASNService._get_instance(asn_or_id))
+        ASNService._lock_inventories(asn)
         asn.is_active = False
         db.session.add(asn)
         db.session.flush()
@@ -502,11 +510,11 @@ class ASNService:
         db.session.flush()
         ASNService._assert_no_duplicate_goods(asn.id)
 
-        # 换了商品时，新旧商品的 ASN 库存都要重算
-        if detail.goods_id != old_goods_id:
-            ASNService._ensure_inventory(detail.goods_id, asn.warehouse_id)
-            InventoryService.update_and_calculate_asn_stock(old_goods_id, asn.warehouse_id)
-        InventoryService.update_and_calculate_asn_stock(detail.goods_id, asn.warehouse_id)
+        # 换了商品时，新旧商品的 ASN 库存都要重算（按 goods_id 升序加锁，B-103）
+        for goods_id in sorted({old_goods_id, detail.goods_id}, key=lock_order_key):
+            if goods_id != old_goods_id:
+                ASNService._ensure_inventory(goods_id, asn.warehouse_id)
+            InventoryService.update_and_calculate_asn_stock(goods_id, asn.warehouse_id)
 
         # db.session.commit()
         return detail
@@ -568,8 +576,8 @@ class ASNService:
         db.session.expire(asn, ['details'])
         latest_details = asn.details # 重新加载后的明细列表
 
-        # 现存明细与被删明细涉及的商品都要重算 ASN 库存
-        for goods_id in {d.goods_id for d in latest_details} | deleted_goods_ids:
+        # 现存明细与被删明细涉及的商品都要重算 ASN 库存（按 goods_id 升序加锁，B-103）
+        for goods_id in sorted({d.goods_id for d in latest_details} | deleted_goods_ids, key=lock_order_key):
             ASNService._ensure_inventory(goods_id, asn.warehouse_id)
             InventoryService.update_and_calculate_asn_stock(goods_id, asn.warehouse_id)
 
@@ -612,6 +620,7 @@ class ASNService:
         if asn.status != 'pending':
             raise BadRequestException("Cannot receive a non-pending ASN", 16021)
 
+        ASNService._lock_inventories(asn)
         asn = ASNService._update_asn_status(asn, "received")
 
         # 更新库存信息
@@ -657,7 +666,7 @@ class ASNService:
         if asn.status != 'received':
             raise BadRequestException("Cannot complete a non-received ASN", 16022)
 
-
+        ASNService._lock_inventories(asn)
         asn = ASNService._update_asn_status(asn, "completed")
         ASNService._update_and_calculate_quantity(asn)
 
@@ -697,6 +706,7 @@ class ASNService:
         if asn.status != 'pending':
             raise BadRequestException("Cannot close a non-pending ASN", 16022)
 
+        ASNService._lock_inventories(asn)
         asn = ASNService._update_asn_status(asn, "closed")
 
         # 更新库存信息
@@ -729,6 +739,7 @@ class ASNService:
             if task.status == 'completed' or task.batches or task.task_details:
                 raise ConflictException("Cannot cancel an ASN whose sorting task already has progress", 16060)
 
+        ASNService._lock_inventories(asn)
         for detail in asn.details:
             InventoryService.asn_cancelled(detail.goods_id, asn.warehouse_id, detail.quantity)
         for task in tasks:

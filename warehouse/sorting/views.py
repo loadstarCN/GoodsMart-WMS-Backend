@@ -225,14 +225,16 @@ class SortingBatchList(Resource):
         - 如果传入 data['details']，则同时批量创建 SortingTaskDetail
         - 要求对应的 SortingTask 必须是 in_progress 状态
         - 明细商品必须在 ASN 明细内，累计分拣量不得超过 ASN 计划量
+        - 可选 client_batch_id（1~64 字符）：同一任务下重复提交同一个 id 且明细相同 → 200 返回已存在的批次，
+          明细不同 → 409 16121
         """
         data = api_ns.payload or {}
         operator_id = require_actor_user_id()
 
         task = _owned_task(task_id)
-        new_batch = SortingTaskService.create_batch(task, data, operator_id)
+        batch, created = SortingTaskService.submit_batch(task, data, operator_id)
 
-        return new_batch, 201
+        return batch, 201 if created else 200
 
 
 @api_ns.doc(security="jsonWebToken")
@@ -296,7 +298,6 @@ class SortingMonthlyStats(Resource):
         # 将筛选参数打包到 dict 中
         filters = {
             'months': args.get('months'),
-            'sorting_type': args.get('sorting_type')
         }
 
         filters = add_warehouse_filter(filters)
@@ -316,9 +317,7 @@ class SortingStatusOverviewStats(Resource):
         args = sorting_monthly_stats_parser.parse_args()
 
         # 将筛选参数打包到 dict 中
-        filters = {
-            'sorting_type': args.get('sorting_type'),
-        }
+        filters = {}
         filters = add_warehouse_filter(filters)
         stats = SortingTaskService.get_status_overview(filters=filters)
         return stats, 200

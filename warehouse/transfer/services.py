@@ -5,9 +5,10 @@ from extensions.error import BadRequestException, NotFoundException
 from extensions.transaction import transactional
 from warehouse.common import (
     require_same_warehouse, require_positive_int, require_bulk_list, require_fields, lock_goods_location,
+    lock_inventory_rows, lock_or_create_goods_location, lock_stock_for_bulk,
 )
 from warehouse.common.locks import lock_row
-from warehouse.goods.models import Goods, GoodsLocation
+from warehouse.goods.models import Goods
 from warehouse.inventory.services import InventoryService
 from warehouse.location.models import Location
 from warehouse.location.services import LocationService
@@ -114,7 +115,8 @@ class TransferService:
         # 先给目标库位行加共享锁再判断启用状态（之后才锁库位库存行）：与并发的停用串行，停用库位不能再移入（400 16085）
         LocationService.require_active_location(lock_row(to_location, shared=True), 'to_location_id')
 
-        # 按库位 id 顺序加锁，避免 A→B 与 B→A 并发时互相等待形成死锁
+        # 加锁顺序（B-103）：库存行先于库位库存行；库位库存行按库位 id 顺序加锁，避免 A→B 与 B→A 并发时互相等待形成死锁
+        lock_inventory_rows([goods_id], from_location.warehouse_id)
         locked = {}
         for location_id in sorted({from_location_id, to_location_id}):
             locked[location_id] = lock_goods_location(goods_id, location_id)
@@ -122,7 +124,10 @@ class TransferService:
         to_goods_location_record = locked[to_location_id]
 
         if from_goods_location_record is None:
-            raise NotFoundException("Goods not found in the specified from_location", 14003)
+            raise NotFoundException(
+                "Goods not found in the specified from_location", 16120,
+                details={'goods_id': goods_id, 'from_location_id': from_location_id},
+            )
         if from_goods_location_record.quantity < quantity:
             raise BadRequestException("Insufficient inventory in the specified location", 15001)
 
@@ -145,14 +150,9 @@ class TransferService:
 
 
         if to_goods_location_record is None:
-            # 创建新的库存信息
-            to_goods_location_record = GoodsLocation(
-                goods_id=goods_id,
-                location_id=to_location_id,
-                quantity=quantity,
-            )
-        else:
-            to_goods_location_record.quantity += quantity
+            # 创建新的库存信息（savepoint 兜底并发首次移入同一库位，B-107）
+            to_goods_location_record, _ = lock_or_create_goods_location(goods_id, to_location_id)
+        to_goods_location_record.quantity += quantity
 
         db.session.add(to_goods_location_record)
         db.session.flush()
@@ -184,6 +184,12 @@ class TransferService:
         :return: 创建成功的 TransferRecord 实例列表
         """
         require_bulk_list(data_list, 'records')
+        # 逐条处理前按统一顺序锁齐全部库存行与来源 / 目标库位库存行（B-103）：两批顺序相反时不再互相等待
+        lock_stock_for_bulk(
+            (data.get('goods_id'), data.get(field))
+            for data in data_list if isinstance(data, dict)
+            for field in ('from_location_id', 'to_location_id')
+        )
         new_records = []
         for data in data_list:
             new_record = TransferService.create_transfer_record(data, created_by_id)

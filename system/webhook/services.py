@@ -372,12 +372,19 @@ def _read_limited(resp, deadline):
 def _post_in_thread(job, deadline, box):
     """发送线程：复核 URL → POST → 读有限的正文 → 关闭连接。
     不碰数据库和 Flask 上下文；拿到的响应 / 异常放进 box"""
-    from .utils import validate_webhook_url
+    from .utils import strict_webhook_session, validate_webhook_url
     resp = None
+    session = None
     try:
-        # 发送前再校验一次 URL（防止配置后 DNS 改指内网），且不跟随重定向
+        # 发送前再校验一次 URL（防止配置后 DNS 改指内网），且不跟随重定向。
+        # 严格模式下建连时还会再解析一次、校验全部地址并只连校验过的 IP（防 DNS rebinding），
+        # 证书仍按原域名校验
         validate_webhook_url(job['url'], strict=job['strict'])
-        resp = requests.post(
+        post = requests.post
+        if job['strict']:
+            session = strict_webhook_session()
+            post = session.post
+        resp = post(
             job['url'],
             data=job['body'],
             headers=job['headers'],
@@ -397,6 +404,8 @@ def _post_in_thread(job, deadline, box):
     finally:
         if resp is not None:
             resp.close()
+        if session is not None:
+            session.close()
 
 
 def _post_with_deadline(job):

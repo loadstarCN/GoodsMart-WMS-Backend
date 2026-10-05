@@ -51,7 +51,12 @@ source venv/bin/activate  # Linux/Mac
 venv\Scripts\activate     # Windows
 
 pip install -r requirements.txt
+# 要跑测试（pytest、fakeredis 等）改装开发依赖：
+pip install -r requirements-dev.txt
 ```
+
+生产只装 `requirements.txt`；测试 / 开发用的包在 `requirements-dev.txt`（第一行 `-r requirements.txt`）。
+用 `./run_tests.sh`（或 `python -m pytest tests/`）跑测试，缺开发依赖时脚本会提示。
 
 ### 3. 配置环境变量
 
@@ -82,6 +87,12 @@ OSS_ENDPOINT=oss-your-region.aliyuncs.com
 OSS_BUCKET_NAME=your-bucket
 OSS_HOST=https://your-bucket.oss-your-region.aliyuncs.com
 ```
+
+布尔开关（`DEBUG`、`WEBHOOK_URL_STRICT`、`RATELIMIT_ENABLED`、`SCHEDULER_ENABLED`、`CHECK_WHITELIST`、`CHECK_BLACKLIST`、
+`FEDEX_ETD_ENABLED`）统一解析：不分大小写，`1` / `true` / `yes` / `on` 为真，其余为假（认不出的值启动时打日志）。
+`FLASK_ENV=production` 时，`JWT_SECRET_KEY` 过弱、数据库是 SQLite、`SETTINGS_ENCRYPTION_KEY` 缺失或不是合法的 Fernet 密钥
+都会拒绝启动（要沿用以前存的密文，填 `system_settings` 表里 `_encryption_key` 的值）；`WEBHOOK_URL_STRICT` 默认开启。
+不设 `FLASK_ENV` 按开发配置运行，此时数据库若不是 SQLite 会打一条醒目的 warning。
 
 ### 4. 数据库初始化
 
@@ -202,6 +213,16 @@ GoodsMart-WMS-Backend/
 - 分拣 / 拣货 / 打包 / 发货任务只由单据流转自动生成（ASN 收货 → 分拣；DN 开始处理 → 拣货；拣货完成 → 打包；打包完成 → 发货），
   没有手工新建接口：`POST /warehouse/sorting/`、`/picking/`、`/packing/`、`/delivery/` → 405。
 - 删除分拣 / 拣货 / 打包批次（任务 `in_progress` 时）连同批次下的明细一起删除。
+- 追加批次（`POST /warehouse/sorting|picking|packing/<task_id>/batches/`）可带可选的 `client_batch_id`（1~64 个字符的字符串，
+  前端每次提交一批生成一个，断网 / 超时重试时原样带上）：第一次提交正常创建（201）；同一任务下同一个 `client_batch_id`
+  再次提交且明细相同（比商品与数量，拣货另比库位，与顺序无关；备注、操作时间不比）→ 不再新增，200 返回已存在的批次
+  （结构与 201 相同）；明细不同 → 409 `16121` `details {client_batch_id, batch_id}`；格式不对 → 400 `16123`。
+  不带 `client_batch_id` 时行为不变。比的是批次当前的明细：批次建好后明细被改过 / 删过，再用原内容重放也是 `16121`；
+  批次被删掉后再重放会重新创建。
+- 调整单职责分离：创建人不能审批（403 `16040`）；最后增 / 改 / 删明细的人（`details_modified_by`）也不能审批 → 409 `16122`。
+- 移库：来源库位没有这个商品 → 404 `16120`（原来与「缺仓库 id」共用 `14003`）。
+- 多商品 / 多库位的单据与批量操作统一按 goods_id（库位库存再按 location_id）升序加锁，先库存行、后库位库存行，
+  两个请求商品顺序相反时不再死锁；同一新商品第一次被并发建 ASN、同一库位第一次被并发上架 / 移入时不再 500。
 - DN 取消（`PUT /warehouse/dn/<id>/cancel/`）：`pending` 等同关闭；`in_progress` 须拣货尚未开始（否则 409 `16053`）；
   `picked` / `packed`（未发货）可取消，已拣 / 已打包的货退回待上架（`sorted_stock`，`total_stock` 不变），拣货 / 打包 / 发货任务停用，
   有效的出口单证作废（`void_reason: dn_cancelled`）；有未结束的承运商自动运单（进行中 / 有效 / 结果不明 / 取消中）→ 409 `16110`，
@@ -264,6 +285,10 @@ WHERE key = 'your-api-key';
 
 推送失败每 30 分钟重试一次，最多 10 次（见 `system/webhook/services.py`）。
 
+`WEBHOOK_URL_STRICT` 开启时（生产默认）：地址必须是 `https`，主机解析出的地址必须全是公网地址（内网、环回、链路本地、
+`100.64.0.0/10` 共享地址——含云元数据地址 `100.100.100.200`——、保留段、组播一律拒绝）。发送时再解析一次、逐个校验，
+只连校验过的 IP（不再做第二次 DNS 查询），TLS 的 SNI 与证书校验仍按原域名；webhook 不走环境变量里的代理。
+
 ### `goods.spec_updated`（按公司订阅）
 
 推给商品所属公司下**所有**「启用、配置了 `webhook_url`、且 `webhook_subscriptions` 含该事件」的 API Key；
@@ -282,13 +307,18 @@ payload 是当前值的完整快照（`null` = 未录入）：
   "goods_weight_kg": 0.235, "goods_length_mm": 120, "goods_width_mm": 80, "goods_height_mm": 45,
   "goods_origin_country": "CN",
   "changed_fields": ["goods_weight_kg", "goods_origin_country"],
-  "source": "station", "changed_at": "2026-01-01T10:00:00+09:00" }
+  "source": "station", "changed_at": "2026-01-01T10:00:00+09:00", "changed_at_ms": 1767229200123 }
 ```
+
+- **新旧判断**：`changed_at` 只到秒（格式不变）。`changed_at_ms`（整数，epoch 毫秒；同一 WMS 进程内严格递增，
+  在商品行写入之后取值）用来判断新旧：接收方按 `goods_id` 记住已应用的最大 `changed_at_ms`，小于或等于它的 payload 忽略。
+  事件可能乱序到达（重试、多个推送进程）。加这个字段之前排队的事件没有 `changed_at_ms`，按 `changed_at` 处理。
 
 - `source`：取商品新建 / 修改请求体里的 `spec_source`（`station` / `manual` / `import` / `api`）；
   没传时 API Key 调用为 `api`、登录用户为 `manual`；CSV 导入为 `import`。
-- 同一商品对同一 Key 还有待发送的事件时，新的变更覆盖它的 payload，不再新增
-  （`dedupe_key = goods:<id>`；`changed_fields` 取并集）；覆盖时失败计数与下次重试时间清零，新数据立即推送。
+- 同一商品对同一 Key 还有没推送过的待发送事件时，新的变更覆盖它的 payload，不再新增
+  （`dedupe_key = goods:<id>`；`changed_fields` 取并集）；已推送失败过的不覆盖，另建新事件（新的 `X-Webhook-Id`）接替、
+  旧的标 `superseded`；发送时发现同一商品已有更新的事件，当前这条也作废。
 - CSV 批量导入时订阅 Key 与待发送事件按公司各查一次，不随行数增长。
 - 请求头、签名、重试与其他事件相同。
 
@@ -334,7 +364,8 @@ Authorization: Bearer <token>
 | 仓库（`PUT /warehouse/warehouse/<id>`） | `address_en`、`country_code`、`contact_name_en`（与公司地址不同时印为 *Ship From*） |
 
 `country_code` 不合法 → 400 `14020`；文本超长 → 400 `14019`。接口输出不补默认值：库里为空就返回 `null`
-（单证上的出口国取仓库的、仓库为空取公司的，都为空报 `EXPORTER_PROFILE_INCOMPLETE`）。
+（单证上的出口国取仓库的、仓库为空取公司的，都为空报 `EXPORTER_PROFILE_INCOMPLETE`）。完整性检查与 CI 上的
+*Country of Export*、*Shipper / Exporter* 栏印的国家都用这个出口国。
 
 ### 报关快照
 
@@ -371,12 +402,15 @@ Authorization: Bearer <token>
 - 错误级问题：`NOT_PACKED`、`PACKAGES_MISSING`、`EXPORTER_PROFILE_INCOMPLETE`、
   `EXPORTER_NON_LATIN_TEXT`（发货人一侧印在单证上的文本含非拉丁字符：公司英文名 / 英文地址 / 联系人 / 签署人 / 税号 /
   电话 / 邮箱、Ship From 的仓库英文地址 / 联系人；`field` 指向要改的主数据字段，如 `company.export_signatory_name`、
-  `warehouse.address_en`、`warehouse.phone`）、`INCOTERM_MISSING`、
+  `warehouse.address_en`、`warehouse.phone`）、`CARRIER_NON_LATIN_TEXT`（印在 CI 上的承运商名——当前发货任务的承运商，
+  没有则 DN 的——含非拉丁字符，如「ヤマト運輸」：请在承运商主数据里改成英文名，`field: carrier.name`）、`INCOTERM_MISSING`、
   `EXPORT_REASON_MISSING`、`CURRENCY_INVALID`、`RECIPIENT_COUNTRY_MISSING`、`LINE_MISSING`、`HS_CODE_MISSING`
   （去掉 `.`、空格、`-` 后须为 6–10 位数字）、`DESCRIPTION_MISSING`、`DESCRIPTION_NOT_ASCII`、`ORIGIN_MISSING`、`UNIT_VALUE_MISSING`。
 - 警告（不拦截）：`RECIPIENT_TAX_ID_MISSING`、`NON_LATIN_TEXT`（收件人含非拉丁字符）、`NET_WEIGHT_UNKNOWN`、`GROSS_LT_NET`、
   `JP_EXPORT_CODE_MISMATCH`（`jp_export_code` 非 9 位数字或前 6 位与 HS 不一致）、
-  `JP_EXPORT_CODE_MISSING`（JPY 货值（FOB，不含运费 / 保险费）超过 200,000 且有行缺 `jp_export_code`）。
+  `JP_EXPORT_CODE_MISSING`（JPY 货值（FOB，不含运费 / 保险费）超过 200,000 且有行缺 `jp_export_code`）、
+  `JP_EXPORT_VALUE_UNVERIFIED`（币种不是 JPY、出口国为 `JP` 且有已打包的行缺 `jp_export_code`：不引入汇率，无法自动判断
+  是否超过 20 万円，请人工确认；每张 DN 一条，`field: jp_export_code`）。
 
 ### 箱子
 
@@ -395,6 +429,8 @@ DN 须为 `picked` 或 `packed`（否则 409 `16067`）。请求体 `{"packages"
 
 - 出单证条件：DN 为 `packed`、有报关快照、至少 1 箱、出口资料齐、没有错误级问题；否则 409 `16068`
   （`details.problems`）；不是海外单 409 `16070`。
+- 某块文字一页排不下（实际上是收件人各字段都很长，如每个约 240 个 CJK 字符）→ 409 `16117`
+  `details {document: "CI" | "PL", reason: "LAYOUT_OVERFLOW"}`，不签发也不作废旧单证；请缩短收件人信息后重新签发。
 - CI 与 PL 成对签发并存库（`dn_documents`），生成即定稿。数据未变再次签发 → 返回现有版本（200）；
   数据变了（含运单号 AWB）→ 旧版作废、版本 +1（201）。
 - 有进行中 / 有效 / 结果不明 / 取消中的自动运单时，当前单证就是随运单提交的那份：要签发的单证数据除 AWB 外有变化
@@ -690,9 +726,9 @@ stdout_logfile=/var/log/wms-api.out.log
 | 库存错误 | 15000-15999 | 400 | 库存相关错误 |
 | 状态错误 | 16000-16999 | 400 | 状态流转错误 |
 
-出口单证相关业务码：`14019` 出口资料文本超长、`14020` 国家代码不合法、`16063` 报关结构不合法、`16064` 报关行商品编码不在 DN 明细或重复、`16065` 已发货不可改（409）、`16066` 箱子数据不合法、`16067` 当前状态不能改箱子（409）、`16068` 单证条件不全（409，`details.problems`）、`16069` 发货前单证缺失或已过期（409，`details {missing_documents, outdated}`）、`16070` 不是海外单（409）、`16071` 单证不存在（404）。承运商运单（FedEx）：`16072` 建单前置条件不满足（409，`details.blockers`）、`16073` FedEx 返回错误（502，`details.errors` / `transaction_id`）、`16074` FedEx 超时（504）、`16075` 没有可取消 / 可确认作废的运单记录（409，`details.unresolved`）、`16076` 有进行中 / 有效 / 结果不明 / 取消中的运单时不能改箱子或报关数据，也不能签发数据有变化的单证（409，`details {reason: CARRIER_SHIPMENT_OPEN | DOCUMENT_DATA_CHANGED, status, carrier, carrier_shipment {id, status, tracking_number}}`）、`16077` `label_format` 不合法（400）、`16078` 运单号 / 承运商与有效的自动运单不一致，或有自动运单时新建 / 删除发货任务（409）、`16079` 有结果不明 / 进行中的建单记录，或运单正在取消 / 取消结果不明——不能建单、存运单号、发货（409，`details.unresolved`）、`16093` 取消 / 确认作废请求里的目标与当前记录不符（409，`details {expected, actual}`）、`16094` 确认作废带运单号的记录时 FedEx 没有确认已取消 / 不存在（409）、`16095` FedEx 已建好运单但 WMS 写库失败，已补偿处理（502，`details {error, compensation, unresolved, …}`）。完成发货：`16080` 运单号与当前 CI 上印的 AWB 不一致（409，`details {document_tracking_number, tracking_number}`）、`16092` 承运商与当前 CI 上印的不一致（409，`details {document_carrier, document_carrier_id, carrier_id}`）。发货任务：`16090` DN 已有未完成的发货任务（409，`details {delivery_task_id, status}`）、`16091` 海外 DN 不是当前发货任务（409，`details {delivery_task_id, current_status}`）。错误响应可能带结构化的 `details`。
+出口单证相关业务码：`14019` 出口资料文本超长、`14020` 国家代码不合法、`16063` 报关结构不合法、`16064` 报关行商品编码不在 DN 明细或重复、`16065` 已发货不可改（409）、`16066` 箱子数据不合法、`16067` 当前状态不能改箱子（409）、`16068` 单证条件不全（409，`details.problems`）、`16069` 发货前单证缺失或已过期（409，`details {missing_documents, outdated}`）、`16070` 不是海外单（409）、`16071` 单证不存在（404）、`16117` 单证排不下——某块文字（通常是收件人信息）一页放不下，请缩短（409，`details {document, reason: LAYOUT_OVERFLOW}`）。承运商运单（FedEx）：`16072` 建单前置条件不满足（409，`details.blockers`）、`16073` FedEx 返回错误（502，`details.errors` / `transaction_id`）、`16074` FedEx 超时（504）、`16075` 没有可取消 / 可确认作废的运单记录（409，`details.unresolved`）、`16076` 有进行中 / 有效 / 结果不明 / 取消中的运单时不能改箱子或报关数据，也不能签发数据有变化的单证（409，`details {reason: CARRIER_SHIPMENT_OPEN | DOCUMENT_DATA_CHANGED, status, carrier, carrier_shipment {id, status, tracking_number}}`）、`16077` `label_format` 不合法（400）、`16078` 运单号 / 承运商与有效的自动运单不一致，或有自动运单时新建 / 删除发货任务（409）、`16079` 有结果不明 / 进行中的建单记录，或运单正在取消 / 取消结果不明——不能建单、存运单号、发货（409，`details.unresolved`）、`16093` 取消 / 确认作废请求里的目标与当前记录不符（409，`details {expected, actual}`）、`16094` 确认作废带运单号的记录时 FedEx 没有确认已取消 / 不存在（409）、`16095` FedEx 已建好运单但 WMS 写库失败，已补偿处理（502，`details {error, compensation, unresolved, …}`）。完成发货：`16080` 运单号与当前 CI 上印的 AWB 不一致（409，`details {document_tracking_number, tracking_number}`）、`16092` 承运商与当前 CI 上印的不一致（409，`details {document_carrier, document_carrier_id, carrier_id}`）。发货任务：`16090` DN 已有未完成的发货任务（409，`details {delivery_task_id, status}`）、`16091` 海外 DN 不是当前发货任务（409，`details {delivery_task_id, current_status}`）。错误响应可能带结构化的 `details`。
 
-作业流程（见上文「作业流程规则」）：`16110` DN 有未结束的承运商运单，请先取消运单（409）、`16111` 调整单已取消（409）、`16112` 调整单当前状态不能取消（409）、`16113` 调整明细无法执行：库位上已没有该商品 / 明细没有库位（409）、`16114` 盘点单有未录入的明细（409，`details.detail_ids`）、`16115` 数值字段不合法（400，`field`）、`16116` 分拣任务的 ASN 不能改（409）、`44009` 库位有历史记录，请改用停用（409）。任务：`16088` 任务已停用（所属 DN / ASN 已取消，409）、`16089` 拣货一件都没拣不能完成（409）。
+作业流程（见上文「作业流程规则」）：`16110` DN 有未结束的承运商运单，请先取消运单（409）、`16111` 调整单已取消（409）、`16112` 调整单当前状态不能取消（409）、`16113` 调整明细无法执行：库位上已没有该商品 / 明细没有库位（409）、`16114` 盘点单有未录入的明细（409，`details.detail_ids`）、`16115` 数值字段不合法（400，`field`）、`16116` 分拣任务的 ASN 不能改（409）、`16120` 移库来源库位没有这个商品（404）、`16121` 同一个 `client_batch_id` 已提交过不同的明细（409，`details {client_batch_id, batch_id}`）、`16122` 修改过调整单明细的人不能审批（409）、`16123` `client_batch_id` 不合法（400）、`44009` 库位有历史记录，请改用停用（409）。任务：`16088` 任务已停用（所属 DN / ASN 已取消，409）、`16089` 拣货一件都没拣不能完成（409）。
 
 主数据与权限：`16100` 商品数值不合法（400）、`16101` CSV 内商品编码重复（400，带行号）、`16102` 数据值不合法（400）、`16103` 不能分配已停用的角色（400）、`16104` 只有公司管理员能新建 / 删除仓库或更换负责人（403）、`16105` 没有公司管理权限时只能管理绑定自己的 API Key（403）、`44004` 被单据或库存引用的主数据不能删除，请改用停用（409，`details {entity, id, references}`）、`44005` 与已有数据冲突（409）。
 

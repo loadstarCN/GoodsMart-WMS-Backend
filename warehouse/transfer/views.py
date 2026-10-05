@@ -73,7 +73,11 @@ class TransferRecordList(Resource):
             raise BadRequestException("The from_location_id and to_location_id cannot be the same", 14006)
 
         if not GoodsLocationService.is_goods_in_location(goods_id, from_location_id):
-            raise NotFoundException("Goods not found in the specified from_location", 14003)
+            # 16120：来源库位没有这个商品（14003 只表示缺仓库 id）
+            raise NotFoundException(
+                "Goods not found in the specified from_location", 16120,
+                details={'goods_id': goods_id, 'from_location_id': from_location_id},
+            )
 
         # 验证员工用户对指定商品的访问权限
         if not check_goods_access(goods_id):
@@ -129,7 +133,11 @@ class TransferRecordBulk(Resource):
                 raise BadRequestException("The from_location_id and to_location_id cannot be the same", 14006)
 
             if not GoodsLocationService.is_goods_in_location(goods_id, from_location_id):
-                raise NotFoundException("Goods not found in the specified from_location", 14003)
+                # 16120：来源库位没有这个商品（14003 只表示缺仓库 id）
+                raise NotFoundException(
+                    "Goods not found in the specified from_location", 16120,
+                    details={'goods_id': goods_id, 'from_location_id': from_location_id},
+                )
 
             # 验证对指定商品和库位的访问权限
             if not check_goods_access(goods_id):

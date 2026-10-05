@@ -34,6 +34,8 @@ from werkzeug.exceptions import HTTPException
 #             details {carrier, action: 'create', tracking_number, transaction_id, error: {code, message},
 #             compensation: {attempted, cancelled, cancel_transaction_id, error}, unresolved, maybe_processed}
 #             （unresolved 为 null = 已在 FedEx 取消；否则为带运单号的结果不明记录，需重试取消 / 确认作废）
+# 16117  409  单证排不下：某块文字比一页还高（实际是收件人各字段都很长，如各约 240 个 CJK 字符），reportlab LayoutError。
+#             不签发、不作废旧单证，请缩短收件人信息：details {document: 'CI' | 'PL', reason: 'LAYOUT_OVERFLOW'}
 #
 # 业务码登记（权限 / 平台 / 主数据）：
 # 16100  400  商品规格数值不合法：须为有限数；0 < weight ≤ 99999.999（kg，3 位小数）；
@@ -60,6 +62,12 @@ from werkzeug.exceptions import HTTPException
 # 16115  400  数值字段不合法（ASN 明细 weight / volume 须为 ≥ 0 的数；库位 width / depth / height / capacity 须 > 0；
 #             空串按 null 处理）：field = 字段名
 # 16116  409  分拣任务的 asn_id 不能改（会造成一张 ASN 两个分拣任务）：details {asn_id}
+# 16120  404  移库的来源库位没有这个商品：details {goods_id, from_location_id}（原 14003，14003 现在只表示缺仓库 id）
+# 16121  409  分拣 / 拣货 / 打包追加批次：同一任务下 client_batch_id 已用过、但明细（商品 / 数量，拣货另比库位）不同：
+#             details {client_batch_id, batch_id}。明细相同的重复提交不报错，200 返回已存在的批次
+# 16122  409  审批人最后增 / 改 / 删过这张调整单的明细，不能自己审批（职责分离）：details {adjustment_id, details_modified_by}
+#             （创建人审批仍是 403 16040）
+# 16123  400  client_batch_id 不合法：须为 1~64 个字符的字符串（field = client_batch_id）
 # 44009  409  库位有历史记录（上架 / 下架 / 移库 / 拣货 / 盘点 / 调整 / 库存快照）引用，不能删除（请改用停用）：
 #             details {entity: 'location', id, references: {记录类型: 行数}}
 

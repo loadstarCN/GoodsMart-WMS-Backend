@@ -10,4 +10,7 @@ from .validation import (
     require_positive_int, require_non_negative_int, require_bulk_list, require_fields, MAX_BULK_ITEMS,
     require_active_task, optional_number,
 )
-from .locks import lock_goods_location, lock_goods_locations_for_goods
+from .locks import (
+    lock_goods_location, lock_goods_locations_for_goods, lock_or_create_goods_location,
+    lock_goods_location_keys, lock_inventory_rows, lock_inventory_pairs, lock_order_key, lock_stock_for_bulk,
+)

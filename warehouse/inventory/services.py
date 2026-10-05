@@ -1,4 +1,5 @@
 from sqlalchemy import func, case
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import lazyload
 from extensions.db import *
 from extensions.error import BadRequestException, NotFoundException
@@ -149,6 +150,28 @@ class InventoryService:
         db.session.add(new_inventory)
         # db.session.commit()
         return new_inventory
+
+    @staticmethod
+    @transactional
+    def ensure_inventory(goods_id: int, warehouse_id: int) -> Inventory:
+        """取库存行，没有就新建（各库存量为 0）。
+
+        新建放在 savepoint 里（B-107）：同一新商品第一次被并发建 ASN / 正向调整时，后到的一方撞主键
+        (goods_id, warehouse_id) → 只回滚 savepoint 并重新读取对方已提交的行，不再 500。
+        PostgreSQL 上后到的 INSERT 会等先到的事务结束：对方提交 → 主键冲突走这里；对方回滚 → 本次插入成功。
+        """
+        inventory = db.session.get(Inventory, (goods_id, warehouse_id))
+        if inventory is not None:
+            return inventory
+        try:
+            with db.session.begin_nested():
+                inventory = InventoryService.create_inventory({'goods_id': goods_id, 'warehouse_id': warehouse_id})
+                db.session.flush()
+        except IntegrityError:
+            inventory = db.session.get(Inventory, (goods_id, warehouse_id))
+            if inventory is None:
+                raise
+        return inventory
 
     @staticmethod
     @transactional

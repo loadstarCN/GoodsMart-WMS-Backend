@@ -1,7 +1,11 @@
+import logging
+
 from flask_restx import Resource
 from system.common import permission_required
 from .schemas import api_ns, smtp_config_model, smtp_test_model
 from .services import SettingsService
+
+logger = logging.getLogger(__name__)
 
 
 @api_ns.doc(security="jsonWebToken")
@@ -41,5 +45,7 @@ class SmtpTestResource(Resource):
         try:
             SettingsService.send_test_email(to)
             return {'message': 'Test email sent successfully'}, 200
-        except Exception as e:
-            return {'message': f'Failed to send: {str(e)}'}, 400
+        except Exception:
+            # 异常原文（SMTP 服务器回应、内网主机名 / 端口、认证细节等）只写日志，不回给调用方
+            logger.exception('SMTP test email failed')
+            return {'message': 'Failed to send the test email; check the SMTP settings and the server log'}, 400

@@ -9,7 +9,7 @@ from extensions.error import (
 from extensions.transaction import transactional
 from warehouse.common import require_positive_int, require_bulk_list, require_fields, require_source_api_key
 from warehouse.inventory.services import InventoryService
-from warehouse.common.locks import lock_row
+from warehouse.common.locks import lock_row, lock_inventory_rows, lock_order_key
 
 from warehouse.goods.services import GoodsService
 from system.webhook.services import emit as webhook_emit
@@ -97,6 +97,12 @@ class DNService:
         return reserved
 
     @staticmethod
+    def _lock_inventories(dn: DN):
+        """多商品操作动库存前，按 goods_id 升序一次锁齐本单涉及的库存行（B-103，加锁顺序见 common/locks.py）。
+        之后逐行的 InventoryService._get_for_update 只是重入已持有的锁"""
+        lock_inventory_rows([d.goods_id for d in dn.details], dn.warehouse_id)
+
+    @staticmethod
     def _assert_dn_stock_available(warehouse_id: int, requested_by_goods: dict, dn: DN | None = None):
         """校验各商品「本 DN 变更后的计划总量」不超过可用量。
 
@@ -105,7 +111,8 @@ class DNService:
         create / create_detail / update_detail / sync 四处复用。
         """
         own = DNService._own_reserved_by_goods(dn)
-        for goods_id, quantity in requested_by_goods.items():
+        # 按 goods_id 升序逐行加锁（B-103）：两个请求商品顺序相反时不再互相等待（PG 死锁 → 500）
+        for goods_id, quantity in sorted(requested_by_goods.items(), key=lambda item: lock_order_key(item[0])):
             inventory = InventoryService._get_for_update(goods_id, warehouse_id)
             available = (
                 inventory.onhand_stock
@@ -558,7 +565,8 @@ class DNService:
         if dn.status != 'pending':
             raise BadRequestException("Cannot delete a non-pending DN", 16002)
 
-        goods_ids = [detail.goods_id for detail in dn.details]
+        # 按 goods_id 升序逐个加锁重算（B-103）
+        goods_ids = sorted({detail.goods_id for detail in dn.details}, key=lock_order_key)
         warehouse_id = dn.warehouse_id
 
         db.session.delete(dn)
@@ -576,6 +584,7 @@ class DNService:
         将指定的 DN 标记为非活动状态（is_active=False）。
         """
         dn = lock_row(DNService._get_instance(dn_or_id))
+        DNService._lock_inventories(dn)
         dn.is_active = False
         db.session.add(dn)
         db.session.flush()
@@ -669,6 +678,8 @@ class DNService:
                 raise BadRequestException(f"Duplicate goods_id: {goods_id}", 16025)
             DNService.assert_company_master_data(company_id, goods_ids=[goods_id])
 
+        # 换商品时新旧两个商品的库存行都要动：先按 goods_id 升序一起锁上（B-103）
+        lock_inventory_rows({goods_id, detail.goods_id}, dn.warehouse_id)
         # 本 DN 变更后该商品的计划总量（同商品其它行 + 本行新量）
         other_total = sum(
             (d.quantity or 0) for d in dn.details
@@ -745,6 +756,8 @@ class DNService:
             resolved.append((item.get('id'), goods_id, quantity, item.get('remark', '')))
 
         DNService.assert_company_master_data(company_id, goods_ids=requested_by_goods.keys())
+        # 新旧明细涉及的全部商品先按 goods_id 升序一起锁上，之后的校验 / 重算只是重入（B-103）
+        lock_inventory_rows(set(touched_goods_ids) | set(requested_by_goods), dn.warehouse_id)
         DNService._assert_dn_stock_available(dn.warehouse_id, requested_by_goods, dn)
 
         new_detail_ids = set()
@@ -780,7 +793,7 @@ class DNService:
         db.session.expire(dn, ['details'])
 
         # 涉及到的商品（新增 / 更新 / 删除 / 换货前后）统一重算预占
-        for goods_id in touched_goods_ids:
+        for goods_id in sorted(touched_goods_ids, key=lock_order_key):
             InventoryService.update_and_calculate_dn_stock(goods_id, dn.warehouse_id)
 
         return dn.details
@@ -798,6 +811,8 @@ class DNService:
 
         # Revalidate just before work starts. Stock may have changed since the
         # DN was created, especially for old integrations that over-reserved.
+        # 先按 goods_id 升序锁齐库存行（B-103），再逐行复核
+        DNService._lock_inventories(dn)
         for detail in dn.details:
             inventory = InventoryService._get_for_update(
                 detail.goods_id, dn.warehouse_id
@@ -834,6 +849,7 @@ class DNService:
         dn = lock_row(DNService._get_instance(dn_or_id))
         if dn.status != 'in_progress':
             raise BadRequestException("Cannot pick a DN that is not in 'in_progress' status.", 16000)
+        DNService._lock_inventories(dn)
 
         dn = DNService._update_dn_status(dn, "picked")
         DNService._update_and_calculate_quantity(dn_or_id)
@@ -860,6 +876,7 @@ class DNService:
         dn = lock_row(DNService._get_instance(dn_or_id))
         if dn.status != 'picked':
             raise BadRequestException("Cannot pack a DN that is not in 'picked' status.", 16000)
+        DNService._lock_inventories(dn)
 
         dn = DNService._update_dn_status(dn, "packed")
         DNService._update_and_calculate_quantity(dn_or_id)
@@ -887,6 +904,7 @@ class DNService:
         dn = lock_row(DNService._get_instance(dn_or_id))
         if dn.status != 'packed':
             raise BadRequestException("Cannot ship a DN that is not in 'packed' status.", 16000)
+        DNService._lock_inventories(dn)
 
         dn = DNService._update_dn_status(dn, "delivered")
         DNService._update_and_calculate_quantity(dn_or_id)
@@ -941,6 +959,7 @@ class DNService:
         dn = lock_row(DNService._get_instance(dn_or_id))
         if dn.status != 'delivered':
             raise BadRequestException("Cannot complete a DN that is not in 'delivered' status.", 16000)
+        DNService._lock_inventories(dn)
 
         dn = DNService._update_dn_status(dn, "completed")
         DNService._update_and_calculate_quantity(dn_or_id)
@@ -977,6 +996,7 @@ class DNService:
         # 判断是否为pending状态
         if dn.status != 'pending':
             raise BadRequestException("Cannot close a DN that is not in 'pending' status.", 16022)
+        DNService._lock_inventories(dn)
 
         dn = DNService._update_dn_status(dn, "closed")
 
@@ -1044,6 +1064,7 @@ class DNService:
             task.is_active = False
             db.session.add(task)
 
+        DNService._lock_inventories(dn)
         dn = DNService._update_dn_status(dn, "closed")
         for detail in dn.details:
             InventoryService.update_and_calculate_dn_stock(detail.goods_id, dn.warehouse_id)
@@ -1095,6 +1116,7 @@ class DNService:
         if any(task.status in ('completed', 'signed') for task in delivery_tasks):
             raise ConflictException("Cannot cancel a DN that has already been shipped.", 16052)
 
+        DNService._lock_inventories(dn)
         for detail in dn.details:
             if dn.status == 'picked':
                 InventoryService.dn_cancelled_after_picking(

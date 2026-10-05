@@ -53,7 +53,13 @@ source venv/bin/activate  # Linux/Mac
 venv\Scripts\activate     # Windows
 
 pip install -r requirements.txt
+# for running the tests (pytest, fakeredis, …) install the dev requirements instead:
+pip install -r requirements-dev.txt
 ```
+
+Production installs `requirements.txt` only; test / development tools live in `requirements-dev.txt`
+(it starts with `-r requirements.txt`). Run the tests with `./run_tests.sh` (or `python -m pytest tests/`);
+the script stops with a hint when the dev requirements are missing.
 
 ### 3. Configuration
 
@@ -84,6 +90,13 @@ OSS_ENDPOINT=oss-your-region.aliyuncs.com
 OSS_BUCKET_NAME=your-bucket
 OSS_HOST=https://your-bucket.oss-your-region.aliyuncs.com
 ```
+
+Boolean switches (`DEBUG`, `WEBHOOK_URL_STRICT`, `RATELIMIT_ENABLED`, `SCHEDULER_ENABLED`, `CHECK_WHITELIST`,
+`CHECK_BLACKLIST`, `FEDEX_ETD_ENABLED`) are parsed the same way: case-insensitive, `1` / `true` / `yes` / `on` mean
+true, anything else false (an unrecognised value is logged at startup). With `FLASK_ENV=production` the app refuses to
+start without a strong `JWT_SECRET_KEY`, a non-SQLite database and a valid `SETTINGS_ENCRYPTION_KEY` (Fernet key; to keep
+secrets stored before, use the value of `system_settings._encryption_key`); `WEBHOOK_URL_STRICT` defaults to true.
+Without `FLASK_ENV` the development configuration is used; if the database is not SQLite a prominent warning is logged.
 
 ### 4. Database Setup
 
@@ -205,6 +218,22 @@ GoodsMart-WMS-Backend/
   progress → picking; picking completed → packing; packing completed → delivery). There is no endpoint to create one by
   hand: `POST /warehouse/sorting/`, `/picking/`, `/packing/`, `/delivery/` → 405.
 - Deleting a sorting / picking / packing batch (task `in_progress`) also deletes the details in it.
+- Adding a batch (`POST /warehouse/sorting|picking|packing/<task_id>/batches/`) accepts an optional `client_batch_id`
+  (a string of 1-64 characters; the client generates one per submission and sends it again unchanged when retrying
+  after a network error / timeout). The first submission creates the batch (201). Submitting the same
+  `client_batch_id` again for the same task with the same details (goods and quantities, plus the location for picking;
+  order does not matter; remark and operation time are not compared) creates nothing and returns the existing batch
+  with 200 (same body as 201); different details → 409 `16121` `details {client_batch_id, batch_id}`; a malformed id →
+  400 `16123`. Without `client_batch_id` nothing changes. The comparison uses the batch's current details: if they were
+  edited / deleted after the batch was created, replaying the original content is also `16121`; if the batch was
+  deleted, a replay creates it again.
+- Adjustment separation of duties: the creator cannot approve (403 `16040`); the user who last added / changed /
+  deleted a detail (`details_modified_by`) cannot approve either → 409 `16122`.
+- Transfer: the goods is not in the source location → 404 `16120` (it used to share `14003` with "missing warehouse id").
+- Documents and bulk operations touching several goods / locations lock rows in one order (inventory rows by goods_id,
+  then goods-location rows by goods_id, location_id), so two requests with the goods in opposite order no longer
+  deadlock; creating the inventory row of a new goods (concurrent ASNs) or the first stock of a goods in a location
+  (concurrent putaway / transfer) no longer fails with 500.
 - Cancelling a DN (`PUT /warehouse/dn/<id>/cancel/`): `pending` = close; `in_progress` only while picking has not
   started (else 409 `16053`); `picked` / `packed` (not shipped) can be cancelled — the picked / packed goods go back to
   `sorted_stock` to be put away (`total_stock` unchanged), the picking / packing / delivery tasks are deactivated and
@@ -275,6 +304,12 @@ Events are POSTed as JSON with headers:
 
 Failed deliveries are retried every 30 minutes, up to 10 attempts (`system/webhook/services.py`).
 
+With `WEBHOOK_URL_STRICT` (the default in production) the URL must be `https` and its host must resolve only to public
+addresses (private, loopback, link-local, shared `100.64.0.0/10` — including the cloud metadata address
+`100.100.100.200` — reserved and multicast ranges are rejected). At send time the host is resolved again, every
+address is checked and the connection goes to a checked IP (no second DNS lookup); TLS SNI and certificate
+verification still use the host name. Proxies from environment variables are not used for webhooks.
+
 ### `goods.spec_updated` (company-wide subscription)
 
 Sent to **every** API Key of the goods' company that is active, has a `webhook_url`, and lists the
@@ -295,14 +330,21 @@ weight, length, width, height or origin country. The payload is a full snapshot 
   "goods_weight_kg": 0.235, "goods_length_mm": 120, "goods_width_mm": 80, "goods_height_mm": 45,
   "goods_origin_country": "CN",
   "changed_fields": ["goods_weight_kg", "goods_origin_country"],
-  "source": "station", "changed_at": "2026-01-01T10:00:00+09:00" }
+  "source": "station", "changed_at": "2026-01-01T10:00:00+09:00", "changed_at_ms": 1767229200123 }
 ```
+
+- **Ordering**: `changed_at` has second precision (format unchanged). `changed_at_ms` (integer, epoch milliseconds,
+  strictly increasing per WMS process and taken after the goods row is written) tells which change is newer: keep the
+  largest `changed_at_ms` applied per `goods_id` and ignore payloads with a smaller or equal value. Events can arrive
+  out of order (retries, several push processes). Events queued before this field existed have no `changed_at_ms` —
+  fall back to `changed_at` for them.
 
 - `source`: `spec_source` from the goods create/update request body (`station` / `manual` / `import` / `api`);
   otherwise `api` for API Key calls and `manual` for logged-in users. CSV import uses `import`.
-- While an event for the same goods is still pending for a key, a newer change overwrites its payload
-  instead of queueing another one (`dedupe_key = goods:<id>`; `changed_fields` becomes the union). Overwriting
-  resets the attempt counter and the next retry time, so the new data is pushed right away.
+- While an event for the same goods is still pending for a key and has not been sent yet, a newer change overwrites
+  its payload instead of queueing another one (`dedupe_key = goods:<id>`; `changed_fields` becomes the union). If it
+  was already attempted, a new event (new `X-Webhook-Id`) replaces it and the old one is marked `superseded`; an event
+  is also superseded when a newer one for the same goods exists at send time.
 - A CSV import looks up the subscribed keys and the pending events once per company, not once per row.
 - Headers, signatures and retries are the same as for the other events.
 
@@ -353,7 +395,8 @@ All exporter data comes from the WMS company / warehouse settings — nothing is
 
 Invalid `country_code` → 400 `14020`; text longer than the column → 400 `14019`. Responses do not fill in a
 default: an empty country is returned as `null` (the documents use the warehouse country, then the company
-country; neither set → `EXPORTER_PROFILE_INCOMPLETE`).
+country; neither set → `EXPORTER_PROFILE_INCOMPLETE`). This *export country* is both what the completeness check
+looks at and what the CI prints as *Country of Export* and in the *Shipper / Exporter* block.
 
 ### Customs snapshot
 
@@ -410,13 +453,17 @@ with `invoice_total = goods_value + freight + insurance` (`insurance` is 0 when 
 | `PACKAGES_MISSING` | No packages recorded |
 | `EXPORTER_PROFILE_INCOMPLETE` | Company `legal_name_en` / `address_en` / phone (warehouse or company) / country missing |
 | `EXPORTER_NON_LATIN_TEXT` | Exporter text printed on the documents contains non-Latin characters (company English name / address / contact / signatory / tax ID / phone / email, *Ship From* warehouse address / contact); `field` names the master-data field to fix, e.g. `company.export_signatory_name`, `warehouse.address_en`, `warehouse.phone` |
+| `CARRIER_NON_LATIN_TEXT` | The carrier name printed on the CI (carrier of the current delivery task, else of the DN) contains non-Latin characters, e.g. `ヤマト運輸`; rename the carrier in English (`field: carrier.name`) |
 | `INCOTERM_MISSING`, `EXPORT_REASON_MISSING`, `CURRENCY_INVALID`, `RECIPIENT_COUNTRY_MISSING` | Header data missing |
 | `LINE_MISSING`, `HS_CODE_MISSING`, `DESCRIPTION_MISSING`, `DESCRIPTION_NOT_ASCII`, `ORIGIN_MISSING`, `UNIT_VALUE_MISSING` | Per packed line (HS code: 6–10 digits after removing `.`, spaces and `-`) |
 
 Warnings (do not block): `RECIPIENT_TAX_ID_MISSING`, `NON_LATIN_TEXT` (consignee text with non-Latin characters),
 `NET_WEIGHT_UNKNOWN`, `GROSS_LT_NET`,
 `JP_EXPORT_CODE_MISMATCH` (`jp_export_code` not 9 digits or its first 6 digits differ from the HS code),
-`JP_EXPORT_CODE_MISSING` (JPY goods value — FOB, without freight and insurance — above 200,000 and a line has no `jp_export_code`).
+`JP_EXPORT_CODE_MISSING` (JPY goods value — FOB, without freight and insurance — above 200,000 and a line has no `jp_export_code`),
+`JP_EXPORT_VALUE_UNVERIFIED` (currency other than JPY, export country `JP`, and a packed line has no `jp_export_code`:
+without exchange rates the 200,000 JPY threshold cannot be checked automatically — confirm manually; one warning per DN,
+`field: jp_export_code`).
 
 ### Packages
 
@@ -442,6 +489,9 @@ the issued documents (`void_reason: packages_changed`).
 
 - `issue` requires: DN `packed`, customs snapshot, at least one package, complete exporter profile and no
   error-level problems (otherwise 409 `16068` with `details.problems`; not an export DN → 409 `16070`).
+- A text block that does not fit on one page (in practice: every consignee field very long, e.g. ~240 CJK
+  characters each) → 409 `16117` `details {document: "CI" | "PL", reason: "LAYOUT_OVERFLOW"}`; nothing is issued
+  or voided. Shorten the consignee / recipient information and issue again.
 - The CI and PL are issued together and stored in the database (`dn_documents`), final once generated.
   Issuing again with unchanged data returns the current version (200); if the data changed (including the
   AWB / tracking number) the old version is voided and a new version is issued (201).
@@ -806,9 +856,9 @@ stdout_logfile=/var/log/wms-api.out.log
 | Inventory | 15000-15999 | 400 | Stock-related errors |
 | State | 16000-16999 | 400 | State transition errors |
 
-Business codes of the export-document features: `14019` export profile text too long, `14020` invalid country code, `16063` customs structure invalid, `16064` customs line goods code not in the DN / duplicated, `16065` shipped — customs data / packages / documents locked (409), `16066` invalid packages, `16067` packages cannot be edited in the current DN status (409), `16068` documents cannot be issued yet (409, `details.problems`), `16069` documents missing or out of date before shipping (409, `details {missing_documents, outdated}`), `16070` not an export DN (409), `16071` document not found (404). Carrier shipments (FedEx): `16072` preconditions not met (409, `details.blockers`), `16073` FedEx returned an error (502, `details.errors` / `transaction_id`), `16074` FedEx timed out (504), `16075` no carrier shipment to cancel / dismiss (409, `details.unresolved`), `16076` packages / customs data cannot be changed, or documents with different data cannot be issued, while a carrier shipment is pending, active, unclear or being cancelled (409, `details {reason: CARRIER_SHIPMENT_OPEN | DOCUMENT_DATA_CHANGED, status, carrier, carrier_shipment {id, status, tracking_number}}`), `16077` invalid `label_format` (400), `16078` tracking number / carrier differs from the active carrier shipment, or a delivery task is added / deleted while a carrier shipment exists (409), `16079` a carrier shipment request is pending or its result is unclear, or the shipment is being cancelled / the cancellation is unclear — no new shipment, tracking number or shipping (409, `details.unresolved`), `16093` the shipment / record named in a cancel / dismiss request is not the current one (409, `details {expected, actual}`), `16094` dismissing a record with a tracking number: FedEx did not confirm it is cancelled / not found (409), `16095` FedEx created the shipment but saving it in WMS failed; compensated (502, `details {error, compensation, unresolved, …}`). Delivery completion: `16080` tracking number differs from the AWB printed on the current CI (409, `details {document_tracking_number, tracking_number}`), `16092` carrier differs from the one printed on the current CI (409, `details {document_carrier, document_carrier_id, carrier_id}`). Delivery tasks: `16090` the DN already has an unfinished delivery task (409, `details {delivery_task_id, status}`), `16091` export DN — not the current delivery task (409, `details {delivery_task_id, current_status}`). Errors may carry a structured `details` object.
+Business codes of the export-document features: `14019` export profile text too long, `14020` invalid country code, `16063` customs structure invalid, `16064` customs line goods code not in the DN / duplicated, `16065` shipped — customs data / packages / documents locked (409), `16066` invalid packages, `16067` packages cannot be edited in the current DN status (409), `16068` documents cannot be issued yet (409, `details.problems`), `16069` documents missing or out of date before shipping (409, `details {missing_documents, outdated}`), `16070` not an export DN (409), `16071` document not found (404), `16117` documents cannot be laid out — a text block (usually the consignee) is too long for one page; shorten it (409, `details {document, reason: LAYOUT_OVERFLOW}`). Carrier shipments (FedEx): `16072` preconditions not met (409, `details.blockers`), `16073` FedEx returned an error (502, `details.errors` / `transaction_id`), `16074` FedEx timed out (504), `16075` no carrier shipment to cancel / dismiss (409, `details.unresolved`), `16076` packages / customs data cannot be changed, or documents with different data cannot be issued, while a carrier shipment is pending, active, unclear or being cancelled (409, `details {reason: CARRIER_SHIPMENT_OPEN | DOCUMENT_DATA_CHANGED, status, carrier, carrier_shipment {id, status, tracking_number}}`), `16077` invalid `label_format` (400), `16078` tracking number / carrier differs from the active carrier shipment, or a delivery task is added / deleted while a carrier shipment exists (409), `16079` a carrier shipment request is pending or its result is unclear, or the shipment is being cancelled / the cancellation is unclear — no new shipment, tracking number or shipping (409, `details.unresolved`), `16093` the shipment / record named in a cancel / dismiss request is not the current one (409, `details {expected, actual}`), `16094` dismissing a record with a tracking number: FedEx did not confirm it is cancelled / not found (409), `16095` FedEx created the shipment but saving it in WMS failed; compensated (502, `details {error, compensation, unresolved, …}`). Delivery completion: `16080` tracking number differs from the AWB printed on the current CI (409, `details {document_tracking_number, tracking_number}`), `16092` carrier differs from the one printed on the current CI (409, `details {document_carrier, document_carrier_id, carrier_id}`). Delivery tasks: `16090` the DN already has an unfinished delivery task (409, `details {delivery_task_id, status}`), `16091` export DN — not the current delivery task (409, `details {delivery_task_id, current_status}`). Errors may carry a structured `details` object.
 
-Process rules (see "Process rules" above): `16110` DN has an unfinished carrier shipment — cancel it first (409), `16111` adjustment cancelled (409), `16112` adjustment cannot be cancelled in its status (409), `16113` adjustment line cannot be applied — the location no longer holds the goods / no location (409), `16114` cycle count has uncounted details (409, `details.detail_ids`), `16115` invalid numeric field (400, `field`), `16116` the ASN of a sorting task cannot be changed (409), `44009` location has history records — deactivate it instead (409). Tasks: `16088` the task is deactivated (its DN / ASN was cancelled, 409), `16089` a picking task with nothing picked cannot be completed (409).
+Process rules (see "Process rules" above): `16110` DN has an unfinished carrier shipment — cancel it first (409), `16111` adjustment cancelled (409), `16112` adjustment cannot be cancelled in its status (409), `16113` adjustment line cannot be applied — the location no longer holds the goods / no location (409), `16114` cycle count has uncounted details (409, `details.detail_ids`), `16115` invalid numeric field (400, `field`), `16116` the ASN of a sorting task cannot be changed (409), `16120` transfer: the goods is not in the source location (404), `16121` the same `client_batch_id` was already submitted with different details (409, `details {client_batch_id, batch_id}`), `16122` the user who changed the adjustment details cannot approve it (409), `16123` invalid `client_batch_id` (400), `44009` location has history records — deactivate it instead (409). Tasks: `16088` the task is deactivated (its DN / ASN was cancelled, 409), `16089` a picking task with nothing picked cannot be completed (409).
 
 Master data and permissions: `16100` invalid goods value (400), `16101` duplicate goods code in the CSV (400, with row numbers), `16102` invalid data value (400), `16103` inactive roles cannot be assigned (400), `16104` only company administrators can create / delete warehouses or change the manager (403), `16105` without company_all_access only API keys bound to yourself can be managed (403), `44004` master data referenced by documents or stock cannot be deleted — deactivate it instead (409, `details {entity, id, references}`), `44005` conflicts with existing data (409).
 

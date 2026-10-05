@@ -2,8 +2,10 @@ from datetime import datetime
 from extensions.db import *
 from extensions.error import BadRequestException, ConflictException, ForbiddenException, NotFoundException
 from extensions.transaction import transactional
-from warehouse.common import lock_goods_location, require_fields, require_non_negative_int, require_company_goods
-from warehouse.common.locks import lock_row
+from warehouse.common import require_fields, require_non_negative_int, require_company_goods
+from warehouse.common.locks import (
+    lock_row, lock_goods_location, lock_or_create_goods_location, lock_inventory_rows, lock_order_key,
+)
 from warehouse.cyclecount.services import CycleCountTaskService
 from warehouse.inventory.services import InventoryService
 from .models import Adjustment, AdjustmentDetail
@@ -246,6 +248,8 @@ class AdjustmentService:
             remark=data.get('remark')
         )
         db.session.add(new_detail)
+        # 记录最后改明细的人：审批人不能是他（B-105）
+        adjustment.details_modified_by = created_by_id
         db.session.flush()  # 确保新创建的 AdjustmentDetail ID 可用
         # db.session.commit()
         return new_detail
@@ -262,13 +266,15 @@ class AdjustmentService:
 
     @staticmethod
     @transactional
-    def update_adjustment_detail(adjustment_id: int, detail_id: int, data: dict) -> AdjustmentDetail:
+    def update_adjustment_detail(adjustment_id: int, detail_id: int, data: dict,
+                                 operator_id: int | None = None) -> AdjustmentDetail:
         """
         更新指定 AdjustmentDetail
 
         :param adjustment_id: Adjustment 的 ID
         :param detail_id: AdjustmentDetail 的 ID
         :param data: 要更新的字段
+        :param operator_id: 修改人；记到 adjustments.details_modified_by，之后他不能审批这张单（B-105）
         :return: 更新后的 AdjustmentDetail 对象
         """
         detail = AdjustmentService.get_adjustment_detail(adjustment_id, detail_id)
@@ -286,21 +292,26 @@ class AdjustmentService:
         detail.actual_quantity = actual_quantity
         detail.adjustment_quantity = adjustment_quantity
         detail.remark = data.get('remark', detail.remark)
+        if operator_id is not None:
+            detail.adjustment.details_modified_by = operator_id
 
         # db.session.commit()
         return detail
 
     @staticmethod
     @transactional
-    def delete_adjustment_detail(adjustment_id: int, detail_id: int):
+    def delete_adjustment_detail(adjustment_id: int, detail_id: int, operator_id: int | None = None):
         """
         删除指定的 AdjustmentDetail（仅 pending 的调整单）
+        operator_id：删除人，记到 adjustments.details_modified_by（B-105）
         """
         detail = AdjustmentService.get_adjustment_detail(adjustment_id, detail_id)
         # 先锁调整单、再锁明细行（与审批 / 完成串行），再按最新状态检查是否可改
         lock_row(detail.adjustment)
         detail = lock_row(detail)
         AdjustmentService._assert_details_editable(detail.adjustment)
+        if operator_id is not None:
+            detail.adjustment.details_modified_by = operator_id
         db.session.delete(detail)
         # db.session.commit()
 
@@ -339,6 +350,12 @@ class AdjustmentService:
         # 职责分离：创建人不能审批自己的调整单
         if adjustment.created_by == operator_id:
             raise ForbiddenException("The creator of an Adjustment cannot approve it", 16040)
+        # 最后增 / 改 / 删明细的人也不能审批（否则可以先改别人建的单再自己审批，B-105）→ 409 16122
+        if adjustment.details_modified_by is not None and adjustment.details_modified_by == operator_id:
+            raise ConflictException(
+                "You modified the details of this Adjustment; another user must approve it.", 16122,
+                details={'adjustment_id': adjustment.id, 'details_modified_by': adjustment.details_modified_by}
+            )
 
         return AdjustmentService._update_adjustment_status(adjustment, 'approved',operator_id)
 
@@ -360,9 +377,12 @@ class AdjustmentService:
 
         adjustment = AdjustmentService._update_adjustment_status(adjustment, 'completed',operator_id)
 
-        # 修改库位信息（FOR UPDATE 读取，避免多 worker 并发下丢更新）
+        # 加锁顺序（B-103，见 common/locks.py）：先按 goods_id 升序锁齐要动的库存行，
+        # 再按 (goods_id, location_id) 升序逐行锁库位库存行（FOR UPDATE 读取，避免多 worker 并发下丢更新）
+        changed = [d for d in adjustment.details if (d.adjustment_quantity or 0) != 0]
+        lock_inventory_rows([d.goods_id for d in changed], adjustment.warehouse_id)
         touched_goods_ids = []
-        for detail in adjustment.details:
+        for detail in sorted(adjustment.details, key=lambda d: lock_order_key(d.goods_id, d.location_id)):
             delta = detail.adjustment_quantity or 0
             if delta == 0:
                 continue
@@ -379,8 +399,8 @@ class AdjustmentService:
                 db.session.add(goods_location_record)
             db.session.flush()
 
-        # 更新库存（只重算动过库位库存的商品）
-        for goods_id in touched_goods_ids:
+        # 更新库存（只重算动过库位库存的商品；库存行上面已锁，这里只是重入）
+        for goods_id in sorted(touched_goods_ids, key=lock_order_key):
             InventoryService.update_and_calculate_stock(goods_id, adjustment.warehouse_id)
 
         return adjustment
@@ -388,8 +408,6 @@ class AdjustmentService:
     @staticmethod
     def _lock_or_create_goods_location(adjustment: Adjustment, detail: AdjustmentDetail):
         """完成调整时取明细对应的库位库存行（FOR UPDATE）；正向调整且不存在时在锁下新建（quantity 先记 0）"""
-        from warehouse.goods.models import GoodsLocation
-        from warehouse.inventory.models import Inventory
         from warehouse.location.models import Location
         from warehouse.location.services import LocationService
 
@@ -415,12 +433,9 @@ class AdjustmentService:
         # 正向：与上架相同，先给库位行加共享锁再判断启用状态（与并发的停用串行），再在锁下新建库位库存行
         LocationService.require_active_location(
             lock_row(get_object_or_404(Location, detail.location_id), shared=True))
-        record = lock_goods_location(detail.goods_id, detail.location_id)
-        if record is None:
-            if db.session.get(Inventory, (detail.goods_id, adjustment.warehouse_id)) is None:
-                InventoryService.create_inventory({'goods_id': detail.goods_id, 'warehouse_id': adjustment.warehouse_id})
-            record = GoodsLocation(goods_id=detail.goods_id, location_id=detail.location_id, quantity=0)
-            db.session.add(record)
+        # 该商品在仓库还没有库存行时先建（savepoint 兜底并发首次创建，B-107），再在锁下取 / 建库位库存行
+        InventoryService.ensure_inventory(detail.goods_id, adjustment.warehouse_id)
+        record, _ = lock_or_create_goods_location(detail.goods_id, detail.location_id)
         return record
 
     @staticmethod

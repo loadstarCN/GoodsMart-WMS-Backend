@@ -2,7 +2,10 @@ from sqlalchemy import or_
 from extensions.db import *
 from extensions.error import BadRequestException, NotFoundException
 from extensions.transaction import transactional
-from warehouse.common import require_positive_int, require_bulk_list, require_fields, lock_goods_location
+from warehouse.common import (
+    require_positive_int, require_bulk_list, require_fields, lock_goods_location, lock_inventory_rows,
+    lock_stock_for_bulk,
+)
 from warehouse.goods.models import Goods
 from warehouse.inventory.services import InventoryService
 from warehouse.location.models import Location
@@ -112,6 +115,8 @@ class RemovalService:
         quantity = require_positive_int(data['quantity'], 'quantity')
         location = get_object_or_404(Location, location_id)
 
+        # 加锁顺序（B-103）：库存行先于库位库存行
+        lock_inventory_rows([goods_id], location.warehouse_id)
         # 持锁读取商品库位记录：找不到 404，库存不足 400，读改写期间其它事务不能插进来
         goods_location_record = lock_goods_location(goods_id, location_id)
         if goods_location_record is None:
@@ -165,6 +170,10 @@ class RemovalService:
         :return: 创建成功的 RemovalRecord 实例列表
         """
         require_bulk_list(data_list, 'records')
+        # 逐条处理前按统一顺序锁齐全部库存行与库位库存行（B-103）：两批商品 / 库位顺序相反时不再互相等待
+        lock_stock_for_bulk(
+            (data.get('goods_id'), data.get('location_id')) for data in data_list if isinstance(data, dict)
+        )
         new_records = []
         for data in data_list:
             new_record = RemovalService.create_removal_record(data, created_by_id)

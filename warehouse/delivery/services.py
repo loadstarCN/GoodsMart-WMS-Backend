@@ -703,9 +703,6 @@ class DeliveryTaskService:
 
         # 动态添加仓库过滤条件
         if filters:
-            if filters.get('sorting_type'):
-                query = query.filter(DeliveryTask.sorting_type == filters['sorting_type'])
-
             if filters.get('warehouse_id') or filters.get('warehouse_ids'):
                 query = query.join(DN, DeliveryTask.dn_id == DN.id)
 

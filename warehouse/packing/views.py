@@ -212,14 +212,16 @@ class PackingBatchList(Resource):
         - 如果传入 data['details']，则同时批量创建 PackingTaskDetail
         - 商品必须在 DN 明细内，累计打包量不得超过已拣量
         - 要求对应的 PackingTask 必须是 in_progress 状态
+        - 可选 client_batch_id（1~64 字符）：同一任务下重复提交同一个 id 且明细相同 → 200 返回已存在的批次，
+          明细不同 → 409 16121
         """
         data = api_ns.payload or {}
         operator_id = require_actor_user_id()
 
         task = _owned_task(task_id)
-        new_batch = PackingTaskService.create_batch(task, data, operator_id)
+        batch, created = PackingTaskService.submit_batch(task, data, operator_id)
 
-        return new_batch, 201
+        return batch, 201 if created else 200
 
 
 @api_ns.doc(security="jsonWebToken")

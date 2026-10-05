@@ -6,7 +6,7 @@ from warehouse.goods.schemas import goods_simple_model as goods_model
 from warehouse.carrier.schemas import carrier_simple_model,carrier_model
 from warehouse.recipient.schemas import recipient_base_model,recipient_model
 from warehouse.warehouse.schemas import warehouse_simple_model,warehouse_model
-from .models import DN, DNDocument
+from .models import DN, DNDocument, _user_ref
 
 # 定义 DN 命名空间（类似于 ASN 的 api_ns）
 api_ns = Namespace('dn', description='Delivery Note (DN) related operations', authorizations=authorizations)
@@ -70,6 +70,9 @@ dn_document_meta_model = api_ns.model('DNCustomsDocument', {
         description='YYYY-MM-DD (DOCUMENT_TIMEZONE)'),
     'issued_at': fields.DateTime(),
     'issued_by': fields.Integer(description='User ID of the issuer'),
+    'issued_by_user': fields.Raw(
+        attribute=lambda x: _user_ref(x.get('issued_by') if isinstance(x, dict) else getattr(x, 'issued_by', None)),
+        description='{id, user_name} of the issuer (null if the user was deleted)'),
     'status': fields.String(enum=['issued', 'void']),
     'sha256': fields.String(description='SHA-256 of the PDF file'),
     'size_bytes': fields.Integer(),

@@ -60,6 +60,9 @@ adjustment_fields = {
     'created_by': fields.Integer(description='Creator ID'),
     'approved_by': fields.Integer(description='Approver ID'),
     'operator_id': fields.Integer(description='Operator ID'),
+    'details_modified_by': fields.Integer(
+        readOnly=True,
+        description='User who last added / changed / deleted a detail; this user cannot approve the adjustment (16122)'),
     'created_at': fields.DateTime(readOnly=True, description='Creation time'),
     'updated_at': fields.DateTime(readOnly=True, description='Last update time'),
     'approved_at': fields.DateTime(description='Approval time'),

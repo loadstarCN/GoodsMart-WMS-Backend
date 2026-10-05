@@ -11,6 +11,7 @@ from .models import (
 
 from warehouse.common import require_positive_int, require_bulk_list, delete_batch_with_details
 from warehouse.common.locks import lock_row
+from warehouse.common.batch_idempotency import parse_client_batch_id, find_batch, replay_or_conflict, insert_batch
 from warehouse.common.validation import require_active_task
 from warehouse.dn.services import DNService, pick_fields, parse_datetime_value
 from dateutil.relativedelta import relativedelta
@@ -244,8 +245,35 @@ class PackingTaskService:
                 )
 
     @staticmethod
+    def _batch_rows(batch: PackingBatch) -> list:
+        """批次明细的比较内容（client_batch_id 重放判断用）：(goods_id, packed_quantity)；packing_time 不比"""
+        return [(d.goods_id, d.packed_quantity or 0) for d in batch.details]
+
+    @staticmethod
+    def _parse_batch_details(data) -> list:
+        """明细字段逐条校验：goods_id 必填、packed_quantity 正整数（缺字段 400 而非 500）"""
+        details_data = []
+        for raw in require_bulk_list(data.get('details') or [], 'details', allow_empty=True):
+            details_data.append({
+                'goods_id': require_positive_int(raw.get('goods_id'), 'goods_id', 16034),
+                'packed_quantity': require_positive_int(raw.get('packed_quantity'), 'packed_quantity'),
+                'packing_time': parse_datetime_value(raw.get('packing_time'), 'packing_time') or datetime.now(),
+            })
+        return details_data
+
+    @staticmethod
+    def _incoming_rows(details_data: list) -> list:
+        return [(d['goods_id'], d['packed_quantity']) for d in details_data]
+
+    @staticmethod
     @transactional
     def create_batch(task_or_id: int | PackingTask, data: dict, operator_id: int):
+        """创建批次并返回它（submit_batch 的简写；client_batch_id 重放时返回已存在的批次）"""
+        return PackingTaskService.submit_batch(task_or_id, data, operator_id)[0]
+
+    @staticmethod
+    @transactional
+    def submit_batch(task_or_id: int | PackingTask, data: dict, operator_id: int) -> tuple[PackingBatch, bool]:
         """
         同时适用于：
         1) 只创建批次
@@ -268,9 +296,18 @@ class PackingTaskService:
                     ...
                 ]
             }
+        可选 client_batch_id：同一任务下重复提交同一个 id 不会重复记数（见 common/batch_idempotency.py，B-102）。
+        返回 (batch, created)——created=False 表示按 client_batch_id 重放了已存在的批次（接口返回 200）
         """
-        # 先锁 DN、再锁任务并重读：并发追加串行执行，「不超已拣量」校验看到前一个请求已提交的明细
+        # 先锁 DN、再锁任务并重读：并发追加串行执行，「不超已拣量」校验看到前一个请求已提交的明细；
+        # client_batch_id 也在锁内查重
         task = PackingTaskService._lock(task_or_id)
+        client_batch_id = parse_client_batch_id(data)
+        existing = find_batch(PackingBatch, 'packing_task_id', task.id, client_batch_id)
+        if existing is not None:
+            incoming = PackingTaskService._incoming_rows(PackingTaskService._parse_batch_details(data))
+            return replay_or_conflict(existing, client_batch_id, PackingTaskService._batch_rows, incoming), False
+
         if task.status != 'in_progress':
             raise BadRequestException("Cannot create a batch or details in a non-in-progress Packing Task", 16009)
 
@@ -278,14 +315,8 @@ class PackingTaskService:
             raise BadRequestException("Request body must be a JSON object", 16015)
         op_time = parse_datetime_value(data.get('operation_time'), 'operation_time')
 
-        # 1) 明细字段逐条校验：goods_id 必填、packed_quantity 正整数（缺字段 400 而非 500）
-        details_data = []
-        for raw in require_bulk_list(data.get('details') or [], 'details', allow_empty=True):
-            details_data.append({
-                'goods_id': require_positive_int(raw.get('goods_id'), 'goods_id', 16034),
-                'packed_quantity': require_positive_int(raw.get('packed_quantity'), 'packed_quantity'),
-                'packing_time': parse_datetime_value(raw.get('packing_time'), 'packing_time') or datetime.now(),
-            })
+        # 1) 明细字段逐条校验
+        details_data = PackingTaskService._parse_batch_details(data)
 
         # 2) 权威校验：商品必须在 DN 明细内，累计已打包量（现有 + 本次）不得超过已拣量
         incoming_by_goods = {}
@@ -297,13 +328,19 @@ class PackingTaskService:
         # 3) 创建批次
         new_batch = PackingBatch(
             packing_task_id=task.id,
+            client_batch_id=client_batch_id,
             operator_id=operator_id,
             operation_time=op_time or datetime.now(),
             remark=data.get('remark', '')
         )
-        db.session.add(new_batch)
-        # 使用 flush() 以获取 new_batch.id
-        db.session.flush()
+        # flush 拿 new_batch.id；唯一约束兜底撞上时按已存在的批次重放 / 409
+        new_batch, created = insert_batch(
+            new_batch, batch_model=PackingBatch, task_fk='packing_task_id', task_id=task.id,
+            client_batch_id=client_batch_id, existing_rows=PackingTaskService._batch_rows,
+            incoming_rows=PackingTaskService._incoming_rows(details_data),
+        )
+        if not created:
+            return new_batch, False
 
         # 4) 批量创建明细
         for item in details_data:
@@ -316,9 +353,9 @@ class PackingTaskService:
                 operator_id=operator_id
             )
             db.session.add(detail)
-        
+
         # db.session.commit()
-        return new_batch
+        return new_batch, True
 
     @staticmethod
     def get_batch(task_id: int, batch_id: int) -> PackingBatch:
@@ -576,9 +613,6 @@ class PackingTaskService:
 
         # 动态添加仓库过滤条件
         if filters:
-            if filters.get('sorting_type'):
-                query = query.filter(PackingTask.sorting_type == filters['sorting_type'])
-
             if filters.get('warehouse_id') or filters.get('warehouse_ids'):
                 query = query.join(DN, PackingTask.dn_id == DN.id)
 

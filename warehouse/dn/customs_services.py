@@ -738,6 +738,13 @@ class CustomsService:
         )
 
     @staticmethod
+    def _printed_carrier(dn: DN, delivery_task=None):
+        """印在 CI 上的承运商：当前发货任务的承运商，没有则 DN 上的（与 _document_data 同一口径）"""
+        if delivery_task is None:
+            delivery_task = CustomsService._delivery_task(dn)
+        return (delivery_task.carrier if delivery_task and delivery_task.carrier else None) or dn.carrier
+
+    @staticmethod
     def build_view(dn: DN) -> dict:
         customs = dn.customs
         currency = (customs.currency if customs else None)
@@ -892,6 +899,12 @@ class CustomsService:
                     problem('EXPORTER_NON_LATIN_TEXT', 'error',
                             f"Exporter {label} contains non-Latin characters; use English / Latin letters only",
                             field=field)
+            # 承运商名也印在英文 CI 上（Carrier 栏），日文名（如「ヤマト運輸」）同样拦：请在承运商主数据里改成英文名
+            printed_carrier = CustomsService._printed_carrier(dn)
+            if printed_carrier is not None and has_non_latin(printed_carrier.name):
+                problem('CARRIER_NON_LATIN_TEXT', 'error',
+                        "Carrier name printed on the commercial invoice contains non-Latin characters; "
+                        "rename the carrier in English / Latin letters", field='carrier.name')
             if total_qty > 0 and not net_known:
                 problem('NET_WEIGHT_UNKNOWN', 'warning',
                         "Net weight cannot be calculated: some goods have no unit weight")
@@ -912,6 +925,20 @@ class CustomsService:
                             f"Japanese export statistics code of goods {line['goods_code']} is missing "
                             f"(goods value exceeds {JP_EXPORT_CODE_THRESHOLD_JPY:,} JPY)",
                             goods_code=line['goods_code'], field='jp_export_code')
+        # 非 JPY 币种：不引入汇率，没法自动判断是否超过 20 万円。从日本出口、且有行没填 9 位统计番号时
+        # 给一条单据级警告，请人工确认（不拦出单证）
+        currency_code = (customs.currency or '').upper() if customs is not None else ''
+        if customs is not None and currency_code != 'JPY' and _CURRENCY_RE.match(currency_code) \
+                and exporter['export_country_code'] == 'JP' and goods_value > 0:
+            missing_codes = [line['goods_code'] for line in lines
+                             if line['packed_quantity'] > 0 and line['has_customs_line'] and not line['jp_export_code']]
+            if missing_codes:
+                problem('JP_EXPORT_VALUE_UNVERIFIED', 'warning',
+                        f"Goods value is in {currency_code}, so whether it exceeds "
+                        f"{JP_EXPORT_CODE_THRESHOLD_JPY:,} JPY cannot be determined automatically; check manually. "
+                        f"If it does, the Japanese 9-digit export statistics code is required for goods "
+                        f"{', '.join(str(c) for c in missing_codes)}",
+                        field='jp_export_code')
         totals = {
             'quantity': total_qty,
             'goods_value': _num(goods_value),
@@ -968,8 +995,11 @@ class CustomsService:
         consignee = view['consignee']
         destination = view['recipient_country']
         delivery_task = CustomsService._delivery_task(dn)
-        carrier = (delivery_task.carrier if delivery_task and delivery_task.carrier else None) or dn.carrier
+        carrier = CustomsService._printed_carrier(dn, delivery_task)
+        # 出口国：仓库国家，没有则公司国家。完整性检查（EXPORTER_PROFILE_INCOMPLETE / country_code）与
+        # Shipper 栏印的国家都用它，不会出现「检查通过、Shipper 却不印国家」
         export_country = exporter['export_country_code']
+        export_country_label = (country_name(export_country) or export_country or '').upper()
         tax_type = (customs.recipient_tax_id_type or '').upper()
         net_known = view['totals']['net_weight_kg'] is not None
 
@@ -1002,12 +1032,12 @@ class CustomsService:
             'export_reason': EXPORT_REASON_LABELS.get(
                 (customs.export_reason or '').upper(),
                 (customs.export_reason or '').replace('_', ' ').title()),
-            'country_of_export': (country_name(export_country) or export_country or '').upper(),
+            'country_of_export': export_country_label,
             'destination': (country_name(destination) or destination or '').upper(),
             'exporter': {
                 'name': exporter['legal_name_en'],
                 'address': exporter['address_en'],
-                'country': (country_name(exporter['country_code']) or exporter['country_code'] or '').upper(),
+                'country': export_country_label,
                 'phone': exporter['phone'],
                 'email': exporter['email'],
                 'contact': exporter['contact_name'],
@@ -1074,7 +1104,7 @@ class CustomsService:
         有进行中 / 有效 / 结果不明 / 取消中的自动运单时，单证数据除 AWB 外必须与当前单证（即随运单提交给承运商的）
         一致，否则 409 16076（details.reason = DOCUMENT_DATA_CHANGED）：例如建单后改了商品原产国、公司 / 仓库出口资料、
         承运商 —— 先取消运单再重签。"""
-        from .customs_documents import render_commercial_invoice, render_packing_list
+        from .customs_documents import DocumentLayoutError, render_commercial_invoice, render_packing_list
 
         dn = CustomsService._lock(dn)
         CustomsService._assert_not_locked(dn)
@@ -1115,7 +1145,18 @@ class CustomsService:
             (DOC_CI, 'CI', render_commercial_invoice),
             (DOC_PL, 'PL', render_packing_list),
         ):
-            content = render(data, meta)
+            try:
+                content = render(data, meta)
+            except DocumentLayoutError as exc:
+                # 某块文字（几乎总是收件人：各字段都很长且多为 CJK）比一页还高，reportlab 排不下。
+                # 整个事务回滚（上面作废的旧单证也恢复），返回 409 让用户缩短收件人信息
+                current_app.logger.warning(f"DN {dn.id}: {prefix} layout failed: {exc}")
+                raise ConflictException(
+                    "Customs documents cannot be laid out: a text block (usually the consignee / recipient "
+                    "information) is too long to fit on one page. Shorten the consignee name, company, "
+                    "address, city, state, postal code or phone and issue again.", 16117,
+                    details={'document': prefix, 'reason': 'LAYOUT_OVERFLOW'},
+                ) from exc
             doc = DNDocument(
                 dn_id=dn.id,
                 doc_type=doc_type,
@@ -1215,9 +1256,9 @@ class CustomsService:
             )
         # 单证未过期 ⇒ 印在 CI 上的 AWB / 承运商就是 _document_data 里的 awb / carrier（当前发货任务上现存的值）
         delivery_task = CustomsService._delivery_task(dn)
-        carrier = (delivery_task.carrier if delivery_task and delivery_task.carrier else None) or dn.carrier
+        carrier = CustomsService._printed_carrier(dn, delivery_task)
         return {
-            'awb': (delivery_task.tracking_number if delivery_task else None) or None,
+            'awb':(delivery_task.tracking_number if delivery_task else None) or None,
             'carrier_id': carrier.id if carrier else None,
             'carrier': carrier.name if carrier else None,
         }

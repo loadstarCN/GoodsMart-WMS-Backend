@@ -7,6 +7,7 @@ from extensions.error import BadRequestException, ConflictException, NotFoundExc
 from extensions.transaction import transactional
 from warehouse.common import require_non_negative_int, require_fields, delete_batch_with_details
 from warehouse.common.locks import lock_row
+from warehouse.common.batch_idempotency import parse_client_batch_id, find_batch, replay_or_conflict, insert_batch
 from warehouse.common.validation import require_active_task
 from warehouse.asn.models import ASN
 from warehouse.asn.services import ASNService
@@ -393,8 +394,27 @@ class SortingTaskService:
         return batch
 
     @staticmethod
+    def _batch_rows(batch: SortingBatch) -> list:
+        """批次明细的比较内容（client_batch_id 重放判断用）：(goods_id, sorted_quantity, damage_quantity)"""
+        return [(d.goods_id, d.sorted_quantity or 0, d.damage_quantity or 0) for d in batch.details]
+
+    @staticmethod
+    def _parse_batch_details(data: dict) -> list:
+        """校验并解析批次请求里的 details → [(goods_id, sorted_quantity, damage_quantity), ...]"""
+        details_data = data.get("details") or []
+        if not isinstance(details_data, list):
+            raise BadRequestException("'details' must be a list (empty is allowed)", 16015)
+        return [SortingTaskService._detail_quantities(item) for item in details_data]
+
+    @staticmethod
     @transactional
     def create_batch(task_or_id: int | SortingTask, data: dict, operator_id: int):
+        """创建批次并返回它（submit_batch 的简写；client_batch_id 重放时返回已存在的批次）"""
+        return SortingTaskService.submit_batch(task_or_id, data, operator_id)[0]
+
+    @staticmethod
+    @transactional
+    def submit_batch(task_or_id: int | SortingTask, data: dict, operator_id: int) -> tuple[SortingBatch, bool]:
         """
         同时适用于：
         1) 只创建批次
@@ -418,22 +438,25 @@ class SortingTaskService:
             }
         如果 data 内部没有 "details" 或其为空数组，表示仅创建批次。
         明细里的 goods 必须在 ASN 明细内，且累计（合格 + 损坏）不得超过 ASN 计划量。
-        返回: batch
+        可选 client_batch_id：同一任务下重复提交同一个 id 不会重复记数（见 common/batch_idempotency.py，B-102）。
+        返回: (batch, created)——created=False 表示按 client_batch_id 重放了已存在的批次（接口返回 200）
         """
 
-        # 先锁 ASN、再锁任务并重读：并发追加串行执行，「不超计划量」校验看到前一个请求已提交的明细
+        # 先锁 ASN、再锁任务并重读：并发追加串行执行，「不超计划量」校验看到前一个请求已提交的明细；
+        # client_batch_id 也在锁内查重（重复提交排在前一个请求提交之后，能看到它建的批次）
         task = SortingTaskService._lock(task_or_id)
+        client_batch_id = parse_client_batch_id(data)
+        existing = find_batch(SortingBatch, 'sorting_task_id', task.id, client_batch_id)
+        if existing is not None:
+            return replay_or_conflict(existing, client_batch_id, SortingTaskService._batch_rows,
+                                      SortingTaskService._parse_batch_details(data)), False
+
         # 统一只允许在 in_progress 状态创建（批次 + 明细）
         if task.status != 'in_progress':
             raise BadRequestException("Cannot create a batch or details in a non-in-progress Sorting Task", 16012)
 
-        # 强制校验类型（若存在且非列表则报错）
-        details_data = data.get("details") or []
-        if not isinstance(details_data, list):
-            raise BadRequestException("'details' must be a list (empty is allowed)", 16015)
-
         # 先做权威校验：累计分拣量（现有 + 本次）不得超过 ASN 计划量，阻止重复 / 超量提交
-        parsed_details = [SortingTaskService._detail_quantities(item) for item in details_data]
+        parsed_details = SortingTaskService._parse_batch_details(data)
         incoming_by_goods = {}
         for goods_id, sorted_quantity, damage_quantity in parsed_details:
             incoming_by_goods[goods_id] = incoming_by_goods.get(goods_id, 0) + sorted_quantity + damage_quantity
@@ -442,12 +465,19 @@ class SortingTaskService:
         # 1) 创建批次
         new_batch = SortingBatch(
             sorting_task_id=task.id,
+            client_batch_id=client_batch_id,
             operator_id=operator_id,
             operation_time=SortingTaskService._parse_datetime(data.get('operation_time')) or datetime.now(),
             remark=data.get('remark', '')
         )
-        db.session.add(new_batch)
-        db.session.flush()  # 为了获取新批次的 ID
+        # flush 拿新批次 ID；唯一约束兜底撞上时按已存在的批次重放 / 409
+        new_batch, created = insert_batch(
+            new_batch, batch_model=SortingBatch, task_fk='sorting_task_id', task_id=task.id,
+            client_batch_id=client_batch_id, existing_rows=SortingTaskService._batch_rows,
+            incoming_rows=parsed_details,
+        )
+        if not created:
+            return new_batch, False
 
         # 2) 如果有 details，就批量创建 detail
         for goods_id, sorted_quantity, damage_quantity in parsed_details:
@@ -463,7 +493,7 @@ class SortingTaskService:
         db.session.flush()
 
         # db.session.commit()
-        return new_batch
+        return new_batch, True
 
     @staticmethod
     @transactional
@@ -595,11 +625,8 @@ class SortingTaskService:
         )
 
         # 动态添加仓库过滤条件
+        # （SortingTask 没有 sorting_type 字段，原来的 sorting_type 过滤会 500，已去掉，B-104）
         if filters:
-
-            if filters.get('sorting_type'):
-                query = query.filter(SortingTask.sorting_type == filters['sorting_type'])
-
             if filters.get('warehouse_id') or filters.get('warehouse_ids'):
                 query = query.join(ASN, SortingTask.asn_id == ASN.id)
 
@@ -672,9 +699,6 @@ class SortingTaskService:
 
         # 动态添加仓库过滤条件
         if filters:
-            if filters.get('sorting_type'):
-                query = query.filter(SortingTask.sorting_type == filters['sorting_type'])
-
             if filters.get('warehouse_id') or filters.get('warehouse_ids'):
                 query = query.join(ASN, SortingTask.asn_id == ASN.id)
 

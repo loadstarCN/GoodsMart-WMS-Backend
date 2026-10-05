@@ -6,6 +6,10 @@
 #   ./run_tests.sh -k user   -- 只运行包含 "user" 的测试
 #   ./run_tests.sh --cov     -- 运行并生成覆盖率报告
 #   ./run_tests.sh -f        -- 遇到第一个失败立即停止
+#
+# 测试依赖（pytest、fakeredis 等）在 requirements-dev.txt，生产只装 requirements.txt。首次运行前：
+#   pip install -r requirements-dev.txt
+# --cov 另需 pytest-cov（pip install pytest-cov）
 # ============================================================
 
 set -e
@@ -20,6 +24,12 @@ elif [ -f "venv/bin/activate" ]; then
     source venv/bin/activate
 else
     echo "❌ 找不到虚拟环境，请先创建: python -m venv venv"
+    exit 1
+fi
+
+# 测试依赖不在 requirements.txt 里（生产不装），缺了先提示
+if ! python -c "import pytest, fakeredis" >/dev/null 2>&1; then
+    echo "❌ 缺少测试依赖，请先执行: pip install -r requirements-dev.txt"
     exit 1
 fi
 
@@ -50,6 +60,10 @@ if [ -n "$FILTER" ]; then
 fi
 
 if [ "$COVERAGE" = true ]; then
+    if ! python -c "import pytest_cov" >/dev/null 2>&1; then
+        echo "❌ --cov 需要 pytest-cov，请先执行: pip install pytest-cov"
+        exit 1
+    fi
     CMD="$CMD --cov=. --cov-config=.coveragerc --cov-report=term-missing --cov-report=html:htmlcov"
 fi
 

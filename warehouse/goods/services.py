@@ -1,3 +1,5 @@
+import threading
+import time
 from datetime import datetime
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from flask import g, has_app_context
@@ -25,6 +27,19 @@ SPEC_FIELDS = (
 # 规格变更来源（goods.spec_updated 的 source）
 SPEC_SOURCES = ('station', 'manual', 'import', 'api')
 SPEC_UPDATED_EVENT = 'goods.spec_updated'
+
+# goods.spec_updated 的排序字段 changed_at_ms（epoch 毫秒）。changed_at 只到秒（外部已在解析，格式不改），
+# 同一秒内的多次变动靠它分先后：本进程内严格递增（同一毫秒或时钟回拨时 +1）
+_spec_order_lock = threading.Lock()
+_last_spec_order_ms = 0
+
+
+def _next_spec_order_ms() -> int:
+    global _last_spec_order_ms
+    with _spec_order_lock:
+        now_ms = time.time_ns() // 1_000_000
+        _last_spec_order_ms = now_ms if now_ms > _last_spec_order_ms else _last_spec_order_ms + 1
+        return _last_spec_order_ms
 
 
 def clean_origin_country(value, field='origin_country'):
@@ -173,6 +188,9 @@ def _emit_spec_changes(changes: list):
             'changed_fields': changed,
             'source': source,
             'changed_at': changed_at,
+            # 在 flush 之后取：PostgreSQL 上 UPDATE 已拿到商品行锁，并发修改同一商品的另一个事务要等本事务
+            # 提交后才走到这里，取到的值一定更大（与数据库里最终留下的值一致）
+            'changed_at_ms': _next_spec_order_ms(),
         }
         by_company[goods.company_id].append((payload, f'goods:{goods.id}'))
     for company_id, items in by_company.items():
@@ -587,9 +605,10 @@ class GoodsLocationService:
         if filters.get('warehouse_id'):
             query = query.filter(Location.warehouse_id == filters['warehouse_id'])
         if filters.get('warehouse_ids'):
-            query = query.filter(Location.warehouse_id.in_(filters['warehouse_ids']))       
+            query = query.filter(Location.warehouse_id.in_(filters['warehouse_ids']))
 
-        return query
+        # 稳定排序：分页靠 LIMIT / OFFSET，不排序时 PostgreSQL 各页的行序不保证一致（会重复或漏行）
+        return query.order_by(GoodsLocation.id)
 
     @staticmethod
     @transactional

@@ -1,7 +1,8 @@
 from extensions.db import *
 from extensions.error import BadRequestException, ConflictException, NotFoundException
 from warehouse.common import require_positive_int, require_bulk_list, lock_goods_location, delete_batch_with_details
-from warehouse.common.locks import lock_row
+from warehouse.common.locks import lock_row, lock_inventory_rows, lock_order_key
+from warehouse.common.batch_idempotency import parse_client_batch_id, find_batch, replay_or_conflict, insert_batch
 from warehouse.common.validation import require_active_task
 from warehouse.dn.models import DN
 from warehouse.dn.services import DNService, pick_fields, parse_datetime_value
@@ -309,7 +310,8 @@ class PickingTaskService:
 
         PickingTaskService._assert_locations_in_warehouse(task, [lid for _, lid in requested])
 
-        for (goods_id, location_id), quantity in requested.items():
+        # 按 (goods_id, location_id) 升序逐行加锁（B-103）：两个请求库位顺序相反时不再互相等待
+        for (goods_id, location_id), quantity in sorted(requested.items(), key=lambda item: lock_order_key(*item[0])):
             stock = lock_goods_location(goods_id, location_id)
             if stock is None:
                 raise BadRequestException(
@@ -338,8 +340,35 @@ class PickingTaskService:
                 )
 
     @staticmethod
+    def _batch_rows(batch: PickingBatch) -> list:
+        """批次明细的比较内容（client_batch_id 重放判断用）：(goods_id, location_id, picked_quantity)"""
+        return [(d.goods_id, d.location_id, d.picked_quantity or 0) for d in batch.details]
+
+    @staticmethod
+    def _parse_batch_details(data) -> list:
+        """明细字段逐条校验：goods_id / location_id 必填、picked_quantity 正整数（缺字段 400 而非 500）"""
+        details_data = []
+        for raw in require_bulk_list(data.get('details') or [], 'details', allow_empty=True):
+            details_data.append({
+                'goods_id': require_positive_int(raw.get('goods_id'), 'goods_id', 16034),
+                'location_id': require_positive_int(raw.get('location_id'), 'location_id', 16034),
+                'picked_quantity': require_positive_int(raw.get('picked_quantity'), 'picked_quantity'),
+            })
+        return details_data
+
+    @staticmethod
+    def _incoming_rows(details_data: list) -> list:
+        return [(d['goods_id'], d['location_id'], d['picked_quantity']) for d in details_data]
+
+    @staticmethod
     @transactional
     def create_batch(task_or_id: int | PickingTask, data: dict, operator_id: int) -> PickingBatch:
+        """创建批次并返回它（submit_batch 的简写；client_batch_id 重放时返回已存在的批次）"""
+        return PickingTaskService.submit_batch(task_or_id, data, operator_id)[0]
+
+    @staticmethod
+    @transactional
+    def submit_batch(task_or_id: int | PickingTask, data: dict, operator_id: int) -> tuple[PickingBatch, bool]:
         """
         创建新的 PickingBatch，并可选地批量创建 PickingTaskDetail。
         仅当 PickingTask.status == 'in_progress' 时允许创建。
@@ -358,10 +387,18 @@ class PickingTaskService:
                     ...
                 ]
             }
+        可选 client_batch_id：同一任务下重复提交同一个 id 不会重复记数（见 common/batch_idempotency.py，B-102）。
+        返回 (batch, created)——created=False 表示按 client_batch_id 重放了已存在的批次（接口返回 200）
         """
         # 先锁 DN、再锁任务并重读：并发追加的批次串行执行，下面「不超计划量」的校验
-        # 看到的是前一个请求已提交的明细，不会两个请求都通过
+        # 看到的是前一个请求已提交的明细，不会两个请求都通过；client_batch_id 也在锁内查重
         task = PickingTaskService._lock(task_or_id)
+        client_batch_id = parse_client_batch_id(data)
+        existing = find_batch(PickingBatch, 'picking_task_id', task.id, client_batch_id)
+        if existing is not None:
+            incoming = PickingTaskService._incoming_rows(PickingTaskService._parse_batch_details(data))
+            return replay_or_conflict(existing, client_batch_id, PickingTaskService._batch_rows, incoming), False
+
         if task.status != 'in_progress':
             raise BadRequestException("Cannot create batch in a non-in_progress Picking Task", 16012)
 
@@ -369,25 +406,10 @@ class PickingTaskService:
             raise BadRequestException("Request body must be a JSON object", 16015)
         op_time = parse_datetime_value(data.get('operation_time'), 'operation_time')
 
-        # 1) 明细字段逐条校验：goods_id / location_id 必填、picked_quantity 正整数（缺字段 400 而非 500）
-        details_data = []
-        for raw in require_bulk_list(data.get('details') or [], 'details', allow_empty=True):
-            details_data.append({
-                'goods_id': require_positive_int(raw.get('goods_id'), 'goods_id', 16034),
-                'location_id': require_positive_int(raw.get('location_id'), 'location_id', 16034),
-                'picked_quantity': require_positive_int(raw.get('picked_quantity'), 'picked_quantity'),
-            })
+        # 1) 明细字段逐条校验
+        details_data = PickingTaskService._parse_batch_details(data)
 
-        new_batch = PickingBatch(
-            picking_task_id=task.id,
-            operator_id=operator_id,
-            operation_time=op_time or datetime.now(),
-            remark=data.get('remark', '')
-        )
-        db.session.add(new_batch)
-        db.session.flush()  # 以获取 new_batch.id
-
-        # 2) 权威校验：累计已拣量（现有 + 本次）不得超过 DN 计划量，
+        # 2) 权威校验（在插入批次之前做完：批次插入是最后一步可能失败的写入）：累计已拣量（现有 + 本次）不得超过 DN 计划量，
         #    阻止重复 / 超量提交污染数据（见 _assert_within_planned）；
         #    库位必须在 DN 仓库内且有足够库存。
         incoming_by_goods = {}
@@ -397,6 +419,23 @@ class PickingTaskService:
         PickingTaskService._assert_goods_in_dn(task, incoming_by_goods)
         PickingTaskService._assert_within_planned(task, incoming_by_goods)
         PickingTaskService._assert_location_stock(task, details_data)
+
+        # 3) 创建批次
+        new_batch = PickingBatch(
+            picking_task_id=task.id,
+            client_batch_id=client_batch_id,
+            operator_id=operator_id,
+            operation_time=op_time or datetime.now(),
+            remark=data.get('remark', '')
+        )
+        # flush 拿 new_batch.id；唯一约束兜底撞上时按已存在的批次重放 / 409
+        new_batch, created = insert_batch(
+            new_batch, batch_model=PickingBatch, task_fk='picking_task_id', task_id=task.id,
+            client_batch_id=client_batch_id, existing_rows=PickingTaskService._batch_rows,
+            incoming_rows=PickingTaskService._incoming_rows(details_data),
+        )
+        if not created:
+            return new_batch, False
 
         for item in details_data:
             detail_obj = PickingTaskDetail(
@@ -409,10 +448,8 @@ class PickingTaskService:
             )
             db.session.add(detail_obj)
 
-        
-
         # db.session.commit()
-        return new_batch
+        return new_batch, True
 
     @staticmethod
     def get_batch(task_id: int, batch_id: int) -> PickingBatch:
@@ -532,6 +569,11 @@ class PickingTaskService:
         # 防御性校验：累计已拣量不得超过 DN 计划量。对已被重复提交污染的历史单据
         # 给出明确报错（16029），而非在 dn_picked 处误报 15008 或撞数据库约束。
         PickingTaskService._assert_within_planned(task)
+        # 加锁顺序（B-103，见 common/locks.py）：库存行先于库位库存行。先按 goods_id 升序锁齐 DN 与本任务涉及的库存行，
+        # 之后的库位复核（库位库存行按 (goods_id, location_id) 升序）、下架、dn_picked 都只是重入
+        lock_inventory_rows(
+            [d.goods_id for d in task.dn.details] + [d.goods_id for d in task.task_details], task.dn.warehouse_id
+        )
         # 扣库存前对全部明细复核：商品必须在 DN 明细内、库位必须在 DN 仓库内、
         # 库位库存仍然足够（明细可能在批次创建后被改量 / 库存被其它流程动过）。
         PickingTaskService._assert_goods_in_dn(task, {d.goods_id for d in task.task_details})
@@ -698,9 +740,6 @@ class PickingTaskService:
 
         # 动态添加仓库过滤条件
         if filters:
-            if filters.get('sorting_type'):
-                query = query.filter(PickingTask.sorting_type == filters['sorting_type'])
-
             if filters.get('warehouse_id') or filters.get('warehouse_ids'):
                 query = query.join(DN, PickingTask.dn_id == DN.id)
 

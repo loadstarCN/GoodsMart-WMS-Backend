@@ -47,6 +47,11 @@ packing_task_detail_for_batch_model = api_ns.model('PackingTaskDetailForBatch', 
 packing_batch_model = api_ns.model('PackingBatch', {
     'id': fields.Integer(readOnly=True, description='Packing batch ID'),
     'packing_task_id': fields.Integer(required=True, description='Associated packing task ID'),
+    'client_batch_id': fields.String(
+        max_length=64,
+        description='Optional client-generated id of this submission (1-64 chars, create only). Re-submitting the '
+                    'same id for the same task with the same details returns the existing batch (200); '
+                    'different details -> 409 16121'),
     'operator_id': fields.Integer(required=True, description='Operator ID'),
     'operation_time': fields.DateTime(description='Operation time'),
     'remark': fields.String(description='Batch remarks'),
