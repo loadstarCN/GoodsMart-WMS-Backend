@@ -43,7 +43,7 @@ def create_app():
     cors_origins = app.config['CORS_ORIGINS']
     if isinstance(cors_origins, str) and ',' in cors_origins:
         cors_origins = [origin.strip() for origin in cors_origins.split(',') if origin.strip()]
-    CORS(app, origins=cors_origins)
+    CORS(app, origins=cors_origins, max_age=app.config['CORS_MAX_AGE'])
     app.logger.info(f"Running in {Config.FLASK_ENV} mode")
 
     # 初始化扩展

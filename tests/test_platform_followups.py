@@ -423,6 +423,33 @@ def test_production_webhook_strict_defaults_true(monkeypatch):
     assert cfg.ProductionConfig.WEBHOOK_URL_STRICT is False        # 显式关闭仍可以（启动时告警）
 
 
+def test_cors_max_age_default_and_override(monkeypatch):
+    """预检缓存默认 7200 秒（Chromium 上限），可用 CORS_MAX_AGE 覆盖"""
+    monkeypatch.delenv('CORS_MAX_AGE', raising=False)
+    assert _fresh_config(monkeypatch).Config.CORS_MAX_AGE == 7200
+    assert _fresh_config(monkeypatch, CORS_MAX_AGE='600').Config.CORS_MAX_AGE == 600
+
+
+def test_cors_preflight_sends_max_age(monkeypatch):
+    """与 app.py 相同的 CORS 调用：预检响应带 Access-Control-Max-Age，APP 的预检结果能被缓存"""
+    from flask import Flask
+    from flask_cors import CORS
+
+    monkeypatch.delenv('CORS_MAX_AGE', raising=False)
+    cfg = _fresh_config(monkeypatch).Config
+    app = Flask(__name__)
+    app.add_url_rule('/ping', 'ping', lambda: 'ok')
+    CORS(app, origins=['https://appassets.androidplatform.net'], max_age=cfg.CORS_MAX_AGE)
+
+    resp = app.test_client().options('/ping', headers={
+        'Origin': 'https://appassets.androidplatform.net',
+        'Access-Control-Request-Method': 'GET',
+        'Access-Control-Request-Headers': 'authorization,x-warehouse-id',
+    })
+    assert resp.headers['Access-Control-Allow-Origin'] == 'https://appassets.androidplatform.net'
+    assert resp.headers['Access-Control-Max-Age'] == '7200'
+
+
 def test_unrecognised_bool_is_reported(monkeypatch, caplog):
     cfg = _fresh_config(monkeypatch, FLASK_ENV='development', RATELIMIT_ENABLED='ture')
     assert cfg.Config.RATELIMIT_ENABLED is False

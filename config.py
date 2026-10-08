@@ -51,6 +51,9 @@ class Config:
 
     DEBUG = env_bool('DEBUG', False)  # 调试模式
     CORS_ORIGINS = os.getenv('CORS_ORIGINS', '*')  # 允许的跨域来源，生产环境应设置为具体域名
+    # 预检（OPTIONS）结果的缓存秒数（Access-Control-Max-Age）。不设时浏览器只缓存 5 秒，APP 每个带 Authorization
+    # 的请求几乎都要多一次预检往返；Chromium / WebView 上限 7200
+    CORS_MAX_AGE = int(os.getenv('CORS_MAX_AGE', 7200))
 
     # 请求体上限（图片 / CSV 上传），超过返回 413，避免无限制上传拖垮单进程
     MAX_CONTENT_LENGTH = int(os.getenv('MAX_CONTENT_LENGTH', 20 * 1024 * 1024))
