@@ -102,6 +102,9 @@ class Config:
     FEDEX_LABEL_A4_STOCK_TYPE = os.getenv('FEDEX_LABEL_A4_STOCK_TYPE') or None
     FEDEX_LABEL_THERMAL_IMAGE_TYPE = os.getenv('FEDEX_LABEL_THERMAL_IMAGE_TYPE') or None
     FEDEX_LABEL_THERMAL_STOCK_TYPE = os.getenv('FEDEX_LABEL_THERMAL_STOCK_TYPE') or None
+    # 热敏面单存档的页面（mm，宽x高）：不设 = 100x150（FedEx 的 4x6 英寸面单等比缩到 98.4%，100×150 纸按实际大小打印
+    # 不切边）；用真 4x6 英寸纸时设 101.6x152.4（不缩放）
+    FEDEX_LABEL_THERMAL_PAGE_SIZE = os.getenv('FEDEX_LABEL_THERMAL_PAGE_SIZE') or None
     # 电子贸易单证（ETD）：开启时先把当前 CI 上传给 FedEx，建单时引用；关闭时仓库打印 CI 随货
     FEDEX_ETD_ENABLED = env_bool('FEDEX_ETD_ENABLED', False)
     # 关税付款方：RECIPIENT（收件人）/ SENDER（发件人账号）

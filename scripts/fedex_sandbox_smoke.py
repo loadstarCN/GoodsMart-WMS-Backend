@@ -34,8 +34,8 @@ FEDEX_KEYS = (
     'FEDEX_API_BASE', 'FEDEX_API_KEY', 'FEDEX_SECRET_KEY', 'FEDEX_ACCOUNT_NUMBER', 'FEDEX_SERVICE_TYPE',
     'FEDEX_PICKUP_TYPE', 'FEDEX_DUTIES_PAYMENT_TYPE', 'FEDEX_DEFAULT_LABEL_FORMAT',
     'FEDEX_LABEL_A4_IMAGE_TYPE', 'FEDEX_LABEL_A4_STOCK_TYPE', 'FEDEX_LABEL_THERMAL_IMAGE_TYPE',
-    'FEDEX_LABEL_THERMAL_STOCK_TYPE', 'FEDEX_DOCUMENT_API_BASE', 'FEDEX_CONNECT_TIMEOUT_SECONDS',
-    'FEDEX_TIMEOUT_SECONDS',
+    'FEDEX_LABEL_THERMAL_STOCK_TYPE', 'FEDEX_LABEL_THERMAL_PAGE_SIZE', 'FEDEX_DOCUMENT_API_BASE',
+    'FEDEX_CONNECT_TIMEOUT_SECONDS', 'FEDEX_TIMEOUT_SECONDS',
 )
 SECRET_KEYS = ('FEDEX_API_KEY', 'FEDEX_SECRET_KEY', 'FEDEX_ACCOUNT_NUMBER')
 
@@ -148,7 +148,8 @@ def _run_one(app, settings, label, packages_count, shipper, recipient, args):
     """建一票 → 存面单 → 取消。返回进程退出码（0 = 成功）"""
     from warehouse.dn import fedex_client
     from warehouse.dn.fedex_client import FedexError
-    from warehouse.dn.fedex_shipment import build_label_archive, build_ship_request, parse_ship_response, split_evenly
+    from warehouse.dn.fedex_shipment import (
+        build_label_archive, build_ship_request, parse_page_size, parse_ship_response, split_evenly)
 
     print(f"\n== {settings['service_type']} / {packages_count} package(s) / {label['label_format']} "
           f"({label['image_type']} {label['stock_type']})")
@@ -192,7 +193,7 @@ def _run_one(app, settings, label, packages_count, shipper, recipient, args):
     for alert in result['alerts']:
         print(f"  alert {alert['alert_type']} {alert['code']}: {alert['message']}")
 
-    archive = build_label_archive(result['documents'], label['image_type'])
+    archive = build_label_archive(result['documents'], label['image_type'], parse_page_size(label['page_size']))
     for part in archive['parts']:
         print(f"  document: {part['source']} #{part['package_sequence'] or '-'} {part['content_type']} "
               f"{part['doc_type']} pages={part['pages']} archived={part['archived']}")

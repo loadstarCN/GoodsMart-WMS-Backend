@@ -504,9 +504,11 @@ declared_value_carriage, delivery_task_id, shipment, warnings[]}`：
 | `label_format` | 打印机 | 默认 imageType / 纸张 | 页面 |
 |----------------|--------|------------------------|------|
 | `A4` | 激光打印机、A4 / Letter 普通纸 | `PDF` / `PAPER_85X11_TOP_HALF_LABEL` | Letter 页，上半页面单、下半页折叠说明 |
-| `THERMAL` | 4 英寸面单机（走驱动当普通打印机用） | `PDF` / `STOCK_4X6` | 4 × 6 英寸（约 100 × 150 mm） |
+| `THERMAL` | 4 英寸面单机（走驱动当普通打印机用） | `PDF` / `STOCK_4X6` | 100 × 150 mm（FedEx 的 4 × 6 英寸页等比缩到 98.4%） |
 
 面单机不要用 `PAPER_4X6`：FedEx 回的是 Letter 页、面单在左上角。各格式的 imageType（`PDF` / `PNG` / `ZPLII` / `EPL2`）与纸张可用配置覆盖。
+
+FedEx 的 4 × 6 英寸（101.6 × 152.4 mm）面单内容几乎铺满整页（离边 0~0.7 mm），打在 100 × 150 mm 面单纸上按实际大小会切边，所以 `THERMAL` 的 PDF 存档每页等比缩小（只缩不放）、居中放到 `FEDEX_LABEL_THERMAL_PAGE_SIZE`（默认 `100x150`）的页面上，浏览器打印时纸张选可打印区域为 100 × 150 mm 的纸、缩放选实际大小。要缩小超过 10% 才放得下的页（例如 Letter 尺寸的单证）保持原样；ZPLII / EPL2 不处理。用真 4 × 6 英寸纸时设 `101.6x152.4`（不缩放）。
 
 ### 建单
 
@@ -658,6 +660,7 @@ a deleted state」）。命中时日志记原始错误码；正式环境遇到�
 | `FEDEX_DEFAULT_LABEL_FORMAT` | `A4` | 建单请求不指定时的面单打印方式（`A4` / `THERMAL`） |
 | `FEDEX_LABEL_A4_IMAGE_TYPE` / `FEDEX_LABEL_A4_STOCK_TYPE` | `PDF` / `PAPER_85X11_TOP_HALF_LABEL` | 覆盖 `A4` 的格式 / 纸张 |
 | `FEDEX_LABEL_THERMAL_IMAGE_TYPE` / `FEDEX_LABEL_THERMAL_STOCK_TYPE` | `PDF` / `STOCK_4X6` | 覆盖 `THERMAL` 的格式 / 纸张（Zebra 等可设 `ZPLII`） |
+| `FEDEX_LABEL_THERMAL_PAGE_SIZE` | `100x150` | `THERMAL` PDF 存档的页面（mm，宽x高），面单等比缩小居中；真 4 × 6 英寸纸设 `101.6x152.4`；格式不对 → `FEDEX_CONFIG_INVALID` |
 | `FEDEX_ETD_ENABLED` | `False` | 电子贸易单证（上传 CI） |
 | `FEDEX_DUTIES_PAYMENT_TYPE` | `RECIPIENT` | `RECIPIENT` 或 `SENDER`（记账到账号） |
 | `FEDEX_DOCUMENT_API_BASE` | （自动） | Trade Documents Upload 的地址，默认按 `FEDEX_API_BASE` 选测试 / 正式 |

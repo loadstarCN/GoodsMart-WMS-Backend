@@ -60,8 +60,8 @@ from .fedex_client import FedexError
 from .fedex_shipment import (
     AddressError, LABEL_FORMATS, MAX_PACKAGES_PER_REQUEST, SUPPORTED_DUTIES_PAYMENT_TYPES,
     SUPPORTED_LABEL_IMAGE_TYPES, SHIPPER_TIN_TYPE, allocate_commodity_weights, build_label_archive,
-    build_ship_request, consignee_address, label_settings, parse_ship_response, split_address_text,
-    split_evenly, tin_type_for,
+    build_ship_request, consignee_address, label_settings, parse_page_size, parse_ship_response,
+    split_address_text, split_evenly, tin_type_for,
 )
 from .models import DN, DNCarrierShipment, DNDocument
 
@@ -523,6 +523,12 @@ class CarrierShipmentService:
                 blockers.append(_blocker('FEDEX_CONFIG_INVALID',
                                          f"FEDEX_LABEL_{fmt}_IMAGE_TYPE must be one of "
                                          f"{', '.join(SUPPORTED_LABEL_IMAGE_TYPES)}"))
+            try:
+                parse_page_size(label['page_size'])
+            except ValueError:
+                blockers.append(_blocker('FEDEX_CONFIG_INVALID',
+                                         f"FEDEX_LABEL_{fmt}_PAGE_SIZE must be WIDTHxHEIGHT in mm "
+                                         "(e.g. 100x150)"))
         if settings['duties_payment_type'] not in SUPPORTED_DUTIES_PAYMENT_TYPES:
             blockers.append(_blocker('FEDEX_CONFIG_INVALID',
                                      "FEDEX_DUTIES_PAYMENT_TYPE must be one of "
@@ -1183,7 +1189,7 @@ class CarrierShipmentService:
             raise RuntimeError(f"carrier shipment record {plan['record_id']} is no longer pending "
                                f"({record.status if record is not None else 'deleted'})")
         tracking = result['tracking_number']
-        archive = build_label_archive(result['documents'], label['image_type'])
+        archive = build_label_archive(result['documents'], label['image_type'], parse_page_size(label['page_size']))
         task = CustomsService._delivery_task(dn)
         if task is None:
             raise RuntimeError(f"DN {dn.id} has no active delivery task any more")

@@ -586,10 +586,16 @@ declared_value_carriage, delivery_task_id, shipment, warnings[]}`:
 | `label_format` | Printer | Default image / stock | Pages |
 |----------------|---------|-----------------------|-------|
 | `A4` | Laser printer, plain A4 / Letter paper | `PDF` / `PAPER_85X11_TOP_HALF_LABEL` | Letter page, label on the top half, folding instructions below |
-| `THERMAL` | 4-inch label printer used through its driver | `PDF` / `STOCK_4X6` | 4 × 6 in (≈ 100 × 150 mm) pages |
+| `THERMAL` | 4-inch label printer used through its driver | `PDF` / `STOCK_4X6` | 100 × 150 mm pages (FedEx's 4 × 6 in pages scaled to 98.4%) |
 
 Do not use `PAPER_4X6` for label printers: FedEx returns a Letter page with the label in the top-left corner.
 Each format's image type (`PDF` / `PNG` / `ZPLII` / `EPL2`) and stock can be overridden by configuration.
+
+FedEx's 4 × 6 in (101.6 × 152.4 mm) labels run almost to the page edge (0–0.7 mm), so printing them at actual size on
+100 × 150 mm label stock cuts the edges. The `THERMAL` PDF archive therefore scales every page down uniformly (never up)
+and centers it on a `FEDEX_LABEL_THERMAL_PAGE_SIZE` page (default `100x150`); print it at actual size on a paper whose
+printable area is 100 × 150 mm. Pages that would need more than 10% shrinking (e.g. Letter-size documents) are kept
+as they are; ZPLII / EPL2 are not touched. For real 4 × 6 in stock set `101.6x152.4` (no scaling).
 
 ### Creating a shipment
 
@@ -786,6 +792,7 @@ deleted state"). Matches are logged with the raw code; add codes seen in product
 | `FEDEX_DEFAULT_LABEL_FORMAT` | `A4` | Label format when the request does not give one (`A4` / `THERMAL`) |
 | `FEDEX_LABEL_A4_IMAGE_TYPE` / `FEDEX_LABEL_A4_STOCK_TYPE` | `PDF` / `PAPER_85X11_TOP_HALF_LABEL` | Override for `A4` |
 | `FEDEX_LABEL_THERMAL_IMAGE_TYPE` / `FEDEX_LABEL_THERMAL_STOCK_TYPE` | `PDF` / `STOCK_4X6` | Override for `THERMAL` (e.g. `ZPLII` for Zebra printers) |
+| `FEDEX_LABEL_THERMAL_PAGE_SIZE` | `100x150` | Page size (mm, WIDTHxHEIGHT) of the `THERMAL` PDF archive; labels are scaled down and centered. `101.6x152.4` for real 4 × 6 in stock; invalid → `FEDEX_CONFIG_INVALID` |
 | `FEDEX_ETD_ENABLED` | `False` | Electronic trade documents (upload the CI) |
 | `FEDEX_DUTIES_PAYMENT_TYPE` | `RECIPIENT` | `RECIPIENT` or `SENDER` (the account) |
 | `FEDEX_DOCUMENT_API_BASE` | (derived) | Trade Documents Upload host; derived from `FEDEX_API_BASE` (sandbox / production) |

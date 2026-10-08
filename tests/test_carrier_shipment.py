@@ -29,7 +29,7 @@ from warehouse.dn.carrier_services import CarrierShipmentService
 from warehouse.dn.customs_services import CustomsService
 from warehouse.dn.fedex_shipment import (
     AddressError, allocate_commodity_weights, build_label_archive, consignee_address, fedex_currency, iso_currency,
-    split_address_text, split_evenly, tin_type_for, wrap_lines,
+    parse_page_size, split_address_text, split_evenly, tin_type_for, wrap_lines,
 )
 from warehouse.dn.models import DNCarrierShipment, DNDocument
 
@@ -1176,6 +1176,80 @@ def test_thermal_label_format_uses_4x6_stock(client, access_token, fedex):
     shipment = response.get_json()['shipment']
     assert (shipment['label_format'], shipment['image_type'], shipment['label_stock_type']) == \
         ('THERMAL', 'PDF', 'STOCK_4X6')
+    # 存档页面：4x6 英寸等比缩到默认的 100x150 mm
+    label = client.get(shipment['label_download_path'].replace('/warehouse', ''), headers=_h(access_token))
+    assert label.status_code == 200
+    assert _page_sizes_mm(label.data) == [(100.0, 150.0)] * 4     # 第 1 箱 3 页 + 第 2 箱 1 页
+
+
+def _page_sizes_mm(content: bytes):
+    from pypdf import PdfReader
+    return [(round(float(page.mediabox.width) * 25.4 / 72, 1), round(float(page.mediabox.height) * 25.4 / 72, 1))
+            for page in PdfReader(io.BytesIO(content)).pages]
+
+
+def _page_scale(content: bytes, index=0) -> float:
+    """fit_pdf_pages 加在页面内容最前面的 cm 矩阵的缩放系数（没有 cm 为 1）"""
+    from pypdf import PdfReader
+    from pypdf.generic import ContentStream
+    page = PdfReader(io.BytesIO(content)).pages[index]
+    for operands, operator in ContentStream(page.get_contents(), None).operations:
+        if operator == b'cm':
+            return round(float(operands[0]), 4)
+    return 1.0
+
+
+def test_label_archive_fits_pages_to_page_size():
+    from PIL import Image
+    from pypdf import PdfReader
+    from reportlab.pdfgen import canvas
+    letter = io.BytesIO()
+    pdf = canvas.Canvas(letter, pagesize=(612, 792))
+    pdf.drawString(20, 700, 'INVOICE')
+    pdf.showPage()
+    pdf.save()
+    documents = [_doc(_label_pdf_pages('LABEL 1', 'AWB COPY 1')),
+                 _doc(letter.getvalue(), content_type='COMMERCIAL_INVOICE', source='shipment', sequence=None)]
+
+    archive = build_label_archive(documents, 'PDF', (100, 150))
+    # 4x6 英寸页等比缩到 100x150 mm（98.4%）；Letter 页要缩小超过 10% 才放得下 → 原样
+    assert _page_sizes_mm(archive['content']) == [(100.0, 150.0), (100.0, 150.0), (215.9, 279.4)]
+    assert _page_scale(archive['content']) == round(100 / 101.6, 4)
+    assert [page.extract_text().strip() for page in PdfReader(io.BytesIO(archive['content'])).pages] == \
+        ['LABEL 1', 'AWB COPY 1', 'INVOICE']
+    assert [p['pages'] for p in archive['parts']] == [2, 1]
+
+    # 不给 page_size：原样；目标比页面大：只居中、不放大
+    assert _page_sizes_mm(build_label_archive(documents[:1], 'PDF')['content']) == [(101.6, 152.4)] * 2
+    larger = build_label_archive(documents[:1], 'PDF', (120, 180))['content']
+    assert _page_sizes_mm(larger) == [(120.0, 180.0)] * 2 and _page_scale(larger) == 1.0
+
+    # PNG 转出来的页同样处理；ZPL 不管 page_size
+    buf = io.BytesIO()
+    Image.new('RGB', (812, 1218), 'white').save(buf, format='PNG')     # 203 dpi 下 4x6 英寸
+    png = build_label_archive([_doc(buf.getvalue(), doc_type='PNG')], 'PNG', (100, 150))
+    assert _page_sizes_mm(png['content']) == [(100.0, 150.0)]
+    zpl = build_label_archive([_doc(b'^XA^XZ', doc_type='ZPLII')], 'ZPLII', (100, 150))
+    assert zpl['content'] == b'^XA^XZ\n'
+
+
+def test_parse_page_size():
+    assert parse_page_size(None) is None and parse_page_size('') is None
+    assert parse_page_size('100x150') == (100.0, 150.0)
+    assert parse_page_size(' 101.6 × 152.4 ') == (101.6, 152.4)
+    assert parse_page_size('100*150') == parse_page_size('100X150') == (100.0, 150.0)
+    for bad in ('100', '100x', 'ax150', '10x150', '100x600', '-100x150'):
+        with pytest.raises(ValueError):
+            parse_page_size(bad)
+
+
+def test_invalid_thermal_page_size_blocks(client, access_token, fedex):
+    dn_id, _task_id = _ready(client, access_token)
+    client.application.config['FEDEX_LABEL_THERMAL_PAGE_SIZE'] = '100'
+    response = _create(client, access_token, dn_id)
+    assert _codes(response) == ['FEDEX_CONFIG_INVALID']
+    assert 'FEDEX_LABEL_THERMAL_PAGE_SIZE' in response.get_json()['details']['blockers'][0]['message']
+    assert fedex.calls == []
 
 
 def test_invalid_label_format_rejected(client, access_token, fedex):

@@ -18,8 +18,11 @@
 - 商品净重：商品主数据有单件重量的行 = 单件重量 × 已打包数量；没有的行分摊「箱子总毛重 − 已知净重」
   （不为正时按数量占比分摊总毛重），按已打包数量比例分。
 - 面单打印方式（label_format）：A4（激光打印机，PDF + PAPER_85X11_TOP_HALF_LABEL）/ THERMAL（4 英寸面单机，
-  PDF + STOCK_4X6，页面就是 4x6 英寸）。imageType / stock 可按格式用配置覆盖（ZPLII / EPL2 也支持）。
+  PDF + STOCK_4X6，FedEx 回 4x6 英寸页）。imageType / stock 可按格式用配置覆盖（ZPLII / EPL2 也支持）。
   注意 PAPER_4X6 在 FedEx 回的是 Letter 页、面单在左上角（sandbox 实测），热敏机要用 STOCK_4X6。
+- 存档页面（page_size，mm）：THERMAL 默认 100x150。FedEx 的 4x6 英寸面单内容几乎铺满整页（离边 0~0.7 mm），
+  在 100×150 mm 面单纸上按实际大小打印会切边，所以每页等比缩小（只缩不放）居中放到 100×150 的页面上（98.4%）。
+  要缩小超过 10% 才放得下的页（例如 Letter 尺寸的单证）保持原样。只对 PDF / PNG 存档生效。
 - 面单存档：响应里所有文档（每箱 packageDocuments、整票 shipmentDocuments）按「面单 → 辅助运单 → 其他」排序，
   PDF / PNG 合成一个 PDF，ZPLII / EPL2 把原始指令按同样顺序拼成一个文件；每份文档的类型与页数记在 parts 里。
   国际件的辅助运单（FEDEX AWB COPY）FedEx 放在每票第一箱面单 PDF 的后几页里（不是单独的文档），请求里不用另外要。
@@ -63,6 +66,12 @@ LABEL_FORMAT_DEFAULTS = {
     'A4': ('PDF', 'PAPER_85X11_TOP_HALF_LABEL'),   # A4 / Letter 普通纸：上半页面单，下半页折叠说明
     'THERMAL': ('PDF', 'STOCK_4X6'),               # 4x6 英寸（约 100×150 mm）热敏面单纸
 }
+# 面单打印方式 → 存档 PDF 的页面（mm，宽x高）；配置 FEDEX_LABEL_<FORMAT>_PAGE_SIZE 可覆盖。
+# 用真 4x6 英寸纸时设 101.6x152.4（不缩放）
+LABEL_PAGE_SIZE_DEFAULTS = {'THERMAL': '100x150'}
+LABEL_PAGE_SIZE_RANGE_MM = (20, 500)
+LABEL_FIT_MIN_SCALE = 0.9       # 要缩小超过 10% 才放得下的页保持原样
+_PAGE_SIZE_RE = re.compile(r'^\s*(\d+(?:\.\d+)?)\s*[xX×*]\s*(\d+(?:\.\d+)?)\s*$')
 # 面单存档文件：imageType → (扩展名, Content-Type)
 LABEL_ARCHIVE_FILES = {
     'PDF': ('pdf', 'application/pdf'),
@@ -135,15 +144,32 @@ def iso_currency(code):
 
 
 def label_settings(config, label_format=None) -> dict:
-    """面单打印方式 → {label_format, image_type, stock_type}。config 是 dict 样的配置（Flask config）。
-    label_format 为空取 FEDEX_DEFAULT_LABEL_FORMAT；不认识的格式原样返回（由调用方报错）。"""
+    """面单打印方式 → {label_format, image_type, stock_type, page_size}。config 是 dict 样的配置（Flask config）。
+    label_format 为空取 FEDEX_DEFAULT_LABEL_FORMAT；不认识的格式原样返回（由调用方报错）。
+    page_size 是配置原文（'100x150'，没有为 None），用 parse_page_size 解析。"""
     fmt = (label_format or config.get('FEDEX_DEFAULT_LABEL_FORMAT') or DEFAULT_LABEL_FORMAT).strip().upper()
     image_default, stock_default = LABEL_FORMAT_DEFAULTS.get(fmt, LABEL_FORMAT_DEFAULTS[DEFAULT_LABEL_FORMAT])
+    page_size = (config.get(f'FEDEX_LABEL_{fmt}_PAGE_SIZE') or LABEL_PAGE_SIZE_DEFAULTS.get(fmt) or '').strip()
     return {
         'label_format': fmt,
         'image_type': (config.get(f'FEDEX_LABEL_{fmt}_IMAGE_TYPE') or image_default).strip().upper(),
         'stock_type': (config.get(f'FEDEX_LABEL_{fmt}_STOCK_TYPE') or stock_default).strip().upper(),
+        'page_size': page_size or None,
     }
+
+
+def parse_page_size(text):
+    """'100x150'（mm，宽x高；x / × / * 都认）→ (宽, 高)；空 → None；格式不对或超出范围抛 ValueError"""
+    if not text:
+        return None
+    match = _PAGE_SIZE_RE.match(str(text))
+    if not match:
+        raise ValueError(f"Page size {text!r} is not WIDTHxHEIGHT in mm")
+    width, height = float(match.group(1)), float(match.group(2))
+    low, high = LABEL_PAGE_SIZE_RANGE_MM
+    if not (low <= width <= high and low <= height <= high):
+        raise ValueError(f"Page size {text!r} is out of range ({low}-{high} mm)")
+    return width, height
 
 
 def tin_type_for(tax_id_type) -> str:
@@ -593,12 +619,39 @@ def _part(document, archived, pages=None, note=None) -> dict:
     return part
 
 
-def build_label_archive(documents, image_type) -> dict:
+def fit_pdf_pages(content: bytes, page_size) -> bytes:
+    """PDF 每页等比缩小（只缩不放）、居中放到 page_size（mm，(宽, 高)）的页面上。
+    要缩小超过 LABEL_FIT_MIN_SCALE 才放得下的页保持原样。"""
+    from pypdf import PdfReader, PdfWriter, Transformation
+    from pypdf.generic import RectangleObject
+    width, height = (value * 72 / 25.4 for value in page_size)
+    writer = PdfWriter(clone_from=PdfReader(io.BytesIO(content)))
+    for page in writer.pages:
+        page.transfer_rotation_to_content()
+        box = page.cropbox
+        box_width, box_height = float(box.width), float(box.height)
+        scale = min(1.0, width / box_width, height / box_height)
+        if scale >= LABEL_FIT_MIN_SCALE:
+            page.add_transformation(
+                Transformation().translate(-float(box.left), -float(box.bottom)).scale(scale, scale)
+                .translate((width - box_width * scale) / 2, (height - box_height * scale) / 2))
+            page.mediabox = RectangleObject((0, 0, width, height))
+            page.cropbox = RectangleObject((0, 0, width, height))
+            for key in ('/TrimBox', '/BleedBox', '/ArtBox'):
+                if key in page:
+                    del page[key]
+    out = io.BytesIO()
+    writer.write(out)
+    return out.getvalue()
+
+
+def build_label_archive(documents, image_type, page_size=None) -> dict:
     """所有面单文档 → 一个存档文件 {content, extension, content_type, parts}。
 
     PDF / PNG：PDF 文档逐页拼接、PNG 每张转一页，合成一个 PDF（只有一份 PDF 时原样保存）；
-    ZPLII / EPL2：同类型的原始指令按顺序拼接。其它类型、只给了 URL 的、合并件不进存档，parts 里 archived=false。
-    一份都存不进去抛 ValueError。
+    给了 page_size（mm，(宽, 高)）时每页再等比缩小居中到这个尺寸（fit_pdf_pages）；
+    ZPLII / EPL2：同类型的原始指令按顺序拼接（不管 page_size）。其它类型、只给了 URL 的、合并件不进存档，
+    parts 里 archived=false。一份都存不进去抛 ValueError。
     """
     image_type = (image_type or 'PDF').upper()
     if image_type not in LABEL_ARCHIVE_FILES:
@@ -646,6 +699,8 @@ def build_label_archive(documents, image_type) -> dict:
                 out = io.BytesIO()
                 writer.write(out)
                 content = out.getvalue()
+            if page_size:
+                content = fit_pdf_pages(content, page_size)
         else:
             if not raw_chunks:
                 raise ValueError(f"FedEx response has no {image_type} label")
