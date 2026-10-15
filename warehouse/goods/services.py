@@ -323,6 +323,9 @@ class GoodsService:
     @staticmethod
     def _build_goods(data: dict, created_by_id: int) -> Goods:
         """按请求数据建 Goods 并加入会话（不 flush、不发事件）"""
+        # 在副本上规范化：data 往往就是 request JSON 本身，原地塞进 Decimal / date 会让
+        # after_request 操作日志序列化请求体时抛 TypeError，已提交的请求被兜成 500
+        data = dict(data)
         # 假设 data['manufacturing_date'] = "2025-01-01"
         if 'manufacturing_date' in data and isinstance(data['manufacturing_date'], str):
             data['manufacturing_date'] = datetime.strptime(data['manufacturing_date'], '%Y-%m-%d').date()
@@ -390,8 +393,8 @@ class GoodsService:
         """
         goods = GoodsService.get_goods(goods_id)
         spec_before = goods_spec_snapshot(goods)
-        # 数值字段：有限、范围内（400 16100）
-        clean_goods_numbers(data)
+        # 数值字段：有限、范围内（400 16100）；在副本上改，不动请求体（同 _build_goods）
+        data = clean_goods_numbers(dict(data))
 
         goods.code = data.get('code', goods.code)
         goods.name = data.get('name', goods.name)

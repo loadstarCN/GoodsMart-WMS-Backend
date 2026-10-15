@@ -197,3 +197,58 @@ def test_bulk_upload_missing_price_and_bad_number(client, access_token):
     }, content_type='multipart/form-data')
     assert response.status_code == 400
     assert response.get_json()['code'] == 10012
+
+
+def test_update_goods_numbers_do_not_mutate_request_json(client, access_token):
+    """weight / price 规范化成 Decimal 只发生在副本上：请求 JSON 保持原样，
+    after_request 操作日志能序列化请求体（以前 TypeError → 已提交的修改返回 500）"""
+    import json
+    from decimal import Decimal
+    from flask import request
+    from system.logs.utils import _capture_request_body
+    from warehouse.goods.models import Goods
+    from warehouse.goods.services import GoodsService
+
+    body = {'weight': 0.328, 'length': 140, 'width': 130, 'height': 13, 'price': 1760}
+    with client.application.app_context():
+        goods_id = get_goods().id
+    with client.application.test_request_context(json=dict(body)):
+        payload = request.get_json()
+        GoodsService.update_goods(goods_id, payload)
+        # 按 JSON 比（Decimal('1760.00') == 1760 为真，直接 == 看不出被改成了 Decimal）
+        assert json.dumps(payload, sort_keys=True) == json.dumps(body, sort_keys=True)
+        assert json.loads(_capture_request_body()) == body
+        goods = db.session.get(Goods, goods_id)
+        assert goods.weight == Decimal('0.328')
+        assert (goods.length, goods.width, goods.height) == (140, 130, 13)
+        assert goods.price == Decimal('1760')
+
+
+def test_create_goods_numbers_do_not_mutate_request_json(client, access_token):
+    """新建同上：_build_goods 在副本上规范化"""
+    import json
+    from flask import request
+    from warehouse.goods.services import GoodsService
+
+    body = {'code': 'G-DEC-1', 'company_id': 1, 'name': 'Decimal goods', 'weight': 1.5, 'price': 980}
+    with client.application.app_context():
+        created_by = get_admin_user().id
+    with client.application.test_request_context(json=dict(body)):
+        payload = request.get_json()
+        GoodsService.create_goods(payload, created_by)
+        assert json.dumps(payload, sort_keys=True) == json.dumps(body, sort_keys=True)
+
+
+def test_capture_request_body_tolerates_non_json_values(client):
+    """视图就地往请求 JSON 里塞了 Decimal / date：操作日志按字符串记下，不抛异常"""
+    import json
+    from datetime import date
+    from decimal import Decimal
+    from flask import request
+    from system.logs.utils import _capture_request_body
+
+    with client.application.test_request_context(json={'weight': 0.328}):
+        payload = request.get_json()
+        payload['weight'] = Decimal('0.328')
+        payload['production_date'] = date(2026, 10, 15)
+        assert json.loads(_capture_request_body()) == {'weight': '0.328', 'production_date': '2026-10-15'}

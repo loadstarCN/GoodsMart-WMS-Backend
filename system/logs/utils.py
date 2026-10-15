@@ -46,12 +46,14 @@ def _should_redact_body(path: str) -> bool:
 
 
 def _capture_request_body() -> str:
-    if request.is_json:
-        payload = request.get_json(silent=True)
-        if payload is not None:
-            return json.dumps(_mask_obj(payload), ensure_ascii=False)
-    # 非 JSON（表单 / 文件上传 / 畸形 JSON）：只记录文本形式，解码失败的字节用替换符
     try:
+        if request.is_json:
+            payload = request.get_json(silent=True)
+            if payload is not None:
+                # 视图可能已就地改过缓存的请求 JSON（塞进 Decimal / date 等）：default=str 兜底，
+                # 日志序列化失败不能把已提交的请求变成 500
+                return json.dumps(_mask_obj(payload), ensure_ascii=False, default=str)
+        # 非 JSON（表单 / 文件上传 / 畸形 JSON）：只记录文本形式，解码失败的字节用替换符
         return request.get_data(as_text=True)
     except Exception:
         return _REDACTED
@@ -62,7 +64,7 @@ def _capture_response_body(response) -> str:
         if response.is_json:
             payload = response.get_json(silent=True)
             if payload is not None:
-                return json.dumps(_mask_obj(payload), ensure_ascii=False)
+                return json.dumps(_mask_obj(payload), ensure_ascii=False, default=str)
         if response.direct_passthrough:
             return '[stream]'
         return response.get_data(as_text=True)
