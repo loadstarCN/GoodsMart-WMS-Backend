@@ -1,6 +1,6 @@
 """DN 承运商运单接口（FedEx Ship API 自动建单 / 取消 / 确认作废结果不明的记录）。
 
-权限：读 = dn_read 或 packing_read；建单 / 取消 / 确认作废 = packing_edit 或 delivery_edit。
+权限：读 = dn_read / packing_read / delivery_read；建单 / 取消 / 确认作废 = packing_edit 或 delivery_edit。
 取消 / 确认作废可带目标标识（tracking_number / unresolved_id），与当前记录不符 → 409 16093。
 面单 PDF 用单证下载接口 GET /warehouse/dn/<id>/customs-documents/<label_document_id>/file。
 """
@@ -38,7 +38,7 @@ carrier_shipment_cancel_model = api_ns.model('DNCarrierShipmentCancel', {
                     'shipment → 409 16093 {expected, actual}'),
 })
 
-_READ = ["all_access", "company_all_access", "dn_read", "packing_read"]
+_READ = ["all_access", "company_all_access", "dn_read", "packing_read", "delivery_read"]
 _SHIP_EDIT = ["all_access", "company_all_access", "packing_edit", "delivery_edit"]
 
 

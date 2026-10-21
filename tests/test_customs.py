@@ -894,6 +894,37 @@ def test_customs_endpoints_cross_company(client, access_token):
     assert response.status_code == 404 and response.get_json()['code'] == 16071
 
 
+def test_delivery_staff_can_read_and_issue_documents(client, access_token):
+    """配送任务页办出荷手续：只有 delivery_read + delivery_edit 的员工能读报关数据 / 运单状态、出单证、下载，
+    但不能改箱子（packing_edit）或报关快照（dn_edit）"""
+    dn_id, _task_id = _export_dn_ready(client, access_token)
+    with client.application.app_context():
+        role = Role(name='delivery_only_role', description='delivery only', is_active=True)
+        for name in ('delivery_read', 'delivery_edit'):
+            permission = Permission.query.filter_by(name=name).first() or Permission(name=name, description=name)
+            role.permissions.append(permission)
+        staff = Staff(user_name='delivery_only', email='delivery_only@example.com', is_active=True,
+                      company_id=get_company().id, created_by=get_admin_user().id)
+        staff.set_password('password')
+        staff.roles.append(role)
+        staff.warehouses.append(get_warehouse())
+        db.session.add_all([role, staff])
+        db.session.commit()
+        token = create_access_token(identity=staff)
+        warehouse_id = get_warehouse().id
+    headers = {'Authorization': f'Bearer {token}', 'X-WAREHOUSE-ID': str(warehouse_id)}
+
+    assert client.get(f'/dn/{dn_id}/customs', headers=headers).status_code == 200
+    assert client.get(f'/dn/{dn_id}/carrier-shipment', headers=headers).status_code == 200
+    response = client.post(f'/dn/{dn_id}/customs-documents/issue', headers=headers)
+    assert response.status_code == 201, response.get_json()
+    doc_id = response.get_json()['documents'][0]['id']
+    assert client.get(f'/dn/{dn_id}/customs-documents/{doc_id}/file', headers=headers).status_code == 200
+
+    assert client.put(f'/dn/{dn_id}/packages', json={'packages': PACKAGES}, headers=headers).status_code == 403
+    assert client.put(f'/dn/{dn_id}/customs', json=_customs(), headers=headers).status_code == 403
+
+
 # ---------------------------------------------------------------------------
 # 公司 / 仓库出口资料、异常 details
 # ---------------------------------------------------------------------------

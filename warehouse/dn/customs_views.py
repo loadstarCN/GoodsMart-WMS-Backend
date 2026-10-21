@@ -1,6 +1,7 @@
 """DN 海外件接口：报关快照、箱子、出口单证（商业发票 / 装箱单）。
 
-权限：读 = dn_read 或 packing_read；改箱子、出单证 = packing_edit；替换报关快照 = dn_edit。
+权限：读 = dn_read / packing_read / delivery_read；改箱子 = packing_edit；出单证 = packing_edit 或 delivery_edit
+（打包、配送任务页都能出单证，与 FedEx 建单一致）；替换报关快照 = dn_edit。
 DN 归属校验与其它 DN 接口一致（跨仓库 403、不存在 404）。
 """
 from flask import Response
@@ -20,8 +21,9 @@ from .schemas import (
     dn_customs_documents_parser,
 )
 
-_READ = ["all_access", "company_all_access", "dn_read", "packing_read"]
+_READ = ["all_access", "company_all_access", "dn_read", "packing_read", "delivery_read"]
 _PACKING_EDIT = ["all_access", "company_all_access", "packing_edit"]
+_ISSUE = ["all_access", "company_all_access", "packing_edit", "delivery_edit"]
 _DN_EDIT = ["all_access", "company_all_access", "dn_edit"]
 
 
@@ -94,7 +96,7 @@ class DNPackagesResource(Resource):
 @api_ns.route('/<int:dn_id>/customs-documents/issue')
 class DNCustomsDocumentIssue(Resource):
 
-    @permission_required(_PACKING_EDIT)
+    @permission_required(_ISSUE)
     @warehouse_required()
     def post(self, dn_id):
         """
