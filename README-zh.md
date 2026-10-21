@@ -648,6 +648,40 @@ FedEx 回「已取消 / 查无此运单」视为取消成功（`reason: already_
 `NOT FOUND` / `NOT EXIST`，以及旧版 Web Services 的 `8159`（「Shipment Delete was requested for a tracking number already in
 a deleted state」）。命中时日志记原始错误码；正式环境遇到没覆盖的码，补到 `carrier_services.ALREADY_CANCELLED_CODES`。
 
+### FedEx 上门揽收
+
+没有和 FedEx 签定期集荷：建运单时 `pickupType` 默认 `CONTACT_FEDEX_TO_SCHEDULE`，运单建好后要另约快递员上门
+（FedEx Pickup Request API，FedEx 开发者项目里要开通该 API）。揽收按「当前仓库（`X-WAREHOUSE-ID`，必带）+ 日期」约，
+一次带多张运单，件数 / 总重量按所带运单的箱子（`dn_packages` 毛重）合计。记录在 `carrier_pickups`，所带运单的
+`dn_carrier_shipments.pickup_id` 指向它（`shipments` 另存快照）。
+
+| 接口 | 说明 |
+|------|------|
+| `GET /warehouse/dn/carrier-pickups` | 待揽收运单（FedEx、`active`、DN 未发货；`can_schedule`）、最近 14 天的预约（结果不明的一律列出）、前置条件 `blockers`、揽收地点 |
+| `GET /warehouse/dn/carrier-pickups/availability` | 只查询：FedEx 开放的揽收日与可选时间（`options[{pickup_date, cutoff_time, access_minutes, ready_times, latest_times, default_ready_time, default_latest_time}]`） |
+| `POST /warehouse/dn/carrier-pickups` | `{shipment_ids, pickup_date, ready_time, close_time, remarks?, notification_email?}` → 201 `{pickup, alerts, message}` |
+| `POST /warehouse/dn/carrier-pickups/<id>/cancel` | 取消已约上、揽收日没过的预约 |
+| `POST /warehouse/dn/carrier-pickups/<id>/dismiss` | `{confirm: true}`：结果不明的预约核对 FedEx 后作废 |
+
+- 权限与自动运单相同：读 `dn_read` / `packing_read` / `delivery_read`，写 `packing_edit` / `delivery_edit`。
+- **揽收地点**：地址 = 仓库英文地址（没有用公司的，与建运单的发件地址同一套拆分规则），联系人 = 仓库联系人（没有用公司出口联系人），
+  电话 = 仓库电话（没有用公司的，须 8～13 位数字），公司名 = 公司英文名。前置条件：`FEDEX_NOT_CONFIGURED` /
+  `FEDEX_CONFIG_INVALID` / `FEDEX_COMPANY_NOT_ALLOWED` / `PICKUP_ADDRESS_MISSING` / `PICKUP_ADDRESS_INVALID` /
+  `PICKUP_PHONE_INVALID`（409 `16130`）。
+- **时间**：日期 / 时间都是仓库当地的（`DOCUMENT_TIMEZONE`，默认 `Asia/Tokyo`）。`readyDateTimestamp` 带时区偏移
+  （`2026-10-22T12:00:00+09:00`，FedEx 示例集里日本的写法），`customerCloseTime` 为当地 `HH:MM:SS`；揽收日是今天时
+  `pickupDateType` = `SAME_DAY`，否则 `FUTURE_DAY`。FedEx 返回的截止时间（准备好时间不能更晚）与 `accessTime`（准备好到最晚揽收
+  的最短间隔）由前端用来限制下拉选项，后端只校验先后与日期范围（今天起 30 天内），其余由 FedEx 判断。
+- **被占着的运单**不能再约（409 `16132`，`reason: ALREADY_SCHEDULED`）：`pending` / `unknown` 的预约，或 `scheduled` 且揽收日没过。
+  揽收日过了、DN 还没发货的运单可以重新预约（快递员没来 / 忘了完成发货）。
+- **预约**与建运单一样分三段，调 FedEx 时不占行锁：锁所选运单 → 插 `pending` 记录并占住运单、提交 → 调 FedEx（受
+  `FEDEX_CREATE_BUDGET_SECONDS` 约束）→ 约上 `scheduled`（`confirmation_code` / `location_code`）；明确拒绝 / 没发出去 →
+  `failed`，运单放开（502 `16073` / 504 `16074`，`details.pickup`）；结果不明（超时、5xx、没有确认号）→ `unknown`，运单仍被占着，
+  操作员查确认邮件 / 致电 FedEx 后 `dismiss` 才放开。`pending` 超过 `FEDEX_PENDING_STALE_MINUTES` 按 `unknown`（`stale`）。
+- **取消**：`scheduled` 且揽收日没过（否则 409 `16133`）。FedEx 取消成功或回「已取消」（判断规则同运单取消）→ `cancelled`，运单放开；
+  明确拒绝 → 仍 `scheduled`（`reason: cancel_refused`）；结果不明 → 仍 `scheduled`（`reason: cancel_unclear`），可重试。
+- 确认邮件（`notification_email`）用 `en_US`；运单状态接口的 `shipment.pickup` 给出这张运单的揽收概要。
+
 ### 配置
 
 | 变量 | 默认值 | 说明 |
@@ -656,7 +690,7 @@ a deleted state」）。命中时日志记原始错误码；正式环境遇到�
 | `FEDEX_API_KEY` / `FEDEX_SECRET_KEY` / `FEDEX_ACCOUNT_NUMBER` | （不设） | FedEx 开发者项目凭证；缺任一项 = 功能关闭 |
 | `FEDEX_ALLOWED_COMPANY_IDS` | （空） | 允许自动建运单的公司 ID（逗号分隔，如 `1,3`）；**不设 = 所有公司都不允许**（运费记在同一个 FedEx 账号上） |
 | `FEDEX_SERVICE_TYPE` | `INTERNATIONAL_ECONOMY` | 服务类型 |
-| `FEDEX_PICKUP_TYPE` | `USE_SCHEDULED_PICKUP` | 揽收方式 |
+| `FEDEX_PICKUP_TYPE` | `CONTACT_FEDEX_TO_SCHEDULE` | 交货方式（Ship API `pickupType`）：`CONTACT_FEDEX_TO_SCHEDULE` = 没有定期集荷，在 WMS 预约揽收（见「FedEx 上门揽收」）；`USE_SCHEDULED_PICKUP` = 签了定期集荷；`DROPOFF_AT_FEDEX_LOCATION` = 自己送营业所 |
 | `FEDEX_DEFAULT_LABEL_FORMAT` | `A4` | 建单请求不指定时的面单打印方式（`A4` / `THERMAL`） |
 | `FEDEX_LABEL_A4_IMAGE_TYPE` / `FEDEX_LABEL_A4_STOCK_TYPE` | `PDF` / `PAPER_85X11_TOP_HALF_LABEL` | 覆盖 `A4` 的格式 / 纸张 |
 | `FEDEX_LABEL_THERMAL_IMAGE_TYPE` / `FEDEX_LABEL_THERMAL_STOCK_TYPE` | `PDF` / `STOCK_4X6` | 覆盖 `THERMAL` 的格式 / 纸张（Zebra 等可设 `ZPLII`） |
@@ -729,7 +763,7 @@ stdout_logfile=/var/log/wms-api.out.log
 | 库存错误 | 15000-15999 | 400 | 库存相关错误 |
 | 状态错误 | 16000-16999 | 400 | 状态流转错误 |
 
-出口单证相关业务码：`14019` 出口资料文本超长、`14020` 国家代码不合法、`16063` 报关结构不合法、`16064` 报关行商品编码不在 DN 明细或重复、`16065` 已发货不可改（409）、`16066` 箱子数据不合法、`16067` 当前状态不能改箱子（409）、`16068` 单证条件不全（409，`details.problems`）、`16069` 发货前单证缺失或已过期（409，`details {missing_documents, outdated}`）、`16070` 不是海外单（409）、`16071` 单证不存在（404）、`16117` 单证排不下——某块文字（通常是收件人信息）一页放不下，请缩短（409，`details {document, reason: LAYOUT_OVERFLOW}`）。承运商运单（FedEx）：`16072` 建单前置条件不满足（409，`details.blockers`）、`16073` FedEx 返回错误（502，`details.errors` / `transaction_id`）、`16074` FedEx 超时（504）、`16075` 没有可取消 / 可确认作废的运单记录（409，`details.unresolved`）、`16076` 有进行中 / 有效 / 结果不明 / 取消中的运单时不能改箱子或报关数据，也不能签发数据有变化的单证（409，`details {reason: CARRIER_SHIPMENT_OPEN | DOCUMENT_DATA_CHANGED, status, carrier, carrier_shipment {id, status, tracking_number}}`）、`16077` `label_format` 不合法（400）、`16078` 运单号 / 承运商与有效的自动运单不一致，或有自动运单时新建 / 删除发货任务（409）、`16079` 有结果不明 / 进行中的建单记录，或运单正在取消 / 取消结果不明——不能建单、存运单号、发货（409，`details.unresolved`）、`16093` 取消 / 确认作废请求里的目标与当前记录不符（409，`details {expected, actual}`）、`16094` 确认作废带运单号的记录时 FedEx 没有确认已取消 / 不存在（409）、`16095` FedEx 已建好运单但 WMS 写库失败，已补偿处理（502，`details {error, compensation, unresolved, …}`）。完成发货：`16080` 运单号与当前 CI 上印的 AWB 不一致（409，`details {document_tracking_number, tracking_number}`）、`16092` 承运商与当前 CI 上印的不一致（409，`details {document_carrier, document_carrier_id, carrier_id}`）。发货任务：`16090` DN 已有未完成的发货任务（409，`details {delivery_task_id, status}`）、`16091` 海外 DN 不是当前发货任务（409，`details {delivery_task_id, current_status}`）。错误响应可能带结构化的 `details`。
+出口单证相关业务码：`14019` 出口资料文本超长、`14020` 国家代码不合法、`16063` 报关结构不合法、`16064` 报关行商品编码不在 DN 明细或重复、`16065` 已发货不可改（409）、`16066` 箱子数据不合法、`16067` 当前状态不能改箱子（409）、`16068` 单证条件不全（409，`details.problems`）、`16069` 发货前单证缺失或已过期（409，`details {missing_documents, outdated}`）、`16070` 不是海外单（409）、`16071` 单证不存在（404）、`16117` 单证排不下——某块文字（通常是收件人信息）一页放不下，请缩短（409，`details {document, reason: LAYOUT_OVERFLOW}`）。承运商运单（FedEx）：`16072` 建单前置条件不满足（409，`details.blockers`）、`16073` FedEx 返回错误（502，`details.errors` / `transaction_id`）、`16074` FedEx 超时（504）、`16075` 没有可取消 / 可确认作废的运单记录（409，`details.unresolved`）、`16076` 有进行中 / 有效 / 结果不明 / 取消中的运单时不能改箱子或报关数据，也不能签发数据有变化的单证（409，`details {reason: CARRIER_SHIPMENT_OPEN | DOCUMENT_DATA_CHANGED, status, carrier, carrier_shipment {id, status, tracking_number}}`）、`16077` `label_format` 不合法（400）、`16078` 运单号 / 承运商与有效的自动运单不一致，或有自动运单时新建 / 删除发货任务（409）、`16079` 有结果不明 / 进行中的建单记录，或运单正在取消 / 取消结果不明——不能建单、存运单号、发货（409，`details.unresolved`）、`16093` 取消 / 确认作废请求里的目标与当前记录不符（409，`details {expected, actual}`）、`16094` 确认作废带运单号的记录时 FedEx 没有确认已取消 / 不存在（409）、`16095` FedEx 已建好运单但 WMS 写库失败，已补偿处理（502，`details {error, compensation, unresolved, …}`）。FedEx 上门揽收：`16130` 前置条件不满足（409，`details.blockers`）、`16131` 预约参数不合法（400，`field`）、`16132` 所选运单不能预约（409，`details.shipments[{shipment_id, tracking_number, reason}]`）、`16133` 当前状态不能取消 / 作废（409，`details {pickup_id, status, reason, pickup_date}`）；FedEx 报错 / 超时同运单（`16073` / `16074`，`details.action` 为 `pickup` / `pickup_cancel` / `pickup_availability`）。完成发货：`16080` 运单号与当前 CI 上印的 AWB 不一致（409，`details {document_tracking_number, tracking_number}`）、`16092` 承运商与当前 CI 上印的不一致（409，`details {document_carrier, document_carrier_id, carrier_id}`）。发货任务：`16090` DN 已有未完成的发货任务（409，`details {delivery_task_id, status}`）、`16091` 海外 DN 不是当前发货任务（409，`details {delivery_task_id, current_status}`）。错误响应可能带结构化的 `details`。
 
 作业流程（见上文「作业流程规则」）：`16110` DN 有未结束的承运商运单，请先取消运单（409）、`16111` 调整单已取消（409）、`16112` 调整单当前状态不能取消（409）、`16113` 调整明细无法执行：库位上已没有该商品 / 明细没有库位（409）、`16114` 盘点单有未录入的明细（409，`details.detail_ids`）、`16115` 数值字段不合法（400，`field`）、`16116` 分拣任务的 ASN 不能改（409）、`16120` 移库来源库位没有这个商品（404）、`16121` 同一个 `client_batch_id` 已提交过不同的明细（409，`details {client_batch_id, batch_id}`）、`16122` 修改过调整单明细的人不能审批（409）、`16123` `client_batch_id` 不合法（400）、`44009` 库位有历史记录，请改用停用（409）。任务：`16088` 任务已停用（所属 DN / ASN 已取消，409）、`16089` 拣货一件都没拣不能完成（409）。
 

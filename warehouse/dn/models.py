@@ -558,6 +558,13 @@ class DNCarrierShipment(db.Model):
     transaction_id = db.Column(db.String(100), nullable=True, info={'description': '建单请求的承运商 transactionId'})
     cancel_transaction_id = db.Column(db.String(100), nullable=True,
                                       info={'description': '取消请求的承运商 transactionId（最近一次）'})
+    pickup_id = db.Column(
+        db.Integer,
+        db.ForeignKey('carrier_pickups.id', ondelete='SET NULL'),
+        nullable=True,
+        index=True,
+        info={'description': '最近一次包含这张运单的揽收预约（预约失败 / 取消 / 作废时清空）'}
+    )
     created_by = db.Column(
         db.Integer,
         db.ForeignKey('users.id', ondelete='SET NULL'),
@@ -625,6 +632,120 @@ class DNCarrierShipment(db.Model):
             'updated_at': self.updated_at.isoformat() if self.updated_at else None,
             'cancelled_at': self.cancelled_at.isoformat() if self.cancelled_at else None,
             'cancelled_by': self.cancelled_by,
+            'dismissed_at': self.dismissed_at.isoformat() if self.dismissed_at else None,
+            'dismissed_by': self.dismissed_by,
+        }
+
+
+class CarrierPickup(db.Model):
+    """向承运商预约的上门揽收（目前只有 FedEx Pickup Request API），每次预约请求一条记录。
+
+    揽收按「仓库 + 日期」约，一次可以带多张自动运单（件数 / 总重量按所带运单的箱子合计）；
+    所带运单的 dn_carrier_shipments.pickup_id 指向本记录，shipments 另存一份快照（运单后来被重约也不丢）。
+    状态：
+    - pending：正在请求承运商（请求前先独立提交这条记录）
+    - scheduled：已约上（confirmation_code / location_code 有值）；揽收日过了仍是 scheduled（按日期区分已过的）
+    - cancelled：已取消；failed：承运商明确拒绝 / 请求没发出去，确定没约上
+    - unknown：结果不明（超时、5xx、响应看不懂……），承运商那边可能已约上
+    - dismissed：unknown（或卡住的 pending）经操作员核对后作废
+    failed / cancelled / dismissed 时所带运单的 pickup_id 清空，可以重新预约。
+    """
+    __tablename__ = 'carrier_pickups'
+
+    STATUSES = ('pending', 'scheduled', 'cancelled', 'failed', 'unknown', 'dismissed')
+    UNRESOLVED_STATUSES = ('pending', 'unknown')
+
+    __table_args__ = (
+        db.Index('idx_carrier_pickup_warehouse_date', 'warehouse_id', 'pickup_date'),
+        db.CheckConstraint(
+            "status IN ('pending','scheduled','cancelled','failed','unknown','dismissed')",
+            name='chk_carrier_pickup_status',
+        ),
+    )
+
+    id = db.Column(db.Integer, primary_key=True)
+    warehouse_id = db.Column(
+        db.Integer,
+        db.ForeignKey('warehouses.id', ondelete='RESTRICT'),
+        nullable=False,
+        info={'description': '揽收仓库ID'}
+    )
+    carrier = db.Column(db.String(30), nullable=False, info={'description': '承运商适配器（fedex）'})
+    status = db.Column(db.String(10), nullable=False, default='pending',
+                       info={'description': 'pending / scheduled / cancelled / failed / unknown / dismissed'})
+    reason = db.Column(db.String(40), nullable=True,
+                       info={'description': '状态原因（如 rejected / not_sent / timeout / server_error / bad_response / '
+                                            'stale / cancel_unclear / already_cancelled）'})
+    error_message = db.Column(db.String(500), nullable=True, info={'description': '失败 / 结果不明时的错误摘要'})
+    pickup_date = db.Column(db.Date, nullable=False, info={'description': '揽收日（仓库当地日期）'})
+    ready_time = db.Column(db.String(5), nullable=False, info={'description': '包裹准备好的时间（当地 HH:MM）'})
+    close_time = db.Column(db.String(5), nullable=False, info={'description': '最晚揽收时间（当地 HH:MM）'})
+    package_count = db.Column(db.Integer, nullable=False, info={'description': '件数（所带运单的箱数合计）'})
+    total_weight_kg = db.Column(db.Numeric(10, 3), nullable=False, info={'description': '总重量 kg（箱子毛重合计）'})
+    shipments = db.Column(db.JSON, nullable=True,
+                          info={'description': '所带运单快照 [{shipment_id, dn_id, tracking_number, package_count, '
+                                               'weight_kg}]'})
+    pickup_location = db.Column(db.JSON, nullable=True,
+                                info={'description': '提交给承运商的揽收地点 {contact, address}'})
+    remarks = db.Column(db.String(100), nullable=True, info={'description': '给快递员的留言'})
+    notification_email = db.Column(db.String(120), nullable=True, info={'description': '承运商确认邮件的收件地址'})
+    confirmation_code = db.Column(db.String(40), nullable=True, info={'description': '承运商的揽收确认号'})
+    location_code = db.Column(db.String(20), nullable=True,
+                              info={'description': '承运商处理这次揽收的站点代码（FedEx 取消时要用）'})
+    transaction_id = db.Column(db.String(100), nullable=True, info={'description': '预约请求的承运商 transactionId'})
+    cancel_transaction_id = db.Column(db.String(100), nullable=True,
+                                      info={'description': '取消请求的承运商 transactionId（最近一次）'})
+    created_by = db.Column(
+        db.Integer,
+        db.ForeignKey('users.id', ondelete='SET NULL'),
+        nullable=True,
+        info={'description': '预约人ID'}
+    )
+    created_at = db.Column(db.DateTime, default=db.func.now(), info={'description': '预约时间'})
+    updated_at = db.Column(db.DateTime, nullable=True, info={'description': '状态最后变化时间'})
+    cancelled_at = db.Column(db.DateTime, nullable=True, info={'description': '取消时间'})
+    cancelled_by = db.Column(
+        db.Integer,
+        db.ForeignKey('users.id', ondelete='SET NULL'),
+        nullable=True,
+        info={'description': '取消人ID'}
+    )
+    dismissed_at = db.Column(db.DateTime, nullable=True, info={'description': '确认作废时间'})
+    dismissed_by = db.Column(
+        db.Integer,
+        db.ForeignKey('users.id', ondelete='SET NULL'),
+        nullable=True,
+        info={'description': '确认作废人ID'}
+    )
+
+    def to_dict(self) -> dict:
+        return {
+            'id': self.id,
+            'warehouse_id': self.warehouse_id,
+            'carrier': self.carrier,
+            'status': self.status,
+            'reason': self.reason,
+            'error_message': self.error_message,
+            'pickup_date': self.pickup_date.isoformat() if self.pickup_date else None,
+            'ready_time': self.ready_time,
+            'close_time': self.close_time,
+            'package_count': self.package_count,
+            'total_weight_kg': float(self.total_weight_kg) if self.total_weight_kg is not None else None,
+            'shipments': self.shipments or [],
+            'pickup_location': self.pickup_location,
+            'remarks': self.remarks,
+            'notification_email': self.notification_email,
+            'confirmation_code': self.confirmation_code,
+            'location_code': self.location_code,
+            'transaction_id': self.transaction_id,
+            'cancel_transaction_id': self.cancel_transaction_id,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'created_by': self.created_by,
+            'created_by_user': _user_ref(self.created_by),
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None,
+            'cancelled_at': self.cancelled_at.isoformat() if self.cancelled_at else None,
+            'cancelled_by': self.cancelled_by,
+            'cancelled_by_user': _user_ref(self.cancelled_by),
             'dismissed_at': self.dismissed_at.isoformat() if self.dismissed_at else None,
             'dismissed_by': self.dismissed_by,
         }

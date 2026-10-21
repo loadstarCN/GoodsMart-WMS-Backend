@@ -159,7 +159,7 @@ def _settings() -> dict:
     cfg = current_app.config
     return {
         'service_type': cfg.get('FEDEX_SERVICE_TYPE') or 'INTERNATIONAL_ECONOMY',
-        'pickup_type': cfg.get('FEDEX_PICKUP_TYPE') or 'USE_SCHEDULED_PICKUP',
+        'pickup_type': cfg.get('FEDEX_PICKUP_TYPE') or 'CONTACT_FEDEX_TO_SCHEDULE',
         'duties_payment_type': (cfg.get('FEDEX_DUTIES_PAYMENT_TYPE') or 'RECIPIENT').upper(),
         'etd_enabled': bool(cfg.get('FEDEX_ETD_ENABLED')),
         'default_label_format': label_settings(cfg)['label_format'],
@@ -396,6 +396,10 @@ class CarrierShipmentService:
             return None
         payload = record.to_dict()
         payload['status'], payload['reason'] = CarrierShipmentService.effective_status(record)
+        # 揽收预约概要（运单还有效时才有意义）；揽收服务依赖本模块，延迟导入
+        from .pickup_services import CarrierPickupService
+        payload['pickup'] = (CarrierPickupService.summary_for_shipment(record)
+                             if record.status in LIVE_STATUSES else None)
         return payload
 
     @staticmethod

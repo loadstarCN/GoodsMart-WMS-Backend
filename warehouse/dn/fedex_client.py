@@ -1,4 +1,5 @@
-"""FedEx REST API 客户端：OAuth、Ship API（建单 / 取消）、Trade Documents Upload API（ETD 上传）。
+"""FedEx REST API 客户端：OAuth、Ship API（建单 / 取消）、Trade Documents Upload API（ETD 上传）、
+Pickup Request API（查可约时间 / 预约揽收 / 取消揽收）。
 
 - 凭证与选项全部来自配置（FEDEX_*），API Key / Secret Key / 账号缺任一项 = 未启用。
 - OAuth：POST {FEDEX_API_BASE}/oauth/token（client_credentials），token 进程内缓存到过期前 60 秒；
@@ -22,11 +23,14 @@ from flask import current_app
 
 logger = logging.getLogger(__name__)
 
-# FedEx 接口路径（developer.fedex.com：Ship API v1 / Trade Documents Upload API v1）
+# FedEx 接口路径（developer.fedex.com：Ship API v1 / Trade Documents Upload API v1 / Pickup Request API v1）
 OAUTH_PATH = '/oauth/token'
 SHIP_PATH = '/ship/v1/shipments'
 CANCEL_PATH = '/ship/v1/shipments/cancel'
 ETD_UPLOAD_PATH = '/documents/v1/etds/upload'
+PICKUP_PATH = '/pickup/v1/pickups'
+PICKUP_CANCEL_PATH = '/pickup/v1/pickups/cancel'
+PICKUP_AVAILABILITY_PATH = '/pickup/v1/pickups/availabilities'
 
 # Trade Documents Upload API 与 Ship API 不在同一个域名；FEDEX_DOCUMENT_API_BASE 不设时按 FEDEX_API_BASE 选
 SANDBOX_DOCUMENT_API_BASE = 'https://documentapitest.prod.fedex.com/sandbox'
@@ -37,6 +41,9 @@ TOKEN_REQUEST = 'OAuth token request'
 CREATE_SHIPMENT = 'create shipment'
 CANCEL_SHIPMENT = 'cancel shipment'
 ETD_UPLOAD = 'trade document upload'
+CREATE_PICKUP = 'create pickup'
+CANCEL_PICKUP = 'cancel pickup'
+PICKUP_AVAILABILITY = 'pickup availability'
 
 DEFAULT_CONNECT_TIMEOUT = 5
 DEFAULT_READ_TIMEOUT = 30
@@ -333,3 +340,19 @@ def upload_etd_document(content: bytes, file_name: str, origin_country: str, des
         ok_statuses=(200, 201),
         deadline=deadline,
     )
+
+
+def pickup_availability(payload: dict, deadline=None) -> dict:
+    """POST /pickup/v1/pickups/availabilities（只查询，不预约）"""
+    return _call('POST', f"{api_base()}{PICKUP_AVAILABILITY_PATH}", PICKUP_AVAILABILITY, json_body=payload,
+                 deadline=deadline)
+
+
+def create_pickup(payload: dict, deadline=None) -> dict:
+    """POST /pickup/v1/pickups（预约快递员上门揽收）"""
+    return _call('POST', f"{api_base()}{PICKUP_PATH}", CREATE_PICKUP, json_body=payload, deadline=deadline)
+
+
+def cancel_pickup(payload: dict, deadline=None) -> dict:
+    """PUT /pickup/v1/pickups/cancel"""
+    return _call('PUT', f"{api_base()}{PICKUP_CANCEL_PATH}", CANCEL_PICKUP, json_body=payload, deadline=deadline)

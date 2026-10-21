@@ -94,7 +94,9 @@ class Config:
     # 允许用 FedEx 自动建运单的公司 ID（逗号分隔）。运费记在同一个 FedEx 账号上：不设 = 所有公司都不允许
     FEDEX_ALLOWED_COMPANY_IDS = os.getenv('FEDEX_ALLOWED_COMPANY_IDS', '')
     FEDEX_SERVICE_TYPE = os.getenv('FEDEX_SERVICE_TYPE', 'INTERNATIONAL_ECONOMY')
-    FEDEX_PICKUP_TYPE = os.getenv('FEDEX_PICKUP_TYPE', 'USE_SCHEDULED_PICKUP')
+    # 交货方式（Ship API pickupType）：没有和 FedEx 签定期集荷 → CONTACT_FEDEX_TO_SCHEDULE，揽收在 WMS 另约
+    # （POST /warehouse/dn/carrier-pickups）；签了定期集荷用 USE_SCHEDULED_PICKUP，自己送营业所用 DROPOFF_AT_FEDEX_LOCATION
+    FEDEX_PICKUP_TYPE = os.getenv('FEDEX_PICKUP_TYPE', 'CONTACT_FEDEX_TO_SCHEDULE')
     # 面单打印方式：A4（激光打印机，PDF + PAPER_85X11_TOP_HALF_LABEL）/ THERMAL（4 英寸面单机，PDF + STOCK_4X6）；
     # 建单时可指定，不指定用默认。各格式的 imageType（PDF / PNG / ZPLII / EPL2）与纸张可覆盖，不设用上面的默认
     FEDEX_DEFAULT_LABEL_FORMAT = os.getenv('FEDEX_DEFAULT_LABEL_FORMAT') or 'A4'

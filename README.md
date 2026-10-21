@@ -780,6 +780,49 @@ containing `ALREADY` together with `CANCEL` / `DELETE`, or `TRACKING` / `SHIPMEN
 deleted state"). Matches are logged with the raw code; add codes seen in production to
 `carrier_services.ALREADY_CANCELLED_CODES`.
 
+### FedEx pickups
+
+There is no regular scheduled pickup with FedEx: shipments are created with `pickupType` `CONTACT_FEDEX_TO_SCHEDULE`
+(the default) and a courier pickup is scheduled separately (FedEx Pickup Request API — enable it in the FedEx developer
+project). Pickups are booked per current warehouse (`X-WAREHOUSE-ID`, required) and date; one pickup covers several
+shipments, and its package count / total weight are the totals of their packages (`dn_packages` gross weight). Records
+live in `carrier_pickups`; `dn_carrier_shipments.pickup_id` points to the pickup a shipment belongs to (`shipments`
+keeps a snapshot).
+
+| Endpoint | Description |
+|----------|-------------|
+| `GET /warehouse/dn/carrier-pickups` | Shipments awaiting pickup (FedEx, `active`, DN not shipped; `can_schedule`), pickups of the last 14 days (every unclear one too), `blockers`, pickup location |
+| `GET /warehouse/dn/carrier-pickups/availability` | Query only: pickup dates and times FedEx offers (`options[{pickup_date, cutoff_time, access_minutes, ready_times, latest_times, default_ready_time, default_latest_time}]`) |
+| `POST /warehouse/dn/carrier-pickups` | `{shipment_ids, pickup_date, ready_time, close_time, remarks?, notification_email?}` → 201 `{pickup, alerts, message}` |
+| `POST /warehouse/dn/carrier-pickups/<id>/cancel` | Cancel a scheduled pickup whose date has not passed |
+| `POST /warehouse/dn/carrier-pickups/<id>/dismiss` | `{confirm: true}`: dismiss a pickup with an unclear result after checking with FedEx |
+
+- Permissions as for carrier shipments: read `dn_read` / `packing_read` / `delivery_read`, write `packing_edit` /
+  `delivery_edit`.
+- **Pickup location**: the warehouse English address (else the company's; split with the same rules as the ship-from
+  address), the warehouse contact (else the company export contact), the warehouse phone (else the company's; 8-13
+  digits) and the company English name. Blockers: `FEDEX_NOT_CONFIGURED` / `FEDEX_CONFIG_INVALID` /
+  `FEDEX_COMPANY_NOT_ALLOWED` / `PICKUP_ADDRESS_MISSING` / `PICKUP_ADDRESS_INVALID` / `PICKUP_PHONE_INVALID` (409 `16130`).
+- **Times** are local to the warehouse (`DOCUMENT_TIMEZONE`, default `Asia/Tokyo`). `readyDateTimestamp` carries the UTC
+  offset (`2026-10-22T12:00:00+09:00`, as in FedEx's Japanese example) and `customerCloseTime` is local `HH:MM:SS`;
+  `pickupDateType` is `SAME_DAY` for today, otherwise `FUTURE_DAY`. FedEx's cutoff time and `accessTime` limit the
+  choices in the UI; the backend only checks the order of the times and the date range (today to 30 days ahead), FedEx
+  checks the rest.
+- **Held shipments** cannot be scheduled again (409 `16132`, `reason: ALREADY_SCHEDULED`): held by a `pending` / `unknown`
+  pickup or a `scheduled` one whose date has not passed. Once the date has passed, shipments whose DN is still not shipped
+  can be scheduled again (the courier did not come / the delivery was not completed).
+- **Scheduling** runs in three steps like creating a shipment, without holding row locks while FedEx is called: lock the
+  shipments → insert a `pending` record holding them and commit → call FedEx (within `FEDEX_CREATE_BUDGET_SECONDS`) →
+  `scheduled` (`confirmation_code` / `location_code`); refused / not sent → `failed`, shipments released (502 `16073` /
+  504 `16074`, `details.pickup`); unclear (timeout, 5xx, no confirmation code) → `unknown`, shipments stay held until the
+  operator checks the confirmation email / calls FedEx and dismisses it. `pending` for longer than
+  `FEDEX_PENDING_STALE_MINUTES` counts as `unknown` (`stale`).
+- **Cancelling**: `scheduled` and the date has not passed (otherwise 409 `16133`). Cancelled by FedEx or reported as
+  already cancelled (same rule as for shipments) → `cancelled`, shipments released; refused → stays `scheduled`
+  (`reason: cancel_refused`); unclear → stays `scheduled` (`reason: cancel_unclear`), retry.
+- The confirmation email (`notification_email`) uses `en_US`; `shipment.pickup` of the carrier-shipment status gives the
+  pickup summary of that shipment.
+
 ### Configuration
 
 | Variable | Default | Description |
@@ -788,7 +831,7 @@ deleted state"). Matches are logged with the raw code; add codes seen in product
 | `FEDEX_API_KEY` / `FEDEX_SECRET_KEY` / `FEDEX_ACCOUNT_NUMBER` | (unset) | Credentials of the FedEx developer project; any one missing = feature disabled |
 | `FEDEX_ALLOWED_COMPANY_IDS` | (empty) | Company IDs allowed to create shipments (comma-separated, e.g. `1,3`); **unset = no company is allowed** (all charges go to one FedEx account) |
 | `FEDEX_SERVICE_TYPE` | `INTERNATIONAL_ECONOMY` | FedEx service type |
-| `FEDEX_PICKUP_TYPE` | `USE_SCHEDULED_PICKUP` | Pickup type |
+| `FEDEX_PICKUP_TYPE` | `CONTACT_FEDEX_TO_SCHEDULE` | How packages are tendered (Ship API `pickupType`): `CONTACT_FEDEX_TO_SCHEDULE` = no regular pickup, schedule it in WMS (see “FedEx pickups”); `USE_SCHEDULED_PICKUP` = regular scheduled pickup; `DROPOFF_AT_FEDEX_LOCATION` |
 | `FEDEX_DEFAULT_LABEL_FORMAT` | `A4` | Label format when the request does not give one (`A4` / `THERMAL`) |
 | `FEDEX_LABEL_A4_IMAGE_TYPE` / `FEDEX_LABEL_A4_STOCK_TYPE` | `PDF` / `PAPER_85X11_TOP_HALF_LABEL` | Override for `A4` |
 | `FEDEX_LABEL_THERMAL_IMAGE_TYPE` / `FEDEX_LABEL_THERMAL_STOCK_TYPE` | `PDF` / `STOCK_4X6` | Override for `THERMAL` (e.g. `ZPLII` for Zebra printers) |
@@ -863,7 +906,7 @@ stdout_logfile=/var/log/wms-api.out.log
 | Inventory | 15000-15999 | 400 | Stock-related errors |
 | State | 16000-16999 | 400 | State transition errors |
 
-Business codes of the export-document features: `14019` export profile text too long, `14020` invalid country code, `16063` customs structure invalid, `16064` customs line goods code not in the DN / duplicated, `16065` shipped — customs data / packages / documents locked (409), `16066` invalid packages, `16067` packages cannot be edited in the current DN status (409), `16068` documents cannot be issued yet (409, `details.problems`), `16069` documents missing or out of date before shipping (409, `details {missing_documents, outdated}`), `16070` not an export DN (409), `16071` document not found (404), `16117` documents cannot be laid out — a text block (usually the consignee) is too long for one page; shorten it (409, `details {document, reason: LAYOUT_OVERFLOW}`). Carrier shipments (FedEx): `16072` preconditions not met (409, `details.blockers`), `16073` FedEx returned an error (502, `details.errors` / `transaction_id`), `16074` FedEx timed out (504), `16075` no carrier shipment to cancel / dismiss (409, `details.unresolved`), `16076` packages / customs data cannot be changed, or documents with different data cannot be issued, while a carrier shipment is pending, active, unclear or being cancelled (409, `details {reason: CARRIER_SHIPMENT_OPEN | DOCUMENT_DATA_CHANGED, status, carrier, carrier_shipment {id, status, tracking_number}}`), `16077` invalid `label_format` (400), `16078` tracking number / carrier differs from the active carrier shipment, or a delivery task is added / deleted while a carrier shipment exists (409), `16079` a carrier shipment request is pending or its result is unclear, or the shipment is being cancelled / the cancellation is unclear — no new shipment, tracking number or shipping (409, `details.unresolved`), `16093` the shipment / record named in a cancel / dismiss request is not the current one (409, `details {expected, actual}`), `16094` dismissing a record with a tracking number: FedEx did not confirm it is cancelled / not found (409), `16095` FedEx created the shipment but saving it in WMS failed; compensated (502, `details {error, compensation, unresolved, …}`). Delivery completion: `16080` tracking number differs from the AWB printed on the current CI (409, `details {document_tracking_number, tracking_number}`), `16092` carrier differs from the one printed on the current CI (409, `details {document_carrier, document_carrier_id, carrier_id}`). Delivery tasks: `16090` the DN already has an unfinished delivery task (409, `details {delivery_task_id, status}`), `16091` export DN — not the current delivery task (409, `details {delivery_task_id, current_status}`). Errors may carry a structured `details` object.
+Business codes of the export-document features: `14019` export profile text too long, `14020` invalid country code, `16063` customs structure invalid, `16064` customs line goods code not in the DN / duplicated, `16065` shipped — customs data / packages / documents locked (409), `16066` invalid packages, `16067` packages cannot be edited in the current DN status (409), `16068` documents cannot be issued yet (409, `details.problems`), `16069` documents missing or out of date before shipping (409, `details {missing_documents, outdated}`), `16070` not an export DN (409), `16071` document not found (404), `16117` documents cannot be laid out — a text block (usually the consignee) is too long for one page; shorten it (409, `details {document, reason: LAYOUT_OVERFLOW}`). Carrier shipments (FedEx): `16072` preconditions not met (409, `details.blockers`), `16073` FedEx returned an error (502, `details.errors` / `transaction_id`), `16074` FedEx timed out (504), `16075` no carrier shipment to cancel / dismiss (409, `details.unresolved`), `16076` packages / customs data cannot be changed, or documents with different data cannot be issued, while a carrier shipment is pending, active, unclear or being cancelled (409, `details {reason: CARRIER_SHIPMENT_OPEN | DOCUMENT_DATA_CHANGED, status, carrier, carrier_shipment {id, status, tracking_number}}`), `16077` invalid `label_format` (400), `16078` tracking number / carrier differs from the active carrier shipment, or a delivery task is added / deleted while a carrier shipment exists (409), `16079` a carrier shipment request is pending or its result is unclear, or the shipment is being cancelled / the cancellation is unclear — no new shipment, tracking number or shipping (409, `details.unresolved`), `16093` the shipment / record named in a cancel / dismiss request is not the current one (409, `details {expected, actual}`), `16094` dismissing a record with a tracking number: FedEx did not confirm it is cancelled / not found (409), `16095` FedEx created the shipment but saving it in WMS failed; compensated (502, `details {error, compensation, unresolved, …}`). FedEx pickups: `16130` blockers (409, `details.blockers`), `16131` invalid pickup request (400, `field`), `16132` selected shipments cannot be scheduled (409, `details.shipments[{shipment_id, tracking_number, reason}]`), `16133` the pickup cannot be cancelled / dismissed in its current state (409, `details {pickup_id, status, reason, pickup_date}`); FedEx errors / timeouts as for shipments (`16073` / `16074`, `details.action` `pickup` / `pickup_cancel` / `pickup_availability`). Delivery completion: `16080` tracking number differs from the AWB printed on the current CI (409, `details {document_tracking_number, tracking_number}`), `16092` carrier differs from the one printed on the current CI (409, `details {document_carrier, document_carrier_id, carrier_id}`). Delivery tasks: `16090` the DN already has an unfinished delivery task (409, `details {delivery_task_id, status}`), `16091` export DN — not the current delivery task (409, `details {delivery_task_id, current_status}`). Errors may carry a structured `details` object.
 
 Process rules (see "Process rules" above): `16110` DN has an unfinished carrier shipment — cancel it first (409), `16111` adjustment cancelled (409), `16112` adjustment cannot be cancelled in its status (409), `16113` adjustment line cannot be applied — the location no longer holds the goods / no location (409), `16114` cycle count has uncounted details (409, `details.detail_ids`), `16115` invalid numeric field (400, `field`), `16116` the ASN of a sorting task cannot be changed (409), `16120` transfer: the goods is not in the source location (404), `16121` the same `client_batch_id` was already submitted with different details (409, `details {client_batch_id, batch_id}`), `16122` the user who changed the adjustment details cannot approve it (409), `16123` invalid `client_batch_id` (400), `44009` location has history records — deactivate it instead (409). Tasks: `16088` the task is deactivated (its DN / ASN was cancelled, 409), `16089` a picking task with nothing picked cannot be completed (409).
 

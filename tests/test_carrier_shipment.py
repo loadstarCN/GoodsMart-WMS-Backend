@@ -348,7 +348,7 @@ def test_request_body_fields(client, access_token, fedex):
     assert body['accountNumber'] == {'value': ACCOUNT}
     shipment = body['requestedShipment']
     assert shipment['serviceType'] == 'INTERNATIONAL_ECONOMY'
-    assert shipment['pickupType'] == 'USE_SCHEDULED_PICKUP'
+    assert shipment['pickupType'] == 'CONTACT_FEDEX_TO_SCHEDULE'    # 没有定期集荷：揽收另约
     assert shipment['packagingType'] == 'YOUR_PACKAGING'
     assert len(shipment['shipDatestamp']) == 10
     assert shipment['shippingChargesPayment'] == {

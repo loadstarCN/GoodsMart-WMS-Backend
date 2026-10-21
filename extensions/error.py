@@ -34,6 +34,13 @@ from werkzeug.exceptions import HTTPException
 #             details {carrier, action: 'create', tracking_number, transaction_id, error: {code, message},
 #             compensation: {attempted, cancelled, cancel_transaction_id, error}, unresolved, maybe_processed}
 #             （unresolved 为 null = 已在 FedEx 取消；否则为带运单号的结果不明记录，需重试取消 / 确认作废）
+# 16130  409  FedEx 上门揽收前置条件不满足（未配置 / 公司不在名单 / 揽收地址或电话放不进 FedEx 格式）：details {blockers}
+# 16131  400  揽收预约参数不合法：field = shipment_ids / pickup_date / ready_time / close_time / remarks /
+#             notification_email / confirm
+# 16132  409  所选运单不能预约揽收：details {shipments: [{shipment_id, tracking_number, reason: NOT_FOUND | NOT_ACTIVE |
+#             DN_SHIPPED | ALREADY_SCHEDULED, ...}]}
+# 16133  409  揽收预约当前状态不能取消（不是 scheduled / 揽收日已过）或确认作废（不是结果不明）：
+#             details {pickup_id, status, reason, pickup_date}
 # 16117  409  单证排不下：某块文字比一页还高（实际是收件人各字段都很长，如各约 240 个 CJK 字符），reportlab LayoutError。
 #             不签发、不作废旧单证，请缩短收件人信息：details {document: 'CI' | 'PL', reason: 'LAYOUT_OVERFLOW'}
 #
