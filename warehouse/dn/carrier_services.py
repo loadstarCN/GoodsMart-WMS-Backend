@@ -1,42 +1,47 @@
-"""海外 DN 在承运商系统自动建运单（目前只有 FedEx Ship API）。
+"""海外 DN 在承运商系统自动建运单（承运商对接插件，见 warehouse/carrier/integrations；内置 FedEx）。
 
-替代「在承运商网站手工建运单 + 保存运单号」这一步，其余流程不变：
-- 前置条件（blockers）全部满足才建单：FedEx 已配置且 DN 所属公司在 FEDEX_ALLOWED_COMPANY_IDS 里、海外 DN、
-  packed、发货任务的承运商是 fedex、没有有效运单也没有手工存过运单号、有箱子（≤ 30）、报关没有错误级问题、
-  贸易条件 DDP 时关税付款方配置是 SENDER、发件人 / 收件人地址放得进 FedEx 格式。
-- 每次建单请求在 dn_carrier_shipments 留一条记录，分三段，调 FedEx 时不占 DN 行锁、也不开着数据库事务：
+替代「在承运商网站手工建运单 + 保存运单号」这一步，其余流程不变。本模块与具体承运商无关，调承运商一律经插件
+（CarrierAdapter：check_shipment / upload_documents / create_shipment / label_archive / cancel_shipment）。
+- 用哪家：当前有效发货任务的承运商（没有用 DN 的），该承运商在承运商编辑页设置了在线对接（carrier_integrations）且已启用、
+  设置齐全；没设对接的承运商照旧手工建运单、保存运单号。
+- 前置条件（blockers）全部满足才建单：海外 DN、packed、承运商有可用的对接、没有有效运单也没有手工存过运单号、
+  有箱子（不超过插件的箱数上限）、报关没有错误级问题、收件人姓名 / 电话齐全，再加插件自己的检查（地址放不放得下、
+  贸易条件与关税付款方是否矛盾……）。
+- 每次建单请求在 dn_carrier_shipments 留一条记录（carrier = 插件代码，carrier_id = 承运商），分三段，
+  调承运商时不占 DN 行锁、也不开着数据库事务：
   1. 锁 DN → 有结果不明的记录（unresolved）→ 409 16079；前置条件不满足 → 409 16072；没有当前有效的 CI / PL
-     （或已过期）就先用现有逻辑签发；组好请求数据；插一条 pending 记录并提交（部分唯一索引兜底并发）。
-  2. FEDEX_ETD_ENABLED 时先上传 CI，再调 FedEx 建单。整个建单流程受 FEDEX_CREATE_BUDGET_SECONDS 总时限约束，
+     （或已过期）就先用现有逻辑签发；组好交给插件的数据（含对接设置的快照）；插一条 pending 记录并提交（部分唯一索引兜底并发）。
+  2. 插件开了电子单证时先上传 CI，再建单。整个建单流程受 CARRIER_CREATE_BUDGET_SECONDS 总时限约束，
      每次请求的超时按剩余时间收缩，不够就不发（worker 超时被杀前收手；真被杀了 pending 过期后按结果不明处理）。
   3. 成功：先独立提交拿到的运单号，再在一个事务里锁 DN → 记录置 active → 主运单号走现有保存运单号的逻辑存到
-     发货任务 → CI / PL 带 AWB 升版本 → 面单存 dn_documents（shipping_label）。
-  结果：FedEx 明确拒绝 / 请求没发出去 → failed；读超时、连接中断、5xx、响应看不懂 → unknown（结果不明）；
+     发货任务 → 面单存 dn_documents（shipping_label）。CI / PL 不印运单号，不用重签。
+  结果：承运商明确拒绝 / 请求没发出去 → failed；读超时、连接中断、5xx、响应看不懂 → unknown（结果不明）；
   第 3 步写库失败 → 先另开事务重读记录：已是 active 且运单号相同（提交其实成功、只是调用方收到了异常）→ 不取消，
   按成功返回；读不到 → 不取消，记 unknown（reason save_unconfirmed，带运单号）；确实没写进去 → 取消刚建的运单（补偿）：
   确认取消 → cancelled（reason compensated），取消失败 / 不确定 → unknown（reason compensation_failed，带运单号）。
   补偿结果用独立事务提交，原事务回滚后仍留痕；接口一律 502 16095（details.unresolved / compensation / error）。
-- pending 超过 FEDEX_PENDING_STALE_MINUTES（不短于建单时限 + 补偿时间 + 余量）读取时按 unknown（reason stale）处理。
+- pending 超过 CARRIER_PENDING_STALE_MINUTES（不短于建单时限 + 补偿时间 + 余量）读取时按 unknown（reason stale）处理。
 - 有结果不明的记录（pending / unknown / cancelling）时：不能再建单、不能保存 / 修改运单号、不能完成发货（409 16079），
   不能改报关数据 / 箱子 / 重签与运单不一致的单证（16076），不能新建 / 删除发货任务（16078）。
   带运单号的 unknown 可以 POST …/carrier-shipment/cancel 重试取消（成功 → cancelled）；确认作废
-  POST …/carrier-shipment/dismiss：没有运单号的由操作员确认后直接 dismissed；带运单号的先向 FedEx 取消，
-  FedEx 确认已取消 / 查无此运单才 dismissed，否则 409 16094。之后才能重新建单。
-- 面单打印方式（label_format）由建单请求指定：A4（激光打印机）/ THERMAL（4 英寸面单机），不指定用配置默认；
-  各格式的 imageType / 纸张见 fedex_shipment.label_settings。
-- 运送申告价额高于已打包货值时自动压到已打包货值（FedEx 拒收申告价额高于报关货值的运单；部分打包时只保实际发出的货），
+  POST …/carrier-shipment/dismiss：没有运单号的由操作员确认后直接 dismissed；带运单号的先向承运商取消，
+  承运商确认已取消 / 查无此运单才 dismissed，否则 409 16094。之后才能重新建单。
+- 面单打印方式（label_format）由建单请求指定：A4（普通打印机）/ THERMAL（热敏标签机），不指定用对接设置里的默认；
+  各格式的文件格式 / 纸张由插件决定（CarrierAdapter.label_options）。
+- 运送申告价额高于已打包货值时自动压到已打包货值（承运商拒收申告价额高于报关货值的运单；部分打包时只保实际发出的货），
   实际提交的值记在运单的 declared_value 上，响应 warnings 里说明。
 - 有有效自动运单时，发货任务的运单号只能是这张运单的号码（完成发货 / 保存运单号 / 修改发货任务传了别的号码 → 409 16078），
   比对忽略空格 / 连字符，入库统一存运单上的标准写法；承运商也不能换（16078）。
   已取消（含补偿取消）的自动运单号不能再存到任务上、也不能用来完成发货（16078，details.status = cancelled）。
-- 取消：DN 未发货才可；用建单时记下的发件国。与建单一样分三段，调 FedEx 时不占 DN 行锁、也不开着数据库事务：
+- 取消：DN 未发货才可；用建单时的承运商（carrier_id）的对接设置（停用了也能取消）和建单时记下的发件国。
+  与建单一样分三段，调承运商时不占 DN 行锁、也不开着数据库事务：
   1. 锁 DN → 有效运单标 cancelling（reason cancel_in_progress）并提交（之后完成发货 / 存运单号 16079）；
-  2. 调 FedEx 取消（受 FEDEX_CREATE_BUDGET_SECONDS 约束）；
-  3. 锁 DN → FedEx 取消成功（或回「已取消 / 查无此运单」）→ cancelled、发货任务上的运单号清掉、面单作废、
-     CI / PL 去掉 AWB 重新签发（条件不满足则作废）；FedEx 明确拒绝 / 请求没发出去 → 回到 active；
-     结果不明（超时、5xx、响应看不懂、200 但没有 cancelledShipment）→ 停在 cancelling（reason 记原因），
-     拦发货，重试取消（或确认作废）到 FedEx 给出明确结果为止。第 3 段写库失败 / 进程被杀 → 停在 cancelling
-     （save_failed / interrupted；什么都没记下的 cancel_in_progress 过期后按 stale），重试取消时 FedEx 回「已取消」即落库。
+  2. 调承运商取消（受 CARRIER_CREATE_BUDGET_SECONDS 约束）；
+  3. 锁 DN → 取消成功（或回「已取消 / 查无此运单」）→ cancelled、发货任务上的运单号清掉、面单作废；
+     承运商明确拒绝 / 请求没发出去 → 回到 active；
+     结果不明（超时、5xx、响应看不懂）→ 停在 cancelling（reason 记原因），
+     拦发货，重试取消（或确认作废）到承运商给出明确结果为止。第 3 段写库失败 / 进程被杀 → 停在 cancelling
+     （save_failed / interrupted；什么都没记下的 cancel_in_progress 过期后按 stale），重试取消时承运商回「已取消」即落库。
 - 取消 / 确认作废的请求可带目标标识（tracking_number / unresolved_id），与当前记录不符 → 409 16093。
 """
 import hashlib
@@ -53,21 +58,16 @@ from extensions.error import (
     APIException, BadGatewayException, BadRequestException, ConflictException, GatewayTimeoutException,
 )
 from extensions.transaction import transactional
+from warehouse.carrier.integration_services import CarrierIntegrationService
+from warehouse.carrier.integrations import display_name, portal_name
+from warehouse.carrier.integrations.base import LABEL_FORMATS, STEP_CREATE, CarrierError, CarrierResponseError, clock
+from warehouse.carrier.models import Carrier
 from warehouse.common.countries import COUNTRY_NAMES_EN
-from . import fedex_client
 from .customs_services import CustomsService, DOC_CI, DOC_TYPES, _document_timezone, LOCKED_DN_STATUSES
-from .fedex_client import FedexError
-from .fedex_shipment import (
-    AddressError, LABEL_FORMATS, MAX_PACKAGES_PER_REQUEST, SUPPORTED_DUTIES_PAYMENT_TYPES,
-    SUPPORTED_LABEL_IMAGE_TYPES, SHIPPER_TIN_TYPE, allocate_commodity_weights, build_label_archive,
-    build_ship_request, consignee_address, label_settings, parse_page_size, parse_ship_response,
-    split_address_text, split_evenly, tin_type_for,
-)
 from .models import DN, DNCarrierShipment, DNDocument
 
 logger = logging.getLogger(__name__)
 
-CARRIER_FEDEX = 'fedex'
 DOC_LABEL = 'shipping_label'
 COMPLETED_TASK_STATUSES = ('completed', 'signed')
 # 报关视图里已由 blockers 自己表达的问题码（不重复列）
@@ -76,8 +76,8 @@ _FILE_SAFE = re.compile(r'[^A-Za-z0-9._-]+')
 
 OPEN_STATUSES = DNCarrierShipment.OPEN_STATUSES              # pending / active / unknown / cancelling：同一 DN 至多一条
 UNRESOLVED_STATUSES = DNCarrierShipment.UNRESOLVED_STATUSES  # pending / unknown / cancelling
-LIVE_STATUSES = ('active', 'cancelling')                     # 运单在 FedEx 上建好了、运单号 / 面单都在（含正在取消）
-CANCEL_IN_PROGRESS = 'cancel_in_progress'                    # cancelling 的 reason：正在调 FedEx 取消
+LIVE_STATUSES = ('active', 'cancelling')                     # 运单在承运商那边建好了、运单号 / 面单都在（含正在取消）
+CANCEL_IN_PROGRESS = 'cancel_in_progress'                    # cancelling 的 reason：正在调承运商取消
 
 DEFAULT_CREATE_BUDGET_SECONDS = 90
 DEFAULT_PENDING_STALE_MINUTES = 10
@@ -87,24 +87,22 @@ COMPENSATION_EXTRA_SECONDS = 15
 STALE_MARGIN_SECONDS = 60
 ERROR_MESSAGE_MAX = 500
 
-# FedEx 取消接口回「已取消 / 查无此运单」时视为取消成功（取消后本地写库失败再点取消、补偿取消撞上已取消的运单）。
-# 依据：FedEx Ship API（REST）公开文档没有单列这两种情况的错误码，本仓库也没有在 sandbox 实测过（按约定不调用 FedEx），
-# 所以只按错误码（不看 message，message 会随 X-locale 变）判断：
-#   - 码里同时有 ALREADY 与 CANCEL / DELETE（已取消）；
-#   - 码里同时有 TRACKING / SHIPMENT 与 NOT FOUND / NOT EXIST（查无此运单）；
-#   - 精确码 ALREADY_CANCELLED_CODES：旧版 FedEx Web Services 的 8159
-#     「Shipment Delete was requested for a tracking number already in a deleted state」。
-# 命中时日志记原始错误码（WARNING）；正式环境遇到没覆盖的码，补到 ALREADY_CANCELLED_CODES。
-ALREADY_CANCELLED_CODES = frozenset({'8159'})
 
-_MAYBE_CREATED = (" The shipment may have been created on the FedEx side: check FedEx Ship Manager, cancel it there "
-                  "if it exists, then confirm with POST /warehouse/dn/<id>/carrier-shipment/dismiss before "
-                  "creating it again.")
-_CANCEL_RETRY = (" Cancel it from WMS (POST /warehouse/dn/<id>/carrier-shipment/cancel), or cancel it in FedEx Ship "
-                 "Manager and then dismiss the record (POST /warehouse/dn/<id>/carrier-shipment/dismiss; FedEx is "
-                 "asked to confirm that it is cancelled).")
-_MAYBE_CANCELLED = (" The shipment may or may not have been cancelled on the FedEx side; the DN cannot be shipped until "
-                    "this is resolved: retry the cancellation (POST /warehouse/dn/<id>/carrier-shipment/cancel).")
+def _maybe_created(code) -> str:
+    return (f" The shipment may have been created on the {display_name(code)} side: check {portal_name(code)}, "
+            "cancel it there if it exists, then confirm with POST /warehouse/dn/<id>/carrier-shipment/dismiss "
+            "before creating it again.")
+
+
+def _cancel_retry(code) -> str:
+    return (f" Cancel it from WMS (POST /warehouse/dn/<id>/carrier-shipment/cancel), or cancel it in "
+            f"{portal_name(code)} and then dismiss the record (POST /warehouse/dn/<id>/carrier-shipment/dismiss; "
+            f"{display_name(code)} is asked to confirm that it is cancelled).")
+
+
+def _maybe_cancelled(code) -> str:
+    return (f" The shipment may or may not have been cancelled on the {display_name(code)} side; the DN cannot be "
+            "shipped until this is resolved: retry the cancellation (POST /warehouse/dn/<id>/carrier-shipment/cancel).")
 
 
 def _blocker(code, message, **extra):
@@ -123,62 +121,28 @@ def _config_number(key, default, minimum) -> float:
 
 
 def create_budget_seconds() -> float:
-    """建单（含 OAuth / ETD 上传 / 建单请求）的总时限，FEDEX_CREATE_BUDGET_SECONDS（默认 90 秒）"""
-    return _config_number('FEDEX_CREATE_BUDGET_SECONDS', DEFAULT_CREATE_BUDGET_SECONDS, 10)
+    """建单（含令牌 / 电子单证上传 / 建单请求）的总时限，CARRIER_CREATE_BUDGET_SECONDS（默认 90 秒）"""
+    return _config_number('CARRIER_CREATE_BUDGET_SECONDS', DEFAULT_CREATE_BUDGET_SECONDS, 10)
 
 
 def stale_after_seconds() -> float:
-    """pending 超过这么久按结果不明（stale）处理：FEDEX_PENDING_STALE_MINUTES（默认 10 分钟），
+    """pending 超过这么久按结果不明（stale）处理：CARRIER_PENDING_STALE_MINUTES（默认 10 分钟），
     但不短于建单时限 + 补偿时间 + 余量"""
-    configured = _config_number('FEDEX_PENDING_STALE_MINUTES', DEFAULT_PENDING_STALE_MINUTES, 1) * 60
+    configured = _config_number('CARRIER_PENDING_STALE_MINUTES', DEFAULT_PENDING_STALE_MINUTES, 1) * 60
     return max(configured, create_budget_seconds() + COMPENSATION_EXTRA_SECONDS + STALE_MARGIN_SECONDS)
 
 
-def allowed_company_ids():
-    """FEDEX_ALLOWED_COMPANY_IDS（逗号分隔的公司 ID）→ (ID 集合, 不合法的项)。
-    不设 / 空 = 空集合 = 所有公司都不允许（运费记在同一个 FedEx 账号上，不能让任何公司都用）。"""
-    raw = current_app.config.get('FEDEX_ALLOWED_COMPANY_IDS')
-    items = raw if isinstance(raw, (list, tuple, set, frozenset)) else str(raw or '').split(',')
-    ids, invalid = set(), []
-    for item in items:
-        text = str(item).strip()
-        if not text:
-            continue
-        if text.isdigit() and int(text) > 0:
-            ids.add(int(text))
-        else:
-            invalid.append(text)
-    return ids, invalid
-
-
-def company_allowed(dn: DN) -> bool:
-    return dn.warehouse.company_id in allowed_company_ids()[0]
-
-
-def _settings() -> dict:
-    cfg = current_app.config
-    return {
-        'service_type': cfg.get('FEDEX_SERVICE_TYPE') or 'INTERNATIONAL_ECONOMY',
-        'pickup_type': cfg.get('FEDEX_PICKUP_TYPE') or 'CONTACT_FEDEX_TO_SCHEDULE',
-        'duties_payment_type': (cfg.get('FEDEX_DUTIES_PAYMENT_TYPE') or 'RECIPIENT').upper(),
-        'etd_enabled': bool(cfg.get('FEDEX_ETD_ENABLED')),
-        'default_label_format': label_settings(cfg)['label_format'],
-        'label_formats': {fmt: label_settings(cfg, fmt) for fmt in LABEL_FORMATS},
-    }
-
-
-def resolve_label_format(value) -> dict:
-    """建单请求的 label_format（A4 / THERMAL，大小写不限；空 = 配置默认）→ label_settings。
-    请求里的值不合法 400 16077；配置默认不合法由 blockers（FEDEX_CONFIG_INVALID）报。"""
+def parse_label_format(value):
+    """建单请求的 label_format（A4 / THERMAL，大小写不限；空 = 对接设置里的默认）→ 大写值或 None；不合法 400 16077。
+    插件不支持该格式时建单那一步再报 16077。"""
     if value is not None and not isinstance(value, str):
         raise BadRequestException("label_format must be one of " + ' / '.join(LABEL_FORMATS), 16077,
                                   field='label_format')
-    value = (value or '').strip() or None
-    settings = label_settings(current_app.config, value)
-    if value is not None and settings['label_format'] not in LABEL_FORMATS:
+    value = (value or '').strip().upper() or None
+    if value is not None and value not in LABEL_FORMATS:
         raise BadRequestException("label_format must be one of " + ' / '.join(LABEL_FORMATS), 16077,
                                   field='label_format')
-    return settings
+    return value
 
 
 def _carrier_code(carrier) -> str:
@@ -218,29 +182,7 @@ def _target_mismatch(message: str, expected, actual) -> ConflictException:
     return ConflictException(message, 16093, details={'expected': expected, 'actual': actual})
 
 
-def _already_cancelled(items) -> bool:
-    """FedEx 错误 / 提示里有「已取消 / 查无此运单」类的码（依据见 ALREADY_CANCELLED_CODES 上方说明）"""
-    for item in items or []:
-        if not isinstance(item, dict):
-            continue
-        code = str(item.get('code') or '').strip().upper()
-        if not code:
-            continue
-        if code in ALREADY_CANCELLED_CODES:
-            return True
-        compact = re.sub(r'[^A-Z0-9]', '', code)
-        if 'ALREADY' in compact and ('CANCEL' in compact or 'DELETE' in compact):
-            return True
-        if ('TRACKING' in compact or 'SHIPMENT' in compact) and ('NOTFOUND' in compact or 'NOTEXIST' in compact):
-            return True
-    return False
-
-
-def _codes(items) -> str:
-    return ', '.join(str(i.get('code')) for i in items or [] if isinstance(i, dict)) or '-'
-
-
-def _unclear_reason(err: FedexError) -> str:
+def _unclear_reason(err: CarrierError) -> str:
     """结果不明的原因：timeout / server_error / bad_response / connection_error"""
     if err.timeout:
         return 'timeout'
@@ -251,11 +193,41 @@ def _unclear_reason(err: FedexError) -> str:
     return 'connection_error'
 
 
-def _fedex_api_exception(err: FedexError, action: str, unresolved=None, with_unresolved=False):
-    """FedexError → 502 16073 / 504 16074；details 带 FedEx errors 与 transactionId（不带凭证）、
+def split_evenly(total: int, count: int) -> list:
+    """整数 total 均分成 count 份，余数从第一份起每份 +1；合计等于 total（申告价额按箱分）"""
+    if count <= 0:
+        return []
+    base, remainder = divmod(int(total), count)
+    return [base + (1 if index < remainder else 0) for index in range(count)]
+
+
+def allocate_commodity_weights(lines, gross_total) -> list:
+    """每行商品净重（kg，Decimal）。lines: [{quantity, unit_weight_kg|None}]。
+    商品主数据有单件重量的行 = 单件重量 × 已打包数量；没有的行分摊「箱子总毛重 − 已知净重」
+    （不为正时按数量占比分摊总毛重），按已打包数量比例分。"""
+    gross_total = Decimal(str(gross_total or 0))
+    known = [Decimal(str(l['unit_weight_kg'])) * l['quantity'] if l.get('unit_weight_kg') is not None else None
+             for l in lines]
+    unknown_qty = sum(l['quantity'] for l, w in zip(lines, known) if w is None)
+    if unknown_qty:
+        total_qty = sum(l['quantity'] for l in lines) or 1
+        remaining = gross_total - sum(w for w in known if w is not None)
+        if remaining <= 0:
+            remaining = gross_total * Decimal(unknown_qty) / Decimal(total_qty)
+    result = []
+    for line, weight in zip(lines, known):
+        if weight is None:
+            weight = remaining * Decimal(line['quantity']) / Decimal(unknown_qty)
+        result.append(weight)
+    return result
+
+
+def _carrier_api_exception(err: CarrierError, action: str, code: str, unresolved=None, with_unresolved=False):
+    """CarrierError → 502 16073 / 504 16074；details 带承运商的 errors 与 transactionId（不带凭证）、
     maybe_processed（结果不明）；建单时再带 unresolved（结果不明的记录，没有则 null）。"""
+    name = display_name(code)
     details = {
-        'carrier': CARRIER_FEDEX,
+        'carrier': code,
         'action': action,
         'http_status': err.status_code,
         'transaction_id': err.transaction_id,
@@ -266,26 +238,26 @@ def _fedex_api_exception(err: FedexError, action: str, unresolved=None, with_unr
         details['unresolved'] = unresolved
     maybe_created = ''
     if err.maybe_processed and action == 'create':
-        maybe_created = _MAYBE_CREATED
+        maybe_created = _maybe_created(code)
     elif err.maybe_processed and action == 'cancel':
-        maybe_created = _MAYBE_CANCELLED
+        maybe_created = _maybe_cancelled(code)
     if err.timeout:
         if err.budget_exhausted:
             details['budget_exhausted'] = True
-            what = 'creating a shipment' if action in ('create', 'etd_upload') else 'the FedEx request'
-            message = (f"FedEx request was not sent ({action}): the time allowed for {what} "
-                       "(FEDEX_CREATE_BUDGET_SECONDS) ran out. Try again.")
+            what = 'creating a shipment' if action in ('create', 'etd_upload') else f'the {name} request'
+            message = (f"{name} request was not sent ({action}): the time allowed for {what} "
+                       "(CARRIER_CREATE_BUDGET_SECONDS) ran out. Try again.")
         else:
-            message = f"FedEx did not respond in time ({action})." + maybe_created
+            message = f"{name} did not respond in time ({action})." + maybe_created
         return GatewayTimeoutException(message, 16074, details=details)
     if err.permission_denied:
         details['permission_denied'] = True
-        message = (f"FedEx refused the request ({action}, HTTP {err.status_code}): check the API credentials "
-                   f"and that the FedEx project has the required API enabled. {err.message}")
+        message = (f"{name} refused the request ({action}, HTTP {err.status_code}): check the API keys in the carrier "
+                   f"settings and that the {name} account has the required API enabled. {err.message}")
     elif err.maybe_processed:
-        message = f"FedEx request failed with an unclear result ({action}): {err.message}." + maybe_created
+        message = f"{name} request failed with an unclear result ({action}): {err.message}." + maybe_created
     else:
-        message = f"FedEx rejected the request ({action}): {err.message}"
+        message = f"{name} rejected the request ({action}): {err.message}"
     return BadGatewayException(message, 16073, details=details)
 
 
@@ -296,11 +268,37 @@ class CarrierShipmentService:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def enabled(dn: DN = None) -> bool:
-        """FedEx 已配置；给了 DN 时还要求 DN 所属公司在 FEDEX_ALLOWED_COMPANY_IDS 里"""
-        if not fedex_client.fedex_configured():
+    def carrier_of(dn: DN, task=None):
+        """建单用的承运商：当前有效发货任务的承运商，没有则 DN 的（与印在 CI 上的同一口径）"""
+        if task is None:
+            task = CustomsService._delivery_task(dn)
+        return (task.carrier if task is not None and task.carrier is not None else None) or dn.carrier
+
+    @staticmethod
+    def integration_of(dn: DN, task=None):
+        """→ (承运商, 对接设置快照 | None, 适配器 | None)。承运商不属于 DN 的公司时按没有对接处理。"""
+        carrier = CarrierShipmentService.carrier_of(dn, task)
+        snapshot = None
+        if carrier is not None and carrier.company_id == dn.warehouse.company_id:
+            snapshot = CarrierIntegrationService.for_carrier(carrier)
+        return carrier, snapshot, CarrierIntegrationService.build(snapshot)
+
+    @staticmethod
+    def enabled(dn: DN) -> bool:
+        """DN 的承运商有可用的对接（已启用、设置齐全），可以自动建运单"""
+        _carrier, snapshot, adapter = CarrierShipmentService.integration_of(dn)
+        return snapshot is not None and not CarrierIntegrationService.problems(snapshot, adapter)
+
+    @staticmethod
+    def is_shipment_carrier(record: DNCarrierShipment, carrier) -> bool:
+        """carrier 是不是这张自动运单的承运商：记录有 carrier_id 时比 id；旧记录比承运商的对接插件或 code"""
+        if carrier is None:
             return False
-        return dn is None or company_allowed(dn)
+        if record.carrier_id is not None:
+            return carrier.id == record.carrier_id
+        code = (record.carrier or '').strip().lower()
+        integration = carrier.integration
+        return _carrier_code(carrier) == code or (integration is not None and integration.adapter == code)
 
     @staticmethod
     def _latest(dn: DN, statuses):
@@ -365,7 +363,7 @@ class CarrierShipmentService:
 
     @staticmethod
     def cancel_in_progress(record: DNCarrierShipment) -> bool:
-        """有请求正在调 FedEx 取消这张运单（cancelling + cancel_in_progress，未过期）"""
+        """有请求正在调承运商取消这张运单（cancelling + cancel_in_progress，未过期）"""
         return (record is not None and record.status == 'cancelling'
                 and CarrierShipmentService.effective_status(record)[1] == CANCEL_IN_PROGRESS)
 
@@ -379,7 +377,7 @@ class CarrierShipmentService:
 
     @staticmethod
     def cancel_target(dn: DN):
-        """可以向 FedEx 取消的记录：有效运单（active）、取消中 / 取消结果不明（cancelling）、
+        """可以向承运商取消的记录：有效运单（active）、取消中 / 取消结果不明（cancelling）、
         带运单号的结果不明记录（unknown，含卡住的 pending，例如补偿取消失败）。没有返回 None。"""
         record = CarrierShipmentService.open_shipment(dn)
         if record is None:
@@ -427,24 +425,28 @@ class CarrierShipmentService:
     def _unresolved_conflict(record, message=None):
         """409 16079：有结果不明（或进行中）的建单记录，或运单正在取消 / 取消结果不明"""
         payload = CarrierShipmentService.unresolved_payload(record)
+        code = record.carrier if record is not None else None
+        name = display_name(code)
         if message is None:
             if payload and payload['status'] == 'pending':
-                message = "A FedEx shipment request for this DN is still in progress; wait for it to finish."
+                message = f"A {name} shipment request for this DN is still in progress; wait for it to finish."
             elif payload and payload['status'] == 'cancelling':
                 message = CarrierShipmentService._cancelling_message(record)
             elif payload and payload['tracking_number']:
-                message = (f"FedEx shipment {payload['tracking_number']} of this DN was not saved in WMS and may "
-                           "still exist on the FedEx side." + _CANCEL_RETRY)
+                message = (f"{name} shipment {payload['tracking_number']} of this DN was not saved in WMS and may "
+                           f"still exist on the {name} side." + _cancel_retry(code))
             else:
-                message = ("The result of the previous FedEx shipment request for this DN is unclear." + _MAYBE_CREATED)
+                message = (f"The result of the previous {name} shipment request for this DN is unclear."
+                           + _maybe_created(code))
         return ConflictException(message, 16079, details={'unresolved': payload})
 
     @staticmethod
     def _cancelling_message(record) -> str:
+        name = display_name(record.carrier)
         if CarrierShipmentService.cancel_in_progress(record):
-            return (f"FedEx shipment {record.tracking_number} of this DN is being cancelled; wait for the "
+            return (f"{name} shipment {record.tracking_number} of this DN is being cancelled; wait for the "
                     "cancellation to finish.")
-        return (f"The result of cancelling FedEx shipment {record.tracking_number} of this DN is unclear; the DN "
+        return (f"The result of cancelling {name} shipment {record.tracking_number} of this DN is unclear; the DN "
                 "cannot be shipped and the tracking number cannot be changed until it is resolved: retry the "
                 "cancellation (POST /warehouse/dn/<id>/carrier-shipment/cancel).")
 
@@ -463,7 +465,8 @@ class CarrierShipmentService:
 
     @staticmethod
     def _shipper(dn: DN, exporter: dict) -> dict:
-        """发件人 = 公司出口资料（英文名、电话（仓库优先）、联系人、税号）+ 发货地址 = 仓库英文地址（没有用公司的）"""
+        """发件人 = 公司出口资料（英文名、电话（仓库优先）、联系人、税号）+ 发货地址 = 仓库英文地址（没有用公司的）。
+        地址是一个英文字符串，怎么拆行由插件决定。"""
         warehouse = dn.warehouse
         company = warehouse.company
         if (warehouse.address_en or '').strip():
@@ -471,105 +474,74 @@ class CarrierShipmentService:
         else:
             text, postal = company.address_en, company.zip_code
         country = CarrierShipmentService._sender_country(dn)
-        address = split_address_text(text, country, postal, COUNTRY_NAMES_EN.get(country))
-        tins = [{'number': company.tax_id, 'tinType': SHIPPER_TIN_TYPE}] if company.tax_id else []
         return {
             'company_name': exporter['legal_name_en'],
             'person_name': company.export_contact_name or warehouse.contact_name_en,
             'phone': exporter['phone'],
             'email': company.email,
-            'address': address,
-            'tins': tins,
+            'address_text': text,
+            'postal_code': postal,
+            'country_code': country,
+            'country_name': COUNTRY_NAMES_EN.get(country),
+            'tax_id': company.tax_id,
         }
 
     @staticmethod
     def _recipient(customs, consignee: dict, country: str) -> dict:
-        address = consignee_address(consignee, country)
-        tins = []
-        if customs.recipient_tax_id:
-            tins.append({'number': customs.recipient_tax_id, 'tinType': tin_type_for(customs.recipient_tax_id_type)})
         return {
             'company_name': consignee.get('company'),
             'person_name': consignee.get('name') or consignee.get('company'),
             'phone': consignee.get('phone'),
             'email': None,
-            'address': address,
-            'tins': tins,
+            'address_line1': consignee.get('address_line1'),
+            'address_line2': consignee.get('address_line2'),
+            'city': consignee.get('city'),
+            'state': consignee.get('state'),
+            'postal_code': consignee.get('postal_code'),
+            'country_code': (country or '').strip().upper(),
+            'tax_id': customs.recipient_tax_id,
+            'tax_id_type': customs.recipient_tax_id_type,
         }
 
     @staticmethod
     def _collect(dn: DN) -> dict:
-        """前置条件检查 + 建单要用的数据：{blockers, view, task, shipper, recipient, settings}"""
+        """前置条件检查 + 建单要用的数据：
+        {blockers, warnings, declared_value, view, task, carrier, integration（快照）, adapter, shipment（交给插件的数据，
+        不含 ship_date / documents）}"""
         blockers = []
-        settings = _settings()
-        ctx = {'blockers': blockers, 'warnings': [], 'declared_value': None, 'settings': settings,
-               'view': None, 'task': None,
-               'shipper': None, 'recipient': None}
+        ctx = {'blockers': blockers, 'warnings': [], 'declared_value': None, 'view': None, 'task': None,
+               'carrier': None, 'integration': None, 'adapter': None, 'shipment': None}
 
-        if not CarrierShipmentService.enabled():
-            blockers.append(_blocker('FEDEX_NOT_CONFIGURED',
-                                     "FedEx is not configured (FEDEX_API_KEY / FEDEX_SECRET_KEY / FEDEX_ACCOUNT_NUMBER)"))
-        else:
-            company_ids, invalid = allowed_company_ids()
-            if invalid:
-                blockers.append(_blocker('FEDEX_CONFIG_INVALID',
-                                         "FEDEX_ALLOWED_COMPANY_IDS must be a comma-separated list of company IDs "
-                                         f"(invalid: {', '.join(invalid)})"))
-            if dn.warehouse.company_id not in company_ids:
-                blockers.append(_blocker('FEDEX_COMPANY_NOT_ALLOWED',
-                                         "FedEx shipments are not enabled for this company "
-                                         "(FEDEX_ALLOWED_COMPANY_IDS)"))
-        if settings['default_label_format'] not in LABEL_FORMATS:
-            blockers.append(_blocker('FEDEX_CONFIG_INVALID',
-                                     f"FEDEX_DEFAULT_LABEL_FORMAT must be one of {', '.join(LABEL_FORMATS)}"))
-        for fmt, label in settings['label_formats'].items():
-            if label['image_type'] not in SUPPORTED_LABEL_IMAGE_TYPES:
-                blockers.append(_blocker('FEDEX_CONFIG_INVALID',
-                                         f"FEDEX_LABEL_{fmt}_IMAGE_TYPE must be one of "
-                                         f"{', '.join(SUPPORTED_LABEL_IMAGE_TYPES)}"))
-            try:
-                parse_page_size(label['page_size'])
-            except ValueError:
-                blockers.append(_blocker('FEDEX_CONFIG_INVALID',
-                                         f"FEDEX_LABEL_{fmt}_PAGE_SIZE must be WIDTHxHEIGHT in mm "
-                                         "(e.g. 100x150)"))
-        if settings['duties_payment_type'] not in SUPPORTED_DUTIES_PAYMENT_TYPES:
-            blockers.append(_blocker('FEDEX_CONFIG_INVALID',
-                                     "FEDEX_DUTIES_PAYMENT_TYPE must be one of "
-                                     f"{', '.join(SUPPORTED_DUTIES_PAYMENT_TYPES)}"))
+        task = CustomsService._delivery_task(dn)
+        carrier, snapshot, adapter = CarrierShipmentService.integration_of(dn, task)
+        ctx.update(task=task, carrier=carrier, integration=snapshot, adapter=adapter)
 
         customs = dn.customs
         if customs is None:
             blockers.append(_blocker('NOT_EXPORT', "DN is not an export shipment (no customs data)"))
             return ctx
 
-        # DDP = 发件人付关税；关税付款方配置成收件人付，会被 FedEx 向收件人收关税，与贸易条件矛盾
-        incoterm = (customs.incoterm or '').strip().upper()
-        if (incoterm == 'DDP' and settings['duties_payment_type'] in SUPPORTED_DUTIES_PAYMENT_TYPES
-                and settings['duties_payment_type'] != 'SENDER'):
-            blockers.append(_blocker(
-                'INCOTERM_DUTIES_MISMATCH',
-                f"Incoterm DDP means the shipper pays duties and taxes, but FEDEX_DUTIES_PAYMENT_TYPE is "
-                f"{settings['duties_payment_type']}; use another incoterm (e.g. DAP) or set "
-                "FEDEX_DUTIES_PAYMENT_TYPE=SENDER", field='incoterm'))
-
         if dn.status in LOCKED_DN_STATUSES:
             blockers.append(_blocker('DN_SHIPPED', f"DN has already been shipped (status: {dn.status})"))
         elif dn.status != 'packed':
             blockers.append(_blocker('NOT_PACKED', f"DN must be packed (current: {dn.status})"))
 
-        task = CustomsService._delivery_task(dn)
-        ctx['task'] = task
         if task is None:
             blockers.append(_blocker('DELIVERY_TASK_MISSING', "DN has no active delivery task"))
+        if carrier is None:
+            blockers.append(_blocker('CARRIER_NOT_SET', "Choose the carrier of the delivery task first"))
+        elif snapshot is None:
+            blockers.append(_blocker(
+                'CARRIER_NOT_INTEGRATED',
+                f"Carrier {carrier.name} has no online integration: create the shipment on the carrier's website "
+                "and save the tracking number, or set up the integration in the carrier settings",
+                carrier_id=carrier.id))
         else:
-            if _carrier_code(task.carrier or dn.carrier) != CARRIER_FEDEX:
-                carrier = task.carrier or dn.carrier
-                blockers.append(_blocker(
-                    'CARRIER_NOT_FEDEX',
-                    f"Carrier of the delivery task is not FedEx (carrier code: {_carrier_code(carrier) or 'none'})"))
-            if task.status in COMPLETED_TASK_STATUSES:
-                blockers.append(_blocker('DELIVERY_TASK_COMPLETED', "Delivery task has already been completed"))
+            for item in CarrierIntegrationService.problems(snapshot, adapter):
+                item.setdefault('carrier_id', carrier.id)
+                blockers.append(item)
+        if task is not None and task.status in COMPLETED_TASK_STATUSES:
+            blockers.append(_blocker('DELIVERY_TASK_COMPLETED', "Delivery task has already been completed"))
 
         active = CarrierShipmentService.live_shipment(dn)
         if active is not None:
@@ -582,15 +554,16 @@ class CarrierShipmentService:
             blockers.append(_blocker(
                 'TRACKING_NUMBER_EXISTS',
                 f"Delivery task already has a tracking number ({task.tracking_number}); clear it first "
-                "if the shipment should be created in FedEx"))
+                "if the shipment should be created automatically"))
 
         packages = list(dn.packages)
+        limit = adapter.max_packages if adapter is not None else None
         if not packages:
             blockers.append(_blocker('PACKAGES_MISSING', "No packages recorded"))
-        elif len(packages) > MAX_PACKAGES_PER_REQUEST:
+        elif limit and len(packages) > limit:
             blockers.append(_blocker('TOO_MANY_PACKAGES',
-                                     f"At most {MAX_PACKAGES_PER_REQUEST} packages per FedEx shipment "
-                                     f"(current: {len(packages)})"))
+                                     f"At most {limit} packages per {adapter.name} shipment "
+                                     f"(current: {len(packages)})", limit=limit))
         for package in packages:
             if not package.gross_weight_kg or not (package.length_mm and package.width_mm and package.height_mm):
                 blockers.append(_blocker('PACKAGE_INCOMPLETE',
@@ -609,33 +582,30 @@ class CarrierShipmentService:
             ctx['warnings'].append(warning)
 
         exporter = view['exporter']
+        shipper = None
         if exporter['legal_name_en'] and (exporter['address_en'] or (dn.warehouse.address_en or '').strip()):
-            try:
-                ctx['shipper'] = CarrierShipmentService._shipper(dn, exporter)
-            except AddressError as exc:
-                blockers.append(_blocker('SHIPPER_ADDRESS_INVALID',
-                                         f"Ship-from address cannot be used for FedEx: {exc}", field='address_en'))
+            shipper = CarrierShipmentService._shipper(dn, exporter)
 
         consignee = view['consignee'] or {}
         country = view['recipient_country']
-        if country:
-            try:
-                ctx['recipient'] = CarrierShipmentService._recipient(customs, consignee, country)
-            except AddressError as exc:
-                blockers.append(_blocker('RECIPIENT_ADDRESS_INVALID',
-                                         f"Consignee address cannot be used for FedEx: {exc}", field='consignee'))
+        recipient = CarrierShipmentService._recipient(customs, consignee, country) if country else None
         if not (consignee.get('name') or consignee.get('company')):
             blockers.append(_blocker('RECIPIENT_NAME_MISSING', "Consignee name and company are both missing",
                                      field='consignee.name'))
         if not re.sub(r'\D', '', str(consignee.get('phone') or '')):
             blockers.append(_blocker('RECIPIENT_PHONE_MISSING', "Consignee phone number is missing",
                                      field='consignee.phone'))
+
+        shipment = CarrierShipmentService._shipment_data(dn, view, ctx['declared_value'], shipper, recipient)
+        ctx['shipment'] = shipment
+        if adapter is not None:
+            blockers.extend(adapter.check_shipment(shipment))
         return ctx
 
     @staticmethod
     def _declared_value(customs, view):
         """随运单提交的申告价额（整数，报关币种）与说明：高于已打包货值时压到已打包货值（取整数部分）。
-        FedEx 拒收申告价额高于报关货值的运单（TOTALCARRIAGEVALUE.EXCEEDS.CUSTOMSVALUE，sandbox 实测）。"""
+        承运商拒收申告价额高于报关货值的运单（FedEx：TOTALCARRIAGEVALUE.EXCEEDS.CUSTOMSVALUE，sandbox 实测）。"""
         requested = customs.declared_value_carriage
         if not requested:
             return None, None
@@ -646,7 +616,7 @@ class CarrierShipmentService:
         return capped, {
             'code': 'DECLARED_VALUE_CAPPED',
             'message': (f"Declared value for carriage {requested} exceeds the customs value of the packed goods "
-                        f"({goods_value}); {capped or 0} is submitted to FedEx instead"),
+                        f"({goods_value}); {capped or 0} is submitted to the carrier instead"),
             'requested': requested,
             'applied': capped,
         }
@@ -667,12 +637,12 @@ class CarrierShipmentService:
     @staticmethod
     def assert_tracking_matches(dn: DN, tracking_number, allow_empty=False):
         """保存 / 修改发货任务运单号、完成发货前的检查（调用方应先锁 DN 行），返回应写入任务的运单号：
-        - 有结果不明 / 进行中的建单记录：给了运单号 → 409 16079（防止在 FedEx 上又手工建一张）；空值放行
+        - 有结果不明 / 进行中的建单记录：给了运单号 → 409 16079（防止在承运商网站上又手工建一张）；空值放行
         - 运单正在取消 / 取消结果不明（cancelling）：给了运单号（含同一个号码）→ 409 16079；
           空值且 allow_empty=False（清空任务上的运单号）也 16079（取消没落定前运单号与面单都要留着）
         - 有有效自动运单：运单号只能是它的号码（按 normalize_tracking 比，忽略空格 / 连字符差异），
           不同 → 409 16078；相同 → 返回运单上的标准写法 shipment.tracking_number（入库统一用它，
-          取消运单时才能按号码清掉、CI 上印的也与运单一字不差）。
+          取消运单时才能按号码清掉）。
           allow_empty=True：空值视为「不改」由调用方跳过；False：清空也算不一致（要清空请取消运单）。
         - 没有有效运单时，给的是本 DN 已取消（含补偿取消）的自动运单号 → 409 16078，
           details {tracking_number: null, cancelled_tracking_number, carrier, status: 'cancelled'}
@@ -688,10 +658,10 @@ class CarrierShipmentService:
             if given:
                 raise CarrierShipmentService._unresolved_conflict(
                     unresolved,
-                    "The result of the automatic FedEx shipment request for this DN is unclear (or still in "
-                    "progress); a tracking number cannot be saved until it is resolved. Check FedEx Ship Manager, "
-                    "then cancel or dismiss the record (POST /warehouse/dn/<id>/carrier-shipment/cancel or "
-                    "/dismiss).")
+                    f"The result of the automatic {display_name(unresolved.carrier)} shipment request for this DN is "
+                    "unclear (or still in progress); a tracking number cannot be saved until it is resolved. Check "
+                    f"{portal_name(unresolved.carrier)}, then cancel or dismiss the record "
+                    "(POST /warehouse/dn/<id>/carrier-shipment/cancel or /dismiss).")
             return tracking_number
         shipment = CarrierShipmentService.active_shipment(dn)
         if shipment is None:
@@ -702,8 +672,8 @@ class CarrierShipmentService:
             return tracking_number
         if given != normalize_tracking(shipment.tracking_number):
             raise ConflictException(
-                f"This DN has an active {shipment.carrier} shipment {shipment.tracking_number}; the tracking number "
-                "cannot be changed. Cancel the carrier shipment first.", 16078,
+                f"This DN has an active {display_name(shipment.carrier)} shipment {shipment.tracking_number}; the "
+                "tracking number cannot be changed. Cancel the carrier shipment first.", 16078,
                 details={'tracking_number': shipment.tracking_number, 'carrier': shipment.carrier},
             )
         return shipment.tracking_number
@@ -723,15 +693,16 @@ class CarrierShipmentService:
         for record in cancelled:
             if normalize_tracking(record.tracking_number) == given:
                 raise ConflictException(
-                    f"{record.carrier} shipment {record.tracking_number} of this DN has been {record.status}; its tracking "
-                    "number cannot be used any more. Create a new shipment or enter another tracking number.", 16078,
+                    f"{display_name(record.carrier)} shipment {record.tracking_number} of this DN has been "
+                    f"{record.status}; its tracking number cannot be used any more. Create a new shipment or enter "
+                    "another tracking number.", 16078,
                     details={'tracking_number': None, 'cancelled_tracking_number': record.tracking_number,
                              'carrier': record.carrier, 'status': 'cancelled', 'record_status': record.status},
                 )
 
     @staticmethod
-    def _resolve_hint(status: str) -> str:
-        """「先处理运单」的提示（按记录的对外状态）"""
+    def _resolve_hint(status: str, code=None) -> str:
+        """「先处理运单」的提示（按记录的对外状态；code 是记录的插件代码）"""
         if status == 'active':
             return "cancel the carrier shipment first"
         if status == 'pending':
@@ -739,7 +710,7 @@ class CarrierShipmentService:
         if status == 'cancelling':
             return ("the carrier shipment is being cancelled: wait for it, or retry the cancellation "
                     "(POST /warehouse/dn/<id>/carrier-shipment/cancel)")
-        return ("resolve the carrier shipment first (check FedEx Ship Manager, then cancel or dismiss it "
+        return (f"resolve the carrier shipment first (check {portal_name(code)}, then cancel or dismiss it "
                 "via POST /warehouse/dn/<id>/carrier-shipment/cancel or /dismiss)")
 
     @staticmethod
@@ -750,9 +721,9 @@ class CarrierShipmentService:
         if record is None:
             return
         summary = CarrierShipmentService._record_summary(record)
-        hint = CarrierShipmentService._resolve_hint(summary['status'])
+        hint = CarrierShipmentService._resolve_hint(summary['status'], record.carrier)
         raise ConflictException(
-            f"This DN has a {record.carrier} shipment ({summary['status']}"
+            f"This DN has a {display_name(record.carrier)} shipment ({summary['status']}"
             f"{' ' + record.tracking_number if record.tracking_number else ''}); delivery tasks cannot be "
             f"{action}; {hint}.", 16078,
             details={'tracking_number': record.tracking_number, 'carrier': record.carrier,
@@ -765,11 +736,11 @@ class CarrierShipmentService:
         """409 16076（改箱子 / 改报关快照 / 签发与运单不一致的单证）：
         details {reason, status, carrier, carrier_shipment: {id, status, tracking_number}}。
         reason：CARRIER_SHIPMENT_OPEN（有未结束的运单时改箱子 / 报关数据）/
-        DOCUMENT_DATA_CHANGED（单证数据除 AWB 外与随运单提交的不一致）。status 与 carrier_shipment.status 相同。"""
+        DOCUMENT_DATA_CHANGED（单证数据与随运单提交的不一致）。status 与 carrier_shipment.status 相同。"""
         summary = CarrierShipmentService._record_summary(record)
-        hint = CarrierShipmentService._resolve_hint(summary['status'])
+        hint = CarrierShipmentService._resolve_hint(summary['status'], record.carrier)
         return ConflictException(
-            f"{what} while the DN has a {record.carrier} shipment ({summary['status']}"
+            f"{what} while the DN has a {display_name(record.carrier)} shipment ({summary['status']}"
             f"{' ' + record.tracking_number if record.tracking_number else ''}); the data was submitted with the "
             f"shipment — {hint}.", 16076,
             details={'reason': reason, 'status': summary['status'], 'carrier': record.carrier,
@@ -797,6 +768,31 @@ class CarrierShipmentService:
     # ------------------------------------------------------------------
 
     @staticmethod
+    def _carrier_payload(carrier):
+        if carrier is None:
+            return None
+        return {'id': carrier.id, 'name': carrier.name, 'code': carrier.code}
+
+    @staticmethod
+    def _integration_payload(snapshot, adapter, blockers):
+        """GET 里的 integration：DN 的承运商的对接（没有为 null）"""
+        if snapshot is None:
+            return None
+        cls = adapter or None
+        problems = {'CARRIER_INTEGRATION_UNAVAILABLE', 'CARRIER_INTEGRATION_DISABLED', 'CARRIER_NOT_CONFIGURED',
+                    'CARRIER_CONFIG_INVALID'}
+        return {
+            'code': snapshot['adapter'],
+            'name': display_name(snapshot['adapter']),
+            'portal_name': cls.portal_name if cls else None,
+            'portal_url': cls.portal_url if cls else None,
+            'enabled': snapshot['enabled'],
+            'ready': cls is not None and not any(b['code'] in problems for b in blockers),
+            # 建好的运单要另约上门揽收（GoodsMart：/warehouse/dn/carrier-pickups）
+            'books_pickups': bool(cls is not None and cls.books_pickups()),
+        }
+
+    @staticmethod
     def status(dn: DN, ctx=None, alerts=None, warnings=None) -> dict:
         """GET /dn/<id>/carrier-shipment"""
         ctx = ctx or CarrierShipmentService._collect(dn)
@@ -805,26 +801,35 @@ class CarrierShipmentService:
         unresolved = CarrierShipmentService.unresolved_payload(unresolved_record)
         target = CarrierShipmentService.cancel_target(dn)
         customs = dn.customs
+        adapter = ctx['adapter']
+        integration = CarrierShipmentService._integration_payload(ctx['integration'], adapter, ctx['blockers'])
+        label_formats = {}
+        if adapter is not None:
+            for fmt in adapter.label_formats:
+                label = adapter.label_options(fmt)
+                label_formats[fmt] = {'image_type': label['image_type'], 'stock_type': label['stock_type']}
         payload = {
-            'enabled': CarrierShipmentService.enabled(dn),
-            'carrier': CARRIER_FEDEX,
+            # DN 的承运商有可用的对接（启用、设置齐全）：能不能建单另看 can_create / blockers
+            'enabled': bool(integration and integration['ready']),
+            # DN 当前的承运商（发货任务的，没有则 DN 的）与它的对接
+            'carrier': CarrierShipmentService._carrier_payload(ctx['carrier']),
+            'integration': integration,
             'can_create': not ctx['blockers'] and unresolved is None,
             'blockers': ctx['blockers'],
             # 结果不明 / 进行中的建单记录、正在取消 / 取消结果不明的运单（有它时不能建单、不能发货）
             'unresolved': unresolved,
-            # unknown（含卡住的 pending）、取消结果不明的 cancelling 可以确认作废（带运单号的先向 FedEx 确认已取消）
+            # unknown（含卡住的 pending）、取消结果不明的 cancelling 可以确认作废（带运单号的先向承运商确认已取消）
             'can_dismiss': CarrierShipmentService.dismissable(unresolved_record),
             # 有效运单、取消结果不明的运单、带运单号的结果不明记录可以（重试）取消；DN 已发货 / 正在取消时不行
             'can_cancel': (target is not None and not CarrierShipmentService.cancel_in_progress(target)
                            and not CustomsService.is_locked(dn)),
-            'etd_enabled': ctx['settings']['etd_enabled'],
-            'default_label_format': ctx['settings']['default_label_format'],
-            'label_formats': {
-                fmt: {'image_type': label['image_type'], 'stock_type': label['stock_type']}
-                for fmt, label in ctx['settings']['label_formats'].items()
-            },
+            'etd_enabled': bool(adapter is not None and adapter.documents_enabled()),
+            'default_label_format': adapter.default_label_format() if adapter is not None else None,
+            'label_formats': label_formats,
             'declared_value_carriage': customs.declared_value_carriage if customs else None,
             'delivery_task_id': ctx['task'].id if ctx['task'] is not None else None,
+            # 发货任务上现在的运单号（自动建的或手工填的）
+            'tracking_number': ctx['task'].tracking_number if ctx['task'] is not None else None,
             'shipment': CarrierShipmentService.shipment_payload(shipment),
             # 建单时会自动做的调整（如申告价额压到已打包货值）；建单响应里是这次实际做了的
             'warnings': ctx['warnings'] if warnings is None else warnings,
@@ -838,12 +843,10 @@ class CarrierShipmentService:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _ship_request_args(dn: DN, ctx: dict, label: dict) -> dict:
-        """build_ship_request 的参数（纯数据，不引用 ORM 对象；etd_document_id 调 FedEx 时再补）"""
-        view = ctx['view']
+    def _shipment_data(dn: DN, view: dict, declared_total, shipper, recipient) -> dict:
+        """交给插件的一票货（纯数据，不引用 ORM 对象；ship_date / documents 建单时再补），形状见 CarrierAdapter"""
         customs = dn.customs
         packages = list(dn.packages)
-        declared_total = ctx['declared_value']
         declared_split = split_evenly(declared_total, len(packages)) if declared_total else [None] * len(packages)
         package_items = [{
             'gross_weight_kg': p.gross_weight_kg,
@@ -882,30 +885,28 @@ class CarrierShipmentService:
             'declared_value': declared_total if declared_total else None,
         }
         return {
-            'account_number': current_app.config.get('FEDEX_ACCOUNT_NUMBER'),
-            'settings': ctx['settings'],
-            'label': label,
-            'ship_date': datetime.now(_document_timezone()).date(),
-            'shipper': ctx['shipper'],
-            'recipient': ctx['recipient'],
+            'reference': dn.order_number,
+            'ship_date': None,
+            'shipper': shipper,
+            'recipient': recipient,
             'packages': package_items,
             'commodities': commodities,
             'invoice': invoice,
-            'reference': dn.order_number,
+            'documents': None,
         }
 
     @staticmethod
     def create_shipment(dn: DN, user_id, label_format=None) -> dict:
         """POST /dn/<id>/carrier-shipment（三段，见模块说明）。
 
-        各段自己提交，不能在外层事务里调用（否则 pending 记录不会先落库、调 FedEx 时还占着锁）。"""
+        各段自己提交，不能在外层事务里调用（否则 pending 记录不会先落库、调承运商时还占着锁）。"""
         if getattr(g, 'transaction_depth', 0):
             raise RuntimeError("create_shipment must not run inside another transaction")
-        label = resolve_label_format(label_format)
-        deadline = fedex_client.clock() + create_budget_seconds()
+        label_format = parse_label_format(label_format)
+        deadline = clock() + create_budget_seconds()
         dn_id = dn.id
         try:
-            plan = CarrierShipmentService._reserve(dn, user_id, label)
+            plan = CarrierShipmentService._reserve(dn, user_id, label_format)
         except IntegrityError as exc:
             # 部分唯一索引兜底：并发请求刚插了同一 DN 的 pending（正常情况下 DN 行锁已让它们排队）
             db.session.rollback()
@@ -916,7 +917,7 @@ class CarrierShipmentService:
 
         state = {'create_sent': False, 'created': None, 'finalized': False}
         try:
-            return CarrierShipmentService._request_and_save(plan, user_id, label, deadline, state)
+            return CarrierShipmentService._request_and_save(plan, user_id, deadline, state)
         except BaseException as exc:
             # worker 超时被杀（gunicorn 抛 SystemExit）等：尽力把记录落到 unknown / failed；落不了就等 stale
             if not isinstance(exc, Exception) and not state['finalized']:
@@ -934,7 +935,7 @@ class CarrierShipmentService:
         active = CarrierShipmentService.active_shipment(dn)
         if active is not None:
             return ConflictException(
-                "FedEx shipment cannot be created; resolve the listed blockers first.", 16072,
+                "The carrier shipment cannot be created; resolve the listed blockers first.", 16072,
                 details={'blockers': [_blocker('SHIPMENT_EXISTS', "An active carrier shipment already exists "
                                                                   f"({active.tracking_number})")]},
             )
@@ -942,7 +943,7 @@ class CarrierShipmentService:
 
     @staticmethod
     @transactional
-    def _reserve(dn: DN, user_id, label: dict) -> dict:
+    def _reserve(dn: DN, user_id, label_format) -> dict:
         """第 1 段：锁 DN、检查、必要时签发 CI / PL、插 pending 记录，随本事务提交（释放 DN 行锁）。"""
         dn = CustomsService._lock(dn)
         unresolved = CarrierShipmentService.unresolved_shipment(dn)
@@ -951,9 +952,14 @@ class CarrierShipmentService:
         ctx = CarrierShipmentService._collect(dn)
         if ctx['blockers']:
             raise ConflictException(
-                "FedEx shipment cannot be created; resolve the listed blockers first.", 16072,
+                "The carrier shipment cannot be created; resolve the listed blockers first.", 16072,
                 details={'blockers': ctx['blockers']},
             )
+        adapter = ctx['adapter']
+        if label_format is not None and label_format not in adapter.label_formats:
+            raise BadRequestException(f"{adapter.name} does not support label_format {label_format} "
+                                      f"(supported: {' / '.join(adapter.label_formats)})", 16077, field='label_format')
+        label = adapter.label_options(label_format)
 
         # CI / PL 必须先签发（没有或已过期 → 用现有逻辑签发；随 pending 记录一起提交）
         current = CustomsService.current_documents(dn)
@@ -961,25 +967,25 @@ class CarrierShipmentService:
             CustomsService.issue_documents(dn, user_id)
             current = CustomsService.current_documents(dn)
 
-        settings = ctx['settings']
-        sender_country = ctx['shipper']['address']['countryCode']
-        etd = None
-        if settings['etd_enabled']:
+        shipment = dict(ctx['shipment'])
+        shipment['ship_date'] = datetime.now(_document_timezone()).date()
+        if adapter.documents_enabled():
             ci = current[DOC_CI]
-            etd = {'content': ci.content, 'file_name': ci.file_name}
+            shipment['documents'] = {'commercial_invoice': {'content': ci.content, 'file_name': ci.file_name}}
 
         now = datetime.now()
         record = DNCarrierShipment(
             dn_id=dn.id,
-            carrier=CARRIER_FEDEX,
+            carrier=adapter.code,
+            carrier_id=ctx['carrier'].id,
             status='pending',
-            service_type=settings['service_type'],
+            service_type=adapter.service_type(),
             package_count=len(dn.packages),
             declared_value=ctx['declared_value'],
             label_format=label['label_format'],
             image_type=label['image_type'],
             label_stock_type=label['stock_type'],
-            sender_country=sender_country,
+            sender_country=shipment['shipper']['country_code'],
             created_by=user_id,
             created_at=now,
             updated_at=now,
@@ -989,98 +995,85 @@ class CarrierShipmentService:
         return {
             'record_id': record.id,
             'dn_id': dn.id,
-            'request_args': CarrierShipmentService._ship_request_args(dn, ctx, label),
-            'etd': etd,
-            'sender_country': sender_country,
-            'recipient_country': ctx['recipient']['address']['countryCode'],
+            'carrier_id': ctx['carrier'].id,
+            'integration': ctx['integration'],
+            'label': label,
+            'shipment': shipment,
+            'sender_country': shipment['shipper']['country_code'],
             'warnings': list(ctx['warnings']),
         }
 
     @staticmethod
-    def _request_and_save(plan: dict, user_id, label: dict, deadline: float, state: dict) -> dict:
-        """第 2 段（调 FedEx，不开事务）+ 第 3 段（写库）。任何出口都把记录落到最终状态。"""
+    def _request_and_save(plan: dict, user_id, deadline: float, state: dict) -> dict:
+        """第 2 段（调承运商，不开事务）+ 第 3 段（写库）。任何出口都把记录落到最终状态。"""
         record_id, dn_id = plan['record_id'], plan['dn_id']
+        adapter = CarrierIntegrationService.build(plan['integration'])
+        code, name = adapter.code, adapter.name
 
-        etd_document_id = None
-        if plan['etd']:
+        document_ref = None
+        if plan['shipment'].get('documents'):
             try:
-                uploaded = fedex_client.upload_etd_document(
-                    plan['etd']['content'], plan['etd']['file_name'], plan['sender_country'],
-                    plan['recipient_country'], deadline=deadline)
-            except FedexError as exc:
+                document_ref = adapter.upload_documents(plan['shipment'], deadline=deadline)
+            except CarrierError as exc:
                 # 运单还没请求：结果确定
                 CarrierShipmentService._finish(record_id, 'failed', state, reason='etd_upload_failed',
                                                error_message=exc.message, transaction_id=exc.transaction_id)
-                raise _fedex_api_exception(exc, 'etd_upload', unresolved=None, with_unresolved=True)
-            etd_document_id = ((uploaded.get('output') or {}).get('meta') or {}).get('docId')
-            if not etd_document_id:
-                CarrierShipmentService._finish(record_id, 'failed', state, reason='etd_upload_failed',
-                                               error_message="FedEx trade document upload returned no docId")
-                raise BadGatewayException("FedEx trade document upload returned no docId", 16073,
-                                          details={'carrier': CARRIER_FEDEX, 'action': 'etd_upload',
-                                                   'errors': [], 'transaction_id': None, 'http_status': None,
-                                                   'maybe_processed': False, 'unresolved': None})
+                raise _carrier_api_exception(exc, 'etd_upload', code, unresolved=None, with_unresolved=True)
 
-        request = build_ship_request(**plan['request_args'], etd_document_id=etd_document_id)
         state['create_sent'] = True
         try:
-            body = fedex_client.create_shipment(request, deadline=deadline)
-        except FedexError as exc:
+            result = adapter.create_shipment(plan['shipment'], plan['label'], deadline=deadline,
+                                             document_ref=document_ref)
+        except CarrierResponseError as exc:
+            logger.error("DN %s: unexpected %s ship response (transactionId %s): %s", dn_id, name,
+                         exc.transaction_id, exc.message)
+            if exc.tracking_number:
+                # 看不懂但有运单号：按写库失败处理，取消它
+                state['created'] = {'tracking_number': exc.tracking_number, 'transaction_id': exc.transaction_id}
+                unresolved, _compensation = CarrierShipmentService._compensate(plan, adapter, state, deadline, user_id)
+            else:
+                unresolved = CarrierShipmentService._finish(
+                    record_id, 'unknown', state, reason='bad_response', error_message=exc.message,
+                    transaction_id=exc.transaction_id, etd_document_id=document_ref)
+            raise BadGatewayException(
+                f"{exc.message}." + (_maybe_created(code) if unresolved else f" The shipment was cancelled in {name}."),
+                16073, details={'carrier': code, 'action': 'create', 'errors': [],
+                                'transaction_id': exc.transaction_id, 'http_status': 200,
+                                'maybe_processed': True, 'unresolved': unresolved})
+        except CarrierError as exc:
             if exc.maybe_processed:
                 reason = _unclear_reason(exc)
-                logger.error("DN %s: FedEx create shipment result unclear (%s, transactionId %s); the shipment "
-                             "may exist on the FedEx side", dn_id, reason, exc.transaction_id)
+                logger.error("DN %s: %s create shipment result unclear (%s, transactionId %s); the shipment "
+                             "may exist on the %s side", dn_id, name, reason, exc.transaction_id, name)
                 unresolved = CarrierShipmentService._finish(
                     record_id, 'unknown', state, reason=reason, error_message=exc.message,
-                    transaction_id=exc.transaction_id, etd_document_id=etd_document_id)
+                    transaction_id=exc.transaction_id, etd_document_id=document_ref)
             else:
-                # rejected = FedEx 对建单请求本身回了 4xx；not_sent = 请求没发出去（token 失败、连不上等）
+                # rejected = 承运商对建单请求本身回了 4xx；not_sent = 请求没发出去（令牌失败、连不上等）
                 if exc.budget_exhausted:
                     reason = 'budget_exhausted'
-                elif exc.what == fedex_client.CREATE_SHIPMENT and exc.status_code:
+                elif exc.step == STEP_CREATE and exc.status_code:
                     reason = 'rejected'
                 else:
                     reason = 'not_sent'
                 unresolved = CarrierShipmentService._finish(
                     record_id, 'failed', state, reason=reason, error_message=exc.message,
-                    transaction_id=exc.transaction_id, etd_document_id=etd_document_id)
-            raise _fedex_api_exception(exc, 'create', unresolved=unresolved, with_unresolved=True)
+                    transaction_id=exc.transaction_id, etd_document_id=document_ref)
+            raise _carrier_api_exception(exc, 'create', code, unresolved=unresolved, with_unresolved=True)
 
-        transaction_id = body.get('transactionId')
-        try:
-            result = parse_ship_response(body)
-        except (ValueError, TypeError, AttributeError, KeyError, IndexError) as exc:
-            logger.error("DN %s: unexpected FedEx ship response (transactionId %s): %s", dn_id, transaction_id, exc)
-            tracking = CarrierShipmentService._loose_tracking_number(body)
-            if tracking:
-                # 看不懂但有运单号：按写库失败处理，取消它
-                state['created'] = {'tracking_number': tracking, 'transaction_id': transaction_id}
-                unresolved, _compensation = CarrierShipmentService._compensate(plan, state, deadline, user_id)
-            else:
-                unresolved = CarrierShipmentService._finish(
-                    record_id, 'unknown', state, reason='bad_response', error_message=f"Unexpected response: {exc}",
-                    transaction_id=transaction_id, etd_document_id=etd_document_id)
-            raise BadGatewayException(
-                f"Unexpected FedEx response: {exc}." + (_MAYBE_CREATED if unresolved else
-                                                        " The shipment was cancelled in FedEx."),
-                16073, details={'carrier': CARRIER_FEDEX, 'action': 'create', 'errors': [],
-                                'transaction_id': transaction_id, 'http_status': 200,
-                                'maybe_processed': True, 'unresolved': unresolved})
-
-        # 从这里起 FedEx 上已有运单：先把运单号独立提交（第 3 段失败 / 进程被杀也留得下号码），之后任何失败都补偿取消
+        # 从这里起承运商那边已有运单：先把运单号独立提交（第 3 段失败 / 进程被杀也留得下号码），之后任何失败都补偿取消
         tracking = result['tracking_number']
-        state['created'] = {'tracking_number': tracking, 'transaction_id': result['transaction_id'] or transaction_id}
-        CarrierShipmentService._note_created(record_id, tracking, state['created']['transaction_id'],
-                                             etd_document_id)
+        state['created'] = {'tracking_number': tracking, 'transaction_id': result['transaction_id']}
+        CarrierShipmentService._note_created(record_id, tracking, state['created']['transaction_id'], document_ref)
         try:
-            response = CarrierShipmentService._save(plan, user_id, label, result, etd_document_id)
+            response = CarrierShipmentService._save(plan, adapter, user_id, result, document_ref)
         except Exception as exc:
-            logger.exception("DN %s: FedEx shipment %s was created but saving it in WMS failed", dn_id, tracking)
+            logger.exception("DN %s: %s shipment %s was created but saving it in WMS failed", dn_id, name, tracking)
             # 补偿取消前另开事务重读记录：提交其实成功（应答丢失等）时记录已是 active —— 不能取消有效运单
             saved = CarrierShipmentService._saved_despite_error(record_id, tracking)
             if saved:
-                logger.warning("DN %s: saving FedEx shipment %s raised but the record is active (the commit went "
-                               "through); not cancelling it", dn_id, tracking)
+                logger.warning("DN %s: saving %s shipment %s raised but the record is active (the commit went "
+                               "through); not cancelling it", dn_id, name, tracking)
                 state['finalized'] = True
                 return CarrierShipmentService.status(db.session.get(DN, dn_id), alerts=result['alerts'],
                                                      warnings=plan['warnings'])
@@ -1094,9 +1087,9 @@ class CarrierShipmentService:
                 compensation = {'attempted': False, 'cancelled': False, 'cancel_transaction_id': None,
                                 'error': 'whether the shipment was saved could not be verified'}
             else:
-                unresolved, compensation = CarrierShipmentService._compensate(plan, state, deadline, user_id)
+                unresolved, compensation = CarrierShipmentService._compensate(plan, adapter, state, deadline, user_id)
             raise CarrierShipmentService._save_failed_exception(
-                exc, tracking, state['created']['transaction_id'], unresolved, compensation) from exc
+                exc, code, tracking, state['created']['transaction_id'], unresolved, compensation) from exc
         state['finalized'] = True
         return response
 
@@ -1121,48 +1114,33 @@ class CarrierShipmentService:
         return row[0] == 'active' and normalize_tracking(row[1]) == normalize_tracking(tracking)
 
     @staticmethod
-    def _save_failed_exception(exc, tracking, transaction_id, unresolved, compensation) -> BadGatewayException:
-        """FedEx 建好运单后 WMS 写库失败（含业务异常，如期间 DN 已发货 16065、单证数据变了 16076）→ 502 16095：
+    def _save_failed_exception(exc, code, tracking, transaction_id, unresolved, compensation) -> BadGatewayException:
+        """承运商建好运单后 WMS 写库失败（含业务异常，如期间 DN 已发货 16065、单证数据变了 16076）→ 502 16095：
         details {carrier, action: create, tracking_number, transaction_id, error: {code, message},
         compensation: {attempted, cancelled, cancel_transaction_id, error}, unresolved, maybe_processed}。
-        unresolved 为 null = 运单已在 FedEx 取消；否则是带运单号的结果不明记录（重试取消 / 确认作废）。"""
+        unresolved 为 null = 运单已在承运商那边取消；否则是带运单号的结果不明记录（重试取消 / 确认作废）。"""
+        name = display_name(code)
         if isinstance(exc, APIException):
             error = {'code': exc.biz_code, 'message': exc.message}
         else:
             error = {'code': None, 'message': type(exc).__name__}
         if compensation['cancelled']:
-            outcome = "the shipment has been cancelled in FedEx; create it again once the problem is fixed."
+            outcome = f"the shipment has been cancelled in {name}; create it again once the problem is fixed."
         elif compensation['attempted']:
-            outcome = f"cancelling it in FedEx failed ({compensation['error']})." + _CANCEL_RETRY
+            outcome = f"cancelling it in {name} failed ({compensation['error']})." + _cancel_retry(code)
         else:
-            outcome = "whether it was saved could not be verified, so it was not cancelled." + _CANCEL_RETRY
+            outcome = "whether it was saved could not be verified, so it was not cancelled." + _cancel_retry(code)
         return BadGatewayException(
-            f"FedEx created shipment {tracking} but saving it in WMS failed ({error['message']}); {outcome}", 16095,
+            f"{name} created shipment {tracking} but saving it in WMS failed ({error['message']}); {outcome}", 16095,
             details={
-                'carrier': CARRIER_FEDEX, 'action': 'create', 'tracking_number': tracking,
+                'carrier': code, 'action': 'create', 'tracking_number': tracking,
                 'transaction_id': transaction_id, 'error': error, 'compensation': compensation,
                 'unresolved': unresolved, 'maybe_processed': unresolved is not None,
             })
 
     @staticmethod
-    def _loose_tracking_number(body):
-        """解析失败的响应里尽量找出主运单号（用来补偿取消）"""
-        try:
-            shipment = ((body.get('output') or {}).get('transactionShipments') or [None])[0] or {}
-            value = shipment.get('masterTrackingNumber') or (
-                ((shipment.get('completedShipmentDetail') or {}).get('masterTrackingId') or {}).get('trackingNumber'))
-            if not value:
-                pieces = [p for p in shipment.get('pieceResponses') or [] if isinstance(p, dict)]
-                if pieces:
-                    value = pieces[0].get('masterTrackingNumber') or pieces[0].get('trackingNumber')
-        except (AttributeError, TypeError, IndexError):
-            return None
-        value = str(value or '').strip()[:100]
-        return value or None
-
-    @staticmethod
     def _note_created(record_id, tracking, transaction_id, etd_document_id):
-        """FedEx 建单成功后立即独立提交运单号（失败只记日志，后面照常写库 / 补偿）"""
+        """承运商建单成功后立即独立提交运单号（失败只记日志，后面照常写库 / 补偿）"""
         try:
             CarrierShipmentService._note_created_tx(record_id, tracking, transaction_id, etd_document_id)
         except Exception:  # noqa: BLE001
@@ -1183,7 +1161,7 @@ class CarrierShipmentService:
 
     @staticmethod
     @transactional
-    def _save(plan: dict, user_id, label: dict, result: dict, etd_document_id) -> dict:
+    def _save(plan: dict, adapter, user_id, result: dict, etd_document_id) -> dict:
         """第 3 段：锁 DN → 记录置 active → 运单号 / CI / PL / 面单，一个事务。"""
         from warehouse.delivery.services import DeliveryTaskService
 
@@ -1193,7 +1171,7 @@ class CarrierShipmentService:
             raise RuntimeError(f"carrier shipment record {plan['record_id']} is no longer pending "
                                f"({record.status if record is not None else 'deleted'})")
         tracking = result['tracking_number']
-        archive = build_label_archive(result['documents'], label['image_type'], parse_page_size(label['page_size']))
+        archive = adapter.label_archive(result['documents'], plan['label'])
         task = CustomsService._delivery_task(dn)
         if task is None:
             raise RuntimeError(f"DN {dn.id} has no active delivery task any more")
@@ -1205,11 +1183,13 @@ class CarrierShipmentService:
         record.updated_at = datetime.now()
         db.session.flush()
 
-        # 运单号：复用现有保存运单号的逻辑；CI / PL 带 AWB 升版本
+        # 运单号：复用现有保存运单号的逻辑
         tracking_payload = {'tracking_number': tracking}
-        if task.carrier_id is None and dn.carrier_id is not None:
-            tracking_payload['carrier_id'] = dn.carrier_id
+        if task.carrier_id is None:
+            tracking_payload['carrier_id'] = plan['carrier_id']
         DeliveryTaskService.save_tracking(task, tracking_payload)
+        # CI / PL 不印运单号，数据没变时这里不出新版本；建单期间单证数据被改了（如公司出口资料）→ 16076，
+        # 按写库失败补偿取消（承运商拿到的申报与现在的数据对不上）
         CustomsService.issue_documents(dn, user_id)
 
         ship_date = None
@@ -1236,66 +1216,40 @@ class CarrierShipmentService:
         return CarrierShipmentService.status(dn, alerts=result['alerts'], warnings=plan['warnings'])
 
     @staticmethod
-    def _cancel_verdict(body):
-        """取消响应（HTTP 200）→ (verdict, detail)：
-        - ('confirmed', None)：cancelledShipment 为 True
-        - ('confirmed', 'already_cancelled')：提示里有「已取消 / 查无此运单」的码（cancelledShipment 为 False 或缺）
-        - ('refused', 原因)：cancelledShipment 为 False —— FedEx 明确没取消
-        - ('unclear', 原因)：缺 cancelledShipment / 不是布尔 / 响应结构不对 —— 不能当成功（用户取消与补偿取消同一口径）"""
-        output = body.get('output') if isinstance(body, dict) else None
-        output = output if isinstance(output, dict) else {}
-        flag = output.get('cancelledShipment')
-        alerts = output.get('alerts')
-        alerts = [a for a in alerts if isinstance(a, dict)] if isinstance(alerts, list) else []
-        if flag is True:
-            return 'confirmed', None
-        if _already_cancelled(alerts):
-            return 'confirmed', 'already_cancelled'
-        text = output.get('message') or '; '.join(f"{a.get('code')}: {a.get('message')}" for a in alerts)
-        if flag is False:
-            return 'refused', text or 'no reason given'
-        return 'unclear', text or 'the response does not say whether the shipment was cancelled (cancelledShipment)'
-
-    @staticmethod
-    def _compensate(plan: dict, state: dict, deadline: float, user_id):
-        """第 3 段失败（或响应看不懂）后取消 FedEx 上刚建的运单，结果独立提交到记录：
+    def _compensate(plan: dict, adapter, state: dict, deadline: float, user_id):
+        """第 3 段失败（或响应看不懂）后取消承运商那边刚建的运单，结果独立提交到记录：
         确认取消 → cancelled（reason compensated）；失败 / 不确定 → unknown（reason compensation_failed）。
         返回 (unresolved 形状（unknown）或 None（已取消）, compensation {attempted, cancelled, cancel_transaction_id,
         error})。"""
         record_id, dn_id = plan['record_id'], plan['dn_id']
         created = state['created']
         tracking = created['tracking_number']
-        logger.error("DN %s: FedEx shipment %s was created (transactionId %s) but saving it in WMS failed; "
-                     "cancelling it", dn_id, tracking, created.get('transaction_id'))
+        name = adapter.name
+        logger.error("DN %s: %s shipment %s was created (transactionId %s) but saving it in WMS failed; "
+                     "cancelling it", dn_id, name, tracking, created.get('transaction_id'))
         cancelled, cancel_transaction_id, problem = False, None, None
         try:
-            body = fedex_client.cancel_shipment(tracking, plan['sender_country'],
-                                                deadline=deadline + COMPENSATION_EXTRA_SECONDS)
-            cancel_transaction_id = body.get('transactionId') if isinstance(body, dict) else None
-            verdict, detail = CarrierShipmentService._cancel_verdict(body)
-            cancelled = verdict == 'confirmed'
-            problem = None if cancelled else detail
-        except FedexError as exc:
+            outcome = adapter.cancel_shipment(tracking, sender_country=plan['sender_country'],
+                                              deadline=deadline + COMPENSATION_EXTRA_SECONDS)
+            cancel_transaction_id = outcome.get('transaction_id')
+            cancelled = outcome['result'] == 'confirmed'
+            problem = None if cancelled else outcome.get('problem')
+        except CarrierError as exc:
             cancel_transaction_id = exc.transaction_id
-            if _already_cancelled(exc.errors):
-                logger.warning("DN %s: FedEx reports shipment %s as already cancelled / not found (%s)",
-                               dn_id, tracking, _codes(exc.errors))
-                cancelled = True
-            else:
-                problem = exc.message
+            problem = exc.message
         except Exception as exc:  # noqa: BLE001 — 补偿本身出错也要留痕
             problem = f"{type(exc).__name__}: {exc}"
 
         compensation = {'attempted': True, 'cancelled': cancelled, 'cancel_transaction_id': cancel_transaction_id,
                         'error': problem}
         if cancelled:
-            logger.error("DN %s: FedEx shipment %s cancelled after the WMS failure", dn_id, tracking)
+            logger.error("DN %s: %s shipment %s cancelled after the WMS failure", dn_id, name, tracking)
             return CarrierShipmentService._finish(
                 record_id, 'cancelled', state, reason='compensated', tracking_number=tracking,
                 transaction_id=created.get('transaction_id'), cancel_transaction_id=cancel_transaction_id,
                 cancelled_by=user_id), compensation
-        logger.error("DN %s: cancelling FedEx shipment %s FAILED (%s); retry the cancellation (or cancel it in "
-                     "FedEx Ship Manager, then dismiss the record)", dn_id, tracking, problem)
+        logger.error("DN %s: cancelling %s shipment %s FAILED (%s); retry the cancellation (or cancel it in "
+                     "%s, then dismiss the record)", dn_id, name, tracking, problem, adapter.portal_name)
         return CarrierShipmentService._finish(
             record_id, 'unknown', state, reason='compensation_failed', tracking_number=tracking,
             transaction_id=created.get('transaction_id'), cancel_transaction_id=cancel_transaction_id,
@@ -1388,7 +1342,7 @@ class CarrierShipmentService:
         return doc
 
     # ------------------------------------------------------------------
-    # 取消 / 确认作废（三段：锁 DN 标记并提交 → 不持锁调 FedEx → 锁 DN 落最终状态）
+    # 取消 / 确认作废（三段：锁 DN 标记并提交 → 不持锁调承运商 → 锁 DN 落最终状态）
     # ------------------------------------------------------------------
 
     @staticmethod
@@ -1396,7 +1350,7 @@ class CarrierShipmentService:
         """POST /dn/<id>/carrier-shipment/cancel：取消有效运单（active）、重试取消结果不明的运单（cancelling），
         或取消带运单号的结果不明记录（unknown，例如补偿取消失败）。
         tracking_number（可选）：操作员要取消的运单号，与当前记录（规范化后）不符 → 409 16093。
-        各段自己提交，不能在外层事务里调用（否则调 FedEx 时还占着 DN 行锁）。"""
+        各段自己提交，不能在外层事务里调用（否则调承运商时还占着 DN 行锁）。"""
         if getattr(g, 'transaction_depth', 0):
             raise RuntimeError("cancel_shipment must not run inside another transaction")
         expected = parse_target_tracking(tracking_number)
@@ -1407,16 +1361,16 @@ class CarrierShipmentService:
     def dismiss(dn: DN, user_id, confirm, unresolved_id=None) -> dict:
         """POST /dn/<id>/carrier-shipment/dismiss：确认作废结果不明的记录（unknown / 卡住的 pending / 取消结果不明的
         cancelling），之后可以重新建单。
-        - 没有运单号：操作员确认 FedEx 上没有这张运单（或已手工取消）后直接 dismissed，不调 FedEx；
-        - 带运单号：先向 FedEx 取消（三段，同取消），FedEx 取消成功或回「已取消 / 查无此运单」才作废
+        - 没有运单号：操作员确认承运商那边没有这张运单（或已手工取消）后直接 dismissed，不调承运商；
+        - 带运单号：先向承运商取消（三段，同取消），承运商取消成功或回「已取消 / 查无此运单」才作废
           （unknown → dismissed；cancelling → cancelled，面单 / 运单号 / CI 一并处理），否则 409 16094。
         unresolved_id（可选）：操作员核对过的记录 id，与当前结果不明的记录不符 → 409 16093。"""
         if getattr(g, 'transaction_depth', 0):
             raise RuntimeError("dismiss must not run inside another transaction")
         if confirm is not True:
             raise BadRequestException(
-                'Set "confirm": true to confirm that FedEx has no such shipment (or that it has been cancelled in '
-                'FedEx Ship Manager).', 40000, field='confirm')
+                'Set "confirm": true to confirm that the carrier has no such shipment (or that it has been cancelled '
+                'on the carrier\'s website).', 40000, field='confirm')
         expected_id = parse_target_id(unresolved_id)
         plan = CarrierShipmentService._begin_dismiss(dn, user_id, expected_id)
         if 'payload' in plan:
@@ -1424,13 +1378,26 @@ class CarrierShipmentService:
         return CarrierShipmentService._run_cancel(plan, user_id)
 
     @staticmethod
-    def _assert_cancel_configured():
-        # 只要求凭证齐全（公司后来被移出 FEDEX_ALLOWED_COMPANY_IDS 也能取消已建的运单）
-        if not CarrierShipmentService.enabled():
+    def _cancel_integration(dn: DN, record: DNCarrierShipment) -> dict:
+        """取消 / 确认作废要用的对接设置快照：建单时的承运商（carrier_id）的对接；旧记录没有 carrier_id 时用 DN 当前承运商的
+        （插件要与记录一致）。只要求凭证齐全，停用了也能取消已建的运单。没有 → 409 16072（details.blockers）。"""
+        carrier = (db.session.get(Carrier, record.carrier_id) if record.carrier_id is not None
+                   else CarrierShipmentService.carrier_of(dn))
+        snapshot = CarrierIntegrationService.for_carrier(carrier)
+        name = display_name(record.carrier)
+        if snapshot is None or snapshot['adapter'] != record.carrier:
+            blockers = [_blocker('CARRIER_NOT_INTEGRATED',
+                                 f"The {name} integration of the carrier that created this shipment is not set up "
+                                 "any more", carrier_id=carrier.id if carrier is not None else None)]
+        else:
+            blockers = CarrierIntegrationService.problems(
+                snapshot, CarrierIntegrationService.build(snapshot), for_create=False)
+        if blockers:
             raise ConflictException(
-                "FedEx is not configured; the shipment cannot be cancelled from WMS.", 16072,
-                details={'blockers': [_blocker('FEDEX_NOT_CONFIGURED', "FedEx is not configured")]},
+                f"{name} is not configured; the shipment cannot be cancelled from WMS.", 16072,
+                details={'blockers': blockers},
             )
+        return snapshot
 
     @staticmethod
     @transactional
@@ -1443,9 +1410,9 @@ class CarrierShipmentService:
             unresolved = CarrierShipmentService.unresolved(dn)
             message = "DN has no active carrier shipment to cancel."
             if unresolved is not None and unresolved['status'] == 'pending':
-                message += " A FedEx shipment request is still in progress; wait for it to finish."
+                message += " A shipment request is still in progress; wait for it to finish."
             elif unresolved is not None:
-                message += (" The unclear shipment request has no tracking number: check FedEx Ship Manager, then "
+                message += (" The unclear shipment request has no tracking number: check the carrier's website, then "
                             "dismiss it (POST /warehouse/dn/<id>/carrier-shipment/dismiss).")
             raise ConflictException(message, 16075, details={'unresolved': unresolved})
         if expected is not None and normalize_tracking(expected) != normalize_tracking(record.tracking_number):
@@ -1457,14 +1424,14 @@ class CarrierShipmentService:
         task = CustomsService._delivery_task(dn)
         if task is not None and task.status in COMPLETED_TASK_STATUSES:
             raise ConflictException("The shipment has been completed; it cannot be cancelled.", 16065)
-        CarrierShipmentService._assert_cancel_configured()
-        return CarrierShipmentService._mark_cancelling(dn, record, user_id, 'cancel')
+        integration = CarrierShipmentService._cancel_integration(dn, record)
+        return CarrierShipmentService._mark_cancelling(dn, record, user_id, 'cancel', integration)
 
     @staticmethod
     @transactional
     def _begin_dismiss(dn: DN, user_id, expected_id) -> dict:
         """确认作废第 1 段：锁 DN → 检查；没有运单号的直接作废（返回 {'payload': ...}），
-        带运单号的标记后（cancelling 才标）提交，交给 _run_cancel 向 FedEx 确认。"""
+        带运单号的标记后（cancelling 才标）提交，交给 _run_cancel 向承运商确认。"""
         dn = CustomsService._lock(dn)
         record = CarrierShipmentService.unresolved_shipment(dn)
         payload = CarrierShipmentService.unresolved_payload(record)
@@ -1476,15 +1443,15 @@ class CarrierShipmentService:
             if payload is None:
                 detail = "."
             elif payload['status'] == 'pending':
-                detail = " (the FedEx request is still in progress)."
+                detail = " (the carrier request is still in progress)."
             else:
                 detail = " (the cancellation is still in progress)."
             raise ConflictException("There is no carrier shipment with an unclear result to dismiss" + detail, 16075,
                                     details={'unresolved': payload})
         if record.tracking_number:
-            # 带运单号：FedEx 上可能真有这张运单 —— 先向 FedEx 取消，确认已取消 / 查无此运单才作废
-            CarrierShipmentService._assert_cancel_configured()
-            return CarrierShipmentService._mark_cancelling(dn, record, user_id, 'dismiss')
+            # 带运单号：承运商那边可能真有这张运单 —— 先向承运商取消，确认已取消 / 查无此运单才作废
+            integration = CarrierShipmentService._cancel_integration(dn, record)
+            return CarrierShipmentService._mark_cancelling(dn, record, user_id, 'dismiss', integration)
 
         now = datetime.now()
         record.reason = payload['reason']            # 卡住的 pending 记下 stale
@@ -1499,9 +1466,9 @@ class CarrierShipmentService:
         return {'payload': CarrierShipmentService.status(dn)}
 
     @staticmethod
-    def _mark_cancelling(dn: DN, record: DNCarrierShipment, user_id, mode: str) -> dict:
+    def _mark_cancelling(dn: DN, record: DNCarrierShipment, user_id, mode: str, integration: dict) -> dict:
         """第 1 段的标记（DN 已锁）：active / cancelling → cancelling（cancel_in_progress，记下请求人），
-        之后完成发货 / 存运单号 16079；unknown / 卡住的 pending 本来就拦着一切，不改状态。返回调 FedEx 的计划。"""
+        之后完成发货 / 存运单号 16079；unknown / 卡住的 pending 本来就拦着一切，不改状态。返回调承运商的计划。"""
         origin_status, origin_reason = CarrierShipmentService.effective_status(record)
         live = record.status in LIVE_STATUSES
         if live:
@@ -1511,14 +1478,16 @@ class CarrierShipmentService:
             record.cancelled_by = user_id
             record.updated_at = now
             db.session.flush()
-        logger.warning("DN %s: %s FedEx shipment %s (record %s, %s) requested by user %s", dn.id,
-                       'cancelling' if mode == 'cancel' else 'dismissing', record.tracking_number, record.id,
-                       origin_status, user_id)
+        logger.warning("DN %s: %s %s shipment %s (record %s, %s) requested by user %s", dn.id,
+                       'cancelling' if mode == 'cancel' else 'dismissing', display_name(record.carrier),
+                       record.tracking_number, record.id, origin_status, user_id)
         return {
             'mode': mode,                              # cancel / dismiss
             'live': live,                              # 运单建好过（active / cancelling）：成功后作废面单、清运单号
             'record_id': record.id,
             'dn_id': dn.id,
+            'carrier': record.carrier,                 # 插件代码
+            'integration': integration,                # 对接设置快照（调承运商时不碰数据库）
             'record_status': record.status,            # 第 3 段时记录应仍是这个状态（否则已被别的请求处理）
             'marked_at': record.updated_at,            # live 时第 3 段据此判断是不是本请求的标记
             'origin_reason': origin_reason,
@@ -1529,27 +1498,28 @@ class CarrierShipmentService:
 
     @staticmethod
     def _run_cancel(plan: dict, user_id) -> dict:
-        """第 2 段（调 FedEx，不开事务）+ 第 3 段（写库）。第 3 段报错 / 进程被杀时记录停在 cancelling（尽力记下原因），
-        重试取消时 FedEx 回「已取消」即落库。"""
+        """第 2 段（调承运商，不开事务）+ 第 3 段（写库）。第 3 段报错 / 进程被杀时记录停在 cancelling（尽力记下原因），
+        重试取消时承运商回「已取消」即落库。"""
+        name = display_name(plan['carrier'])
         try:
             outcome = CarrierShipmentService._request_cancel(plan)
         except BaseException:
             # worker 超时被杀（SystemExit）等：取消请求可能已发出 —— 尽力标 interrupted（之后可以直接重试取消）
-            CarrierShipmentService._note_cancel_problem(plan, 'interrupted', "Interrupted while calling FedEx")
+            CarrierShipmentService._note_cancel_problem(plan, 'interrupted', f"Interrupted while calling {name}")
             raise
         try:
             result = CarrierShipmentService._finish_cancel(plan, outcome, user_id)
         except Exception:
             if outcome['result'] == 'confirmed':
-                logger.exception("DN %s: FedEx shipment %s was cancelled on FedEx but updating WMS failed; cancelling "
-                                 "again marks it cancelled (FedEx answers already cancelled)",
-                                 plan['dn_id'], plan['tracking_number'])
+                logger.exception("DN %s: %s shipment %s was cancelled on the carrier side but updating WMS failed; "
+                                 "cancelling again marks it cancelled (the carrier answers already cancelled)",
+                                 plan['dn_id'], name, plan['tracking_number'])
             else:
-                logger.exception("DN %s: recording the FedEx cancel result of shipment %s failed",
-                                 plan['dn_id'], plan['tracking_number'])
+                logger.exception("DN %s: recording the %s cancel result of shipment %s failed",
+                                 plan['dn_id'], name, plan['tracking_number'])
             CarrierShipmentService._note_cancel_problem(
-                plan, 'save_failed', "Updating WMS failed after the FedEx cancel request "
-                                     f"(FedEx result: {outcome['result']})")
+                plan, 'save_failed', f"Updating WMS failed after the {name} cancel request "
+                                     f"(result: {outcome['result']})")
             raise
         if result['error'] is not None:
             raise result['error']
@@ -1557,47 +1527,30 @@ class CarrierShipmentService:
 
     @staticmethod
     def _request_cancel(plan: dict) -> dict:
-        """第 2 段：调 FedEx 取消 → outcome {result: confirmed | refused | unclear, reason, problem, transaction_id,
-        fedex_error（FedexError 时）, alerts（HTTP 200 时）}。
-        - confirmed：cancelledShipment True，或 FedEx 回「已取消 / 查无此运单」（reason already_cancelled）
-        - refused：FedEx 明确没取消（4xx、cancelledShipment False），或请求没发出去 —— 运单仍有效
-        - unclear：读超时、连接中断、5xx、响应看不懂、200 但没有 cancelledShipment —— 可能取消了也可能没有"""
+        """第 2 段：调承运商取消 → outcome {result: confirmed | refused | unclear, reason, problem, transaction_id,
+        carrier_error（CarrierError 时）, alerts（承运商回了响应时）}。
+        - confirmed：已取消，或承运商回「已取消 / 查无此运单」（reason already_cancelled）
+        - refused：承运商明确没取消（4xx、明确回了没取消），或请求没发出去 —— 运单仍有效
+        - unclear：读超时、连接中断、5xx、响应看不懂 —— 可能取消了也可能没有"""
         tracking = plan['tracking_number']
-        deadline = fedex_client.clock() + create_budget_seconds()
+        adapter = CarrierIntegrationService.build(plan['integration'])
+        deadline = clock() + create_budget_seconds()
         try:
-            body = fedex_client.cancel_shipment(tracking, plan['sender_country'], deadline=deadline)
-        except FedexError as exc:
-            if _already_cancelled(exc.errors):
-                # 例：上次取消在 FedEx 成功了但本地写库失败，再点取消 FedEx 回「已取消」
-                logger.warning("DN %s: FedEx reports shipment %s as already cancelled / not found (%s)",
-                               plan['dn_id'], tracking, _codes(exc.errors))
-                return {'result': 'confirmed', 'reason': 'already_cancelled', 'transaction_id': exc.transaction_id}
+            return adapter.cancel_shipment(tracking, sender_country=plan['sender_country'], deadline=deadline)
+        except CarrierError as exc:
             return {'result': 'unclear' if exc.maybe_processed else 'refused',
                     'reason': _unclear_reason(exc) if exc.maybe_processed else None,
-                    'problem': exc.message, 'transaction_id': exc.transaction_id, 'fedex_error': exc}
+                    'problem': exc.message, 'transaction_id': exc.transaction_id, 'carrier_error': exc}
         except Exception as exc:  # noqa: BLE001 — 调用本身出了意外：不知道请求发没发出去，按结果不明
-            logger.exception("DN %s: cancelling FedEx shipment %s failed unexpectedly", plan['dn_id'], tracking)
+            logger.exception("DN %s: cancelling %s shipment %s failed unexpectedly", plan['dn_id'], adapter.name,
+                             tracking)
             return {'result': 'unclear', 'reason': 'error', 'problem': f"{type(exc).__name__}: {exc}",
                     'transaction_id': None}
-        transaction_id = body.get('transactionId') if isinstance(body, dict) else None
-        output = body.get('output') if isinstance(body, dict) and isinstance(body.get('output'), dict) else {}
-        verdict, detail = CarrierShipmentService._cancel_verdict(body)
-        if verdict == 'confirmed':
-            if detail == 'already_cancelled':
-                logger.warning("DN %s: FedEx reports shipment %s as already cancelled (%s)", plan['dn_id'],
-                               tracking, _codes(output.get('alerts') if isinstance(output.get('alerts'), list)
-                                                else None))
-            return {'result': 'confirmed', 'reason': detail, 'transaction_id': transaction_id}
-        if verdict == 'unclear':
-            logger.error("DN %s: FedEx cancel response for shipment %s is unclear (transactionId %s): %s",
-                         plan['dn_id'], tracking, transaction_id, detail)
-        return {'result': verdict, 'reason': 'bad_response' if verdict == 'unclear' else None, 'problem': detail,
-                'transaction_id': transaction_id, 'alerts': output.get('alerts') or []}
 
     @staticmethod
     @transactional
     def _finish_cancel(plan: dict, outcome: dict, user_id) -> dict:
-        """第 3 段：锁 DN → 按 FedEx 的结果落记录 → {'payload': GET 形状 | None, 'error': 要抛的异常 | None}。
+        """第 3 段：锁 DN → 按承运商的结果落记录 → {'payload': GET 形状 | None, 'error': 要抛的异常 | None}。
         错误也在这里组好、提交之后再由调用方抛（记录状态的变化要留下）。"""
         dn = CustomsService._lock(db.session.get(DN, plan['dn_id']))
         record = db.session.get(DNCarrierShipment, plan['record_id'])
@@ -1623,7 +1576,7 @@ class CarrierShipmentService:
                 record.cancelled_at = now
                 record.cancelled_by = user_id
             else:
-                # 确认作废带运单号的结果不明记录：FedEx 已确认取消 / 查无此运单
+                # 确认作废带运单号的结果不明记录：承运商已确认取消 / 查无此运单
                 record.status = 'dismissed'
                 record.reason = plan['origin_reason']        # 卡住的 pending 记下 stale
                 record.dismissed_at = now
@@ -1632,8 +1585,8 @@ class CarrierShipmentService:
             record.updated_at = now
             db.session.flush()
             CarrierShipmentService._cleanup_after_cancel(dn, record, user_id)
-            logger.warning("DN %s: FedEx shipment %s (record %s) %s by user %s", dn.id, record.tracking_number,
-                           record.id, record.status, user_id)
+            logger.warning("DN %s: %s shipment %s (record %s) %s by user %s", dn.id, display_name(record.carrier),
+                           record.tracking_number, record.id, record.status, user_id)
             db.session.expire(dn, ['carrier_shipments', 'customs_documents'])
             return {'payload': CarrierShipmentService.status(dn), 'error': None}
 
@@ -1642,7 +1595,7 @@ class CarrierShipmentService:
             record.cancel_transaction_id = outcome['transaction_id']
         if plan['live'] and ours:
             if outcome['result'] == 'refused':
-                # FedEx 明确没取消（或请求没发出去）：运单仍有效
+                # 承运商明确没取消（或请求没发出去）：运单仍有效
                 record.status = 'active'
                 record.reason = None
                 record.cancelled_by = None
@@ -1655,16 +1608,15 @@ class CarrierShipmentService:
             record.error_message = f"Cancel {'refused' if outcome['result'] == 'refused' else 'unclear'}: {problem}"
             record.updated_at = now
         db.session.flush()
-        logger.error("DN %s: cancelling FedEx shipment %s (record %s): %s (%s)", dn.id, plan['tracking_number'],
-                     record.id, outcome['result'], problem)
+        logger.error("DN %s: cancelling %s shipment %s (record %s): %s (%s)", dn.id, display_name(record.carrier),
+                     plan['tracking_number'], record.id, outcome['result'], problem)
         db.session.expire(dn, ['carrier_shipments'])
         return {'payload': None, 'error': CarrierShipmentService._cancel_error(
             plan, outcome, CarrierShipmentService.unresolved_payload(record))}
 
     @staticmethod
     def _cleanup_after_cancel(dn: DN, record: DNCarrierShipment, user_id):
-        """运单在 FedEx 上取消后（记录已落 cancelled / dismissed）：面单作废、发货任务上的这张运单号清掉、
-        CI / PL 去掉 AWB 重新签发（条件不满足则作废）。"""
+        """运单在承运商那边取消后（记录已落 cancelled / dismissed）：面单作废、发货任务上的这张运单号清掉。"""
         from warehouse.delivery.services import DeliveryTaskService
         now = datetime.now()
         if record.label_document_id:
@@ -1680,34 +1632,27 @@ class CarrierShipmentService:
             DeliveryTaskService.save_tracking(task, {'tracking_number': None})
         db.session.flush()
 
-        # CI / PL 上印着这张运单号：去掉 AWB 重新签发；条件不满足（数据已变）就作废，出库前再签
-        if CustomsService.current_documents(dn):
-            view = CustomsService.build_view(dn)
-            if view['documents_outdated']:
-                if any(p['level'] == 'error' for p in view['problems']):
-                    CustomsService._void_current_documents(dn, 'shipment_cancelled')
-                else:
-                    CustomsService.issue_documents(dn, user_id)
-
     @staticmethod
     def _cancel_error(plan: dict, outcome: dict, unresolved):
         """取消 / 确认作废没成功时的异常（第 3 段提交之后抛）：
         - 确认作废（dismiss）：一律 409 16094（details {unresolved, carrier, tracking_number, result, http_status,
           transaction_id, errors, alerts, maybe_processed}）
-        - 取消：FedEx 报错 → 502 16073 / 504 16074（_fedex_api_exception，带 unresolved）；
-          HTTP 200 但没取消 / 看不懂 → 502 16073（details.alerts / maybe_processed / unresolved）"""
-        err = outcome.get('fedex_error')
+        - 取消：承运商报错 → 502 16073 / 504 16074（_carrier_api_exception，带 unresolved）；
+          承运商回了响应但没取消 / 看不懂 → 502 16073（details.alerts / maybe_processed / unresolved）"""
+        err = outcome.get('carrier_error')
         unclear = outcome['result'] == 'unclear'
         tracking = plan['tracking_number']
+        code = plan['carrier']
+        name = display_name(code)
         problem = outcome.get('problem') or ''
-        # FedEx 回了 HTTP 200（没取消 / 看不懂）时带 alerts；调用本身出意外时两者都没有
+        # 承运商回了响应（没取消 / 看不懂）时带 alerts；调用本身出意外时两者都没有
         http_status = err.status_code if err is not None else (200 if 'alerts' in outcome else None)
         if plan['mode'] == 'dismiss':
             return ConflictException(
-                f"FedEx did not confirm that shipment {tracking} is cancelled ({problem}); the record cannot be "
-                "dismissed. Cancel it in FedEx Ship Manager (or try again later), then dismiss it again.", 16094,
+                f"{name} did not confirm that shipment {tracking} is cancelled ({problem}); the record cannot be "
+                f"dismissed. Cancel it in {portal_name(code)} (or try again later), then dismiss it again.", 16094,
                 details={
-                    'unresolved': unresolved, 'carrier': CARRIER_FEDEX, 'tracking_number': tracking,
+                    'unresolved': unresolved, 'carrier': code, 'tracking_number': tracking,
                     'result': outcome['result'],
                     'http_status': http_status,
                     'transaction_id': outcome.get('transaction_id'),
@@ -1716,14 +1661,14 @@ class CarrierShipmentService:
                     'maybe_processed': unclear,
                 })
         if err is not None:
-            return _fedex_api_exception(err, 'cancel', unresolved=unresolved, with_unresolved=True)
+            return _carrier_api_exception(err, 'cancel', code, unresolved=unresolved, with_unresolved=True)
         if unclear:
-            message = f"FedEx did not confirm the cancellation of shipment {tracking}: {problem}." + _MAYBE_CANCELLED
+            message = f"{name} did not confirm the cancellation of shipment {tracking}: {problem}." + _maybe_cancelled(code)
         else:
-            message = f"FedEx did not cancel the shipment: {problem}"
+            message = f"{name} did not cancel the shipment: {problem}"
         return BadGatewayException(
             message, 16073,
-            details={'carrier': CARRIER_FEDEX, 'action': 'cancel', 'http_status': http_status,
+            details={'carrier': code, 'action': 'cancel', 'http_status': http_status,
                      'transaction_id': outcome.get('transaction_id'), 'errors': [],
                      'alerts': outcome.get('alerts') or [], 'maybe_processed': unclear, 'unresolved': unresolved})
 

@@ -32,6 +32,8 @@ carrier_fields = {
     'email': fields.String(description='Carrier Email'),
     'contact': fields.String(description='Contact Person'),
     'is_active': fields.Boolean(description='Is the carrier active?'),
+    'integration': fields.Raw(attribute='integration_summary', readonly=True,
+                              description='Online integration (automatic shipments): {adapter, name, enabled} or null'),
     'company_id': fields.Integer(required=True, description='ID of the associated company'),
     'company': fields.Nested(company_model, readonly=True, description='Associated company details'),
     'created_at': fields.DateTime(readOnly=True, description='Creation timestamp'),
@@ -55,3 +57,16 @@ carrier_pagination_parser.add_argument('is_active', type=inputs.boolean, help='F
 carrier_pagination_parser.add_argument('company_id', type=int, help='Filter by Company ID')
 
 pagination_model = create_pagination_model(api_ns, carrier_model)
+
+
+# -----------------------------
+# 在线对接（自动建运单）设置
+# -----------------------------
+carrier_integration_input_model = api_ns.model('CarrierIntegrationInput', {
+    'adapter': fields.String(description='Integration code (GET /carrier/integrations); empty or null removes the '
+                                         'integration'),
+    'enabled': fields.Boolean(description='false: no new shipments (existing ones can still be cancelled)'),
+    'settings': fields.Raw(description='Settings except keys: {field key: value} (see the integration fields)'),
+    'secrets': fields.Raw(description='Keys: {field key: value}; omitted or empty keeps the saved value. '
+                                      'Saved keys are never returned'),
+})

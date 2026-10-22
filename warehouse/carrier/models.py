@@ -103,3 +103,51 @@ class Carrier(db.Model):
         info={'description': '所属公司对象'}
     )
 
+
+    @property
+    def integration_summary(self):
+        """在线对接（自动建运单）的概要：{adapter, name, enabled}；没有对接为 None"""
+        integration = self.integration
+        if integration is None:
+            return None
+        from .integrations import display_name
+        return {'adapter': integration.adapter, 'name': display_name(integration.adapter),
+                'enabled': bool(integration.enabled)}
+
+
+class CarrierIntegration(db.Model):
+    """承运商的在线对接设置（自动建运单）：一个承运商至多一条。
+
+    adapter 是对接插件的代码（如 fedex，见 warehouse/carrier/integrations）。settings 是不保密的设置（账号、环境、
+    服务类型、面单……），secrets 是密钥（API Key 等）的 JSON 用 Fernet 加密后的密文（密钥见 SETTINGS_ENCRYPTION_KEY），
+    接口永远不返回明文。enabled = False 时不能新建运单，已建的运单仍可以取消。
+    """
+    __tablename__ = 'carrier_integrations'
+
+    id = db.Column(db.Integer, primary_key=True)
+    carrier_id = db.Column(
+        db.Integer,
+        db.ForeignKey('carriers.id', ondelete='CASCADE'),
+        nullable=False, unique=True,
+        info={'description': '承运商ID'}
+    )
+    adapter = db.Column(db.String(30), nullable=False, info={'description': '对接插件代码（如 fedex）'})
+    enabled = db.Column(db.Boolean, nullable=False, default=True, info={'description': '启用（可以新建运单）'})
+    settings = db.Column(db.JSON, nullable=True, info={'description': '不保密的设置'})
+    secrets = db.Column(db.Text, nullable=True, info={'description': '密钥 JSON 的密文（Fernet）'})
+    updated_by = db.Column(
+        db.Integer,
+        db.ForeignKey('users.id', ondelete='SET NULL'),
+        nullable=True,
+        info={'description': '最后修改人ID'}
+    )
+    created_at = db.Column(db.DateTime, default=db.func.now(), info={'description': '创建时间'})
+    updated_at = db.Column(db.DateTime, default=db.func.now(), onupdate=db.func.now(),
+                           info={'description': '最后修改时间'})
+
+    carrier = db.relationship(
+        'Carrier',
+        backref=db.backref('integration', uselist=False, lazy='select', cascade='all, delete-orphan',
+                           passive_deletes=True),
+        info={'description': '承运商'}
+    )

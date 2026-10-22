@@ -86,39 +86,15 @@ class Config:
     DOCUMENT_TIMEZONE = os.getenv('DOCUMENT_TIMEZONE', 'Asia/Tokyo')
     CUSTOMS_PDF_FONT_PATH = os.getenv('CUSTOMS_PDF_FONT_PATH') or None
 
-    # 承运商对接：FedEx 自动建运单（Ship API）。API Key / Secret Key / 账号缺任一项 = 功能关闭
-    FEDEX_API_BASE = os.getenv('FEDEX_API_BASE') or 'https://apis-sandbox.fedex.com'
-    FEDEX_API_KEY = os.getenv('FEDEX_API_KEY') or None
-    FEDEX_SECRET_KEY = os.getenv('FEDEX_SECRET_KEY') or None
-    FEDEX_ACCOUNT_NUMBER = os.getenv('FEDEX_ACCOUNT_NUMBER') or None
-    # 允许用 FedEx 自动建运单的公司 ID（逗号分隔）。运费记在同一个 FedEx 账号上：不设 = 所有公司都不允许
-    FEDEX_ALLOWED_COMPANY_IDS = os.getenv('FEDEX_ALLOWED_COMPANY_IDS', '')
-    FEDEX_SERVICE_TYPE = os.getenv('FEDEX_SERVICE_TYPE', 'INTERNATIONAL_ECONOMY')
-    # 交货方式（Ship API pickupType）：没有和 FedEx 签定期集荷 → CONTACT_FEDEX_TO_SCHEDULE，揽收在 WMS 另约
-    # （POST /warehouse/dn/carrier-pickups）；签了定期集荷用 USE_SCHEDULED_PICKUP，自己送营业所用 DROPOFF_AT_FEDEX_LOCATION
-    FEDEX_PICKUP_TYPE = os.getenv('FEDEX_PICKUP_TYPE', 'CONTACT_FEDEX_TO_SCHEDULE')
-    # 面单打印方式：A4（激光打印机，PDF + PAPER_85X11_TOP_HALF_LABEL）/ THERMAL（4 英寸面单机，PDF + STOCK_4X6）；
-    # 建单时可指定，不指定用默认。各格式的 imageType（PDF / PNG / ZPLII / EPL2）与纸张可覆盖，不设用上面的默认
-    FEDEX_DEFAULT_LABEL_FORMAT = os.getenv('FEDEX_DEFAULT_LABEL_FORMAT') or 'A4'
-    FEDEX_LABEL_A4_IMAGE_TYPE = os.getenv('FEDEX_LABEL_A4_IMAGE_TYPE') or None
-    FEDEX_LABEL_A4_STOCK_TYPE = os.getenv('FEDEX_LABEL_A4_STOCK_TYPE') or None
-    FEDEX_LABEL_THERMAL_IMAGE_TYPE = os.getenv('FEDEX_LABEL_THERMAL_IMAGE_TYPE') or None
-    FEDEX_LABEL_THERMAL_STOCK_TYPE = os.getenv('FEDEX_LABEL_THERMAL_STOCK_TYPE') or None
-    # 热敏面单存档的页面（mm，宽x高）：不设 = 100x150（FedEx 的 4x6 英寸面单等比缩到 98.4%，100×150 纸按实际大小打印
-    # 不切边）；用真 4x6 英寸纸时设 101.6x152.4（不缩放）
-    FEDEX_LABEL_THERMAL_PAGE_SIZE = os.getenv('FEDEX_LABEL_THERMAL_PAGE_SIZE') or None
-    # 电子贸易单证（ETD）：开启时先把当前 CI 上传给 FedEx，建单时引用；关闭时仓库打印 CI 随货
-    FEDEX_ETD_ENABLED = env_bool('FEDEX_ETD_ENABLED', False)
-    # 关税付款方：RECIPIENT（收件人）/ SENDER（发件人账号）
-    FEDEX_DUTIES_PAYMENT_TYPE = os.getenv('FEDEX_DUTIES_PAYMENT_TYPE', 'RECIPIENT')
-    # Trade Documents Upload API 的地址（与 Ship API 不同域）；不设则按 FEDEX_API_BASE 是否为测试环境自动选
-    FEDEX_DOCUMENT_API_BASE = os.getenv('FEDEX_DOCUMENT_API_BASE') or None
-    FEDEX_CONNECT_TIMEOUT_SECONDS = float(os.getenv('FEDEX_CONNECT_TIMEOUT_SECONDS', 5))
-    FEDEX_TIMEOUT_SECONDS = float(os.getenv('FEDEX_TIMEOUT_SECONDS', 30))
-    # 建单总时限（OAuth + ETD 上传 + 建单请求，各次请求的超时按剩余时间收缩）；要小于 worker / 反向代理超时
-    FEDEX_CREATE_BUDGET_SECONDS = float(os.getenv('FEDEX_CREATE_BUDGET_SECONDS', 90))
+    # 承运商对接（自动建运单）：账号 / 密钥 / 服务等按承运商在「承运商」编辑页设置（carrier_integrations，密钥用
+    # SETTINGS_ENCRYPTION_KEY 加密），这里只放与承运商无关的时限。插件见 warehouse/carrier/integrations。
+    # 每次请求的连接 / 读取超时（秒）
+    CARRIER_CONNECT_TIMEOUT_SECONDS = float(os.getenv('CARRIER_CONNECT_TIMEOUT_SECONDS', 5))
+    CARRIER_TIMEOUT_SECONDS = float(os.getenv('CARRIER_TIMEOUT_SECONDS', 30))
+    # 建单总时限（令牌 + 电子单证上传 + 建单请求，各次请求的超时按剩余时间收缩）；要小于 worker / 反向代理超时
+    CARRIER_CREATE_BUDGET_SECONDS = float(os.getenv('CARRIER_CREATE_BUDGET_SECONDS', 90))
     # 建单记录停在 pending 超过这么多分钟按「结果不明」处理（进程被杀等）；实际不短于建单总时限 + 75 秒
-    FEDEX_PENDING_STALE_MINUTES = float(os.getenv('FEDEX_PENDING_STALE_MINUTES', 10))
+    CARRIER_PENDING_STALE_MINUTES = float(os.getenv('CARRIER_PENDING_STALE_MINUTES', 10))
 
 class DevelopmentConfig(Config):
     DEBUG = True # 只在开发环境中启用调试
@@ -136,12 +112,6 @@ class TestingConfig(Config):
     WEBHOOK_URL_STRICT = False
     RATELIMIT_ENABLED = False
     SCHEDULER_ENABLED = False
-    # 测试里 FedEx 一律关闭（用例需要时自己设置并 mock HTTP），本机 .env 里的凭证不影响测试
-    FEDEX_API_KEY = None
-    FEDEX_SECRET_KEY = None
-    FEDEX_ACCOUNT_NUMBER = None
-    FEDEX_ALLOWED_COMPANY_IDS = ''
-    FEDEX_ETD_ENABLED = False
     SQLALCHEMY_DATABASE_URI = os.getenv('SQLALCHEMY_DATABASE_URI_TEST', 'sqlite:///test.db')  # 数据库连接
     REDIS_URL = os.getenv('REDIS_URL_TEST', 'redis://localhost:6379/0') # REDIS配置
     OSS_ENDPOINT = os.getenv('OSS_ENDPOINT_TEST')  # 阿里云 OSS Endpoint

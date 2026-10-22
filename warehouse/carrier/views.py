@@ -4,10 +4,14 @@ from extensions import db
 from extensions.error import BadRequestException
 from system.common import paginate,permission_required
 from system.common.permissions import get_actor_company_id
+from warehouse.carrier.integration_services import CarrierIntegrationService
 from warehouse.carrier.services import CarrierService
 from warehouse.common import get_company_owned, require_actor_user_id
 from .models import Carrier
-from .schemas import api_ns, carrier_model,carrier_input_model, carrier_pagination_parser,pagination_model
+from .schemas import (
+    api_ns, carrier_model, carrier_input_model, carrier_pagination_parser, pagination_model,
+    carrier_integration_input_model,
+)
 
 
 @api_ns.doc(security="jsonWebToken")
@@ -88,3 +92,59 @@ class CarrierDetail(Resource):
         CarrierService.delete_carrier(carrier_id)
 
         return {"message": "Carrier deleted successfully"}, 200
+
+
+# ------------------------------------------------------------------
+# 在线对接（自动建运单）：插件列表、按承运商读写设置、测试连接
+# ------------------------------------------------------------------
+
+@api_ns.doc(security="jsonWebToken")
+@api_ns.route('/integrations')
+class CarrierIntegrationList(Resource):
+
+    @permission_required(["all_access", "company_all_access", "carrier_read"])
+    def get(self):
+        """Available carrier integrations: [{code, name, portal_name, portal_url, label_formats,
+        fields: [{key, kind: text|secret|select|boolean, label: {locale: text}, required, default, options, help,
+        group: account|shipping|label}]}]"""
+        return CarrierIntegrationService.available()
+
+
+@api_ns.doc(security="jsonWebToken")
+@api_ns.route('/<int:carrier_id>/integration')
+class CarrierIntegrationResource(Resource):
+
+    @permission_required(["all_access", "company_all_access", "carrier_read"])
+    def get(self, carrier_id):
+        """Integration of a carrier: {adapter, name, enabled, settings, secrets: {key: is set}, ready,
+        problems: [{code, message}], updated_at, updated_by}, or null. Saved keys are never returned."""
+        return CarrierIntegrationService.payload(get_company_owned(Carrier, carrier_id))
+
+    @permission_required(["all_access", "company_all_access", "carrier_edit"])
+    @api_ns.expect(carrier_integration_input_model)
+    def put(self, carrier_id):
+        """Save the integration of a carrier (same shape as GET; adapter empty = remove).
+        Invalid settings → 400 16124 (field adapter / settings.<key> / secrets.<key> / enabled);
+        removing or changing it while the carrier has unfinished shipments → 409 16125"""
+        carrier = get_company_owned(Carrier, carrier_id)
+        return CarrierIntegrationService.save(carrier, api_ns.payload or {}, require_actor_user_id())
+
+    @permission_required(["all_access", "company_all_access", "carrier_edit"])
+    def delete(self, carrier_id):
+        """Remove the integration of a carrier (409 16125 while it has unfinished shipments)"""
+        carrier = get_company_owned(Carrier, carrier_id)
+        CarrierIntegrationService.save(carrier, {'adapter': None}, require_actor_user_id())
+        return None, 204
+
+
+@api_ns.doc(security="jsonWebToken")
+@api_ns.route('/<int:carrier_id>/integration/test')
+class CarrierIntegrationTest(Resource):
+
+    @permission_required(["all_access", "company_all_access", "carrier_edit"])
+    @api_ns.expect(carrier_integration_input_model)
+    def post(self, carrier_id):
+        """Connect to the carrier once with the given settings (keys left empty use the saved ones), without
+        saving: {ok, message, errors?, missing?}. A failed connection is also 200 (ok = false)."""
+        carrier = get_company_owned(Carrier, carrier_id)
+        return CarrierIntegrationService.test(carrier, api_ns.payload or None)

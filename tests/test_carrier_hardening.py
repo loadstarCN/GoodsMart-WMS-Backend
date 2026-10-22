@@ -1,4 +1,4 @@
-"""FedEx 自动运单 / 出口单证加固（2026-10-04 审计 B-63 ~ B-66、B-68、B-87、B-89、W-31、W-35）：
+"""承运商自动运单（FedEx 插件）/ 出口单证加固（2026-10-04 审计 B-63 ~ B-66、B-68、B-87、B-89、W-31、W-35）：
 
 - 取消分三段（标 cancelling 提交 → 不开事务调 FedEx → 落最终状态）；结果不明停在 cancelling，拦发货（16079），
   重试取消 / 确认作废时 FedEx 给出明确结果才落 cancelled；FedEx 明确拒绝回到 active
@@ -23,7 +23,7 @@ import pytest
 import requests
 from sqlalchemy.exc import OperationalError
 
-from warehouse.dn import fedex_client
+from warehouse.carrier.integrations.fedex import client as fedex_client
 from warehouse.dn.carrier_services import CarrierShipmentService
 from warehouse.dn.customs_services import CustomsService
 from warehouse.dn.models import DNCarrierShipment, DNCustoms, DNDocument
@@ -570,11 +570,12 @@ def test_reissue_with_changed_master_data_blocked_while_shipment_active(client, 
         db.session.commit()
     _assert_16076(_issue(client, access_token, dn_id), 'DOCUMENT_DATA_CHANGED', 'active', created['id'], TRACKING)
 
-    # 取消运单后放开：取消时 CI / PL 已按新数据（去掉 AWB）重签
+    # 取消运单后放开：单证还是建单时那份（数据已变 → 过期），重新生成即可
     assert _cancel(client, access_token, dn_id).status_code == 200
     view = client.get(f'/dn/{dn_id}/customs', headers=_h(access_token)).get_json()
-    assert view['documents_outdated'] is False
-    assert _issue(client, access_token, dn_id).status_code == 200
+    assert view['documents_outdated'] is True
+    assert _issue(client, access_token, dn_id).status_code == 201
+    assert client.get(f'/dn/{dn_id}/customs', headers=_h(access_token)).get_json()['documents_outdated'] is False
 
 
 def test_reissue_blocked_while_result_unclear(client, access_token, fedex):

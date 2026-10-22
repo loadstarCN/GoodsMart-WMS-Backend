@@ -292,9 +292,10 @@ def _common_pairs(data, meta, commercial: bool):
         ('Invoice Date', meta['invoice_date']),
         ('Reference / Order No.', data['reference'] or '-'),
     ]
-    if data['awb']:
+    # 运单号 / 承运商现在不进单证数据；只有以前的数据里有
+    if data.get('awb'):
         pairs.append(('AWB No.', data['awb']))
-    if data['carrier']:
+    if data.get('carrier'):
         pairs.append(('Carrier', data['carrier']))
     if commercial:
         pairs += [

@@ -209,6 +209,12 @@ def _data_hash(data: dict) -> str:
     ).hexdigest()
 
 
+def _legacy_hashes(data: dict, awbs, carriers) -> set:
+    """以前的单证数据里还有 awb / carrier 两项（运单号、承运商名印在 CI / PL 上）。那时签发的单证，除这两项外内容
+    相同就算同一份：按可能印过的值（没有 / 运单号 / 承运商名）各算一次指纹。"""
+    return {_data_hash(dict(data, awb=awb, carrier=carrier)) for awb in awbs for carrier in carriers}
+
+
 def country_name(code):
     """ISO 3166-1 alpha-2 → 英文国名；空值或无效代码返回 None。"""
     return COUNTRY_NAMES_EN.get(normalize_country(code)) or None
@@ -738,11 +744,17 @@ class CustomsService:
         )
 
     @staticmethod
-    def _printed_carrier(dn: DN, delivery_task=None):
-        """印在 CI 上的承运商：当前发货任务的承运商，没有则 DN 上的（与 _document_data 同一口径）"""
-        if delivery_task is None:
-            delivery_task = CustomsService._delivery_task(dn)
-        return (delivery_task.carrier if delivery_task and delivery_task.carrier else None) or dn.carrier
+    def _content_hashes(dn: DN, data: dict) -> set:
+        """与 data 内容相同的单证指纹：现在的写法，加上以前印着运单号 / 承运商的写法（见 _legacy_hashes）"""
+        from .carrier_services import CarrierShipmentService
+        task = CustomsService._delivery_task(dn)
+        awbs = {None, (task.tracking_number if task else None) or None}
+        record = CarrierShipmentService.open_shipment(dn)
+        if record is not None:
+            awbs.add(record.tracking_number or None)
+        carrier = (task.carrier if task is not None and task.carrier is not None else None) or dn.carrier
+        carriers = {None, carrier.name if carrier is not None else None}
+        return {_data_hash(data)} | _legacy_hashes(data, awbs, carriers)
 
     @staticmethod
     def build_view(dn: DN) -> dict:
@@ -899,12 +911,6 @@ class CustomsService:
                     problem('EXPORTER_NON_LATIN_TEXT', 'error',
                             f"Exporter {label} contains non-Latin characters; use English / Latin letters only",
                             field=field)
-            # 承运商名也印在英文 CI 上（Carrier 栏），日文名（如「ヤマト運輸」）同样拦：请在承运商主数据里改成英文名
-            printed_carrier = CustomsService._printed_carrier(dn)
-            if printed_carrier is not None and has_non_latin(printed_carrier.name):
-                problem('CARRIER_NON_LATIN_TEXT', 'error',
-                        "Carrier name printed on the commercial invoice contains non-Latin characters; "
-                        "rename the carrier in English / Latin letters", field='carrier.name')
             if total_qty > 0 and not net_known:
                 problem('NET_WEIGHT_UNKNOWN', 'warning',
                         "Net weight cannot be calculated: some goods have no unit weight")
@@ -971,10 +977,10 @@ class CustomsService:
             'current_documents': [current_docs[t].to_meta() for t in DOC_TYPES if t in current_docs],
             'documents_outdated': False,
         }
-        # 当前单证与现在的数据（含运单号 AWB）不一致 → 提示重新签发（不自动作废，也不拦发货）
+        # 当前单证与现在的数据不一致 → 要重新签发（不自动作废；发货前 assert_ready_to_ship 拦）
         if customs is not None and current_docs:
-            data_sha256 = _data_hash(CustomsService._document_data(dn, view))
-            view['documents_outdated'] = any(doc.data_sha256 != data_sha256 for doc in current_docs.values())
+            hashes = CustomsService._content_hashes(dn, CustomsService._document_data(dn, view))
+            view['documents_outdated'] = any(doc.data_sha256 not in hashes for doc in current_docs.values())
         return view
 
     @staticmethod
@@ -988,14 +994,13 @@ class CustomsService:
 
     @staticmethod
     def _document_data(dn: DN, view: dict) -> dict:
-        """单证内容（不含日期 / 版本）：同样的数据 → 同样的指纹 → 不升版本。"""
+        """单证内容（不含日期 / 版本）：同样的数据 → 同样的指纹 → 不升版本。
+        只有货物、双方和箱子：运单号、承运商不印（单证在打包时随箱子出，运单在配送时才建，承运商也可能那时才定）。"""
         customs = dn.customs
         currency = customs.currency
         exporter = view['exporter']
         consignee = view['consignee']
         destination = view['recipient_country']
-        delivery_task = CustomsService._delivery_task(dn)
-        carrier = CustomsService._printed_carrier(dn, delivery_task)
         # 出口国：仓库国家，没有则公司国家。完整性检查（EXPORTER_PROFILE_INCOMPLETE / country_code）与
         # Shipper 栏印的国家都用它，不会出现「检查通过、Shipper 却不印国家」
         export_country = exporter['export_country_code']
@@ -1025,8 +1030,6 @@ class CustomsService:
             'currency': currency,
             'invoice_number': view['invoice_number'],
             'reference': dn.order_number,
-            'awb': (delivery_task.tracking_number if delivery_task else None) or None,
-            'carrier': carrier.name if carrier else None,
             'incoterm': customs.incoterm,
             'terms': f"{customs.incoterm} {(country_name(destination) or destination or '').upper()}".strip(),
             'export_reason': EXPORT_REASON_LABELS.get(
@@ -1101,9 +1104,9 @@ class CustomsService:
     def issue_documents(dn: DN, user_id) -> tuple:
         """签发 CI + PL。返回 (http_status, {version, documents})：
         201 新签发；200 单证数据未变，返回现有版本。条件不全 409 16068（details.problems）。
-        有进行中 / 有效 / 结果不明 / 取消中的自动运单时，单证数据除 AWB 外必须与当前单证（即随运单提交给承运商的）
-        一致，否则 409 16076（details.reason = DOCUMENT_DATA_CHANGED）：例如建单后改了商品原产国、公司 / 仓库出口资料、
-        承运商 —— 先取消运单再重签。"""
+        有进行中 / 有效 / 结果不明 / 取消中的自动运单时，单证数据必须与当前单证（即随运单提交给承运商的）一致，
+        否则 409 16076（details.reason = DOCUMENT_DATA_CHANGED）：例如建单后改了商品原产国、公司 / 仓库出口资料 ——
+        先取消运单再重签。"""
         from .customs_documents import DocumentLayoutError, render_commercial_invoice, render_packing_list
 
         dn = CustomsService._lock(dn)
@@ -1180,10 +1183,10 @@ class CustomsService:
 
     @staticmethod
     def _assert_matches_carrier_shipment(dn: DN, data: dict, current: dict):
-        """有未结束的自动运单（pending / active / unknown / cancelling）时，新单证数据除 AWB 外须与当前单证一致：
-        当前单证就是建单时随运单（含 ETD）提交的那份（建单前签发，写库时只多了 AWB），数据变了说明与承运商那边的申报
-        不一致 → 409 16076（reason DOCUMENT_DATA_CHANGED）。比较时把新数据的 AWB 依次换成「没有」/ 运单号 /
-        发货任务上的号码算指纹，与当前单证的指纹比。没有当前单证（不该出现）时无从比较，放行。"""
+        """有未结束的自动运单（pending / active / unknown / cancelling）时，新单证数据须与当前单证一致：
+        当前单证就是建单时随运单（含 ETD）提交的那份，数据变了说明与承运商那边的申报不一致
+        → 409 16076（reason DOCUMENT_DATA_CHANGED）。以前签发、印着运单号 / 承运商的单证按 _content_hashes 比。
+        没有当前单证（不该出现）时无从比较，放行。"""
         from .carrier_services import CarrierShipmentService
         record = CarrierShipmentService.open_shipment(dn)
         if record is None:
@@ -1191,13 +1194,10 @@ class CustomsService:
         baseline = {doc.data_sha256 for doc in current.values()}
         if not baseline:
             return
-        task = CustomsService._delivery_task(dn)
-        candidates = {None, record.tracking_number or None, (task.tracking_number if task else None) or None}
-        hashes = {_data_hash(dict(data, awb=awb)) for awb in candidates}
-        if baseline <= hashes:
+        if baseline <= CustomsService._content_hashes(dn, data):
             return
         raise CarrierShipmentService.open_shipment_conflict(
-            record, "Customs documents with different data (other than the AWB) cannot be issued",
+            record, "Customs documents with different data cannot be issued",
             reason='DOCUMENT_DATA_CHANGED')
 
     @staticmethod
@@ -1221,22 +1221,20 @@ class CustomsService:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def assert_ready_to_ship(dn: DN) -> dict:
-        """发货前检查（按当前已存的数据）。国内件不检查，返回 {}。
+    def assert_ready_to_ship(dn: DN) -> None:
+        """发货前检查（按当前已存的数据）。国内件不检查。
 
         海外件（带报关快照）：
         - 没有当前有效的 CI 或 PL → 409 16069，details {missing_documents: [...], outdated: false}
-        - 有但已过期（数据指纹变了：箱子 / 快照 / 运单号 / 公司资料等改过没重出）
+        - 有但已过期（数据指纹变了：箱子 / 快照 / 公司资料等改过没重出）
           → 409 16069，details {missing_documents: [], outdated: true}
         - 自动运单进行中 / 结果不明 / 正在取消或取消结果不明（pending / unknown / cancelling）→ 409 16079
           （details.unresolved）：FedEx 上可能有运单、或面单可能已作废，先处理（取消 / 确认作废）再发货。
           请求里带不带运单号都拦（带了的在 assert_tracking_matches 已拦）。
-        通过时返回 {'awb': 当前单证上印的运单号（没印为 None）,
-                    'carrier_id' / 'carrier': CI 上印的承运商（与 _document_data 同一口径：当前发货任务的承运商，
-                    没有则 DN 的；都没有为 None）}。
+        单证不印运单号 / 承运商，所以完成发货时填的运单号、承运商与单证无关。
         """
         if dn.customs is None:
-            return {}
+            return
         from .carrier_services import CarrierShipmentService
         unresolved = CarrierShipmentService.unresolved_shipment(dn)
         if unresolved is not None:
@@ -1251,17 +1249,9 @@ class CustomsService:
         if CustomsService.build_view(dn)['documents_outdated']:
             raise ConflictException(
                 "The commercial invoice / packing list no longer match the current data "
-                "(packages, customs data or tracking number changed); issue them again before shipping.",
+                "(packages or customs data changed); issue them again before shipping.",
                 16069, details={'missing_documents': [], 'outdated': True},
             )
-        # 单证未过期 ⇒ 印在 CI 上的 AWB / 承运商就是 _document_data 里的 awb / carrier（当前发货任务上现存的值）
-        delivery_task = CustomsService._delivery_task(dn)
-        carrier = CustomsService._printed_carrier(dn, delivery_task)
-        return {
-            'awb':(delivery_task.tracking_number if delivery_task else None) or None,
-            'carrier_id': carrier.id if carrier else None,
-            'carrier': carrier.name if carrier else None,
-        }
 
     @staticmethod
     def delivered_webhook_fields(dn: DN) -> dict:

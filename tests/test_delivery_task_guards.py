@@ -3,11 +3,10 @@
 - 发货任务只由打包完成自动生成（手工新建接口 POST /delivery/ 已去掉 → 405）；一张 DN 同时只允许一条
   未完成（pending / in_progress）的有效发货任务：自动生成时已有（修复前手工建的存量任务）→ 复用那条
 - 海外 DN 只能对当前发货任务（最新的有效任务）完成发货 / 存运单号 / 修改 → 409 16091
-- 完成发货后任务上的运单号（请求值，没带则已存值）与 CI 上印的 AWB 不同 → 409 16080
 - dn.delivered 的 tracking_number 取被完成的那条任务的运单号
 - 有效自动运单期间运单号统一存运单上的标准写法；取消时按规范化后的号码清空任务上的运单号
 - 本 DN 已取消（含补偿取消）的自动运单号不能再用 → 409 16078（details.status = cancelled）
-- 有效自动运单期间保存运单号也不能换承运商 → 409 16078；海外件完成发货的承运商与 CI 上印的不同 → 409 16092
+- 有效自动运单期间保存运单号也不能换承运商 → 409 16078；单证不印承运商，没有自动运单时完成发货可以换承运商
 
 FedEx 一律 mock（沿用 test_carrier_shipment 的 fedex fixture），不联网。
 """
@@ -123,31 +122,6 @@ def test_export_only_current_task_can_ship(client, access_token):
         assert db.session.get(DN, dn_id).status == 'delivered'
 
 
-def test_document_awb_compared_with_saved_tracking(client, access_token, monkeypatch):
-    """完成后任务上的运单号（没带就是已存值）与 CI 上印的 AWB 不同 → 16080；带了与 CI 一致的号码则按 CI 的写法写入"""
-    dn_id, task_id = _export_dn_ready(client, access_token)
-    assert _save_tracking(client, access_token, task_id, {'tracking_number': 'AWB-SAVED'}).status_code == 200
-    assert _issue(client, access_token, dn_id).status_code == 201
-
-    # 模拟 CI 上印的是别的号码（修复前：单证按同一 DN 的另一条任务出的）
-    original = CustomsService.assert_ready_to_ship
-    monkeypatch.setattr(CustomsService, 'assert_ready_to_ship',
-                        staticmethod(lambda dn: {**original(dn), 'awb': 'AWB-ON-CI'}))
-
-    response = _ship(client, access_token, task_id)                       # 不带运单号：按已存值比
-    assert response.status_code == 409 and response.get_json()['code'] == 16080
-    assert response.get_json()['details'] == {'document_tracking_number': 'AWB-ON-CI',
-                                              'tracking_number': 'AWB-SAVED'}
-    response = _complete(client, access_token, task_id, {'tracking_number': ''})   # 空串同样按已存值
-    assert response.status_code == 409 and response.get_json()['code'] == 16080
-    assert _task(client, task_id)[:2] == ('in_progress', 'AWB-SAVED')
-
-    # 带了与 CI 一致的号码（空格 / 连字符不同也算）→ 按 CI 上的写法写入
-    response = _complete(client, access_token, task_id, {'tracking_number': 'AWB ON CI'})
-    assert response.status_code == 200, response.get_json()
-    assert response.get_json()['tracking_number'] == 'AWB-ON-CI'
-
-
 def test_delivered_webhook_uses_completed_task_tracking(client, access_token):
     dn_id, t1 = _domestic_packed(client, access_token, 'ORD-GUARD-WEBHOOK')
     assert _save_tracking(client, access_token, t1, {'tracking_number': 'OLD-T1'}).status_code == 200
@@ -258,24 +232,17 @@ def test_save_tracking_cannot_change_carrier_while_shipment_active(client, acces
     assert response.status_code == 200 and response.get_json()['carrier_id'] == other_id
 
 
-def test_export_complete_carrier_must_match_ci(client, access_token):
+def test_export_complete_may_change_carrier_without_shipment(client, access_token):
+    """单证不印承运商：没有自动运单时，出单证后完成发货换承运商照常，单证不过期"""
     dn_id, task_id = _export_dn_ready(client, access_token)
     yamato = _other_carrier(client, 'yamato')
     sagawa = _other_carrier(client, 'sagawa')
     response = _save_tracking(client, access_token, task_id, {'tracking_number': 'AWB-1', 'carrier_id': yamato})
     assert response.status_code == 200, response.get_json()
-    assert _issue(client, access_token, dn_id).status_code == 201       # CI 印 Other yamato
+    assert _issue(client, access_token, dn_id).status_code == 201
 
     response = _ship(client, access_token, task_id, carrier_id=sagawa)
-    assert response.status_code == 409 and response.get_json()['code'] == 16092
-    assert response.get_json()['details'] == {'document_carrier': 'Other yamato', 'document_carrier_id': yamato,
-                                              'carrier_id': sagawa}
-    # null = 清空任务上的承运商，CI 取数回落到 DN 的承运商（与 CI 上的不同）→ 同样 16092
-    response = _complete(client, access_token, task_id, {'carrier_id': None})
-    assert response.status_code == 409 and response.get_json()['code'] == 16092
-    assert _task(client, task_id) == ('in_progress', 'AWB-1', yamato)
-
-    # 同一承运商照常
-    response = _complete(client, access_token, task_id, {'carrier_id': yamato})
     assert response.status_code == 200, response.get_json()
-    assert response.get_json()['carrier_id'] == yamato
+    assert response.get_json()['carrier_id'] == sagawa
+
+

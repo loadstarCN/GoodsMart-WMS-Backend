@@ -86,6 +86,9 @@ def create_app():
     from tasks.commands import snapshot_cli
     app.cli.add_command(snapshot_cli)
 
+    from warehouse.carrier.commands import carrier_cli
+    app.cli.add_command(carrier_cli)
+
     # 初始化 IP 黑白名单到 Redis（开关打开时才加载，避免无 Redis 的本地环境启动失败）
     if app.config.get('CHECK_BLACKLIST') or app.config.get('CHECK_WHITELIST'):
         with app.app_context():

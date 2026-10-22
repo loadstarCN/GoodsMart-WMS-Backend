@@ -1,7 +1,8 @@
-"""海外 DN 在 FedEx 自动建运单（Ship API + ETD）：前置条件、请求体、写库、建单记录状态（pending / failed /
-unknown / dismissed）、补偿取消、取消流程、时间预算、公司白名单、运单号 / 报关 / 发货任务锁定。
+"""海外 DN 经承运商对接插件（FedEx：Ship API + ETD）自动建运单：前置条件、请求体、写库、建单记录状态（pending / failed /
+unknown / dismissed）、补偿取消、取消流程、时间预算、对接设置、运单号 / 报关 / 发货任务锁定。
 
-FedEx 一律 mock：替换 warehouse.dn.fedex_client._send，不联网。
+FedEx 一律 mock：替换 warehouse.carrier.integrations.fedex.client._send，不联网。
+对接设置按承运商保存（_set_fedex 给 get_carrier() 设 FedEx 对接）。
 """
 from .helpers import *
 from .test_customs import (
@@ -23,19 +24,25 @@ import pytest
 import requests
 from urllib3.exceptions import MaxRetryError, NewConnectionError, ProtocolError
 
-from warehouse.delivery.services import DeliveryTaskService
-from warehouse.dn import carrier_services, fedex_client
-from warehouse.dn.carrier_services import CarrierShipmentService
-from warehouse.dn.customs_services import CustomsService
-from warehouse.dn.fedex_shipment import (
-    AddressError, allocate_commodity_weights, build_label_archive, consignee_address, fedex_currency, iso_currency,
-    parse_page_size, split_address_text, split_evenly, tin_type_for, wrap_lines,
+from warehouse.carrier.integration_services import CarrierIntegrationService
+from warehouse.carrier.integrations import base as carrier_base
+from warehouse.carrier.integrations.fedex import adapter as fedex_adapter, client as fedex_client
+from warehouse.carrier.integrations.fedex.client import FedexClient
+from warehouse.carrier.integrations.fedex.shipment import (
+    AddressError, build_label_archive, consignee_address, fedex_currency, iso_currency, parse_page_size,
+    split_address_text, tin_type_for, wrap_lines,
 )
+from warehouse.carrier.models import Carrier
+from warehouse.delivery.services import DeliveryTaskService
+from warehouse.dn.carrier_services import CarrierShipmentService, allocate_commodity_weights, split_evenly
+from warehouse.dn.customs_services import CustomsService
 from warehouse.dn.models import DNCarrierShipment, DNDocument
 
 API_KEY = 'test-fedex-api-key'
 SECRET = 'test-fedex-secret-key'
 ACCOUNT = '000000000'
+FEDEX_SETTINGS = {'environment': 'sandbox', 'account_number': ACCOUNT, 'etd_enabled': False,
+                  'duties_payment_type': 'RECIPIENT'}
 
 
 def _label_pdf(text: str) -> bytes:
@@ -143,29 +150,43 @@ class FakeFedex:
         return self.of('/ship/v1/shipments')[index]['json']
 
 
+def _set_fedex(client, carrier_id=None, enabled=True, secrets=None, **settings):
+    """给承运商（默认 get_carrier()）设 FedEx 对接；settings 覆盖 FEDEX_SETTINGS 里的项（值为 None = 去掉）"""
+    merged = {k: v for k, v in {**FEDEX_SETTINGS, **settings}.items() if v is not None}
+    with client.application.app_context():
+        carrier = db.session.get(Carrier, carrier_id) if carrier_id else get_carrier()
+        CarrierIntegrationService.save(carrier, {
+            'adapter': 'fedex', 'enabled': enabled, 'settings': merged,
+            'secrets': {'api_key': API_KEY, 'secret_key': SECRET} if secrets is None else secrets,
+        }, None)
+
+
 @pytest.fixture
 def fedex(client, monkeypatch):
     fake = FakeFedex()
     monkeypatch.setattr(fedex_client, '_send', fake)
     fedex_client.clear_token_cache()
-    with client.application.app_context():
-        company_id = get_company().id
-    client.application.config.update(
-        FEDEX_API_BASE='https://apis-sandbox.fedex.com',
-        FEDEX_API_KEY=API_KEY, FEDEX_SECRET_KEY=SECRET, FEDEX_ACCOUNT_NUMBER=ACCOUNT,
-        FEDEX_ETD_ENABLED=False, FEDEX_DUTIES_PAYMENT_TYPE='RECIPIENT',
-        FEDEX_ALLOWED_COMPANY_IDS=f' {company_id} ,',
-    )
+    _set_fedex(client)
     yield fake
     fedex_client.clear_token_cache()
 
 
-def _use_fedex(client, task_id, code='fedex'):
+def _use_fedex(client, task_id, carrier_id=None):
+    """发货任务的承运商设成 carrier_id（默认 get_carrier()，fedex fixture 给它设了 FedEx 对接）"""
     with client.application.app_context():
-        carrier = get_carrier()
-        carrier.code = code
+        carrier = db.session.get(Carrier, carrier_id) if carrier_id else get_carrier()
         db.session.get(DeliveryTask, task_id).carrier_id = carrier.id
         db.session.commit()
+
+
+def _other_carrier(client, name='Yamato', code='yamato'):
+    """同公司另一个没有对接的承运商 → id"""
+    with client.application.app_context():
+        base = get_carrier()
+        carrier = Carrier(name=name, code=code, company_id=base.company_id, created_by=base.created_by)
+        db.session.add(carrier)
+        db.session.commit()
+        return carrier.id
 
 
 def _ready(client, token, **kwargs):
@@ -231,7 +252,7 @@ UNRESOLVED_KEYS = {'id', 'status', 'reason', 'tracking_number', 'transaction_id'
 # 未启用 / 前置条件
 # ---------------------------------------------------------------------------
 
-def test_disabled_without_credentials(client, access_token, monkeypatch):
+def test_carrier_without_integration_is_manual(client, access_token, monkeypatch):
     calls = []
     monkeypatch.setattr(fedex_client, '_send', lambda *a, **k: calls.append(a))
     dn_id, task_id = _export_dn_ready(client, access_token)
@@ -239,14 +260,46 @@ def test_disabled_without_credentials(client, access_token, monkeypatch):
 
     view = client.get(f'/dn/{dn_id}/carrier-shipment', headers=_h(access_token)).get_json()
     assert view['enabled'] is False and view['can_create'] is False
-    assert view['carrier'] == 'fedex' and view['shipment'] is None
-    assert [b['code'] for b in view['blockers']] == ['FEDEX_NOT_CONFIGURED']
+    assert view['integration'] is None and view['shipment'] is None
+    with client.application.app_context():
+        carrier = get_carrier()
+        assert view['carrier'] == {'id': carrier.id, 'name': carrier.name, 'code': carrier.code}
+    assert [b['code'] for b in view['blockers']] == ['CARRIER_NOT_INTEGRATED']
+    assert view['label_formats'] == {} and view['default_label_format'] is None
 
     response = _create(client, access_token, dn_id)
     assert response.status_code == 409 and response.get_json()['code'] == 16072
-    assert _codes(response) == ['FEDEX_NOT_CONFIGURED']
+    assert _codes(response) == ['CARRIER_NOT_INTEGRATED']
     assert calls == []
     assert _counts(client, dn_id) == {'shipments': 0, 'documents': 0, 'tracking': None}
+
+
+def test_integration_without_keys_or_turned_off(client, access_token, monkeypatch):
+    calls = []
+    monkeypatch.setattr(fedex_client, '_send', lambda *a, **k: calls.append(a))
+    dn_id, task_id = _export_dn_ready(client, access_token)
+    _use_fedex(client, task_id)
+
+    _set_fedex(client, secrets={}, account_number=None)
+    view = _get(client, access_token, dn_id)
+    assert view['enabled'] is False and [b['code'] for b in view['blockers']] == ['CARRIER_NOT_CONFIGURED']
+    assert set(view['blockers'][0]['fields']) == {'account_number', 'api_key', 'secret_key'}
+    assert view['integration']['code'] == 'fedex' and view['integration']['ready'] is False
+
+    _set_fedex(client, enabled=False)
+    view = _get(client, access_token, dn_id)
+    assert view['enabled'] is False and [b['code'] for b in view['blockers']] == ['CARRIER_INTEGRATION_DISABLED']
+    assert _codes(_create(client, access_token, dn_id)) == ['CARRIER_INTEGRATION_DISABLED']
+
+    _set_fedex(client)
+    view = _get(client, access_token, dn_id)
+    assert view['enabled'] is True and view['can_create'] is True
+    assert view['integration'] == {'code': 'fedex', 'name': 'FedEx', 'portal_name': 'FedEx Ship Manager',
+                                   'portal_url': fedex_adapter.FedexAdapter.portal_url, 'enabled': True,
+                                   'ready': True, 'books_pickups': True}
+    assert calls == []
+    _set_fedex(client, pickup_type='USE_SCHEDULED_PICKUP')     # 签了定期集荷：不用另约揽收
+    assert _get(client, access_token, dn_id)['integration']['books_pickups'] is False
 
 
 def test_ready_dn_can_create(client, access_token, fedex):
@@ -266,7 +319,8 @@ def test_blockers_listed_together(client, access_token, fedex):
     }, recipient_country='US')
     customs['lines'][0]['hs_code'] = None
     dn_id, task_id = _export_dn_ready(client, access_token, customs=customs)
-    _use_fedex(client, task_id, code='yamato')
+    _use_fedex(client, task_id)
+    _set_fedex(client, enabled=False)
     with client.application.app_context():
         db.session.get(DeliveryTask, task_id).tracking_number = 'MANUAL-1'
         company = get_company()
@@ -276,7 +330,7 @@ def test_blockers_listed_together(client, access_token, fedex):
     response = _create(client, access_token, dn_id)
     assert response.status_code == 409 and response.get_json()['code'] == 16072
     codes = _codes(response)
-    for expected in ('CARRIER_NOT_FEDEX', 'TRACKING_NUMBER_EXISTS', 'HS_CODE_MISSING',
+    for expected in ('CARRIER_INTEGRATION_DISABLED', 'TRACKING_NUMBER_EXISTS', 'HS_CODE_MISSING',
                      'EXPORTER_PROFILE_INCOMPLETE', 'RECIPIENT_ADDRESS_INVALID', 'RECIPIENT_NAME_MISSING',
                      'RECIPIENT_PHONE_MISSING'):
         assert expected in codes, (expected, codes)
@@ -328,8 +382,6 @@ def test_blockers_status_packages_task_and_domestic(client, access_token, fedex)
     for expected in ('NOT_PACKED', 'DELIVERY_TASK_MISSING', 'PACKAGES_MISSING'):
         assert expected in codes, (expected, codes)
 
-    client.application.config['FEDEX_LABEL_THERMAL_IMAGE_TYPE'] = 'GIF'
-    assert 'FEDEX_CONFIG_INVALID' in _codes(_create(client, access_token, dn_id))
     assert fedex.calls == []
 
 
@@ -467,15 +519,15 @@ def test_create_saves_tracking_label_and_bumps_ci(client, access_token, fedex):
     assert shipment['transaction_id'] == 'tx-ship-0001'
     assert shipment['created_by'] is not None and shipment['cancelled_at'] is None
 
-    # 运单号存到发货任务；CI / PL 带 AWB 升版本
+    # 运单号存到发货任务；CI / PL 不印运单号，沿用建单前的第 1 版
     with client.application.app_context():
         assert db.session.get(DeliveryTask, task_id).tracking_number == '794600000001'
     view = client.get(f'/dn/{dn_id}/customs', headers=_h(access_token)).get_json()
-    assert [d['version'] for d in view['current_documents']] == [2, 2]
+    assert [d['version'] for d in view['current_documents']] == [1, 1]
     assert view['documents_outdated'] is False
     ci_id = view['current_documents'][0]['id']
     ci = client.get(f'/dn/{dn_id}/customs-documents/{ci_id}/file', headers=_h(access_token))
-    assert b'794600000001' in _pdf_streams(ci.data)
+    assert b'794600000001' not in _pdf_streams(ci.data)
 
     # 面单：两箱合成一个 PDF，存 dn_documents（shipping_label）
     label = client.get(shipment['label_download_path'].replace('/warehouse', ''), headers=_h(access_token))
@@ -519,14 +571,13 @@ def test_create_issues_documents_first_when_missing(client, access_token, fedex)
         docs = DNDocument.query.filter_by(dn_id=dn_id).order_by(DNDocument.id).all()
         summary = [(d.doc_type, d.version, d.status) for d in docs]
     assert summary == [
-        ('commercial_invoice', 1, 'void'), ('packing_list', 1, 'void'),      # 建单前签发
-        ('commercial_invoice', 2, 'issued'), ('packing_list', 2, 'issued'),  # 带 AWB 升版本
+        ('commercial_invoice', 1, 'issued'), ('packing_list', 1, 'issued'),  # 建单前签发，之后不再升版本
         ('shipping_label', 1, 'issued'),
     ]
 
 
 def test_etd_uploads_current_ci_and_references_it(client, access_token, fedex):
-    client.application.config['FEDEX_ETD_ENABLED'] = True
+    _set_fedex(client, etd_enabled=True)
     dn_id, _task_id = _ready(client, access_token)
     ci_meta = _issue(client, access_token, dn_id).get_json()['documents'][0]
     response = _create(client, access_token, dn_id)
@@ -560,7 +611,7 @@ def test_etd_uploads_current_ci_and_references_it(client, access_token, fedex):
 
 
 def test_duties_paid_by_sender_has_payor(client, access_token, fedex):
-    client.application.config['FEDEX_DUTIES_PAYMENT_TYPE'] = 'SENDER'
+    _set_fedex(client, duties_payment_type='SENDER')
     dn_id, _task_id = _ready(client, access_token)
     assert _create(client, access_token, dn_id).status_code == 201
     duties = fedex.ship_request()['requestedShipment']['customsClearanceDetail']['dutiesPayment']
@@ -702,7 +753,7 @@ def test_requests_not_sent_record_failed(client, access_token, fedex, failure, s
 
 
 def test_etd_upload_error_records_failed(client, access_token, fedex):
-    client.application.config['FEDEX_ETD_ENABLED'] = True
+    _set_fedex(client, etd_enabled=True)
     dn_id, _task_id = _ready(client, access_token)
     fedex.set('/sandbox/documents/v1/etds/upload', (400, {'errors': [{'code': '1001', 'message': 'bad file'}]}))
     response = _create(client, access_token, dn_id)
@@ -821,7 +872,7 @@ def test_unparseable_response_with_tracking_is_cancelled(client, access_token, f
 
     def broken(body):
         raise ValueError('unexpected document structure')
-    monkeypatch.setattr(carrier_services, 'parse_ship_response', broken)
+    monkeypatch.setattr(fedex_adapter, 'parse_ship_response', broken)
     response = _create(client, access_token, dn_id)
     assert response.status_code == 502 and response.get_json()['code'] == 16073
     assert response.get_json()['details']['unresolved'] is None
@@ -833,7 +884,7 @@ def test_unparseable_response_with_tracking_is_cancelled(client, access_token, f
 @pytest.mark.parametrize('etd, expected', [(False, ('unknown', 'interrupted')), (True, ('failed', 'interrupted'))])
 def test_worker_interrupted_during_fedex_call(client, access_token, fedex, etd, expected):
     # gunicorn 超时杀 worker 抛 SystemExit：except Exception 接不住，也要把记录落下来
-    client.application.config['FEDEX_ETD_ENABLED'] = etd
+    _set_fedex(client, etd_enabled=etd)
     dn_id, _task_id = _ready(client, access_token)
     path = '/sandbox/documents/v1/etds/upload' if etd else '/ship/v1/shipments'
     fedex.errors[path] = SystemExit(1)
@@ -899,8 +950,8 @@ def test_stale_pending_becomes_dismissable(client, access_token, fedex):
                           headers=_h(access_token))
     assert response.get_json()['code'] == 16079
 
-    # FEDEX_PENDING_STALE_MINUTES = 1，但不短于 建单时限 90 + 补偿 15 + 余量 60 = 165 秒
-    client.application.config['FEDEX_PENDING_STALE_MINUTES'] = 1
+    # CARRIER_PENDING_STALE_MINUTES = 1，但不短于 建单时限 90 + 补偿 15 + 余量 60 = 165 秒
+    client.application.config['CARRIER_PENDING_STALE_MINUTES'] = 1
     set_age(150)
     assert _get(client, access_token, dn_id)['unresolved']['status'] == 'pending'
     set_age(170)
@@ -984,12 +1035,10 @@ def test_cancel_flow(client, access_token, fedex):
         record = DNCarrierShipment.query.filter_by(dn_id=dn_id).one()
         assert record.cancel_transaction_id == 'tx-cancel-0001'
 
-    # CI / PL 去掉 AWB 重新签发
+    # CI / PL 不印运单号：取消后照样有效，不重签
     view = client.get(f'/dn/{dn_id}/customs', headers=_h(access_token)).get_json()
-    assert [d['version'] for d in view['current_documents']] == [3, 3]
-    ci = client.get(f"/dn/{dn_id}/customs-documents/{view['current_documents'][0]['id']}/file",
-                    headers=_h(access_token))
-    assert b'794600000001' not in _pdf_streams(ci.data)
+    assert [d['version'] for d in view['current_documents']] == [1, 1]
+    assert view['documents_outdated'] is False
 
     again = client.post(f'/dn/{dn_id}/carrier-shipment/cancel', headers=_h(access_token))
     assert again.status_code == 409 and again.get_json()['code'] == 16075
@@ -1243,12 +1292,16 @@ def test_parse_page_size():
             parse_page_size(bad)
 
 
-def test_invalid_thermal_page_size_blocks(client, access_token, fedex):
+def test_invalid_saved_setting_blocks(client, access_token, fedex):
+    # 设置是保存时校验的；库里的值失效（插件升级后不再支持等）时建单前拦下
     dn_id, _task_id = _ready(client, access_token)
-    client.application.config['FEDEX_LABEL_THERMAL_PAGE_SIZE'] = '100'
+    with client.application.app_context():
+        integration = get_carrier().integration
+        integration.settings = {**integration.settings, 'thermal_page_size': '100'}
+        db.session.commit()
     response = _create(client, access_token, dn_id)
-    assert _codes(response) == ['FEDEX_CONFIG_INVALID']
-    assert 'FEDEX_LABEL_THERMAL_PAGE_SIZE' in response.get_json()['details']['blockers'][0]['message']
+    assert _codes(response) == ['CARRIER_CONFIG_INVALID']
+    assert 'thermal_page_size' in response.get_json()['details']['blockers'][0]['message']
     assert fedex.calls == []
 
 
@@ -1286,7 +1339,7 @@ def test_label_documents_ordered_label_auxiliary_other(client, access_token, fed
 
 
 def test_zpl_labels_stored_raw(client, access_token, fedex):
-    client.application.config['FEDEX_LABEL_THERMAL_IMAGE_TYPE'] = 'ZPLII'
+    _set_fedex(client, thermal_image_type='ZPLII')
     zpl = b'^XA^FDLABEL^FS^XZ\n^XA^FDAWB COPY^FS^PQ2\n^XZ\n'
     fedex.set('/ship/v1/shipments', (200, _ship_body(packages=2, image=zpl)))
     dn_id, _task_id = _ready(client, access_token)
@@ -1386,27 +1439,42 @@ def test_manual_tracking_allowed_after_cancel(client, access_token, fedex):
 # 公司白名单 / DDP / 发件国 / 已取消 / 时间预算 / 发货任务与报关锁定
 # ---------------------------------------------------------------------------
 
-def test_company_allow_list(client, access_token, fedex):
-    dn_id, _task_id = _ready(client, access_token)
-    company_id = _company_id(client)
-    for value, codes, enabled in ((None, ['FEDEX_COMPANY_NOT_ALLOWED'], False),
-                                  ('', ['FEDEX_COMPANY_NOT_ALLOWED'], False),
-                                  (f'{company_id + 1000}', ['FEDEX_COMPANY_NOT_ALLOWED'], False),
-                                  (f'abc, {company_id}', ['FEDEX_CONFIG_INVALID'], True)):
-        client.application.config['FEDEX_ALLOWED_COMPANY_IDS'] = value
-        view = _get(client, access_token, dn_id)
-        assert [b['code'] for b in view['blockers']] == codes, value
-        assert view['can_create'] is False and view['enabled'] is enabled, value
-        response = _create(client, access_token, dn_id)
-        assert response.status_code == 409 and _codes(response) == codes
+def test_integration_follows_the_task_carrier(client, access_token, fedex):
+    dn_id, task_id = _ready(client, access_token)
+    other = _other_carrier(client)
+    _use_fedex(client, task_id, other)
+    view = _get(client, access_token, dn_id)
+    assert [b['code'] for b in view['blockers']] == ['CARRIER_NOT_INTEGRATED']
+    assert view['carrier']['id'] == other and view['integration'] is None and view['enabled'] is False
     assert fedex.calls == []
 
-    # 已建的运单：公司后来被移出名单也能取消
-    client.application.config['FEDEX_ALLOWED_COMPANY_IDS'] = f'{company_id + 1000},{company_id}'
-    assert _get(client, access_token, dn_id)['enabled'] is True
+    # 另一个承运商也设了 FedEx 对接（另一个账号）：用它的设置建单，记录记下这个承运商
+    _set_fedex(client, carrier_id=other, account_number='111111111')
     assert _create(client, access_token, dn_id).status_code == 201
-    client.application.config['FEDEX_ALLOWED_COMPANY_IDS'] = ''
+    assert fedex.ship_request()['accountNumber'] == {'value': '111111111'}
+    with client.application.app_context():
+        assert DNCarrierShipment.query.filter_by(dn_id=dn_id).one().carrier_id == other
+
+    # 停用之后已建的运单仍能取消（用建单时那个承运商的设置）
+    _set_fedex(client, carrier_id=other, enabled=False, account_number='111111111')
     assert _cancel(client, access_token, dn_id).status_code == 200
+    assert fedex.of('/ship/v1/shipments/cancel')[0]['json']['accountNumber'] == {'value': '111111111'}
+
+
+def test_carrier_of_another_company_is_not_used(client, access_token, fedex):
+    dn_id, task_id = _ready(client, access_token)
+    with client.application.app_context():
+        task = db.session.get(DeliveryTask, task_id)
+        company_b = Company.query.filter_by(name='Company B').first()
+        carrier = Carrier(name='FedEx B', code='fedex', company_id=company_b.id, created_by=get_carrier().created_by)
+        db.session.add(carrier)
+        db.session.commit()
+        other = carrier.id
+        task.carrier_id = other
+        db.session.commit()
+    _set_fedex(client, carrier_id=other)
+    assert [b['code'] for b in _get(client, access_token, dn_id)['blockers']] == ['CARRIER_NOT_INTEGRATED']
+    assert fedex.calls == []
 
 
 def test_ddp_requires_sender_duties(client, access_token, fedex):
@@ -1414,9 +1482,9 @@ def test_ddp_requires_sender_duties(client, access_token, fedex):
     response = _create(client, access_token, dn_id)
     assert response.status_code == 409 and _codes(response) == ['INCOTERM_DUTIES_MISMATCH']
     blocker = response.get_json()['details']['blockers'][0]
-    assert blocker['field'] == 'incoterm' and 'FEDEX_DUTIES_PAYMENT_TYPE' in blocker['message']
+    assert blocker['field'] == 'incoterm' and 'duties payment type' in blocker['message']
     assert fedex.calls == []
-    client.application.config['FEDEX_DUTIES_PAYMENT_TYPE'] = 'SENDER'
+    _set_fedex(client, duties_payment_type='SENDER')
     assert _create(client, access_token, dn_id).status_code == 201
     assert fedex.ship_request()['requestedShipment']['customsClearanceDetail']['commercialInvoice'][
         'termsOfSale'] == 'DDP'
@@ -1465,12 +1533,12 @@ def test_cancel_retry_after_local_failure(client, access_token, fedex, monkeypat
     created = _create(client, access_token, dn_id).get_json()['shipment']
 
     # FedEx 取消成功，本地写库失败 → 第 3 段回滚；第 1 段已提交的「取消中」留着（reason save_failed），拦发货
-    original = CustomsService.issue_documents
-    monkeypatch.setattr(CustomsService, 'issue_documents',
+    original = DeliveryTaskService.save_tracking
+    monkeypatch.setattr(DeliveryTaskService, 'save_tracking',
                         staticmethod(lambda *a, **k: (_ for _ in ()).throw(RuntimeError('db down'))))
     assert _cancel(client, access_token, dn_id).status_code == 500
     assert _states(client, dn_id) == [('cancelling', 'save_failed', '794600000001')]
-    monkeypatch.setattr(CustomsService, 'issue_documents', staticmethod(original))
+    monkeypatch.setattr(DeliveryTaskService, 'save_tracking', staticmethod(original))
 
     # 再点取消：FedEx 回「已取消 / 查无此运单」→ 视为取消成功
     fedex.set('/ship/v1/shipments/cancel', second_response)
@@ -1486,7 +1554,7 @@ def test_cancel_retry_after_local_failure(client, access_token, fedex, monkeypat
 
 
 def test_already_cancelled_codes():
-    matches = carrier_services._already_cancelled
+    matches = fedex_adapter.already_cancelled
     for code in ('SHIPMENT.ALREADY.CANCELLED', 'TRACKING.TRACKINGNUMBER.NOTFOUND', 'SHIPMENT.NOT.FOUND',
                  'TRACKINGNUMBER.DOES.NOT.EXIST', 'ALREADY.DELETED', '8159'):
         assert matches([{'code': code}]), code
@@ -1497,11 +1565,11 @@ def test_already_cancelled_codes():
 
 def test_create_budget_limits_request_timeouts(client, access_token, fedex, monkeypatch):
     dn_id, _task_id = _ready(client, access_token)
-    client.application.config.update(FEDEX_CREATE_BUDGET_SECONDS=20, FEDEX_CONNECT_TIMEOUT_SECONDS=5,
-                                     FEDEX_TIMEOUT_SECONDS=30)
+    client.application.config.update(CARRIER_CREATE_BUDGET_SECONDS=20, CARRIER_CONNECT_TIMEOUT_SECONDS=5,
+                                     CARRIER_TIMEOUT_SECONDS=30)
     now = [1000.0]
     step = [12]
-    monkeypatch.setattr(fedex_client, '_clock', lambda: now[0])
+    monkeypatch.setattr(carrier_base, '_clock', lambda: now[0])
 
     def slow(method, url, **kwargs):
         response = fedex(method, url, **kwargs)
@@ -1541,28 +1609,38 @@ def test_fedex_client_error_classification(client, fedex):
         (lambda: fedex.set(path, (422, {'errors': [{'code': 'SHIPMENT.VALIDATION', 'message': 'x'}]})), False, False),
         (lambda: fedex.set(path, (200, 'not json')), True, False),
     ]
+    api = FedexClient(api_base='https://apis-sandbox.fedex.com',
+                      document_api_base='https://documentapitest.prod.fedex.com/sandbox',
+                      api_key=API_KEY, secret_key=SECRET, account_number=ACCOUNT)
     with client.application.app_context():
         for index, (arrange, maybe_processed, timeout) in enumerate(cases):
             fedex.errors.clear()
             arrange()
-            with pytest.raises(fedex_client.FedexError) as caught:
-                fedex_client.create_shipment({})
+            with pytest.raises(carrier_base.CarrierError) as caught:
+                api.create_shipment({})
             assert (caught.value.maybe_processed, caught.value.timeout) == (maybe_processed, timeout), index
-            assert caught.value.what == fedex_client.CREATE_SHIPMENT
+            assert caught.value.step == carrier_base.STEP_CREATE
 
         # token 请求失败：业务请求没发，结果确定
         fedex.errors.clear()
         fedex_client.clear_token_cache()
         fedex.set('/oauth/token', (500, {'errors': [{'code': 'INTERNAL.SERVER.ERROR', 'message': 'x'}]}))
-        with pytest.raises(fedex_client.FedexError) as caught:
-            fedex_client.create_shipment({})
-        assert caught.value.maybe_processed is False and caught.value.what == fedex_client.TOKEN_REQUEST
+        with pytest.raises(carrier_base.CarrierError) as caught:
+            api.create_shipment({})
+        assert caught.value.maybe_processed is False and caught.value.step == carrier_base.STEP_AUTH
 
         # 时间预算不够：不发请求
         calls = len(fedex.calls)
-        with pytest.raises(fedex_client.FedexError) as caught:
-            fedex_client.create_shipment({}, deadline=fedex_client.clock() + 3)
+        with pytest.raises(carrier_base.CarrierError) as caught:
+            api.create_shipment({}, deadline=carrier_base.clock() + 3)
         assert caught.value.budget_exhausted is True and caught.value.maybe_processed is False
+        assert len(fedex.calls) == calls
+
+        # 凭证不全：不发请求
+        incomplete = FedexClient(api_base='https://apis-sandbox.fedex.com', document_api_base='x',
+                                 api_key=API_KEY, secret_key=None, account_number=ACCOUNT)
+        with pytest.raises(carrier_base.CarrierError):
+            incomplete.create_shipment({})
         assert len(fedex.calls) == calls
 
 

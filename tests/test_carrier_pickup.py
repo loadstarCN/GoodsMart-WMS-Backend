@@ -1,10 +1,12 @@
-"""FedEx 上门揽收预约（Pickup Request API）：待揽收运单、前置条件、查可约时间、预约请求体、预约结果
-（scheduled / failed / unknown）、占用与释放运单、取消、确认作废、运单状态里的揽收概要。
+"""上门揽收预约（FedEx 对接插件的 Pickup Request API）：承运商选择、待揽收运单、前置条件、查可约时间、预约请求体、
+预约结果（scheduled / failed / unknown）、占用与释放运单、取消、确认作废、运单状态里的揽收概要。
 
-FedEx 一律 mock：替换 warehouse.dn.fedex_client._send，不联网（夹具见 test_carrier_shipment）。
+FedEx 一律 mock：替换 warehouse.carrier.integrations.fedex.client._send，不联网（夹具见 test_carrier_shipment）。
 """
 from .helpers import *
-from .test_carrier_shipment import ACCOUNT, _create, _ready, _ship_body, _use_fedex, fedex  # noqa: F401
+from .test_carrier_shipment import (  # noqa: F401
+    ACCOUNT, _create, _other_carrier, _ready, _set_fedex, _ship_body, _use_fedex, fedex,
+)
 from .test_customs import PACKAGES, _create_dn, _force_packed, _h, _prepare, _ship
 
 from datetime import datetime as _datetime, timedelta as _timedelta
@@ -62,13 +64,13 @@ def _wh(token):
     return _h(token, **{'X-WAREHOUSE-ID': str(_WAREHOUSE['id'])})
 
 
-def _shipment(client, token, order_number=None):
-    """建好一张 FedEx 自动运单（DN 已打包、2 箱各 3.25 kg）。返回 (dn_id, task_id, shipment_id)。"""
+def _shipment(client, token, order_number=None, carrier_id=None):
+    """建好一张 FedEx 自动运单（DN 已打包、2 箱各 3.25 kg；承运商默认 get_carrier()）。返回 (dn_id, task_id, shipment_id)。"""
     if order_number:
         dn_id = _create_dn(client, token, order_number=order_number).get_json()['id']
         task_id = _force_packed(client, dn_id)
         assert client.put(f'/dn/{dn_id}/packages', json={'packages': PACKAGES}, headers=_h(token)).status_code == 200
-        _use_fedex(client, task_id)
+        _use_fedex(client, task_id, carrier_id)
     else:
         dn_id, task_id = _ready(client, token)
     response = _create(client, token, dn_id)
@@ -91,8 +93,9 @@ def _book(client, token, shipment_ids, **overrides):
     return client.post('/dn/carrier-pickups', json=body, headers=_wh(token))
 
 
-def _overview(client, token):
-    response = client.get('/dn/carrier-pickups', headers=_wh(token))
+def _overview(client, token, carrier_id=None):
+    query = f'?carrier_id={carrier_id}' if carrier_id else ''
+    response = client.get(f'/dn/carrier-pickups{query}', headers=_wh(token))
     assert response.status_code == 200, response.get_json()
     return response.get_json()
 
@@ -118,10 +121,17 @@ def test_overview_lists_open_shipments_and_location(client, access_token, pickup
     dn_id, task_id, shipment_id = _shipment(client, access_token)
     data = _overview(client, access_token)
     assert data['enabled'] is True and data['blockers'] == [] and data['can_create'] is True
+    with client.application.app_context():
+        carrier_id = get_carrier().id
+    assert data['carrier']['id'] == carrier_id and data['carrier']['adapter'] == 'fedex'
+    assert [c['id'] for c in data['carriers']] == [carrier_id]
+    assert data['integration']['code'] == 'fedex' and data['integration']['name'] == 'FedEx'
+    assert data['max_remarks'] == 60
     assert data['today'] == local_today().isoformat() and data['timezone'] == 'Asia/Tokyo'
     row = _row(data, shipment_id)
     assert row['dn_id'] == dn_id and row['delivery_task_id'] == task_id
     assert row['tracking_number'] == '794600000001' and row['package_count'] == 2 and row['weight_kg'] == 6.5
+    assert row['service_name'] == 'International Economy'
     assert row['pickup'] is None and row['can_schedule'] is True
     # 仓库没有英文地址 → 用公司的；联系人 / 电话用仓库的
     assert data['pickup_location'] == {
@@ -153,11 +163,12 @@ def test_blockers(client, access_token, pickup_fedex):
     data = _overview(client, access_token)
     assert [b['code'] for b in data['blockers']] == ['PICKUP_PHONE_INVALID'] and data['can_create'] is False
 
-    client.application.config['FEDEX_ALLOWED_COMPANY_IDS'] = ''
+    _set_fedex(client, enabled=False)          # 对接停用
     response = _book(client, access_token, [shipment_id])
     assert response.status_code == 409 and response.get_json()['code'] == 16130
     assert [b['code'] for b in response.get_json()['details']['blockers']] == [
-        'FEDEX_COMPANY_NOT_ALLOWED', 'PICKUP_PHONE_INVALID']
+        'CARRIER_INTEGRATION_DISABLED', 'PICKUP_PHONE_INVALID']
+    assert _overview(client, access_token)['enabled'] is False
     assert client.get('/dn/carrier-pickups/availability', headers=_wh(access_token)).get_json()['code'] == 16130
     assert pickup_fedex.of(PICKUP) == [] and pickup_fedex.of(AVAILABILITY) == []
 
@@ -363,7 +374,8 @@ def test_response_without_confirmation_is_unknown(client, access_token, pickup_f
 def test_stale_pending_is_unknown(client, access_token, pickup_fedex):
     _dn_id, _task_id, shipment_id = _shipment(client, access_token)
     with client.application.app_context():
-        record = CarrierPickup(warehouse_id=get_warehouse().id, carrier='fedex', status='pending',
+        record = CarrierPickup(warehouse_id=get_warehouse().id, carrier='fedex', carrier_id=get_carrier().id,
+                               status='pending',
                                pickup_date=local_today(), ready_time='12:00', close_time='18:00', package_count=2,
                                total_weight_kg=6.5, created_at=_datetime.now() - _timedelta(hours=1))
         db.session.add(record)
@@ -452,3 +464,83 @@ def test_unknown_pickup_is_404(client, access_token, pickup_fedex):
         response = client.post(f'/dn/carrier-pickups/99999/{action}', json={'confirm': True},
                                headers=_wh(access_token))
         assert response.status_code == 404 and response.get_json()['code'] == 13001
+
+
+# ---------------------------------------------------------------------------
+# 承运商
+# ---------------------------------------------------------------------------
+
+def test_no_carrier_can_book_pickups(client, access_token):
+    with client.application.app_context():
+        _WAREHOUSE['id'] = get_warehouse().id
+    data = _overview(client, access_token)
+    assert data['enabled'] is False and data['carrier'] is None and data['carriers'] == []
+    assert [b['code'] for b in data['blockers']] == ['PICKUP_CARRIER_MISSING']
+    assert data['shipments'] == [] and data['pickups'] == [] and data['can_create'] is False
+    response = client.get('/dn/carrier-pickups/availability', headers=_wh(access_token))
+    assert response.status_code == 409 and response.get_json()['code'] == 16130
+
+
+def test_pickups_are_per_carrier(client, access_token, pickup_fedex):
+    """同公司两个承运商各有 FedEx 对接（各自的账号）：运单、预约按承运商分开，预约用该承运商的账号"""
+    _dn_id, _task_id, first = _shipment(client, access_token)
+    other = _other_carrier(client, name='FedEx (second account)', code='fedex2')
+    _set_fedex(client, carrier_id=other, account_number='999999999')
+    pickup_fedex.set('/ship/v1/shipments', (200, _ship_body(tracking='794600000009')))
+    _dn2, _task2, second = _shipment(client, access_token, order_number='ORD-EXP-2', carrier_id=other)
+
+    with client.application.app_context():
+        base = get_carrier().id
+    default = _overview(client, access_token, carrier_id=base)
+    assert len(default['carriers']) == 2
+    assert [r['shipment_id'] for r in default['shipments']] == [first]
+    data = _overview(client, access_token, carrier_id=other)
+    assert data['carrier']['id'] == other and [r['shipment_id'] for r in data['shipments']] == [second]
+
+    # 别的承运商的运单不能一起约
+    response = _book(client, access_token, [first, second], carrier_id=base)
+    assert response.status_code == 409 and response.get_json()['code'] == 16132
+    assert response.get_json()['details']['shipments'] == [
+        {'shipment_id': second, 'tracking_number': '794600000009', 'reason': 'OTHER_CARRIER', 'carrier': 'fedex'}]
+
+    response = _book(client, access_token, [second], carrier_id=other)
+    assert response.status_code == 201, response.get_json()
+    pickup = response.get_json()['pickup']
+    assert pickup['carrier_id'] == other and pickup['carrier'] == 'fedex'
+    assert pickup_fedex.of(PICKUP)[0]['json']['associatedAccountNumber'] == {'value': '999999999'}
+    assert [p['id'] for p in _overview(client, access_token, carrier_id=other)['pickups']] == [pickup['id']]
+    assert _overview(client, access_token, carrier_id=base)['pickups'] == []
+
+
+@pytest.mark.parametrize('carrier_id', ['abc', 0, 99999])
+def test_invalid_carrier_id(client, access_token, pickup_fedex, carrier_id):
+    response = client.get(f'/dn/carrier-pickups?carrier_id={carrier_id}', headers=_wh(access_token))
+    assert response.status_code == 400 and response.get_json()['code'] == 16131
+    assert response.get_json()['field'] == 'carrier_id'
+
+
+def test_carrier_without_integration_is_not_offered(client, access_token, pickup_fedex):
+    other = _other_carrier(client)
+    data = _overview(client, access_token)
+    assert [c['id'] for c in data['carriers']] != [] and other not in [c['id'] for c in data['carriers']]
+    response = client.get(f'/dn/carrier-pickups?carrier_id={other}', headers=_wh(access_token))
+    assert response.status_code == 400 and response.get_json()['field'] == 'carrier_id'
+
+
+def test_cancel_works_after_integration_turned_off(client, access_token, pickup_fedex):
+    _shipment_id, pickup_id = _scheduled(client, access_token, pickup_fedex)
+    _set_fedex(client, enabled=False)
+    response = client.post(f'/dn/carrier-pickups/{pickup_id}/cancel', headers=_wh(access_token))
+    assert response.status_code == 200 and response.get_json()['pickup']['status'] == 'cancelled'
+
+
+def test_cancel_blocked_when_integration_removed(client, access_token, pickup_fedex):
+    _shipment_id, pickup_id = _scheduled(client, access_token, pickup_fedex)
+    with client.application.app_context():
+        db.session.delete(get_carrier().integration)
+        db.session.commit()
+    response = client.post(f'/dn/carrier-pickups/{pickup_id}/cancel', headers=_wh(access_token))
+    assert response.status_code == 409 and response.get_json()['code'] == 16130
+    assert response.get_json()['details']['blockers'][0]['code'] == 'CARRIER_NOT_INTEGRATED'
+    assert pickup_fedex.of(PICKUP_CANCEL) == []
+    assert _record(client, pickup_id)['status'] == 'scheduled'

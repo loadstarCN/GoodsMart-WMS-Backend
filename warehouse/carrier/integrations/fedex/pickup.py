@@ -21,7 +21,7 @@
 from datetime import date, datetime, time
 from decimal import Decimal, ROUND_CEILING
 
-from .fedex_shipment import MAX_COMPANY_NAME, MAX_EMAIL, MAX_PERSON_NAME, _alerts, _clip, phone_digits
+from .shipment import MAX_COMPANY_NAME, MAX_EMAIL, MAX_PERSON_NAME, _alerts, _clip, phone_digits
 
 CARRIER_CODE = 'FDXE'                       # FedEx Express
 COUNTRY_RELATIONSHIP = 'INTERNATIONAL'      # 揽收的都是海外件

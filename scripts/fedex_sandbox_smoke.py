@@ -1,12 +1,14 @@
 """FedEx 测试环境（sandbox）冒烟：按面单打印方式（A4 / THERMAL）× 箱数各建一票测试运单 → 存面单 → 取消。
 
-不进 pytest、不连数据库，直接用 WMS 的请求组装与面单存档代码（warehouse/dn/fedex_shipment.py）和客户端
-（warehouse/dn/fedex_client.py）。面单文件按「服务_箱数_打印方式.扩展名」存（如
-INTERNATIONAL_ECONOMY_2pkg_A4.pdf），可作为向 FedEx 申请面单认证（label certification）的样张。
+不进 pytest、不连数据库，直接调 WMS 的 FedEx 对接插件（warehouse/carrier/integrations/fedex：FedexAdapter 的
+upload_documents / create_shipment / label_archive / cancel_shipment，与 WMS 建单走同一套代码）。
+面单文件按「服务_箱数_打印方式.扩展名」存（如 INTERNATIONAL_ECONOMY_2pkg_A4.pdf），可作为向 FedEx 申请面单认证
+（label certification）的样张。
 
-只允许 FEDEX_API_BASE 含 "sandbox"，否则拒绝执行。凭证从环境变量读（FEDEX_API_KEY / FEDEX_SECRET_KEY /
-FEDEX_ACCOUNT_NUMBER / FEDEX_API_BASE 以及 FEDEX_* 选项），也可用 --env-file 只读入某个 .env 里未注释的
-FEDEX_* 项。不打印任何凭证。
+只连 FedEx sandbox。凭证从环境变量读（FEDEX_API_KEY / FEDEX_SECRET_KEY / FEDEX_ACCOUNT_NUMBER，可选
+FEDEX_SERVICE_TYPE / FEDEX_PICKUP_TYPE / FEDEX_DUTIES_PAYMENT_TYPE / FEDEX_LABEL_THERMAL_IMAGE_TYPE /
+FEDEX_LABEL_THERMAL_PAGE_SIZE），也可用 --env-file 只读入某个 .env 里未注释的这些项。不打印任何凭证。
+（WMS 本身不再读这些环境变量，对接设置在承运商编辑页里按承运商保存。）
 
 发件人 / 收件人：默认用虚构数据；认证样张请用 --shipper-json 给出贵司出口资料（与 WMS 公司 / 仓库设置相同的
 字段），用 --recipient-json 给一个真实格式的海外地址（与报关快照 consignee 相同的字段）：
@@ -31,13 +33,18 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 FEDEX_KEYS = (
-    'FEDEX_API_BASE', 'FEDEX_API_KEY', 'FEDEX_SECRET_KEY', 'FEDEX_ACCOUNT_NUMBER', 'FEDEX_SERVICE_TYPE',
-    'FEDEX_PICKUP_TYPE', 'FEDEX_DUTIES_PAYMENT_TYPE', 'FEDEX_DEFAULT_LABEL_FORMAT',
-    'FEDEX_LABEL_A4_IMAGE_TYPE', 'FEDEX_LABEL_A4_STOCK_TYPE', 'FEDEX_LABEL_THERMAL_IMAGE_TYPE',
-    'FEDEX_LABEL_THERMAL_STOCK_TYPE', 'FEDEX_LABEL_THERMAL_PAGE_SIZE', 'FEDEX_DOCUMENT_API_BASE',
-    'FEDEX_CONNECT_TIMEOUT_SECONDS', 'FEDEX_TIMEOUT_SECONDS',
+    'FEDEX_API_KEY', 'FEDEX_SECRET_KEY', 'FEDEX_ACCOUNT_NUMBER', 'FEDEX_SERVICE_TYPE', 'FEDEX_PICKUP_TYPE',
+    'FEDEX_DUTIES_PAYMENT_TYPE', 'FEDEX_LABEL_THERMAL_IMAGE_TYPE', 'FEDEX_LABEL_THERMAL_PAGE_SIZE',
 )
 SECRET_KEYS = ('FEDEX_API_KEY', 'FEDEX_SECRET_KEY', 'FEDEX_ACCOUNT_NUMBER')
+# 环境变量 → FedexAdapter 的设置项
+SETTING_KEYS = {
+    'FEDEX_SERVICE_TYPE': 'service_type',
+    'FEDEX_PICKUP_TYPE': 'pickup_type',
+    'FEDEX_DUTIES_PAYMENT_TYPE': 'duties_payment_type',
+    'FEDEX_LABEL_THERMAL_IMAGE_TYPE': 'thermal_image_type',
+    'FEDEX_LABEL_THERMAL_PAGE_SIZE': 'thermal_page_size',
+}
 
 # 虚构收件人（报关快照 consignee 的字段）
 RECIPIENTS = {
@@ -85,9 +92,8 @@ def _load_json(path):
 
 
 def _parties(shipper_raw, recipient_raw):
-    """与 WMS 建单相同的规则把发件人 / 收件人整理成 FedEx 格式（地址放不下会抛 AddressError）"""
+    """JSON / 预设数据 → 交给插件的发件人 / 收件人（与 WMS 建单时的 shipment.shipper / recipient 同形）"""
     from warehouse.common.countries import COUNTRY_NAMES_EN
-    from warehouse.dn.fedex_shipment import SHIPPER_TIN_TYPE, consignee_address, split_address_text, tin_type_for
 
     country = (shipper_raw.get('country_code') or 'JP').upper()
     shipper = {
@@ -95,20 +101,25 @@ def _parties(shipper_raw, recipient_raw):
         'person_name': shipper_raw.get('person_name'),
         'phone': shipper_raw.get('phone'),
         'email': shipper_raw.get('email'),
-        'address': split_address_text(shipper_raw.get('address_en'), country, shipper_raw.get('postal_code'),
-                                      COUNTRY_NAMES_EN.get(country)),
-        'tins': ([{'number': shipper_raw['tax_id'], 'tinType': SHIPPER_TIN_TYPE}]
-                 if shipper_raw.get('tax_id') else []),
+        'address_text': shipper_raw.get('address_en'),
+        'postal_code': shipper_raw.get('postal_code'),
+        'country_code': country,
+        'country_name': COUNTRY_NAMES_EN.get(country),
+        'tax_id': shipper_raw.get('tax_id'),
     }
-    recipient_country = (recipient_raw.get('country') or '').upper()
     recipient = {
         'company_name': recipient_raw.get('company'),
         'person_name': recipient_raw.get('name') or recipient_raw.get('company'),
         'phone': recipient_raw.get('phone'),
         'email': None,
-        'address': consignee_address(recipient_raw, recipient_country),
-        'tins': ([{'number': recipient_raw['tax_id'], 'tinType': tin_type_for(recipient_raw.get('tax_id_type'))}]
-                 if recipient_raw.get('tax_id') else []),
+        'address_line1': recipient_raw.get('address_line1'),
+        'address_line2': recipient_raw.get('address_line2'),
+        'city': recipient_raw.get('city'),
+        'state': recipient_raw.get('state'),
+        'postal_code': recipient_raw.get('postal_code'),
+        'country_code': (recipient_raw.get('country') or '').upper(),
+        'tax_id': recipient_raw.get('tax_id'),
+        'tax_id_type': recipient_raw.get('tax_id_type'),
     }
     return shipper, recipient
 
@@ -144,48 +155,44 @@ def _report_error(what, exc):
               "或凭证无权限。请在 developer.fedex.com 的项目里添加对应 API 后重试。")
 
 
-def _run_one(app, settings, label, packages_count, shipper, recipient, args):
+def _run_one(adapter, label, packages_count, shipper, recipient, args):
     """建一票 → 存面单 → 取消。返回进程退出码（0 = 成功）"""
-    from warehouse.dn import fedex_client
-    from warehouse.dn.fedex_client import FedexError
-    from warehouse.dn.fedex_shipment import (
-        build_label_archive, build_ship_request, parse_page_size, parse_ship_response, split_evenly)
+    from warehouse.carrier.integrations.base import CarrierError, clock
+    from warehouse.dn.carrier_services import split_evenly
 
-    print(f"\n== {settings['service_type']} / {packages_count} package(s) / {label['label_format']} "
+    service = adapter.service_type()
+    print(f"\n== {service} / {packages_count} package(s) / {label['label_format']} "
           f"({label['image_type']} {label['stock_type']})")
     invoice_number = f"SANDBOX-{datetime.now():%Y%m%d%H%M%S}-{packages_count}{label['label_format'][0]}"
-    packages = [{'gross_weight_kg': Decimal('2.5'), 'length_mm': 300, 'width_mm': 200, 'height_mm': 150,
-                 'declared_value': value} for value in split_evenly(DECLARED_VALUE, packages_count)]
+    shipment = {
+        'reference': invoice_number,
+        'ship_date': datetime.now().date(),
+        'shipper': shipper,
+        'recipient': recipient,
+        'packages': [{'gross_weight_kg': Decimal('2.5'), 'length_mm': 300, 'width_mm': 200, 'height_mm': 150,
+                      'declared_value': value} for value in split_evenly(DECLARED_VALUE, packages_count)],
+        'commodities': COMMODITIES,
+        'invoice': {'invoice_number': invoice_number, 'currency': 'JPY', 'incoterm': 'DAP',
+                    'export_reason': 'SALE', 'freight': 3000, 'insurance': 0,
+                    'goods_value': sum(c['amount'] for c in COMMODITIES), 'declared_value': DECLARED_VALUE},
+        'documents': ({'commercial_invoice': {'content': _dummy_invoice_pdf(invoice_number),
+                                              'file_name': f'CI_{invoice_number}.pdf'}} if args.etd else None),
+    }
 
-    etd_document_id = None
+    document_ref = None
     if args.etd:
         try:
-            uploaded = fedex_client.upload_etd_document(
-                _dummy_invoice_pdf(invoice_number), f'CI_{invoice_number}.pdf',
-                shipper['address']['countryCode'], recipient['address']['countryCode'])
-        except FedexError as exc:
+            document_ref = adapter.upload_documents(shipment, deadline=clock() + 60)
+        except CarrierError as exc:
             _report_error('Trade Documents Upload', exc)
             return 3
-        meta = (uploaded.get('output') or {}).get('meta') or {}
-        etd_document_id = meta.get('docId')
-        print(f"  ETD upload OK: docId={etd_document_id} documentType={meta.get('documentType')}")
+        print(f"  ETD upload OK: docId={document_ref}")
 
-    request = build_ship_request(
-        account_number=app.config['FEDEX_ACCOUNT_NUMBER'], settings=settings, label=label,
-        ship_date=datetime.now().date(), shipper=shipper, recipient=recipient,
-        packages=packages, commodities=COMMODITIES,
-        invoice={'invoice_number': invoice_number, 'currency': 'JPY', 'incoterm': 'DAP',
-                 'export_reason': 'SALE', 'freight': 3000, 'insurance': 0,
-                 'goods_value': sum(c['amount'] for c in COMMODITIES), 'declared_value': DECLARED_VALUE},
-        reference=invoice_number, etd_document_id=etd_document_id,
-    )
     try:
-        body = fedex_client.create_shipment(request)
-    except FedexError as exc:
+        result = adapter.create_shipment(shipment, label, deadline=clock() + 90, document_ref=document_ref)
+    except CarrierError as exc:
         _report_error('Ship API create', exc)
         return 3
-
-    result = parse_ship_response(body)
     print(f"  created: master tracking {result['tracking_number']}  service {result['service_type']}  "
           f"ship date {result['ship_date']}  packages {', '.join(result['package_tracking_numbers']) or '-'}")
     print(f"  net charge: {result['net_charge']} {result['currency'] or ''}  "
@@ -193,14 +200,13 @@ def _run_one(app, settings, label, packages_count, shipper, recipient, args):
     for alert in result['alerts']:
         print(f"  alert {alert['alert_type']} {alert['code']}: {alert['message']}")
 
-    archive = build_label_archive(result['documents'], label['image_type'], parse_page_size(label['page_size']))
+    archive = adapter.label_archive(result['documents'], label)
     for part in archive['parts']:
         print(f"  document: {part['source']} #{part['package_sequence'] or '-'} {part['content_type']} "
               f"{part['doc_type']} pages={part['pages']} archived={part['archived']}")
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
-    path = out_dir / (f"{settings['service_type']}_{packages_count}pkg_{label['label_format']}"
-                      f".{archive['extension']}")
+    path = out_dir / f"{service}_{packages_count}pkg_{label['label_format']}.{archive['extension']}"
     path.write_bytes(archive['content'])
     print(f"  saved {path} ({len(archive['content'])} bytes)")
 
@@ -208,15 +214,14 @@ def _run_one(app, settings, label, packages_count, shipper, recipient, args):
         print("  --keep: the test shipment was NOT cancelled")
         return 0
     try:
-        cancelled = fedex_client.cancel_shipment(result['tracking_number'], shipper['address']['countryCode'])
-    except FedexError as exc:
+        outcome = adapter.cancel_shipment(result['tracking_number'], sender_country=shipper['country_code'],
+                                          deadline=clock() + 60)
+    except CarrierError as exc:
         _report_error('Ship API cancel', exc)
         return 4
-    output = cancelled.get('output') or {}
-    print(f"  cancelled: cancelledShipment={output.get('cancelledShipment')} "
-          f"message={output.get('successMessage') or output.get('message')} "
-          f"transactionId={cancelled.get('transactionId')}")
-    return 0 if output.get('cancelledShipment') is not False else 4
+    print(f"  cancel: {outcome['result']} {outcome.get('reason') or ''} {outcome.get('problem') or ''} "
+          f"transactionId={outcome.get('transaction_id')}")
+    return 0 if outcome['result'] == 'confirmed' else 4
 
 
 def main():
@@ -237,10 +242,6 @@ def main():
         loaded = _load_env_file(args.env_file)
         print(f"Loaded from env file: {', '.join(loaded) or '(nothing)'}")
 
-    base = os.environ.get('FEDEX_API_BASE') or 'https://apis-sandbox.fedex.com'
-    if 'sandbox' not in base.lower():
-        print(f"REFUSED: FEDEX_API_BASE={base} is not the FedEx sandbox. This script only runs against sandbox.")
-        return 2
     missing = [k for k in SECRET_KEYS if not os.environ.get(k)]
     if missing:
         print(f"Missing credentials: {', '.join(missing)}")
@@ -254,35 +255,41 @@ def main():
         return 2
 
     from flask import Flask
-    from warehouse.dn import fedex_client
-    from warehouse.dn.fedex_shipment import AddressError, LABEL_FORMATS, label_settings
+    from warehouse.carrier.integrations.fedex import FedexAdapter
 
-    app = Flask('fedex_sandbox_smoke')
-    app.config.update({k: os.environ[k] for k in FEDEX_KEYS if os.environ.get(k)})
-    app.config['FEDEX_API_BASE'] = base
-    settings = {
-        'service_type': app.config.get('FEDEX_SERVICE_TYPE', 'INTERNATIONAL_ECONOMY'),
-        'pickup_type': app.config.get('FEDEX_PICKUP_TYPE', 'USE_SCHEDULED_PICKUP'),
-        'duties_payment_type': app.config.get('FEDEX_DUTIES_PAYMENT_TYPE', 'RECIPIENT').upper(),
-    }
-    formats = LABEL_FORMATS if args.label_format == 'both' else (args.label_format,)
-    try:
-        shipper, recipient = _parties(
-            _load_json(args.shipper_json) if args.shipper_json else SHIPPER,
-            _load_json(args.recipient_json) if args.recipient_json else RECIPIENTS[args.to])
-    except AddressError as exc:
-        print(f"Address does not fit the FedEx format: {exc}")
+    # 只连 sandbox：environment 固定，不从环境变量读
+    settings = {'environment': 'sandbox', 'account_number': os.environ['FEDEX_ACCOUNT_NUMBER'],
+                'etd_enabled': bool(args.etd)}
+    for env_name, key in SETTING_KEYS.items():
+        if os.environ.get(env_name):
+            try:
+                settings.update(FedexAdapter.clean_settings({key: os.environ[env_name].strip()}))
+            except ValueError as exc:
+                print(f"{env_name}: {exc.args[-1]}")
+                return 2
+    adapter = FedexAdapter(settings, {'api_key': os.environ['FEDEX_API_KEY'],
+                                      'secret_key': os.environ['FEDEX_SECRET_KEY']})
+    shipper, recipient = _parties(
+        _load_json(args.shipper_json) if args.shipper_json else SHIPPER,
+        _load_json(args.recipient_json) if args.recipient_json else RECIPIENTS[args.to])
+    problems = adapter.check_shipment({'shipper': shipper, 'recipient': recipient, 'invoice': {'incoterm': 'DAP'}})
+    if problems:
+        for problem in problems:
+            print(f"{problem['code']}: {problem['message']}")
         return 2
 
+    app = Flask('fedex_sandbox_smoke')
+    formats = adapter.label_formats if args.label_format == 'both' else (args.label_format,)
     exit_code = 0
     with app.app_context():
-        print(f"API base: {base}  (document API: {fedex_client.document_api_base()})")
-        print(f"Service {settings['service_type']} / pickup {settings['pickup_type']} / "
-              f"duties {settings['duties_payment_type']} / to {recipient['address']['countryCode']}")
+        client = adapter.client()
+        print(f"API base: {client.api_base}  (document API: {client.document_api_base})")
+        print(f"Service {adapter.service_type()} / pickup {adapter.settings['pickup_type']} / "
+              f"duties {adapter.duties_payment_type} / to {recipient['country_code']}")
         for fmt in formats:
-            label = label_settings(app.config, fmt)
+            label = adapter.label_options(fmt)
             for count in counts:
-                exit_code = _run_one(app, settings, label, count, shipper, recipient, args) or exit_code
+                exit_code = _run_one(adapter, label, count, shipper, recipient, args) or exit_code
     return exit_code
 
 

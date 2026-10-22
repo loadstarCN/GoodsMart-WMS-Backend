@@ -105,8 +105,8 @@ class DNCustomsDocumentIssue(Resource):
         - 200: data unchanged, the current version is returned
         - 409 16068: conditions not met (details.problems); 16070: not an export DN; 16065: shipped
         - 409 16076: a carrier shipment is pending / active / unclear / being cancelled and the document data
-          differs (other than the AWB) from the current documents submitted with it - e.g. goods origin country,
-          exporter profile or carrier changed (details {reason: DOCUMENT_DATA_CHANGED, status, carrier,
+          differs from the current documents submitted with it - e.g. goods origin country or exporter profile
+          changed (details {reason: DOCUMENT_DATA_CHANGED, status, carrier,
           carrier_shipment {id, status, tracking_number}}); cancel the shipment first
         """
         dn = _owned_dn(dn_id)

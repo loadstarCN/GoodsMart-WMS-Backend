@@ -6,7 +6,7 @@
 - B-94  布尔开关统一解析；生产必填 SETTINGS_ENCRYPTION_KEY、WEBHOOK_URL_STRICT 默认开；没设 FLASK_ENV 只告警
 - B-95  测试依赖移到 requirements-dev.txt
 - B-96  CI 的 Shipper 国家与完整性检查同一来源（出口国）
-- B-97  CI 上的承运商名含非拉丁字符 → CARRIER_NON_LATIN_TEXT（error）
+- B-97  承运商名含非拉丁字符：以前印在 CI 上要拦（CARRIER_NON_LATIN_TEXT），现在单证不印承运商，不再拦
 - B-98  非 JPY 币种：JP_EXPORT_VALUE_UNVERIFIED（warning，请人工确认是否超过 20 万円）
 - B-99  收件人超长导致 reportlab LayoutError → 409 16117（不再 500）
 - B-100 department 4 个端点在未绑定用户的 API Key 下不再 500
@@ -373,7 +373,7 @@ def test_strict_delivery_keeps_response_body_limit(tmp_path):
 def _fresh_config(monkeypatch, **env):
     """按给定环境变量重新执行一份 config.py（不替换已导入的 config 模块）"""
     for name in ('FLASK_ENV', 'WEBHOOK_URL_STRICT', 'RATELIMIT_ENABLED', 'SCHEDULER_ENABLED', 'DEBUG',
-                 'CHECK_WHITELIST', 'CHECK_BLACKLIST', 'FEDEX_ETD_ENABLED', 'SETTINGS_ENCRYPTION_KEY'):
+                 'CHECK_WHITELIST', 'CHECK_BLACKLIST', 'SETTINGS_ENCRYPTION_KEY'):
         monkeypatch.delenv(name, raising=False)
     for name, value in env.items():
         monkeypatch.setenv(name, value)
@@ -405,13 +405,12 @@ def test_parse_bool_default_for_missing():
 def test_lowercase_switches_now_take_effect(monkeypatch):
     cfg = _fresh_config(monkeypatch, FLASK_ENV=' Production ', WEBHOOK_URL_STRICT='true',
                         RATELIMIT_ENABLED='1', SCHEDULER_ENABLED='true', CHECK_BLACKLIST='yes',
-                        FEDEX_ETD_ENABLED='on', DEBUG='false')
+                        DEBUG='false')
     assert cfg.Config.FLASK_ENV == 'production' and cfg.Config.FLASK_ENV_SET is True
     assert cfg.ProductionConfig.WEBHOOK_URL_STRICT is True
     assert cfg.Config.RATELIMIT_ENABLED is True
     assert cfg.Config.SCHEDULER_ENABLED is True
     assert cfg.Config.CHECK_BLACKLIST is True
-    assert cfg.Config.FEDEX_ETD_ENABLED is True
     assert cfg.Config.DEBUG is False
 
 
@@ -610,18 +609,15 @@ def _set_task_carrier(client, token, task_id, name, code):
     return carrier_id
 
 
-def test_non_latin_carrier_name_blocks_issue(client, access_token):
+def test_non_latin_carrier_name_does_not_block_issue(client, access_token):
+    """承运商名不印在单证上：日文名（如「ヤマト運輸」）不再拦签发"""
     dn_id, task_id = _export_dn_ready(client, access_token)
     _set_task_carrier(client, access_token, task_id, 'ヤマト運輸', 'yamato')
 
     view = _view(client, access_token, dn_id)
-    problems = _problems(view, 'CARRIER_NON_LATIN_TEXT')
-    assert len(problems) == 1
-    assert problems[0]['level'] == 'error' and problems[0]['field'] == 'carrier.name'
-    assert view['ready'] is False
-    response = _issue(client, access_token, dn_id)
-    assert response.status_code == 409
-    assert response.get_json()['code'] == 16068
+    assert _problems(view, 'CARRIER_NON_LATIN_TEXT') == []
+    assert view['ready'] is True
+    assert _issue(client, access_token, dn_id).status_code == 201
 
 
 def test_latin_carrier_name_not_flagged(client, access_token):

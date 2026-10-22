@@ -480,7 +480,7 @@ def test_documents_pdf_content_and_totals(client, access_token):
     assert 1_000 < len(ci.data) < 300_000
 
     text = _pdf_streams(ci.data)
-    for expected in (b'COMMERCIAL INVOICE', b'INV-TEST-001', b'ORD-EXPORT-1', b'AWB-TEST-0001',
+    for expected in (b'COMMERCIAL INVOICE', b'INV-TEST-001', b'ORD-EXPORT-1',
                      b'Example Trading Co., Ltd.', b'Corporate No.: 1234567890123',
                      b'EORI No.: DE123456789', b'DAP GERMANY', b'GERMANY', b'JAPAN',
                      b'9503.00', b'3926.40', b'CN - China', b'VN - Vietnam',
@@ -489,6 +489,8 @@ def test_documents_pdf_content_and_totals(client, access_token):
                      b'I/We hereby certify', b'Taro Example', b'Export Manager', b'Same as Consignee'):
         assert expected in text, expected
     assert b'Insurance' not in text                  # 没投保：不印 Insurance 行
+    # 运单号、承运商不印在单证上（单证打包时就出，运单配送时才建）
+    assert b'AWB' not in text and b'AWB-TEST-0001' not in text and b'Carrier' not in text
     lowered = (text + ci.data).lower()
     assert b'exempt' not in lowered and b'consumption' not in lowered
 
@@ -668,7 +670,7 @@ def test_old_snapshot_without_insurance_keeps_document_fingerprint(client, acces
         dn = db.session.get(DN, dn_id)
         data = CustomsService._document_data(dn, CustomsService.build_view(dn))
     assert set(data) == {
-        'currency', 'invoice_number', 'reference', 'awb', 'carrier', 'incoterm', 'terms', 'export_reason',
+        'currency', 'invoice_number', 'reference', 'incoterm', 'terms', 'export_reason',
         'country_of_export', 'destination', 'exporter', 'ship_from', 'consignee', 'items', 'show_net_weight',
         'totals', 'packages', 'signatory_name', 'signatory_title', 'declaration',
     }
@@ -801,42 +803,55 @@ def test_ship_requires_documents_then_locks(client, access_token):
         assert response.get_json()['code'] == 16065
 
 
-def test_tracking_saved_before_shipping_prints_awb_and_bumps_version(client, access_token):
+def test_tracking_number_not_on_documents(client, access_token):
+    """单证不印运单号：出单证后再存运单号，单证照样有效，不升版本，完成发货时填别的号码也不拦"""
     dn_id, task_id = _export_dn_ready(client, access_token)
     first = _issue(client, access_token, dn_id).get_json()
     assert first['version'] == 1
-    ci = client.get(f"/dn/{dn_id}/customs-documents/{first['documents'][0]['id']}/file", headers=_h(access_token))
-    assert b'AWB No.' not in _pdf_streams(ci.data)          # 还没有运单号：不印 AWB 行
 
     response = client.put(f'/delivery/{task_id}/tracking', json={'tracking_number': ' 7946 0000 0001 '},
                           headers=_h(access_token))
     assert response.status_code == 200, response.get_json()
     assert response.get_json()['tracking_number'] == '7946 0000 0001'
-    assert response.get_json()['status'] == 'pending'
 
     view = client.get(f'/dn/{dn_id}/customs', headers=_h(access_token)).get_json()
-    assert view['documents_outdated'] is True           # 运单号计入单证数据：提示重出，不自动作废
-    assert [d['version'] for d in view['current_documents']] == [1, 1]
+    assert view['documents_outdated'] is False
+    assert _issue(client, access_token, dn_id).status_code == 200      # 数据没变：沿用第 1 版
+    ci = client.get(f"/dn/{dn_id}/customs-documents/{first['documents'][0]['id']}/file", headers=_h(access_token))
+    assert b'AWB' not in _pdf_streams(ci.data) and b'7946' not in _pdf_streams(ci.data)
 
-    second = _issue(client, access_token, dn_id)
-    assert second.status_code == 201 and second.get_json()['version'] == 2
-    ci = client.get(f"/dn/{dn_id}/customs-documents/{second.get_json()['documents'][0]['id']}/file",
-                    headers=_h(access_token))
-    assert b'AWB No.' in _pdf_streams(ci.data) and b'7946 0000 0001' in _pdf_streams(ci.data)
-    assert client.get(f'/dn/{dn_id}/customs', headers=_h(access_token)).get_json()['documents_outdated'] is False
-
-    # 完成发货时运单号与 CI 上印的 AWB 不同 → 409 16080（先保存运单号并重出单证）；相同照常
-    rejected = _ship(client, access_token, task_id, tracking_number='7946 0000 0002')
-    assert rejected.status_code == 409 and rejected.get_json()['code'] == 16080
-    assert rejected.get_json()['details'] == {'document_tracking_number': '7946 0000 0001',
-                                              'tracking_number': '7946 0000 0002'}
-    shipped = client.put(f'/delivery/{task_id}/complete/', json={'tracking_number': '7946 0000 0001'},
-                         headers=_h(access_token))
+    shipped = _ship(client, access_token, task_id, tracking_number='7946 0000 0002')
     assert shipped.status_code == 200, shipped.get_json()
-    assert shipped.get_json()['tracking_number'] == '7946 0000 0001'
-
+    assert shipped.get_json()['tracking_number'] == '7946 0000 0002'
     locked = client.put(f'/delivery/{task_id}/tracking', json={'tracking_number': 'X'}, headers=_h(access_token))
     assert locked.status_code == 409 and locked.get_json()['code'] == 16065
+
+
+def test_documents_issued_with_awb_before_the_change_stay_current(client, access_token):
+    """以前签发的单证数据里有 awb / carrier（印着运单号、承运商）：内容其它都一样就不算过期，照常发货；
+    重新生成会出一版不印这两项的"""
+    from warehouse.dn.customs_services import _data_hash
+    dn_id, task_id = _export_dn_ready(client, access_token)
+    with client.application.app_context():
+        carrier = get_carrier()
+        carrier_id, carrier_name = carrier.id, carrier.name
+    response = client.put(f'/delivery/{task_id}/tracking',
+                          json={'tracking_number': 'AWB-LEGACY-1', 'carrier_id': carrier_id}, headers=_h(access_token))
+    assert response.status_code == 200, response.get_json()
+    first = _issue(client, access_token, dn_id).get_json()
+    with client.application.app_context():
+        dn = db.session.get(DN, dn_id)
+        data = CustomsService._document_data(dn, CustomsService.build_view(dn))
+        legacy = _data_hash(dict(data, awb='AWB-LEGACY-1', carrier=carrier_name))
+        for doc in DNDocument.query.filter_by(dn_id=dn_id, status='issued').all():
+            doc.data_sha256 = legacy
+        db.session.commit()
+
+    assert client.get(f'/dn/{dn_id}/customs', headers=_h(access_token)).get_json()['documents_outdated'] is False
+    again = _issue(client, access_token, dn_id)
+    assert again.status_code == 201 and again.get_json()['version'] == first['version'] + 1
+    response = _ship(client, access_token, task_id)
+    assert response.status_code == 200, response.get_json()
 
 
 def test_is_export_visible_on_nested_dn_of_tasks(client, access_token):

@@ -8,37 +8,40 @@ from werkzeug.exceptions import HTTPException
 # 16069  409  海外件发货前单证不可用：details {missing_documents: [...], outdated: bool}
 #             （缺 CI / PL → missing_documents 非空、outdated false；已过期 → missing_documents []、outdated true）
 # 16076  409  有未结束的自动运单（pending / active / unknown / cancelling）时改箱子 / 改报关快照
-#             （reason CARRIER_SHIPMENT_OPEN），或签发除 AWB 外与当前单证不一致的单证（reason DOCUMENT_DATA_CHANGED）：
+#             （reason CARRIER_SHIPMENT_OPEN），或签发与当前单证（随运单提交的）内容不一致的单证（reason DOCUMENT_DATA_CHANGED）：
 #             details {reason, status, carrier, carrier_shipment: {id, status, tracking_number}}
 # 16078  409  有有效自动运单时运单号 / 承运商与运单不一致：details {tracking_number, carrier[, carrier_id]}；
 #             用了本 DN 已取消的自动运单号：details {tracking_number: null, cancelled_tracking_number, carrier,
 #             status: 'cancelled', record_status: 'cancelled' | 'dismissed'}（已确认作废的运单号同样拦）
 # 16079  409  自动运单进行中 / 结果不明 / 正在取消或取消结果不明（pending / unknown / cancelling）：不能建单、存运单号、
 #             完成发货（不带运单号也拦），也不能再点取消（取消进行中）：details {unresolved}
-# 16080  409  完成发货后的运单号与当前 CI 上印的 AWB 不一致（先保存运单号并重出单证）：
-#             details {document_tracking_number, tracking_number}
+# 16080  409  （已不再使用：单证不印运单号）完成发货后的运单号与当前 CI 上印的 AWB 不一致
 # 16088  409  任务已停用（所属 DN / ASN 已取消），不能再操作：details {task_id}
 # 16089  409  拣货任务一件都没拣，不能完成（拣不到货请取消 DN）
 # 16090  409  DN 已有未完成（pending / in_progress）的有效发货任务（手工新建接口已去掉，目前不会出现）：
 #             details {delivery_task_id, status}
 # 16091  409  海外 DN 只能对当前发货任务完成发货 / 存运单号 / 修改：details {delivery_task_id, current_status}
-# 16092  409  完成发货的承运商与当前 CI 上印的不一致（先改承运商并重出单证）：
-#             details {document_carrier, document_carrier_id, carrier_id}
+# 16092  409  （已不再使用：单证不印承运商）完成发货的承运商与当前 CI 上印的不一致
 # 16093  409  取消运单 / 确认作废请求里带的目标与当前记录不符（页面上的记录已变，先重新读取）：
 #             details {expected: 请求里的值, actual: 服务端当前的值}；取消比 tracking_number（规范化后），
 #             确认作废比 unresolved_id（记录 id）
-# 16094  409  确认作废带运单号的记录时，FedEx 没有确认这张运单已取消 / 不存在（明确拒绝取消或结果不明），不能作废：
+# 16094  409  确认作废带运单号的记录时，承运商没有确认这张运单已取消 / 不存在（明确拒绝取消或结果不明），不能作废：
 #             details {unresolved, carrier, tracking_number, result: refused | unclear, http_status, transaction_id,
 #             errors, alerts, maybe_processed}
-# 16095  502  FedEx 已建好运单但 WMS 写库失败（含期间 DN 已发货等业务异常），已按补偿规则处理：
+# 16095  502  承运商已建好运单但 WMS 写库失败（含期间 DN 已发货等业务异常），已按补偿规则处理：
 #             details {carrier, action: 'create', tracking_number, transaction_id, error: {code, message},
 #             compensation: {attempted, cancelled, cancel_transaction_id, error}, unresolved, maybe_processed}
-#             （unresolved 为 null = 已在 FedEx 取消；否则为带运单号的结果不明记录，需重试取消 / 确认作废）
-# 16130  409  FedEx 上门揽收前置条件不满足（未配置 / 公司不在名单 / 揽收地址或电话放不进 FedEx 格式）：details {blockers}
-# 16131  400  揽收预约参数不合法：field = shipment_ids / pickup_date / ready_time / close_time / remarks /
+#             （unresolved 为 null = 已在承运商那边取消；否则为带运单号的结果不明记录，需重试取消 / 确认作废）
+# 16124  400  承运商在线对接的设置不合法（PUT / POST test /carrier/<id>/integration）：field = adapter / enabled /
+#             settings.<key> / secrets.<key>
+# 16125  409  承运商还有未结束的自动运单（pending / active / unknown / cancelling）时删除对接或换插件（取消运单要用这套设置）：
+#             details {shipments: [{id, dn_id, status, tracking_number}]}
+# 16130  409  上门揽收前置条件不满足（承运商没有可用的对接 / 不支持预约揽收 / 揽收地址或电话放不进承运商的格式）：
+#             details {blockers}
+# 16131  400  揽收预约参数不合法：field = carrier_id / shipment_ids / pickup_date / ready_time / close_time / remarks /
 #             notification_email / confirm
 # 16132  409  所选运单不能预约揽收：details {shipments: [{shipment_id, tracking_number, reason: NOT_FOUND | NOT_ACTIVE |
-#             DN_SHIPPED | ALREADY_SCHEDULED, ...}]}
+#             OTHER_CARRIER | DN_SHIPPED | ALREADY_SCHEDULED, ...}]}
 # 16133  409  揽收预约当前状态不能取消（不是 scheduled / 揽收日已过）或确认作废（不是结果不明）：
 #             details {pickup_id, status, reason, pickup_date}
 # 16117  409  单证排不下：某块文字比一页还高（实际是收件人各字段都很长，如各约 240 个 CJK 字符），reportlab LayoutError。
@@ -147,16 +150,18 @@ class GatewayTimeoutException(APIException):
         super().__init__(message, biz_code, 504, field, details)
 
 
-# 承运商运单（FedEx 自动建运单，warehouse/dn/carrier_services.py）业务码
+# 承运商运单（自动建运单，warehouse/dn/carrier_services.py；插件见 warehouse/carrier/integrations）业务码
 CARRIER_BIZ_CODES = {
     16072: "建单前置条件不满足（409，details.blockers）",
     16073: "承运商返回错误 / 结果不明（502，details.errors / transaction_id / maybe_processed / unresolved）",
     16074: "承运商超时或时间预算用完（504，details.maybe_processed / unresolved / budget_exhausted）",
     16075: "没有有效运单可取消 / 没有结果不明的记录可确认作废（409）",
     16076: "有进行中 / 有效 / 结果不明的运单时不能改箱子或报关数据（409）",
-    16077: "label_format 不合法（400）",
+    16077: "label_format 不合法或该承运商不支持（400）",
     16078: "运单号与有效自动运单不一致，或有自动运单时新建 / 删除发货任务（409）",
     16079: "有进行中 / 结果不明的建单记录：不能再建单、不能保存运单号（409，details.unresolved）",
+    16124: "承运商在线对接的设置不合法（400，field）",
+    16125: "承运商还有未结束的自动运单，不能删除对接或换插件（409，details.shipments）",
 }
 
 def register_error_handlers(app):

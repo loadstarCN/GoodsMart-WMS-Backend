@@ -2,7 +2,7 @@
 
 字段名按 FedEx Ship API v1（developer.fedex.com 发布的 OpenAPI）。拿不准的取值集中在本文件顶部的常量里。
 
-规则（写死在这里，改之前先看 README「承运商对接（FedEx）」）：
+规则（写死在这里，改之前先看 README「承运商对接」）：
 - 地址：FedEx 每行 streetLines ≤ 35 字符、最多 3 行，city ≤ 35 字符。放不下就拦截（不截断地址），
   名称（companyName ≤ 35）超长截断。
 - 发件人地址来自一个英文地址字符串（仓库 address_en，没有则公司 address_en）：按换行 / 逗号切段，
@@ -14,13 +14,10 @@
   州代码只对 US / CA / PR 传（两位字母，缺了拦截）。
 - 电话只保留数字。
 - 重量 kg 向上取两位小数（最小 0.01）；外箱尺寸 mm → cm 向上取整。
-- 申告价额按箱均分（余数给前面的箱子），合计等于申告价额。
-- 商品净重：商品主数据有单件重量的行 = 单件重量 × 已打包数量；没有的行分摊「箱子总毛重 − 已知净重」
-  （不为正时按数量占比分摊总毛重），按已打包数量比例分。
+- 每箱申告价额、商品净重由 WMS 算好传进来（warehouse/dn/carrier_services.py）。
 - 面单打印方式（label_format）：A4（激光打印机，PDF + PAPER_85X11_TOP_HALF_LABEL）/ THERMAL（4 英寸面单机，
-  PDF + STOCK_4X6，FedEx 回 4x6 英寸页）。imageType / stock 可按格式用配置覆盖（ZPLII / EPL2 也支持）。
-  注意 PAPER_4X6 在 FedEx 回的是 Letter 页、面单在左上角（sandbox 实测），热敏机要用 STOCK_4X6。
-- 存档页面（page_size，mm）：THERMAL 默认 100x150。FedEx 的 4x6 英寸面单内容几乎铺满整页（离边 0~0.7 mm），
+  PDF + STOCK_4X6，FedEx 回 4x6 英寸页），见 adapter.LABEL_STOCKS；热敏也可以设成 ZPLII / EPL2。
+- 存档页面（page_size，mm）：THERMAL 默认 100x150（承运商设置「热敏面单纸尺寸」）。FedEx 的 4x6 英寸面单内容几乎铺满整页（离边 0~0.7 mm），
   在 100×150 mm 面单纸上按实际大小打印会切边，所以每页等比缩小（只缩不放）居中放到 100×150 的页面上（98.4%）。
   要缩小超过 10% 才放得下的页（例如 Letter 尺寸的单证）保持原样。只对 PDF / PNG 存档生效。
 - 面单存档：响应里所有文档（每箱 packageDocuments、整票 shipmentDocuments）按「面单 → 辅助运单 → 其他」排序，
@@ -56,19 +53,8 @@ TOTAL_WEIGHT_UNIT = 'LB'                # 未确认：requestedShipment.totalWei
 KG_TO_LB = Decimal('2.20462262')
 ETD_SPECIAL_SERVICE = 'ELECTRONIC_TRADE_DOCUMENTS'
 ETD_DOCUMENT_TYPE = 'COMMERCIAL_INVOICE'
-SUPPORTED_LABEL_IMAGE_TYPES = ('PDF', 'PNG', 'ZPLII', 'EPL2')
-SUPPORTED_DUTIES_PAYMENT_TYPES = ('RECIPIENT', 'SENDER')
 
-# 面单打印方式 → 默认 (imageType, labelStockType)；配置 FEDEX_LABEL_<FORMAT>_IMAGE_TYPE / _STOCK_TYPE 可覆盖
-LABEL_FORMATS = ('A4', 'THERMAL')
-DEFAULT_LABEL_FORMAT = 'A4'
-LABEL_FORMAT_DEFAULTS = {
-    'A4': ('PDF', 'PAPER_85X11_TOP_HALF_LABEL'),   # A4 / Letter 普通纸：上半页面单，下半页折叠说明
-    'THERMAL': ('PDF', 'STOCK_4X6'),               # 4x6 英寸（约 100×150 mm）热敏面单纸
-}
-# 面单打印方式 → 存档 PDF 的页面（mm，宽x高）；配置 FEDEX_LABEL_<FORMAT>_PAGE_SIZE 可覆盖。
-# 用真 4x6 英寸纸时设 101.6x152.4（不缩放）
-LABEL_PAGE_SIZE_DEFAULTS = {'THERMAL': '100x150'}
+# 面单存档的页面（mm，宽x高）：parse_page_size 接受的范围
 LABEL_PAGE_SIZE_RANGE_MM = (20, 500)
 LABEL_FIT_MIN_SCALE = 0.9       # 要缩小超过 10% 才放得下的页保持原样
 _PAGE_SIZE_RE = re.compile(r'^\s*(\d+(?:\.\d+)?)\s*[xX×*]\s*(\d+(?:\.\d+)?)\s*$')
@@ -143,21 +129,6 @@ def iso_currency(code):
     return _ISO_FROM_FEDEX.get(code, code) or None
 
 
-def label_settings(config, label_format=None) -> dict:
-    """面单打印方式 → {label_format, image_type, stock_type, page_size}。config 是 dict 样的配置（Flask config）。
-    label_format 为空取 FEDEX_DEFAULT_LABEL_FORMAT；不认识的格式原样返回（由调用方报错）。
-    page_size 是配置原文（'100x150'，没有为 None），用 parse_page_size 解析。"""
-    fmt = (label_format or config.get('FEDEX_DEFAULT_LABEL_FORMAT') or DEFAULT_LABEL_FORMAT).strip().upper()
-    image_default, stock_default = LABEL_FORMAT_DEFAULTS.get(fmt, LABEL_FORMAT_DEFAULTS[DEFAULT_LABEL_FORMAT])
-    page_size = (config.get(f'FEDEX_LABEL_{fmt}_PAGE_SIZE') or LABEL_PAGE_SIZE_DEFAULTS.get(fmt) or '').strip()
-    return {
-        'label_format': fmt,
-        'image_type': (config.get(f'FEDEX_LABEL_{fmt}_IMAGE_TYPE') or image_default).strip().upper(),
-        'stock_type': (config.get(f'FEDEX_LABEL_{fmt}_STOCK_TYPE') or stock_default).strip().upper(),
-        'page_size': page_size or None,
-    }
-
-
 def parse_page_size(text):
     """'100x150'（mm，宽x高；x / × / * 都认）→ (宽, 高)；空 → None；格式不对或超出范围抛 ValueError"""
     if not text:
@@ -197,14 +168,6 @@ def weight_kg(value) -> float:
 
 def mm_to_cm(value) -> int:
     return max(int(math.ceil(int(value) / 10)), 1)
-
-
-def split_evenly(total: int, count: int) -> list:
-    """整数 total 均分成 count 份，余数从第一份起每份 +1；合计等于 total"""
-    if count <= 0:
-        return []
-    base, remainder = divmod(int(total), count)
-    return [base + (1 if index < remainder else 0) for index in range(count)]
 
 
 def _wrap(text, width):
@@ -314,25 +277,6 @@ def consignee_address(consignee: dict, country_code: str) -> dict:
     return address
 
 
-def allocate_commodity_weights(lines, gross_total) -> list:
-    """每行商品重量（kg，Decimal）。lines: [{quantity, unit_weight_kg|None}]；规则见模块说明。"""
-    gross_total = Decimal(str(gross_total or 0))
-    known = [Decimal(str(l['unit_weight_kg'])) * l['quantity'] if l.get('unit_weight_kg') is not None else None
-             for l in lines]
-    unknown_qty = sum(l['quantity'] for l, w in zip(lines, known) if w is None)
-    if unknown_qty:
-        total_qty = sum(l['quantity'] for l in lines) or 1
-        remaining = gross_total - sum(w for w in known if w is not None)
-        if remaining <= 0:
-            remaining = gross_total * Decimal(unknown_qty) / Decimal(total_qty)
-    result = []
-    for line, weight in zip(lines, known):
-        if weight is None:
-            weight = remaining * Decimal(line['quantity']) / Decimal(unknown_qty)
-        result.append(weight)
-    return result
-
-
 # ------------------------------------------------------------------
 # 请求组装
 # ------------------------------------------------------------------
@@ -346,7 +290,7 @@ def build_ship_request(*, account_number, settings, label, ship_date, shipper, r
     """组装 POST /ship/v1/shipments 请求体。
 
     settings: {service_type, pickup_type, duties_payment_type}
-    label: {image_type, stock_type}（label_settings() 的结果）
+    label: {image_type, stock_type}（FedexAdapter.label_options() 的结果）
     shipper / recipient: {company_name, person_name, phone, email, address{...}, tins[]}
     packages: [{gross_weight_kg, length_mm, width_mm, height_mm, declared_value|None}]
     commodities: [{description, origin_country, hs_code, quantity, quantity_unit, unit_value, amount,

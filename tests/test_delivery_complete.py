@@ -3,8 +3,7 @@
 - tracking_number 为空串 / null / 不传 → 不改已存值（国内件也一样）
 - 海外件按写入前的已存状态检查单证：缺 → 409 16069 {missing_documents, outdated: false}；
   过期 → 409 16069 {missing_documents: [], outdated: true}
-- 当前 CI 已印 AWB、请求带了不同的运单号 → 409 16080 {document_tracking_number, tracking_number}；
-  CI 没印 AWB 时照常写入
+- 单证不印运单号 / 承运商：完成发货时填的运单号、承运商与单证无关（以前的 16080 / 16092 不再出现）
 - 有有效自动运单时承运商不一致 → 409 16078（details 带 carrier_id）
 - 检查前先锁 DN 行
 """
@@ -77,7 +76,7 @@ def test_tracking_number_type_and_length_checked(client, access_token):
     assert response.status_code == 200 and response.get_json()['tracking_number'] == '794600000001'
 
 
-def test_export_empty_tracking_keeps_awb_printed_on_ci(client, access_token):
+def test_export_empty_tracking_keeps_saved(client, access_token):
     dn_id, task_id = _export_dn_ready(client, access_token)
     _save_tracking(client, access_token, task_id, 'AWB-SAVED-1')
     assert _issue(client, access_token, dn_id).status_code == 201
@@ -101,8 +100,12 @@ def test_missing_documents_details(client, access_token):
 def test_outdated_documents_block_shipping(client, access_token):
     dn_id, task_id = _export_dn_ready(client, access_token)
     assert _issue(client, access_token, dn_id).status_code == 201
-    # 出单证后才存运单号：单证上没有 AWB → 过期
     _save_tracking(client, access_token, task_id, '7946 0000 0009')
+    # 存运单号不影响单证（不印运单号）；出口资料改了才过期
+    assert client.get(f'/dn/{dn_id}/customs', headers=_h(access_token)).get_json()['documents_outdated'] is False
+    with client.application.app_context():
+        get_company().export_signatory_name = 'Someone Else'
+        db.session.commit()
     assert client.get(f'/dn/{dn_id}/customs', headers=_h(access_token)).get_json()['documents_outdated'] is True
 
     response = _ship(client, access_token, task_id)
@@ -113,7 +116,7 @@ def test_outdated_documents_block_shipping(client, access_token):
     with client.application.app_context():
         assert db.session.get(DN, dn_id).status == 'packed'
 
-    # 重出单证（v2 印 AWB）后照常发货
+    # 重出单证后照常发货
     assert _issue(client, access_token, dn_id).get_json()['version'] == 2
     response = _complete(client, access_token, task_id, {})
     assert response.status_code == 200, response.get_json()
@@ -142,39 +145,21 @@ def test_outdated_check_uses_state_before_writing_request_tracking(client, acces
 
 
 # ---------------------------------------------------------------------------
-# 16080：请求的运单号与 CI 上印的 AWB 不一致
+# 运单号与单证无关
 # ---------------------------------------------------------------------------
 
-def test_tracking_different_from_ci_awb_rejected(client, access_token):
-    dn_id, task_id = _export_dn_ready(client, access_token)
-    _save_tracking(client, access_token, task_id, '7946 0000 0001')
-    assert _issue(client, access_token, dn_id).status_code == 201
-
-    response = _ship(client, access_token, task_id, tracking_number='7946 0000 0002')
-    assert response.status_code == 409, response.get_json()
-    assert response.get_json()['code'] == 16080
-    assert response.get_json()['details'] == {
-        'document_tracking_number': '7946 0000 0001', 'tracking_number': '7946 0000 0002'}
-    assert _task(client, task_id)[:2] == ('in_progress', '7946 0000 0001')
-
-    # 同一号码（空白不同）照常，已存值保持与 CI 一字不差
-    response = _complete(client, access_token, task_id, {'tracking_number': '794600000001'})
-    assert response.status_code == 200, response.get_json()
-    assert response.get_json()['tracking_number'] == '7946 0000 0001'
-
-
-def test_changing_tracking_requires_saving_and_reissuing(client, access_token):
+def test_tracking_changed_after_documents_needs_no_reissue(client, access_token):
+    """单证不印运单号：出单证后改运单号（保存或完成发货时带新号码）都不用重出单证"""
     dn_id, task_id = _export_dn_ready(client, access_token)
     _save_tracking(client, access_token, task_id, 'AWB-OLD')
     assert _issue(client, access_token, dn_id).status_code == 201
-    assert _ship(client, access_token, task_id, tracking_number='AWB-NEW').get_json()['code'] == 16080
-
-    # 按提示：先保存新运单号 → 单证过期 16069 → 重出单证 → 发货
-    _save_tracking(client, access_token, task_id, 'AWB-NEW')
-    assert _complete(client, access_token, task_id, {'tracking_number': 'AWB-NEW'}).get_json()['code'] == 16069
-    assert _issue(client, access_token, dn_id).get_json()['version'] == 2
-    response = _complete(client, access_token, task_id, {'tracking_number': 'AWB-NEW'})
-    assert response.status_code == 200 and response.get_json()['tracking_number'] == 'AWB-NEW'
+    _save_tracking(client, access_token, task_id, 'AWB-NEWER')
+    response = _ship(client, access_token, task_id, tracking_number='AWB-NEW')
+    assert response.status_code == 200, response.get_json()
+    assert response.get_json()['tracking_number'] == 'AWB-NEW'
+    with client.application.app_context():
+        versions = {d.version for d in DNDocument.query.filter_by(dn_id=dn_id)}
+    assert versions == {1}
 
 
 # ---------------------------------------------------------------------------
@@ -257,26 +242,19 @@ def test_carrier_must_match_active_shipment(client, access_token, fedex):
     assert response.get_json()['carrier_id'] == fedex_id
 
 
-def test_same_carrier_code_accepted(client, access_token, fedex):
+def test_other_carrier_record_rejected_even_with_same_code(client, access_token, fedex):
     dn_id, task_id = _ready(client, access_token)
     assert _create(client, access_token, dn_id).status_code == 201
     other_fedex = _other_carrier(client, code='FedEx')      # 另一条 code 也是 fedex 的承运商记录
-    # 自动运单的承运商按 code 比：改任务照常（16078 不拦）
+    # 自动运单记下了建单的承运商（对接账号跟着承运商记录走）：换成另一条记录（哪怕 code 相同）→ 16078
     response = client.put(f'/delivery/{task_id}', json={'carrier_id': other_fedex}, headers=_h(access_token))
-    assert response.status_code == 200, response.get_json()
-    # 但 CI 上印的承运商名称随之变了：运单有效期间不能重签与运单（含 ETD 上传的 CI）不一致的单证
-    # （B-66 → 409 16076 DOCUMENT_DATA_CHANGED），当前 CI 也就过期了，不能照此发货（16069）
-    response = _issue(client, access_token, dn_id)
-    assert response.status_code == 409 and response.get_json()['code'] == 16076
-    details = response.get_json()['details']
-    assert details['reason'] == 'DOCUMENT_DATA_CHANGED' and details['carrier_shipment']['status'] == 'active'
+    assert response.status_code == 409 and response.get_json()['code'] == 16078
+    assert response.get_json()['details']['carrier_id'] == other_fedex
     response = _ship(client, access_token, task_id, carrier_id=other_fedex)
-    assert response.status_code == 409 and response.get_json()['code'] == 16069
-    # 改回原承运商后 CI 不再过期，照常发货
+    assert response.status_code == 409 and response.get_json()['code'] == 16078
+    # 原承运商照常发货
     with client.application.app_context():
         original_id = get_carrier().id
-    response = client.put(f'/delivery/{task_id}', json={'carrier_id': original_id}, headers=_h(access_token))
-    assert response.status_code == 200, response.get_json()
     response = client.put(f'/delivery/{task_id}/complete/', json={'carrier_id': original_id},
                           headers=_h(access_token))
     assert response.status_code == 200, response.get_json()

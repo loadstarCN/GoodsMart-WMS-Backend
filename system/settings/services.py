@@ -54,6 +54,16 @@ def _decrypt(ciphertext: str) -> str:
         return ''
 
 
+def encrypt_secret(plaintext: str) -> str:
+    """加密其它模块要保存的密钥（与系统设置同一把密钥）"""
+    return _encrypt(plaintext)
+
+
+def decrypt_secret(ciphertext: str) -> str:
+    """解密 encrypt_secret 的结果；密钥换过等原因解不开时抛 cryptography.fernet.InvalidToken"""
+    return _get_fernet().decrypt(ciphertext.encode()).decode()
+
+
 class SettingsService:
 
     @staticmethod

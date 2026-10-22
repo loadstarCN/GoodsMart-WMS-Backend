@@ -9,6 +9,15 @@ def _user_ref(user_id):
     user = db.session.get(User, user_id)
     return {'id': user.id, 'user_name': user.user_name} if user else None
 
+
+def _service_name(adapter_code, service_type):
+    """承运商服务代码 → 显示名（INTERNATIONAL_ECONOMY → International Economy）"""
+    if not service_type:
+        return None
+    from warehouse.carrier.integrations import adapter_class
+    from warehouse.carrier.integrations.base import CarrierAdapter
+    return (adapter_class(adapter_code) or CarrierAdapter).service_name(service_type)
+
 class DN(db.Model):
     """发货单主表
     
@@ -483,7 +492,7 @@ class DNDocument(db.Model):
 
 
 class DNCarrierShipment(db.Model):
-    """DN 在承运商系统自动建的运单（目前只有 FedEx），每次建单请求一条记录。
+    """DN 在承运商系统自动建的运单（承运商对接插件，见 warehouse/carrier/integrations），每次建单请求一条记录。
 
     状态：
     - pending：正在请求承运商（请求前先独立提交这条记录）
@@ -525,7 +534,13 @@ class DNCarrierShipment(db.Model):
         nullable=False,
         info={'description': 'DN ID'}
     )
-    carrier = db.Column(db.String(30), nullable=False, info={'description': '承运商适配器（fedex）'})
+    carrier = db.Column(db.String(30), nullable=False, info={'description': '对接插件代码（如 fedex，见 warehouse/carrier/integrations）'})
+    carrier_id = db.Column(
+        db.Integer,
+        db.ForeignKey('carriers.id', ondelete='SET NULL'),
+        nullable=True,
+        info={'description': '建单用的承运商（取消时用它的对接设置；旧记录为空，按 DN 当前承运商找）'}
+    )
     tracking_number = db.Column(db.String(100), nullable=True, index=True,
                                 info={'description': '主运单号（pending / failed / 结果不明且没拿到号码时为空）'})
     package_tracking_numbers = db.Column(db.JSON, nullable=True, info={'description': '每箱运单号（按箱号）'})
@@ -545,7 +560,7 @@ class DNCarrierShipment(db.Model):
     declared_value = db.Column(db.Integer, nullable=True, info={'description': '随运单提交的申告价额（合计）'})
     label_format = db.Column(db.String(10), nullable=True, info={'description': '面单打印方式（A4 / THERMAL）'})
     image_type = db.Column(db.String(10), nullable=True, info={'description': '面单格式（PDF / PNG / ZPLII / EPL2）'})
-    label_stock_type = db.Column(db.String(40), nullable=True, info={'description': '面单纸张（FedEx labelStockType）'})
+    label_stock_type = db.Column(db.String(40), nullable=True, info={'description': '面单纸张（承运商的纸张代码）'})
     label_parts = db.Column(db.JSON, nullable=True,
                             info={'description': '面单存档里的各文档（类型、箱号、页数、是否存入）'})
     label_document_id = db.Column(
@@ -602,10 +617,12 @@ class DNCarrierShipment(db.Model):
         return {
             'id': self.id,
             'carrier': self.carrier,
+            'carrier_id': self.carrier_id,
             'tracking_number': self.tracking_number,
             'package_tracking_numbers': self.package_tracking_numbers or [],
             'status': self.status,
             'service_type': self.service_type,
+            'service_name': _service_name(self.carrier, self.service_type),
             'ship_date': self.ship_date.isoformat() if self.ship_date else None,
             'package_count': self.package_count,
             'net_charge': float(self.net_charge) if self.net_charge is not None else None,
@@ -638,9 +655,9 @@ class DNCarrierShipment(db.Model):
 
 
 class CarrierPickup(db.Model):
-    """向承运商预约的上门揽收（目前只有 FedEx Pickup Request API），每次预约请求一条记录。
+    """向承运商预约的上门揽收（承运商对接插件 supports_pickup，如 FedEx Pickup Request API），每次预约请求一条记录。
 
-    揽收按「仓库 + 日期」约，一次可以带多张自动运单（件数 / 总重量按所带运单的箱子合计）；
+    揽收按「仓库 + 承运商 + 日期」约，一次可以带多张同一承运商的自动运单（件数 / 总重量按所带运单的箱子合计）；
     所带运单的 dn_carrier_shipments.pickup_id 指向本记录，shipments 另存一份快照（运单后来被重约也不丢）。
     状态：
     - pending：正在请求承运商（请求前先独立提交这条记录）
@@ -670,7 +687,13 @@ class CarrierPickup(db.Model):
         nullable=False,
         info={'description': '揽收仓库ID'}
     )
-    carrier = db.Column(db.String(30), nullable=False, info={'description': '承运商适配器（fedex）'})
+    carrier = db.Column(db.String(30), nullable=False, info={'description': '对接插件代码（如 fedex）'})
+    carrier_id = db.Column(
+        db.Integer,
+        db.ForeignKey('carriers.id', ondelete='SET NULL'),
+        nullable=True,
+        info={'description': '预约用的承运商（取消时用它的对接设置）'}
+    )
     status = db.Column(db.String(10), nullable=False, default='pending',
                        info={'description': 'pending / scheduled / cancelled / failed / unknown / dismissed'})
     reason = db.Column(db.String(40), nullable=True,
@@ -723,6 +746,7 @@ class CarrierPickup(db.Model):
             'id': self.id,
             'warehouse_id': self.warehouse_id,
             'carrier': self.carrier,
+            'carrier_id': self.carrier_id,
             'status': self.status,
             'reason': self.reason,
             'error_message': self.error_message,
