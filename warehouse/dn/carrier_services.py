@@ -674,7 +674,8 @@ class CarrierShipmentService:
             raise ConflictException(
                 f"This DN has an active {display_name(shipment.carrier)} shipment {shipment.tracking_number}; the "
                 "tracking number cannot be changed. Cancel the carrier shipment first.", 16078,
-                details={'tracking_number': shipment.tracking_number, 'carrier': shipment.carrier},
+                details={'tracking_number': shipment.tracking_number, 'carrier': shipment.carrier,
+                         'shipment_carrier_id': shipment.carrier_id},
             )
         return shipment.tracking_number
 
@@ -697,7 +698,8 @@ class CarrierShipmentService:
                     f"{record.status}; its tracking number cannot be used any more. Create a new shipment or enter "
                     "another tracking number.", 16078,
                     details={'tracking_number': None, 'cancelled_tracking_number': record.tracking_number,
-                             'carrier': record.carrier, 'status': 'cancelled', 'record_status': record.status},
+                             'carrier': record.carrier, 'shipment_carrier_id': record.carrier_id,
+                             'status': 'cancelled', 'record_status': record.status},
                 )
 
     @staticmethod
@@ -727,6 +729,7 @@ class CarrierShipmentService:
             f"{' ' + record.tracking_number if record.tracking_number else ''}); delivery tasks cannot be "
             f"{action}; {hint}.", 16078,
             details={'tracking_number': record.tracking_number, 'carrier': record.carrier,
+                     'shipment_carrier_id': record.carrier_id,
                      'status': summary['status']},
         )
 

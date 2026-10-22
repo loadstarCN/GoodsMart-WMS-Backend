@@ -81,7 +81,8 @@ class DeliveryTaskService:
         - 请求里的运单号为空视为不改；有效运单时与它不同 → 409 16078（要换运单号先取消自动运单）；
           进行中 / 结果不明时带了运单号 → 409 16079（防止在承运商网站又手工建一张）
         - 有效运单时：请求里的 carrier_id 为 null 视为不改；承运商与运单的不同 → 409 16078
-          （details {tracking_number, carrier, carrier_id}，carrier_id 为请求里的值）"""
+          （details {tracking_number, carrier, carrier_id, shipment_carrier_id}，carrier_id 为请求里的值，
+          shipment_carrier_id 为建这张运单的承运商）"""
         if 'tracking_number' not in payload and 'carrier_id' not in payload:
             return
         from warehouse.dn.carrier_services import CarrierShipmentService
@@ -113,7 +114,8 @@ class DeliveryTaskService:
                 f"This DN has an active {display_name(shipment.carrier)} shipment"
                 f"{' ' + tracking if tracking else ''}; the carrier cannot be changed. "
                 "Cancel the carrier shipment first.", 16078,
-                details={'tracking_number': tracking, 'carrier': shipment.carrier, 'carrier_id': carrier_id},
+                details={'tracking_number': tracking, 'carrier': shipment.carrier, 'carrier_id': carrier_id,
+                         'shipment_carrier_id': shipment.carrier_id},
             )
 
     @staticmethod

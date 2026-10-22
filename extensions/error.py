@@ -10,9 +10,10 @@ from werkzeug.exceptions import HTTPException
 # 16076  409  有未结束的自动运单（pending / active / unknown / cancelling）时改箱子 / 改报关快照
 #             （reason CARRIER_SHIPMENT_OPEN），或签发与当前单证（随运单提交的）内容不一致的单证（reason DOCUMENT_DATA_CHANGED）：
 #             details {reason, status, carrier, carrier_shipment: {id, status, tracking_number}}
-# 16078  409  有有效自动运单时运单号 / 承运商与运单不一致：details {tracking_number, carrier[, carrier_id]}；
+# 16078  409  有有效自动运单时运单号 / 承运商与运单不一致：details {tracking_number, carrier（插件代码）,
+#             shipment_carrier_id（建这张运单的承运商）[, carrier_id（请求里的承运商）]}；
 #             用了本 DN 已取消的自动运单号：details {tracking_number: null, cancelled_tracking_number, carrier,
-#             status: 'cancelled', record_status: 'cancelled' | 'dismissed'}（已确认作废的运单号同样拦）
+#             shipment_carrier_id, status: 'cancelled', record_status: 'cancelled' | 'dismissed'}（已确认作废的运单号同样拦）
 # 16079  409  自动运单进行中 / 结果不明 / 正在取消或取消结果不明（pending / unknown / cancelling）：不能建单、存运单号、
 #             完成发货（不带运单号也拦），也不能再点取消（取消进行中）：details {unresolved}
 # 16080  409  （已不再使用：单证不印运单号）完成发货后的运单号与当前 CI 上印的 AWB 不一致

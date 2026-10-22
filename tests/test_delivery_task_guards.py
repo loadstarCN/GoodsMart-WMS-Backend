@@ -171,8 +171,10 @@ def test_cancelled_tracking_rejected(client, access_token, fedex):
     assert _create(client, access_token, dn_id).status_code == 201
     assert _cancel(client, access_token, dn_id).status_code == 200
     assert client.put(f'/delivery/{task_id}/process/', headers=_h(access_token)).status_code == 200
+    with client.application.app_context():
+        carrier_id = get_carrier().id
     expected = {'tracking_number': None, 'cancelled_tracking_number': '794600000001', 'carrier': 'fedex',
-                'status': 'cancelled', 'record_status': 'cancelled'}
+                'shipment_carrier_id': carrier_id, 'status': 'cancelled', 'record_status': 'cancelled'}
 
     # 完成发货（PDA 表单还停在旧预填值）/ 保存运单号 / 修改任务：已取消的号码（各种写法）→ 16078
     for value in ('794600000001', '7946 0000 0001', '7946-0000-0001'):
@@ -222,7 +224,8 @@ def test_save_tracking_cannot_change_carrier_while_shipment_active(client, acces
         response = _save_tracking(client, access_token, task_id, body)
         assert response.status_code == 409 and response.get_json()['code'] == 16078, body
         assert response.get_json()['details'] == {
-            'tracking_number': '794600000001', 'carrier': 'fedex', 'carrier_id': other_id}
+            'tracking_number': '794600000001', 'carrier': 'fedex', 'carrier_id': other_id,
+            'shipment_carrier_id': fedex_id}
     assert _task(client, task_id) == ('pending', '794600000001', fedex_id)
 
     # 同一承运商照常；取消运单后可以换

@@ -230,7 +230,7 @@ def test_carrier_must_match_active_shipment(client, access_token, fedex):
     response = client.put(f'/delivery/{task_id}', json={'carrier_id': other_id}, headers=_h(access_token))
     assert response.status_code == 409 and response.get_json()['code'] == 16078
     assert response.get_json()['details'] == {
-        'tracking_number': '794600000001', 'carrier': 'fedex', 'carrier_id': other_id}
+        'tracking_number': '794600000001', 'carrier': 'fedex', 'carrier_id': other_id, 'shipment_carrier_id': fedex_id}
     response = _ship(client, access_token, task_id, carrier_id=other_id)
     assert response.status_code == 409 and response.get_json()['code'] == 16078
     assert response.get_json()['details']['carrier_id'] == other_id
@@ -250,6 +250,8 @@ def test_other_carrier_record_rejected_even_with_same_code(client, access_token,
     response = client.put(f'/delivery/{task_id}', json={'carrier_id': other_fedex}, headers=_h(access_token))
     assert response.status_code == 409 and response.get_json()['code'] == 16078
     assert response.get_json()['details']['carrier_id'] == other_fedex
+    with client.application.app_context():
+        assert response.get_json()['details']['shipment_carrier_id'] == get_carrier().id   # 改回用这个
     response = _ship(client, access_token, task_id, carrier_id=other_fedex)
     assert response.status_code == 409 and response.get_json()['code'] == 16078
     # 原承运商照常发货
