@@ -14,6 +14,9 @@ WMS 的仓库现场和管理端均在日本。当前生产 PostgreSQL 会话是 
   `WMS_TIMEZONE`；重启并探测服务。备份路径与 SHA-256 会写入工作流日志。
 - 开关使 Python 的 `datetime.now()` 和 PostgreSQL 应用连接都采用 `Asia/Tokyo`。
   单证日期原本已用 `Asia/Tokyo`，不重复转换。
+- 迁移完成后，已将 WMS 数据库账号在生产库中的默认会话时区也设为 `Asia/Tokyo`
+  （`ALTER ROLE … IN DATABASE … SET timezone`）。这只影响该账号连接该库，
+  不改变 PostgreSQL 实例或其他数据库的默认时区；新建直连会话已验证为日本时间。
 
 ## 历史字段口径
 
