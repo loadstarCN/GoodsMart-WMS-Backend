@@ -270,6 +270,8 @@ WMS pushes event notifications to external systems via Webhook with HMAC-SHA256 
 | `asn.completed` | ASN completed with actual quantities |
 | `asn.cancelled` | A received (not yet sorted) ASN was cancelled |
 | `dn.in_progress` | DN processing started |
+| `dn.picked` | DN picking completed (includes the planned / picked quantity per goods) |
+| `dn.packed` | DN packing completed (includes the planned / picked / packed quantity per goods) |
 | `dn.delivered` | DN delivered (includes tracking number) |
 | `dn.completed` | DN completed |
 | `dn.cancelled` | A DN was cancelled after processing started (`in_progress` / `picked` / `packed`; includes `previous_status` and the picked / packed quantity per goods) |

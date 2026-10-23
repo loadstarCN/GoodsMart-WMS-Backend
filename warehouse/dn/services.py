@@ -862,6 +862,19 @@ class DNService:
         from warehouse.packing.services import PackingTaskService
         PackingTaskService.create_packing_task_from_dn(dn.id,dn.created_by)
 
+        # 来源系统（批发站）据此显示仓库作业进度；拣少了能从 picked_quantity 提前看到
+        webhook_emit('dn.picked', {
+            'dn_id': dn.id, 'status': 'picked', 'order_number': dn.order_number,
+            'details': [
+                {
+                    'goods_code': detail.goods.code if detail.goods else None,
+                    'planned_quantity': detail.quantity,
+                    'picked_quantity': detail.picked_quantity,
+                }
+                for detail in dn.details
+            ],
+        }, api_key_id=dn.api_key_id)
+
         return dn
 
 
@@ -890,6 +903,19 @@ class DNService:
         # 创建发货任务
         from warehouse.delivery.services import DeliveryTaskService
         DeliveryTaskService.create_delivery_task_from_dn(dn.id,dn.created_by)
+
+        webhook_emit('dn.packed', {
+            'dn_id': dn.id, 'status': 'packed', 'order_number': dn.order_number,
+            'details': [
+                {
+                    'goods_code': detail.goods.code if detail.goods else None,
+                    'planned_quantity': detail.quantity,
+                    'picked_quantity': detail.picked_quantity,
+                    'packed_quantity': detail.packed_quantity,
+                }
+                for detail in dn.details
+            ],
+        }, api_key_id=dn.api_key_id)
 
         return dn
 

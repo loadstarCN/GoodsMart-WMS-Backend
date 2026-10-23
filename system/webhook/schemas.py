@@ -20,6 +20,8 @@ EVENT_TYPES = [
     'asn.completed',
     'asn.cancelled',
     'dn.in_progress',
+    'dn.picked',
+    'dn.packed',
     'dn.delivered',
     'dn.completed',
     'dn.cancelled',

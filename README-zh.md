@@ -251,6 +251,8 @@ WMS 通过 Webhook 向外部系统推送事件通知，使用 HMAC-SHA256 签名
 | `asn.completed` | ASN 完成（含实际数量） |
 | `asn.cancelled` | 已收货（未分拣）的 ASN 被取消 |
 | `dn.in_progress` | DN 开始处理 |
+| `dn.picked` | DN 拣货完成（含各商品计划 / 已拣量） |
+| `dn.packed` | DN 打包完成（含各商品计划 / 已拣 / 已打包量） |
 | `dn.delivered` | DN 已发货（含运单号） |
 | `dn.completed` | DN 完成 |
 | `dn.cancelled` | 开始处理后（`in_progress` / `picked` / `packed`）的 DN 被取消（含 `previous_status` 与各商品已拣 / 已打包量） |
