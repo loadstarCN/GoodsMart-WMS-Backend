@@ -1,9 +1,22 @@
 import os
+import time
 from dotenv import load_dotenv
 from datetime import timedelta
 
 # 加载 .env 文件
 load_dotenv()
+
+# The warehouse stores wall-clock times in PostgreSQL timestamp columns without
+# a timezone.  Enable the Japan clock only after the one-time data conversion;
+# the maintenance command writes this flag after its backup and conversion.
+WMS_TIMEZONE = (os.getenv('WMS_TIMEZONE') or '').strip()
+if WMS_TIMEZONE:
+    if WMS_TIMEZONE != 'Asia/Tokyo':
+        raise RuntimeError('WMS_TIMEZONE must be Asia/Tokyo')
+    os.environ['TZ'] = WMS_TIMEZONE
+    if not hasattr(time, 'tzset'):
+        raise RuntimeError('WMS_TIMEZONE requires time.tzset()')
+    time.tzset()
 
 _TRUE_VALUES = ('1', 'true', 'yes', 'on')
 _FALSE_VALUES = ('0', 'false', 'no', 'off')
@@ -124,6 +137,12 @@ class TestingConfig(Config):
 
 class ProductionConfig(Config):
     DEBUG = False
+    # db.func.now() is written into timezone-naive columns.  The PostgreSQL
+    # session must use the same wall clock as Python's datetime.now().
+    SQLALCHEMY_ENGINE_OPTIONS = (
+        {'connect_args': {'options': '-c timezone=Asia/Tokyo'}}
+        if WMS_TIMEZONE else {}
+    )
     # 生产默认严格校验 webhook 地址（显式设为 false 才关，启动时会打 warning）
     WEBHOOK_URL_STRICT = env_bool('WEBHOOK_URL_STRICT', True)
     SQLALCHEMY_DATABASE_URI = os.getenv('SQLALCHEMY_DATABASE_URI', 'sqlite:///test.db')  # 数据库连接    
