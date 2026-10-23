@@ -78,6 +78,8 @@ def _document_nodes(value):
 
 def _message_nodes(value):
     for item in _objects(value):
+        for alert in _objects(item.get('cxsalerts')):
+            yield alert
         for message in _objects(item.get('userMessages')):
             yield message
         for advisory in _objects(item.get('regulatoryCountryAdvisories')):
@@ -97,7 +99,7 @@ def parse_regulatory_response(body):
         kind = str(doc.get('documentType') or '').upper()
         localized = doc.get('localizedAttributes')
         name = ((localized.get('name') if isinstance(localized, dict) else None)
-                or doc.get('fileName') or kind)
+                or doc.get('name') or doc.get('fileName') or kind)
         key = (kind, str(doc.get('id') or ''), str(name))
         if (not kind and not name) or key in seen:
             continue
@@ -114,8 +116,8 @@ def parse_regulatory_response(body):
     return {
         'source': 'fedex_global_trade',
         'documents': documents,
-        'messages': list(dict.fromkeys(str(m.get('text') or m.get('localizedText') or '').strip()
+        'messages': list(dict.fromkeys(str(m.get('text') or m.get('localizedText') or m.get('message') or '').strip()
                                        for m in _message_nodes(output)
-                                       if m.get('text') or m.get('localizedText'))),
+                                       if m.get('text') or m.get('localizedText') or m.get('message'))),
         'transaction_id': body.get('transactionId'),
     }

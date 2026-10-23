@@ -848,6 +848,12 @@ class CarrierShipmentService:
     def _trade_document_plan(regulatory: dict, etd_enabled: bool) -> dict:
         """Classify FedEx's required documents against the PDFs available for this DN."""
         missing, paper, upload_packing_list = [], [], False
+        # Global Trade may mark both invoice variants REQUIRED for one commodity.
+        # When a CI is required, the pro forma entry is an invoice alternative.
+        commercial_invoice_required = any(
+            doc['required'] and doc['document_type'] in ('COMMERCIAL_INVOICE', 'COMMERCIAL_OR_PRO_FORMA_INVOICE')
+            for doc in regulatory['documents']
+        )
         for doc in regulatory['documents']:
             if not doc['required']:
                 continue
@@ -855,7 +861,9 @@ class CarrierShipmentService:
             title = (doc['name'] + ' ' + str(doc.get('message') or '')).upper()
             if kind == 'AIR_WAYBILL' or doc.get('completion_type') == 'COMPLETE':
                 continue
-            available = kind in ('COMMERCIAL_INVOICE', 'COMMERCIAL_OR_PRO_FORMA_INVOICE')
+            available = kind in ('COMMERCIAL_INVOICE', 'COMMERCIAL_OR_PRO_FORMA_INVOICE') or (
+                kind == 'PRO_FORMA_INVOICE' and commercial_invoice_required
+            )
             packing_list = kind == 'PACKING_LIST' or (kind == 'OTHER' and 'PACKING LIST' in title)
             if doc['support_type'] == 'PRINT_ONLY':
                 paper.append(doc)

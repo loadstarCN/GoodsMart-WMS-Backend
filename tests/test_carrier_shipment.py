@@ -662,6 +662,25 @@ def test_regulatory_check_uploads_required_packing_list_and_preserves_paper_copi
     assert _get(client, access_token, dn_id)['shipment']['trade_documents'] == trade
 
 
+def test_global_trade_invoice_alternatives_and_alerts():
+    from warehouse.carrier.integrations.fedex.regulatory import parse_regulatory_response
+    from warehouse.dn.carrier_services import CarrierShipmentService
+
+    body = {'output': {
+        'countryDetails': [{'shipmentDetails': [{'regulatoryDocuments': [
+            {'id': 'WWF001', 'name': 'Commercial Invoice', 'documentType': 'COMMERCIAL_INVOICE',
+             'allowability': 'REQUIRED', 'supportType': 'FEDEX_GENERATED'},
+            {'id': 'FXEF010', 'name': 'Pro Forma Invoice', 'documentType': 'PRO_FORMA_INVOICE',
+             'allowability': 'REQUIRED', 'supportType': 'FEDEX_GENERATED'},
+        ]}]}],
+        'cxsalerts': [{'alertType': 'WARNING', 'message': 'Confirm the destination rules.'}],
+    }}
+    regulatory = parse_regulatory_response(body)
+    assert [d['name'] for d in regulatory['documents']] == ['Commercial Invoice', 'Pro Forma Invoice']
+    assert regulatory['messages'] == ['Confirm the destination rules.']
+    assert CarrierShipmentService._trade_document_plan(regulatory, True)['missing_documents'] == []
+
+
 def test_regulatory_check_blocks_missing_document_before_upload_or_ship(client, access_token, fedex):
     _set_fedex(client, etd_enabled=True, regulatory_check_enabled=True)
     dn_id, _task_id = _ready(client, access_token)
