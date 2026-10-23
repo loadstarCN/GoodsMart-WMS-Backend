@@ -1,6 +1,7 @@
 """DN 承运商运单接口（经承运商对接插件自动建单 / 取消 / 确认作废结果不明的记录，见 warehouse/carrier/integrations）。
 
-权限：读 = dn_read / packing_read / delivery_read；建单 / 取消 / 确认作废 / 刷新跟踪 = packing_edit 或 delivery_edit。
+权限：读 = dn_read / packing_read / delivery_read；建单 / 取消 / 确认作废 = packing_edit 或 delivery_edit；
+刷新跟踪 = delivery_edit（可能当场完成发货 / 签收，与完成发货同一权限）。
 取消 / 确认作废可带目标标识（tracking_number / unresolved_id），与当前记录不符 → 409 16093。
 面单 PDF 用单证下载接口 GET /warehouse/dn/<id>/customs-documents/<label_document_id>/file。
 """
@@ -13,7 +14,7 @@ from warehouse.common import warehouse_required, get_warehouse_owned, require_ac
 
 from .carrier_services import CarrierShipmentService
 from .models import DN
-from .tracking_services import CarrierTrackingService
+from .tracking_services import MANUAL_BUDGET_SECONDS, CarrierTrackingService
 from .schemas import api_ns
 
 carrier_shipment_create_model = api_ns.model('DNCarrierShipmentCreate', {
@@ -42,6 +43,7 @@ carrier_shipment_cancel_model = api_ns.model('DNCarrierShipmentCancel', {
 
 _READ = ["all_access", "company_all_access", "dn_read", "packing_read", "delivery_read"]
 _SHIP_EDIT = ["all_access", "company_all_access", "packing_edit", "delivery_edit"]
+_DELIVERY_EDIT = ["all_access", "company_all_access", "delivery_edit"]
 
 
 def _owned_dn(dn_id: int) -> DN:
@@ -187,17 +189,19 @@ class DNCarrierShipmentDismiss(Resource):
 @api_ns.route('/<int:dn_id>/carrier-shipment/track', '/<int:dn_id>/carrier-shipment/track/')
 class DNCarrierShipmentTrack(Resource):
 
-    @permission_required(_SHIP_EDIT)
+    @permission_required(_DELIVERY_EDIT)
     @warehouse_required()
     def post(self, dn_id):
         """
         Refresh the carrier tracking of the DN's active shipment now (the scheduler does this every
         CARRIER_TRACKING_INTERVAL_MINUTES) and apply it like the scheduler: once the carrier has the parcel a packed DN
         is shipped automatically (dn.delivered), once it is delivered the delivery task is signed (dn.completed);
-        changes are pushed as dn.tracking_updated.
+        changes are pushed as dn.tracking_updated. Needs delivery_edit (it may complete / sign the delivery);
+        the lookup is limited to about 40 seconds.
         Returns the same body as GET (shipment.tracking: {status: label_created | in_transit | out_for_delivery |
         delivered | exception | unknown, code, status_text, picked_up_at, delivered_at, estimated_delivery, events[],
-        error, synced_at, problem}) plus `tracking_sync` {tracked, updated, shipped, signed, problems, errors}.
+        error, synced_at, problem}) plus `tracking_sync` {tracked, updated, shipped, signed, problems, errors,
+        skipped}.
         - 409 16134: no active shipment with a tracking number, or its carrier integration cannot track
         A failed lookup is not an HTTP error: it is recorded in shipment.tracking.error (the last result is kept);
         a step that could not be done automatically is in shipment.tracking.problem.
@@ -206,7 +210,7 @@ class DNCarrierShipmentTrack(Resource):
         record = CarrierShipmentService.active_shipment(dn)
         if record is None or not record.tracking_number or not CarrierTrackingService.supports_tracking(record):
             raise ConflictException("This DN has no active carrier shipment that can be tracked.", 16134)
-        stats = CarrierTrackingService.sync(dn_id=dn.id)
+        stats = CarrierTrackingService.sync(dn_id=dn.id, budget=MANUAL_BUDGET_SECONDS)
         dn = _owned_dn(dn_id)
         return {**CarrierShipmentService.status(dn), 'tracking_sync': stats}, 200
 

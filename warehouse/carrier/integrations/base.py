@@ -174,6 +174,7 @@ class CarrierAdapter:
     max_packages = None         # 一票最多几箱（None = 不限）
     supports_pickup = False     # 能在 WMS 里预约上门揽收（实现了下面的 pickup_* / schedule_pickup / cancel_pickup）
     supports_tracking = False   # 能查跟踪（实现了下面的 track）：WMS 据此自动完成发货 / 签收
+    track_batch_size = 30       # WMS 每次交给 track() 的单号数（一批失败只影响这一批）
     pickup_max_remarks = 60     # 给快递员的留言最多几个字符
 
     def __init__(self, settings=None, secrets=None):

@@ -131,12 +131,23 @@ def normalize_track_result(result: dict) -> dict:
     }
 
 
+def _newest_scan(result: dict) -> str:
+    events = result.get('events') or []
+    return max((e['time'] or '' for e in events), default='')
+
+
 def parse_track_response(body: dict) -> dict:
-    """Track API 响应 → {运单号: normalize_track_result(...)}（同一单号有多条结果时取第一条）"""
+    """Track API 响应 → {运单号: normalize_track_result(...)}。
+    同一单号有多条结果（FedEx 回收再用的单号，新旧包裹都在）时取最新扫描最晚的那条；WMS 另按建单时刻排除旧包裹"""
     results = {}
     for complete in (body.get('output') or {}).get('completeTrackResults') or []:
         number = str(complete.get('trackingNumber') or '').strip()
         track_results = [r for r in complete.get('trackResults') or [] if isinstance(r, dict)]
-        if number and track_results and number not in results:
-            results[number] = normalize_track_result(track_results[0])
+        if not number or not track_results:
+            continue
+        candidates = [normalize_track_result(r) for r in track_results]
+        if number in results:
+            candidates.append(results[number])
+        ok = [c for c in candidates if not c.get('error')]
+        results[number] = max(ok, key=_newest_scan) if ok else candidates[0]
     return results

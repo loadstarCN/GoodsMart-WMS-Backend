@@ -34,6 +34,7 @@ IT = {'date': '2026-10-23T09:00:00+09:00', 'derivedStatusCode': 'IT', 'eventType
                                                          'countryCode': 'US'}}
 DL = {'date': '2026-10-25T14:00:00+02:00', 'derivedStatusCode': 'DL', 'eventType': 'DL',
       'eventDescription': 'Delivered', 'scanLocation': {'city': 'BERLIN', 'countryCode': 'DE'}}
+CREATED_AT = datetime(2026, 10, 21, 15, 0, 0)        # 运单记录的建单时刻（服务器本地时间）
 TEXT = {'OC': 'Label created', 'PU': 'Picked up', 'IT': 'In transit', 'DL': 'Delivered', 'DE': 'Delivery exception'}
 
 
@@ -57,6 +58,8 @@ def _shipped_ready(client, token, fedex):
     key_id = _webhook_key(client)
     with client.application.app_context():
         db.session.get(DN, dn_id).api_key_id = key_id
+        # 建单时刻早于下面造的扫描（晚于建单的扫描才算这张运单的，见 from_older_shipment）
+        DNCarrierShipment.query.filter_by(dn_id=dn_id, status='active').one().created_at = CREATED_AT
         db.session.commit()
     return dn_id, task_id, key_id
 
@@ -258,3 +261,145 @@ def test_manual_refresh_without_shipment(client, access_token, fedex):
     response = client.post(f'/dn/{dn_id}/carrier-shipment/track', headers=_h(access_token))
     assert response.status_code == 409
     assert response.get_json()['code'] == 16134
+
+
+# ---------------------------------------------------------------------------
+# 审核修正（2026-10-23）
+# ---------------------------------------------------------------------------
+
+def _record_id(client, dn_id):
+    with client.application.app_context():
+        return DNCarrierShipment.query.filter_by(dn_id=dn_id, status='active').one().id
+
+
+def test_scans_older_than_the_shipment_are_ignored(client, access_token, fedex):
+    """承运商回收再用的运单号查到旧包裹（揽收 / 送达早于建单）：不自动发货 / 签收，记 error"""
+    dn_id, task_id, key_id = _shipped_ready(client, access_token, fedex)
+    old_pu = {**PU, 'date': '2025-01-03T10:00:00+09:00'}
+    old_dl = {**DL, 'date': '2025-01-05T10:00:00+01:00'}
+    fedex.set(TRACK, (200, _track_body('DL', [old_pu, old_dl], delivered='2025-01-05T10:00:00+01:00')))
+    stats = _sync(client)
+    assert (stats['shipped'], stats['signed']) == (0, 0)
+    state = _state(client, dn_id, task_id)
+    assert (state['dn'], state['task']) == ('packed', 'pending')
+    assert state['tracking']['error'].startswith('TRACKING.OLD_SHIPMENT')
+    assert _events(client, key_id) == []
+
+
+def test_newest_of_duplicate_results_is_used():
+    """同一单号回来新旧两条结果：取最新扫描最晚的那条"""
+    from warehouse.carrier.integrations.fedex.tracking import parse_track_response
+    old = _track_body('DL', [{**PU, 'date': '2025-01-03T10:00:00+09:00'}])['output']['completeTrackResults'][0]
+    new = _track_body('OC', [OC])['output']['completeTrackResults'][0]
+    body = {'output': {'completeTrackResults': [
+        {'trackingNumber': AWB, 'trackResults': old['trackResults'] + new['trackResults']}]}}
+    assert parse_track_response(body)[AWB]['code'] == 'OC'
+
+
+def test_failed_batch_does_not_discard_other_batches(client, access_token, fedex, monkeypatch):
+    """一批请求失败只影响这一批：另一批照常处理（插件 track_batch_size = 1 → 两张运单两批）"""
+    from warehouse.carrier.integrations.fedex.adapter import FedexAdapter
+    from .test_carrier_shipment import _ship_body
+    from .test_customs import _create_dn, _force_packed, PACKAGES
+    from .test_carrier_shipment import _use_fedex
+    first_dn, first_task, key_id = _shipped_ready(client, access_token, fedex)
+    second_dn = _create_dn(client, access_token, order_number='ORD-EXPORT-2').get_json()['id']
+    second_task = _force_packed(client, second_dn)
+    assert client.put(f'/dn/{second_dn}/packages', json={'packages': PACKAGES},
+                      headers=_h(access_token)).status_code == 200
+    _use_fedex(client, second_task)
+    fedex.set('/ship/v1/shipments', (200, _ship_body(tracking='794600000002')))
+    assert _create(client, access_token, second_dn).status_code == 201
+    with client.application.app_context():
+        DNCarrierShipment.query.filter_by(dn_id=second_dn, status='active').one().created_at = CREATED_AT
+        db.session.commit()
+
+    monkeypatch.setattr(FedexAdapter, 'track_batch_size', 1)
+    fedex.set(TRACK, (500, {'errors': [{'code': 'SYSTEM.UNAVAILABLE.EXCEPTION', 'message': 'down'}]}),
+              (200, _track_body('PU', [OC, PU], number='794600000002')))
+    stats = _sync(client)
+    assert (stats['errors'], stats['shipped']) == (1, 1)
+    assert _state(client, first_dn, first_task)['tracking']['error'].startswith('FedEx track')
+    assert _state(client, second_dn, second_task)['dn'] == 'delivered'
+
+
+def test_signed_time_not_before_shipping(client, access_token, fedex):
+    """手动发货晚于承运商的送达时刻：签收时间按完成发货时刻（不早于发货）"""
+    from .test_customs import _ship
+    dn_id, task_id, _key = _shipped_ready(client, access_token, fedex)
+    assert _ship(client, access_token, task_id).status_code == 200
+    fedex.set(TRACK, (200, _track_body('DL', [OC, PU, {**DL, 'date': '2026-10-22T08:00:00+00:00'}],
+                                       delivered='2026-10-22T08:00:00+00:00')))
+    assert _sync(client)['signed'] == 1
+    with client.application.app_context():
+        task = db.session.get(DeliveryTask, task_id)
+        assert task.signed_at == task.completed_at
+
+
+def test_cancelled_or_fresher_record_is_not_overwritten(client, access_token, fedex):
+    """运单已不是有效的这张、或这一轮开始后别人已存了更新的结果：不写、不推"""
+    dn_id, task_id, key_id = _shipped_ready(client, access_token, fedex)
+    record_id = _record_id(client, dn_id)
+    result = {'status': TRACK_IN_TRANSIT, 'code': 'IT', 'events': []}
+    with client.application.app_context():
+        record = db.session.get(DNCarrierShipment, record_id)
+        record.tracking_synced_at = datetime.now()
+        db.session.commit()
+        assert CarrierTrackingService._save(record_id, AWB, result, None, datetime.now() - timedelta(minutes=1)) is False
+        record = db.session.get(DNCarrierShipment, record_id)
+        record.status = 'cancelled'
+        db.session.commit()
+        assert CarrierTrackingService._save(record_id, AWB, result, None, datetime.now()) is False
+        assert db.session.get(DNCarrierShipment, record_id).tracking_status is None
+    assert _events(client, key_id) == []
+
+
+def test_unexpected_error_is_recorded_as_problem(client, access_token, fedex, monkeypatch):
+    from warehouse.delivery.services import DeliveryTaskService
+
+    def boom(*args, **kwargs):
+        raise RuntimeError('db constraint')
+
+    dn_id, task_id, _key = _shipped_ready(client, access_token, fedex)
+    monkeypatch.setattr(DeliveryTaskService, 'complete_task', staticmethod(boom))
+    fedex.set(TRACK, (200, _track_body('PU', [OC, PU])))
+    stats = _sync(client)
+    assert (stats['shipped'], stats['problems'], stats['errors']) == (0, 1, 0)
+    tracking = _state(client, dn_id, task_id)['tracking']
+    assert 'Unexpected error: RuntimeError' in tracking['problem']
+    assert tracking['status'] == TRACK_IN_TRANSIT
+
+
+def test_completed_dn_keeps_tracking_until_delivered(client, access_token, fedex):
+    """仓库手工签收（DN 完成）后，跟踪没到送达前继续更新显示；送达后不再查"""
+    from .test_customs import _ship
+    dn_id, task_id, key_id = _shipped_ready(client, access_token, fedex)
+    assert _ship(client, access_token, task_id).status_code == 200
+    assert client.put(f'/delivery/{task_id}/sign/', json={}, headers=_h(access_token)).status_code == 200
+    fedex.set(TRACK, (200, _track_body('IT', [OC, PU, IT])))
+    assert _sync(client)['tracked'] == 1
+    fedex.set(TRACK, (200, _track_body('DL', [OC, PU, IT, DL], delivered='2026-10-25T14:00:00+02:00')))
+    stats = _sync(client)
+    assert (stats['tracked'], stats['signed']) == (1, 0)
+    assert _state(client, dn_id, task_id)['tracking']['status'] == TRACK_DELIVERED
+    assert _sync(client)['tracked'] == 0
+    completed = [e for e in _events(client, key_id) if e[0] == 'dn.completed']
+    assert completed[0][1]['tracking_number'] == AWB
+
+
+def test_other_plugin_is_not_used_for_tracking(client, access_token, fedex):
+    """运单记录的插件与承运商现在的对接插件不同：不拿别家插件去查"""
+    dn_id, _task, _key = _shipped_ready(client, access_token, fedex)
+    with client.application.app_context():
+        record = DNCarrierShipment.query.filter_by(dn_id=dn_id, status='active').one()
+        record.carrier = 'otherplugin'
+        db.session.commit()
+    response = client.post(f'/dn/{dn_id}/carrier-shipment/track', headers=_h(access_token))
+    assert response.status_code == 409 and response.get_json()['code'] == 16134
+
+
+def test_refresh_needs_delivery_edit(client, access_token, fedex):
+    from .test_process_guards import _staff_token
+    dn_id, _task, _key = _shipped_ready(client, access_token, fedex)
+    packer = _staff_token(client, 'packer-only', ['packing_edit', 'packing_read'])
+    assert client.post(f'/dn/{dn_id}/carrier-shipment/track', headers=packer).status_code == 403

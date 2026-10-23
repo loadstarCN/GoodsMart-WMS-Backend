@@ -1066,16 +1066,21 @@ WMS creates the shipments, so WMS tracks them (plugin capability `CarrierAdapter
 built-in FedEx plugin uses the Track API, which must be enabled in the FedEx developer project). The logic is
 carrier-agnostic, in `warehouse/dn/tracking_services.py`:
 
-- **What is tracked**: `active` automatic shipments with a tracking number whose DN is `packed` / `delivered`, created at
-  most `CARRIER_TRACKING_MAX_DAYS` days ago. The scheduler runs a round every `CARRIER_TRACKING_INTERVAL_MINUTES` minutes
-  (grouped by carrier, at most 30 numbers per request, the round limited to `CARRIER_TRACKING_BUDGET_SECONDS`) without
-  holding row locks while calling the carrier. A turned-off integration is still tracked.
+- **What is tracked**: `active` automatic shipments with a tracking number, created at most `CARRIER_TRACKING_MAX_DAYS`
+  days ago, whose DN is `packed` / `delivered`, or completed (signed by hand) while tracking is not yet delivered (display
+  only). The scheduler runs a round every `CARRIER_TRACKING_INTERVAL_MINUTES` minutes (least recently checked first;
+  grouped by carrier and batched by the plugin's `track_batch_size` - a failed batch only affects that batch; the round is
+  limited to `CARRIER_TRACKING_BUDGET_SECONDS`, the rest waits for the next round) without holding row locks while calling
+  the carrier. A turned-off integration is still tracked; a shipment created by another plugin than the carrier's current
+  one is not. Results whose pickup / delivery is more than 12 hours before the shipment was created (a reused tracking
+  number) are ignored and recorded as `error` (`TRACKING.OLD_SHIPMENT`).
 - **Automatic shipping**: once the carrier has the parcel (`picked_up_at`, or status `in_transit` / `out_for_delivery` /
   `delivered`) and the DN is still `packed`, the delivery is completed in the name of the user who created the shipment
   (a `pending` task is started first; the same checks as a manual *complete* - documents, shipment, expected shipping
   date) and `dn.delivered` is pushed.
 - **Automatic signing**: tracking `delivered` and DN `delivered` → the delivery task is signed (signed time = the
-  carrier's delivery time in the server's local time, like the other WMS timestamps), the DN completes and `dn.completed` is pushed.
+  carrier's delivery time in the server's local time, like the other WMS timestamps, never before the shipping time), the
+  DN completes and `dn.completed` (with `tracking_number`) is pushed.
 - When a step cannot be done (e.g. 16061 expected shipping date later, 16069 outdated documents) the reason is kept in the
   shipment's `tracking_problem` (shown on the delivery page) and retried next round; it is cleared once done. Manual
   completion / signing still works; whichever comes first wins.
@@ -1087,9 +1092,11 @@ carrier-agnostic, in `warehouse/dn/tracking_services.py`:
 - Changes of status / scans push `dn.tracking_updated` (`{dn_id, order_number, carrier, tracking_number, tracking{…}}`,
   `dedupe_key = dn:<id>`: an unsent older update is superseded, only the latest is delivered). Automatic steps run before
   the tracking update is pushed.
-- `POST /warehouse/dn/<id>/carrier-shipment/track` (`packing_edit` / `delivery_edit`) checks now and applies the result the
-  same way; it returns the shipment status plus `tracking_sync {tracked, updated, shipped, signed, problems, errors}`;
-  no trackable shipment → 409 `16134`. `integration.tracks_shipments` tells whether the carrier can be tracked.
+- When a manual refresh and the scheduler overlap, a result saved by someone else after this round started is not
+  overwritten; a cancelled / renumbered shipment is not written.
+- `POST /warehouse/dn/<id>/carrier-shipment/track` (`delivery_edit`: it may complete / sign the delivery) checks now
+  (about 40 s limit) and applies the result the same way; it returns the shipment status plus
+  `tracking_sync {tracked, updated, shipped, signed, problems, errors, skipped}`; no trackable shipment → 409 `16134`. `integration.tracks_shipments` tells whether the carrier can be tracked.
 
 ### Configuration
 

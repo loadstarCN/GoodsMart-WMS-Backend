@@ -132,6 +132,7 @@ class FedexAdapter(CarrierAdapter):
     supports_pickup = True
     pickup_max_remarks = MAX_REMARKS
     supports_tracking = True
+    track_batch_size = MAX_NUMBERS_PER_REQUEST
 
     fields = (
         setting('environment', FIELD_SELECT, required=True, default='sandbox',

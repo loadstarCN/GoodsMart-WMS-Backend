@@ -881,14 +881,18 @@ python scripts/fedex_sandbox_smoke.py [--label-format A4|THERMAL|both] [--packag
 运单是 WMS 建的，所以由 WMS 查承运商跟踪（插件能力 `CarrierAdapter.supports_tracking` + `track()`，内置 FedEx 插件用
 Track API，FedEx 开发者项目里要开通 Track API）。实现在 `warehouse/dn/tracking_services.py`，与具体承运商无关：
 
-- **查哪些**：`active` 的自动运单、有运单号、DN 是 `packed` / `delivered`、建单不超过 `CARRIER_TRACKING_MAX_DAYS` 天。
-  定时任务每 `CARRIER_TRACKING_INTERVAL_MINUTES` 分钟查一轮（按承运商分组、一次最多 30 个单号，整轮受
-  `CARRIER_TRACKING_BUDGET_SECONDS` 约束），调承运商时不占行锁。对接停用了照样查（已建的运单要跟到底）。
+- **查哪些**：`active` 的自动运单、有运单号、建单不超过 `CARRIER_TRACKING_MAX_DAYS` 天，DN 是 `packed` / `delivered`，
+  或 DN 已完成（仓库手工签收）但跟踪还没到送达（只更新显示）。定时任务每 `CARRIER_TRACKING_INTERVAL_MINUTES` 分钟查一轮
+  （最久没查的先查；按承运商分组、按插件的 `track_batch_size` 分批，一批失败只影响这一批；整轮受
+  `CARRIER_TRACKING_BUDGET_SECONDS` 约束，用完的留到下一轮），调承运商时不占行锁。对接停用了照样查（已建的运单要跟到底）；
+  运单记录的插件与承运商现在的对接插件不同时不查。揽收 / 送达时刻早于建单 12 小时以上（承运商回收再用的单号查到旧包裹）
+  的结果不用，记成 `error`（`TRACKING.OLD_SHIPMENT`）。
 - **自动发货**：承运商已经经手（插件给出 `picked_up_at`，或状态是 `in_transit` / `out_for_delivery` / `delivered`）而 DN 还是
   `packed` → 以建运单的人的名义完成发货（`pending` 的发货任务先开始；单证、运单、计划发货日等校验与手动「完成发货」相同），推
   `dn.delivered`。
 - **自动签收**：跟踪是 `delivered` 而 DN 是 `delivered` → 签收发货任务（签收时间 = 承运商的送达时刻，换成
-  服务器本地时间，与 WMS 其他时间列同一口径），DN 完成，推 `dn.completed`。
+  服务器本地时间，与 WMS 其他时间列同一口径；早于完成发货时刻的按完成发货时刻），DN 完成，推 `dn.completed`
+  （带 `tracking_number`）。
 - 做不成（如 16061 计划发货日在后、16069 单证过期）把原因记在运单的 `tracking_problem`（配送页显示），人处理后下一轮再试；
   做成了清空。手动完成发货 / 签收照常可用，谁先到算谁。
 - **跟踪结果**存在 `dn_carrier_shipments.tracking_*`，运单状态接口的 `shipment.tracking`：
@@ -898,8 +902,10 @@ Track API，FedEx 开发者项目里要开通 Track API）。实现在 `warehous
   查询失败只记 `error`，保留上一次的结果。
 - 状态 / 扫描记录有变化时推 `dn.tracking_updated`（`{dn_id, order_number, carrier, tracking_number, tracking{…}}`，
   `dedupe_key = dn:<id>`：没送出去的旧更新被新的取代，只送最新一条）。先自动发货 / 签收、后推跟踪。
-- `POST /warehouse/dn/<id>/carrier-shipment/track`（`packing_edit` / `delivery_edit`）立即查一次并照样处理，回运单状态 +
-  `tracking_sync {tracked, updated, shipped, signed, problems, errors}`；没有可跟踪的运单 → 409 `16134`。
+- 手动刷新与定时任务撞上时，这一轮开始后别人已存了更新结果的不覆盖；运单已取消 / 换号的不写。
+- `POST /warehouse/dn/<id>/carrier-shipment/track`（`delivery_edit`：可能当场完成发货 / 签收）立即查一次（约 40 秒时限）
+  并照样处理，回运单状态 + `tracking_sync {tracked, updated, shipped, signed, problems, errors, skipped}`；
+  没有可跟踪的运单 → 409 `16134`。
   对接信息里的 `integration.tracks_shipments` 表示能跟踪。
 
 ### 配置

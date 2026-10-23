@@ -993,8 +993,18 @@ class DNService:
         for detail in dn.details:
             InventoryService.dn_completed(detail.goods_id,dn.warehouse_id,detail.delivered_quantity)
 
+        # tracking_number：签收的那条发货任务的运单号。dn.delivered 没送到（重试中）时来源系统靠它补上发货信息
+        from warehouse.delivery.models import DeliveryTask
+        signed_task = (
+            DeliveryTask.query
+            .filter(DeliveryTask.dn_id == dn.id, DeliveryTask.is_active == True,
+                    DeliveryTask.status.in_(('signed', 'completed')))
+            .order_by(DeliveryTask.id.desc())
+            .first()
+        )
         webhook_emit('dn.completed', {
             'dn_id': dn.id, 'status': 'completed', 'order_number': dn.order_number,
+            'tracking_number': signed_task.tracking_number if signed_task else None,
             'details': [
                 {
                     'goods_code': detail.goods.code,
