@@ -254,6 +254,7 @@ WMS 通过 Webhook 向外部系统推送事件通知，使用 HMAC-SHA256 签名
 | `dn.picked` | DN 拣货完成（含各商品计划 / 已拣量） |
 | `dn.packed` | DN 打包完成（含各商品计划 / 已拣 / 已打包量） |
 | `dn.delivered` | DN 已发货（含运单号） |
+| `dn.tracking_updated` | 自动运单的承运商跟踪有变化（状态 / 扫描记录，完整的最新结果，见「跟踪」） |
 | `dn.completed` | DN 完成 |
 | `dn.cancelled` | 开始处理后（`in_progress` / `picked` / `packed`）的 DN 被取消（含 `previous_status` 与各商品已拣 / 已打包量） |
 | `goods.spec_updated` | 商品重量 / 尺寸 / 原产国变更（按公司广播，需订阅，见下文） |
@@ -875,6 +876,32 @@ python scripts/fedex_sandbox_smoke.py [--label-format A4|THERMAL|both] [--packag
   结果不明 → 仍 `scheduled`（`reason: cancel_unclear`），可重试。
 - FedEx 确认邮件（`notification_email`）用 `en_US`；运单状态接口的 `shipment.pickup` 给出这张运单的揽收概要。
 
+### 跟踪（揽收后自动发货、送达后自动签收）
+
+运单是 WMS 建的，所以由 WMS 查承运商跟踪（插件能力 `CarrierAdapter.supports_tracking` + `track()`，内置 FedEx 插件用
+Track API，FedEx 开发者项目里要开通 Track API）。实现在 `warehouse/dn/tracking_services.py`，与具体承运商无关：
+
+- **查哪些**：`active` 的自动运单、有运单号、DN 是 `packed` / `delivered`、建单不超过 `CARRIER_TRACKING_MAX_DAYS` 天。
+  定时任务每 `CARRIER_TRACKING_INTERVAL_MINUTES` 分钟查一轮（按承运商分组、一次最多 30 个单号，整轮受
+  `CARRIER_TRACKING_BUDGET_SECONDS` 约束），调承运商时不占行锁。对接停用了照样查（已建的运单要跟到底）。
+- **自动发货**：承运商已经经手（插件给出 `picked_up_at`，或状态是 `in_transit` / `out_for_delivery` / `delivered`）而 DN 还是
+  `packed` → 以建运单的人的名义完成发货（`pending` 的发货任务先开始；单证、运单、计划发货日等校验与手动「完成发货」相同），推
+  `dn.delivered`。
+- **自动签收**：跟踪是 `delivered` 而 DN 是 `delivered` → 签收发货任务（签收时间 = 承运商的送达时刻，换成
+  `DOCUMENT_TIMEZONE` 当地时间），DN 完成，推 `dn.completed`。
+- 做不成（如 16061 计划发货日在后、16069 单证过期）把原因记在运单的 `tracking_problem`（配送页显示），人处理后下一轮再试；
+  做成了清空。手动完成发货 / 签收照常可用，谁先到算谁。
+- **跟踪结果**存在 `dn_carrier_shipments.tracking_*`，运单状态接口的 `shipment.tracking`：
+  `{status, code, status_text, picked_up_at, delivered_at, estimated_delivery, events[], error, synced_at, problem}`。
+  `status` 是归一化的 `label_created` / `in_transit` / `out_for_delivery` / `delivered` / `exception` / `unknown`
+  （`code` 是承运商自己的码，如 FedEx `OC` / `PU` / `DL`；认不出的码一律 `unknown`，不会触发自动发货 / 签收）。
+  查询失败只记 `error`，保留上一次的结果。
+- 状态 / 扫描记录有变化时推 `dn.tracking_updated`（`{dn_id, order_number, carrier, tracking_number, tracking{…}}`，
+  `dedupe_key = dn:<id>`：没送出去的旧更新被新的取代，只送最新一条）。先自动发货 / 签收、后推跟踪。
+- `POST /warehouse/dn/<id>/carrier-shipment/track`（`packing_edit` / `delivery_edit`）立即查一次并照样处理，回运单状态 +
+  `tracking_sync {tracked, updated, shipped, signed, problems, errors}`；没有可跟踪的运单 → 409 `16134`。
+  对接信息里的 `integration.tracks_shipments` 表示能跟踪。
+
 ### 配置
 
 | 变量 | 默认值 | 说明 |
@@ -882,6 +909,9 @@ python scripts/fedex_sandbox_smoke.py [--label-format A4|THERMAL|both] [--packag
 | `CARRIER_CONNECT_TIMEOUT_SECONDS` / `CARRIER_TIMEOUT_SECONDS` | `5` / `30` | 单次请求的连接 / 读取超时（秒）；建单 / 取消时再按剩余总时限收缩 |
 | `CARRIER_CREATE_BUDGET_SECONDS` | `90` | 建单总时限（取令牌 + 电子单证上传 + 建单，最少 10 秒）；要小于 gunicorn / nginx 超时（例如 120 秒）。取消也按这个时限 |
 | `CARRIER_PENDING_STALE_MINUTES` | `10` | `pending` 超过多少分钟按结果不明（`stale`）处理；实际不短于建单总时限 + 75 秒 |
+| `CARRIER_TRACKING_INTERVAL_MINUTES` | `30` | 跟踪定时任务的间隔（分钟），`0` = 不跑 |
+| `CARRIER_TRACKING_MAX_DAYS` | `60` | 只跟建单不超过这么多天的运单 |
+| `CARRIER_TRACKING_BUDGET_SECONDS` | `120` | 一轮跟踪查询的总时限（秒） |
 
 账号、密钥、服务等按承运商存在对接设置里，不用环境变量；密钥用 `SETTINGS_ENCRYPTION_KEY` 加密（生产环境必须设置，见「快速开始」）。
 
@@ -929,7 +959,7 @@ stdout_logfile=/var/log/wms-api.out.log
 | 库存错误 | 15000-15999 | 400 | 库存相关错误 |
 | 状态错误 | 16000-16999 | 400 | 状态流转错误 |
 
-出口单证相关业务码：`14019` 出口资料文本超长、`14020` 国家代码不合法、`16063` 报关结构不合法、`16064` 报关行商品编码不在 DN 明细或重复、`16065` 已发货不可改（409）、`16066` 箱子数据不合法、`16067` 当前状态不能改箱子（409）、`16068` 单证条件不全（409，`details.problems`）、`16069` 发货前单证缺失或已过期（409，`details {missing_documents, outdated}`）、`16070` 不是海外单（409）、`16071` 单证不存在（404）、`16117` 单证排不下——某块文字（通常是收件人信息）一页放不下，请缩短（409，`details {document, reason: LAYOUT_OVERFLOW}`）。承运商运单（自动建运单）：`16072` 建单 / 取消的前置条件不满足（409，`details.blockers`）、`16073` 承运商返回错误或结果不明（502，`details.errors` / `transaction_id` / `maybe_processed`）、`16074` 承运商超时或时间预算用完（504，`details.budget_exhausted`）、`16075` 没有可取消 / 可确认作废的运单记录（409，`details.unresolved`）、`16076` 有进行中 / 有效 / 结果不明 / 取消中的运单时不能改箱子或报关数据，也不能签发数据有变化的单证（409，`details {reason: CARRIER_SHIPMENT_OPEN | DOCUMENT_DATA_CHANGED, status, carrier, carrier_shipment {id, status, tracking_number}}`）、`16077` `label_format` 不合法或该承运商不支持（400）、`16078` 运单号 / 承运商与有效的自动运单不一致，或有自动运单时新建 / 删除发货任务（409）、`16079` 有结果不明 / 进行中的建单记录，或运单正在取消 / 取消结果不明——不能建单、存运单号、发货（409，`details.unresolved`）、`16093` 取消 / 确认作废请求里的目标与当前记录不符（409，`details {expected, actual}`）、`16094` 确认作废带运单号的记录时承运商没有确认已取消 / 不存在（409）、`16095` 承运商已建好运单但 WMS 写库失败，已补偿处理（502，`details {error, compensation, unresolved, …}`）。承运商在线对接：`16124` 对接设置不合法（400，`field`：`adapter` / `enabled` / `settings.<key>` / `secrets.<key>`）、`16125` 承运商还有未结束的自动运单，不能删除对接或换插件（409，`details.shipments`）。上门揽收：`16130` 前置条件不满足（409，`details.blockers`）、`16131` 预约参数不合法（400，`field`）、`16132` 所选运单不能预约（409，`details.shipments[{shipment_id, tracking_number, reason}]`）、`16133` 当前状态不能取消 / 作废（409，`details {pickup_id, status, reason, pickup_date}`）；承运商报错 / 超时同运单（`16073` / `16074`，`details.action` 为 `pickup` / `pickup_cancel` / `pickup_availability`）。已不再使用（单证不再印运单号和承运商）：`16080`（原：完成发货时运单号与 CI 上印的 AWB 不一致）、`16092`（原：完成发货时承运商与 CI 上印的不一致）。发货任务：`16090` DN 已有未完成的发货任务（409，`details {delivery_task_id, status}`）、`16091` 海外 DN 不是当前发货任务（409，`details {delivery_task_id, current_status}`）。错误响应可能带结构化的 `details`。
+出口单证相关业务码：`14019` 出口资料文本超长、`14020` 国家代码不合法、`16063` 报关结构不合法、`16064` 报关行商品编码不在 DN 明细或重复、`16065` 已发货不可改（409）、`16066` 箱子数据不合法、`16067` 当前状态不能改箱子（409）、`16068` 单证条件不全（409，`details.problems`）、`16069` 发货前单证缺失或已过期（409，`details {missing_documents, outdated}`）、`16070` 不是海外单（409）、`16071` 单证不存在（404）、`16117` 单证排不下——某块文字（通常是收件人信息）一页放不下，请缩短（409，`details {document, reason: LAYOUT_OVERFLOW}`）。承运商运单（自动建运单）：`16072` 建单 / 取消的前置条件不满足（409，`details.blockers`）、`16073` 承运商返回错误或结果不明（502，`details.errors` / `transaction_id` / `maybe_processed`）、`16074` 承运商超时或时间预算用完（504，`details.budget_exhausted`）、`16075` 没有可取消 / 可确认作废的运单记录（409，`details.unresolved`）、`16076` 有进行中 / 有效 / 结果不明 / 取消中的运单时不能改箱子或报关数据，也不能签发数据有变化的单证（409，`details {reason: CARRIER_SHIPMENT_OPEN | DOCUMENT_DATA_CHANGED, status, carrier, carrier_shipment {id, status, tracking_number}}`）、`16077` `label_format` 不合法或该承运商不支持（400）、`16078` 运单号 / 承运商与有效的自动运单不一致，或有自动运单时新建 / 删除发货任务（409）、`16079` 有结果不明 / 进行中的建单记录，或运单正在取消 / 取消结果不明——不能建单、存运单号、发货（409，`details.unresolved`）、`16093` 取消 / 确认作废请求里的目标与当前记录不符（409，`details {expected, actual}`）、`16094` 确认作废带运单号的记录时承运商没有确认已取消 / 不存在（409）、`16095` 承运商已建好运单但 WMS 写库失败，已补偿处理（502，`details {error, compensation, unresolved, …}`）。承运商在线对接：`16124` 对接设置不合法（400，`field`：`adapter` / `enabled` / `settings.<key>` / `secrets.<key>`）、`16125` 承运商还有未结束的自动运单，不能删除对接或换插件（409，`details.shipments`）。上门揽收：`16130` 前置条件不满足（409，`details.blockers`）、`16131` 预约参数不合法（400，`field`）、`16132` 所选运单不能预约（409，`details.shipments[{shipment_id, tracking_number, reason}]`）、`16133` 当前状态不能取消 / 作废（409，`details {pickup_id, status, reason, pickup_date}`）；跟踪：`16134` 没有可跟踪的自动运单（409）；承运商报错 / 超时同运单（`16073` / `16074`，`details.action` 为 `pickup` / `pickup_cancel` / `pickup_availability`）。已不再使用（单证不再印运单号和承运商）：`16080`（原：完成发货时运单号与 CI 上印的 AWB 不一致）、`16092`（原：完成发货时承运商与 CI 上印的不一致）。发货任务：`16090` DN 已有未完成的发货任务（409，`details {delivery_task_id, status}`）、`16091` 海外 DN 不是当前发货任务（409，`details {delivery_task_id, current_status}`）。错误响应可能带结构化的 `details`。
 
 作业流程（见上文「作业流程规则」）：`16110` DN 有未结束的承运商运单，请先取消运单（409）、`16111` 调整单已取消（409）、`16112` 调整单当前状态不能取消（409）、`16113` 调整明细无法执行：库位上已没有该商品 / 明细没有库位（409）、`16114` 盘点单有未录入的明细（409，`details.detail_ids`）、`16115` 数值字段不合法（400，`field`）、`16116` 分拣任务的 ASN 不能改（409）、`16120` 移库来源库位没有这个商品（404）、`16121` 同一个 `client_batch_id` 已提交过不同的明细（409，`details {client_batch_id, batch_id}`）、`16122` 修改过调整单明细的人不能审批（409）、`16123` `client_batch_id` 不合法（400）、`44009` 库位有历史记录，请改用停用（409）。任务：`16088` 任务已停用（所属 DN / ASN 已取消，409）、`16089` 拣货一件都没拣不能完成（409）。
 

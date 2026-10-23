@@ -1,5 +1,5 @@
 """FedEx REST API 客户端：OAuth、Ship API（建单 / 取消）、Trade Documents Upload API（ETD 上传）、
-Pickup Request API（查可约时间 / 预约揽收 / 取消揽收）。
+Pickup Request API（查可约时间 / 预约揽收 / 取消揽收）、Track API（查跟踪）。
 
 - 凭证由调用方传入（FedexClient(api_key=…, …)，来自承运商记录的对接设置），不读全局配置；异常与日志里不带任何凭证。
 - OAuth：POST {api_base}/oauth/token（client_credentials），token 进程内按「API 地址 + API Key」缓存到过期前 60 秒；
@@ -21,12 +21,12 @@ import requests
 
 from ..base import (
     STEP_AUTH, STEP_CANCEL, STEP_CREATE, STEP_DOCUMENTS, STEP_PICKUP, STEP_PICKUP_AVAILABILITY, STEP_PICKUP_CANCEL,
-    CarrierError, request_timeout,
+    STEP_TRACK, CarrierError, request_timeout,
 )
 
 logger = logging.getLogger(__name__)
 
-# FedEx 接口路径（developer.fedex.com：Ship API v1 / Trade Documents Upload API v1 / Pickup Request API v1）
+# FedEx 接口路径（developer.fedex.com：Ship API v1 / Trade Documents Upload API v1 / Pickup Request API v1 / Track API v1）
 OAUTH_PATH = '/oauth/token'
 SHIP_PATH = '/ship/v1/shipments'
 CANCEL_PATH = '/ship/v1/shipments/cancel'
@@ -34,6 +34,7 @@ ETD_UPLOAD_PATH = '/documents/v1/etds/upload'
 PICKUP_PATH = '/pickup/v1/pickups'
 PICKUP_CANCEL_PATH = '/pickup/v1/pickups/cancel'
 PICKUP_AVAILABILITY_PATH = '/pickup/v1/pickups/availabilities'
+TRACK_PATH = '/track/v1/trackingnumbers'
 
 # 请求名（写进错误信息）→ CarrierError.step
 TOKEN_REQUEST = 'OAuth token request'
@@ -43,9 +44,10 @@ ETD_UPLOAD = 'trade document upload'
 CREATE_PICKUP = 'create pickup'
 CANCEL_PICKUP = 'cancel pickup'
 PICKUP_AVAILABILITY = 'pickup availability'
+TRACK = 'track shipments'
 _STEPS = {TOKEN_REQUEST: STEP_AUTH, CREATE_SHIPMENT: STEP_CREATE, CANCEL_SHIPMENT: STEP_CANCEL,
           ETD_UPLOAD: STEP_DOCUMENTS, CREATE_PICKUP: STEP_PICKUP, CANCEL_PICKUP: STEP_PICKUP_CANCEL,
-          PICKUP_AVAILABILITY: STEP_PICKUP_AVAILABILITY}
+          PICKUP_AVAILABILITY: STEP_PICKUP_AVAILABILITY, TRACK: STEP_TRACK}
 
 TOKEN_REFRESH_MARGIN_SECONDS = 60
 
@@ -292,3 +294,7 @@ class FedexClient:
         """PUT /pickup/v1/pickups/cancel"""
         return self._call('PUT', f"{self.api_base}{PICKUP_CANCEL_PATH}", CANCEL_PICKUP, json_body=payload,
                           deadline=deadline)
+
+    def track(self, payload: dict, deadline=None) -> dict:
+        """POST /track/v1/trackingnumbers（只查询）"""
+        return self._call('POST', f"{self.api_base}{TRACK_PATH}", TRACK, json_body=payload, deadline=deadline)

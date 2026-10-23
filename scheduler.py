@@ -23,6 +23,8 @@ def init_scheduler(app):
     webhook_interval = int(os.getenv('WEBHOOK_PUSH_INTERVAL_MINUTES', '1'))
     snapshot_hour = int(os.getenv('SNAPSHOT_HOUR', '2'))
     snapshot_minute = int(os.getenv('SNAPSHOT_MINUTE', '0'))
+    # 承运商跟踪（自动完成发货 / 签收），默认每 30 分钟；0 = 不跑
+    tracking_interval = int(os.getenv('CARRIER_TRACKING_INTERVAL_MINUTES', '30'))
 
     app.config['JOBS'] = [
         {
@@ -42,6 +44,14 @@ def init_scheduler(app):
             'misfire_grace_time': 3600,
         },
     ]
+    if tracking_interval > 0:
+        app.config['JOBS'].append({
+            'id': 'carrier_tracking',
+            'func': 'scheduler:_job_carrier_tracking',
+            'trigger': 'interval',
+            'minutes': tracking_interval,
+            'misfire_grace_time': 300,
+        })
 
     scheduler.init_app(app)
     _try_start(app)
@@ -99,6 +109,21 @@ def _job_webhook_push(time_budget=None):
                 logger.info(f'[Scheduler] Webhook push: {sent} sent, {failed} failed')
         except Exception as e:
             logger.error(f'[Scheduler] Webhook push failed: {e}')
+
+
+def _job_carrier_tracking():
+    """定时任务：查有效自动运单的承运商跟踪，自动完成发货 / 签收（warehouse/dn/tracking_services.py）"""
+    app = scheduler.app
+    if app is None:
+        return
+    with app.app_context():
+        try:
+            from warehouse.dn.tracking_services import CarrierTrackingService
+            stats = CarrierTrackingService.sync()
+            if stats['tracked'] or stats['errors']:
+                logger.info(f'[Scheduler] Carrier tracking: {stats}')
+        except Exception as e:
+            logger.error(f'[Scheduler] Carrier tracking failed: {e}')
 
 
 def _job_inventory_snapshot():

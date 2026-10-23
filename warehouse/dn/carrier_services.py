@@ -793,6 +793,8 @@ class CarrierShipmentService:
             'ready': cls is not None and not any(b['code'] in problems for b in blockers),
             # 建好的运单要另约上门揽收（GoodsMart：/warehouse/dn/carrier-pickups）
             'books_pickups': bool(cls is not None and cls.books_pickups()),
+            # 能查跟踪：揽收后自动完成发货、送达后自动签收（warehouse/dn/tracking_services.py）
+            'tracks_shipments': bool(cls is not None and cls.supports_tracking),
         }
 
     @staticmethod

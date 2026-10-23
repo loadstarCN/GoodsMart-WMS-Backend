@@ -240,6 +240,11 @@ def _dismiss(client, token, dn_id, body=None):
                        json={'confirm': True} if body is None else body, headers=_h(token))
 
 
+def _carrier_id(client):
+    with client.application.app_context():
+        return get_carrier().id
+
+
 def _company_id(client):
     with client.application.app_context():
         return get_company().id
@@ -296,7 +301,7 @@ def test_integration_without_keys_or_turned_off(client, access_token, monkeypatc
     assert view['enabled'] is True and view['can_create'] is True
     assert view['integration'] == {'code': 'fedex', 'name': 'FedEx', 'portal_name': 'FedEx Ship Manager',
                                    'portal_url': fedex_adapter.FedexAdapter.portal_url, 'enabled': True,
-                                   'ready': True, 'books_pickups': True}
+                                   'ready': True, 'books_pickups': True, 'tracks_shipments': True}
     assert calls == []
     _set_fedex(client, pickup_type='USE_SCHEDULED_PICKUP')     # 签了定期集荷：不用另约揽收
     assert _get(client, access_token, dn_id)['integration']['books_pickups'] is False
@@ -1651,7 +1656,7 @@ def test_delivery_tasks_and_customs_locked_while_shipment_active(client, access_
     # 删除发货任务 → 16078（手工新建接口已去掉）
     response = client.delete(f'/delivery/{task_id}', headers=_h(access_token))
     assert response.get_json()['details'] == {'tracking_number': '794600000001', 'carrier': 'fedex',
-                                              'status': 'active'}
+                                              'status': 'active', 'shipment_carrier_id': _carrier_id(client)}
     assert response.status_code == 409 and response.get_json()['code'] == 16078
 
     # 报关数据已随运单提交 → 16076（与改箱子同码）

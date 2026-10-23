@@ -8,6 +8,8 @@
   交给这家承运商（地址放不放得下、贸易条件与关税付款方是否矛盾……）；上传电子单证、建单、取消、生成面单文件、测试连接。
 - 上门揽收（可选，supports_pickup = True 的插件）：WMS（warehouse/dn/pickup_services.py）管预约记录的状态机、
   占用运单、件数 / 重量合计；适配器把仓库地址转成承运商的格式、查可约时间、预约、取消。
+- 跟踪（可选，supports_tracking = True 的插件）：WMS（warehouse/dn/tracking_services.py）定时查有效运单、按结果自动完成发货 /
+  签收、推 dn.tracking_updated；适配器只负责查询，并把承运商的状态码归到 TRACK_* 几类。
 
 适配器的调用失败一律抛 CarrierError。maybe_processed 表示请求可能已被承运商处理（读超时、连接中途断开、5xx、
 响应看不懂）：建单时 WMS 按「结果不明」处理（不能再建、要核对），取消时按「取消结果不明」处理。
@@ -33,6 +35,17 @@ STEP_TEST = 'test'              # 测试连接
 STEP_PICKUP = 'pickup'                              # 预约上门揽收
 STEP_PICKUP_CANCEL = 'pickup_cancel'                # 取消揽收预约
 STEP_PICKUP_AVAILABILITY = 'pickup_availability'    # 查可约的揽收日 / 时间
+STEP_TRACK = 'track'                                # 查跟踪
+
+# 跟踪状态：插件把承运商的状态码归到这几类，WMS 只按它决定自动发货 / 签收
+TRACK_LABEL_CREATED = 'label_created'           # 只建了单，承运商还没收到货
+TRACK_IN_TRANSIT = 'in_transit'                 # 已揽收、在途（含通关）
+TRACK_OUT_FOR_DELIVERY = 'out_for_delivery'     # 派送中 / 到网点等收件人自取
+TRACK_DELIVERED = 'delivered'                   # 已送达
+TRACK_EXCEPTION = 'exception'                   # 异常（退回、延误、运单被取消……），要人看
+TRACK_UNKNOWN = 'unknown'                       # 认不出的状态码
+TRACK_STATUSES = (TRACK_LABEL_CREATED, TRACK_IN_TRANSIT, TRACK_OUT_FOR_DELIVERY, TRACK_DELIVERED, TRACK_EXCEPTION,
+                  TRACK_UNKNOWN)
 
 # 面单打印方式（各承运商共用的取值）：A4 = 普通打印机打在 A4 / Letter 纸上；THERMAL = 热敏标签机
 LABEL_FORMATS = ('A4', 'THERMAL')
@@ -160,6 +173,7 @@ class CarrierAdapter:
     label_formats = LABEL_FORMATS
     max_packages = None         # 一票最多几箱（None = 不限）
     supports_pickup = False     # 能在 WMS 里预约上门揽收（实现了下面的 pickup_* / schedule_pickup / cancel_pickup）
+    supports_tracking = False   # 能查跟踪（实现了下面的 track）：WMS 据此自动完成发货 / 签收
     pickup_max_remarks = 60     # 给快递员的留言最多几个字符
 
     def __init__(self, settings=None, secrets=None):
@@ -190,6 +204,7 @@ class CarrierAdapter:
             'portal_url': cls.portal_url,
             'label_formats': list(cls.label_formats),
             'supports_pickup': bool(cls.supports_pickup),
+            'supports_tracking': bool(cls.supports_tracking),
             'fields': [dict(field) for field in cls.fields],
         }
 
@@ -339,4 +354,19 @@ class CarrierAdapter:
         """取消揽收预约。pickup：{confirmation_code, location_code, pickup_date: date}。
         → {reason: None | 'already_cancelled', message, alerts, transaction_id}（承运商回「已取消」也算取消成功）。
         失败抛 CarrierError；响应看不懂抛 maybe_processed 的 CarrierError。"""
+        raise NotImplementedError
+
+    # ------------------------------------------------------------------
+    # 跟踪（supports_tracking = True 时实现）
+    # ------------------------------------------------------------------
+
+    def track(self, tracking_numbers, *, deadline) -> dict:
+        """查一批主运单号的跟踪 → {运单号: {status, code, status_text, picked_up_at, delivered_at, estimated_delivery,
+        events: [{time, code, description, location}]（新的在前）, error}}。
+        - status：TRACK_* 之一；code / status_text：承运商自己的最新状态码与说明
+        - picked_up_at：承运商第一次实际经手（揽收等）的时刻，还没经手为 None。WMS 据此自动完成发货
+        - delivered_at：送达时刻（WMS 据此自动签收）；时刻一律是 UTC ISO 串
+        - estimated_delivery：预计送达日（目的地当地日期 'YYYY-MM-DD'）
+        - error：单号级的错误（查无此号等）不抛，写在这里（其余字段为空）；没返回的单号可以不出现在结果里
+        请求本身失败抛 CarrierError（step = STEP_TRACK）。"""
         raise NotImplementedError

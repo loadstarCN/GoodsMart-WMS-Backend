@@ -1,17 +1,19 @@
 """DN 承运商运单接口（经承运商对接插件自动建单 / 取消 / 确认作废结果不明的记录，见 warehouse/carrier/integrations）。
 
-权限：读 = dn_read / packing_read / delivery_read；建单 / 取消 / 确认作废 = packing_edit 或 delivery_edit。
+权限：读 = dn_read / packing_read / delivery_read；建单 / 取消 / 确认作废 / 刷新跟踪 = packing_edit 或 delivery_edit。
 取消 / 确认作废可带目标标识（tracking_number / unresolved_id），与当前记录不符 → 409 16093。
 面单 PDF 用单证下载接口 GET /warehouse/dn/<id>/customs-documents/<label_document_id>/file。
 """
 from flask import request
 from flask_restx import Resource, fields
 
+from extensions.error import ConflictException
 from system.common import permission_required
 from warehouse.common import warehouse_required, get_warehouse_owned, require_actor_user_id
 
 from .carrier_services import CarrierShipmentService
 from .models import DN
+from .tracking_services import CarrierTrackingService
 from .schemas import api_ns
 
 carrier_shipment_create_model = api_ns.model('DNCarrierShipmentCreate', {
@@ -179,3 +181,32 @@ class DNCarrierShipmentDismiss(Resource):
         confirm = body.get('confirm') if isinstance(body, dict) else None
         unresolved_id = body.get('unresolved_id') if isinstance(body, dict) else None
         return CarrierShipmentService.dismiss(dn, require_actor_user_id(), confirm, unresolved_id), 200
+
+
+@api_ns.doc(security="jsonWebToken")
+@api_ns.route('/<int:dn_id>/carrier-shipment/track', '/<int:dn_id>/carrier-shipment/track/')
+class DNCarrierShipmentTrack(Resource):
+
+    @permission_required(_SHIP_EDIT)
+    @warehouse_required()
+    def post(self, dn_id):
+        """
+        Refresh the carrier tracking of the DN's active shipment now (the scheduler does this every
+        CARRIER_TRACKING_INTERVAL_MINUTES) and apply it like the scheduler: once the carrier has the parcel a packed DN
+        is shipped automatically (dn.delivered), once it is delivered the delivery task is signed (dn.completed);
+        changes are pushed as dn.tracking_updated.
+        Returns the same body as GET (shipment.tracking: {status: label_created | in_transit | out_for_delivery |
+        delivered | exception | unknown, code, status_text, picked_up_at, delivered_at, estimated_delivery, events[],
+        error, synced_at, problem}) plus `tracking_sync` {tracked, updated, shipped, signed, problems, errors}.
+        - 409 16134: no active shipment with a tracking number, or its carrier integration cannot track
+        A failed lookup is not an HTTP error: it is recorded in shipment.tracking.error (the last result is kept);
+        a step that could not be done automatically is in shipment.tracking.problem.
+        """
+        dn = _owned_dn(dn_id)
+        record = CarrierShipmentService.active_shipment(dn)
+        if record is None or not record.tracking_number or not CarrierTrackingService.supports_tracking(record):
+            raise ConflictException("This DN has no active carrier shipment that can be tracked.", 16134)
+        stats = CarrierTrackingService.sync(dn_id=dn.id)
+        dn = _owned_dn(dn_id)
+        return {**CarrierShipmentService.status(dn), 'tracking_sync': stats}, 200
+

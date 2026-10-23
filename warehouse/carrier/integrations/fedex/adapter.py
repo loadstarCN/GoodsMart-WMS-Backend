@@ -1,13 +1,14 @@
-"""FedEx 对接（Ship API 建单 / 取消、Trade Documents Upload API 电子单证、Pickup Request API 上门揽收、OAuth 测试连接）。
+"""FedEx 对接（Ship API 建单 / 取消、Trade Documents Upload API 电子单证、Pickup Request API 上门揽收、Track API 跟踪、
+OAuth 测试连接）。
 
 设置项见 FedexAdapter.fields：账号与 API Key / Secret Key 按承运商记录保存（密钥加密），每家公司用自己的 FedEx 账号。
-请求组装 / 响应解析在 shipment.py、pickup.py（纯函数），HTTP 在 client.py。
+请求组装 / 响应解析在 shipment.py、pickup.py、tracking.py（纯函数），HTTP 在 client.py。
 """
 import logging
 import re
 
 from ..base import (
-    FIELD_BOOLEAN, FIELD_SECRET, FIELD_SELECT, FIELD_TEXT, STEP_DOCUMENTS, STEP_PICKUP, STEP_PICKUP_CANCEL,
+    FIELD_BOOLEAN, FIELD_SECRET, FIELD_SELECT, FIELD_TEXT, STEP_DOCUMENTS, STEP_PICKUP, STEP_PICKUP_CANCEL, STEP_TRACK,
     CarrierAdapter, CarrierError, CarrierResponseError, option, setting,
 )
 from .client import FedexClient
@@ -19,6 +20,7 @@ from .shipment import (
     AddressError, MAX_PACKAGES_PER_REQUEST, SHIPPER_TIN_TYPE, build_label_archive, build_ship_request,
     consignee_address, parse_page_size, parse_ship_response, split_address_text, tin_type_for,
 )
+from .tracking import MAX_NUMBERS_PER_REQUEST, build_track_request, parse_track_response
 
 logger = logging.getLogger(__name__)
 
@@ -129,6 +131,7 @@ class FedexAdapter(CarrierAdapter):
     max_packages = MAX_PACKAGES_PER_REQUEST
     supports_pickup = True
     pickup_max_remarks = MAX_REMARKS
+    supports_tracking = True
 
     fields = (
         setting('environment', FIELD_SELECT, required=True, default='sandbox',
@@ -424,3 +427,20 @@ class FedexAdapter(CarrierAdapter):
                                transaction_id=transaction_id, maybe_processed=True) from exc
         return {'reason': None, 'message': result['message'], 'alerts': result['alerts'],
                 'transaction_id': transaction_id}
+
+    # ------------------------------------------------------------------
+    # 跟踪（Track API）
+    # ------------------------------------------------------------------
+
+    def track(self, tracking_numbers, *, deadline) -> dict:
+        numbers = [n for n in dict.fromkeys(str(n or '').strip() for n in tracking_numbers) if n]
+        results = {}
+        for start in range(0, len(numbers), MAX_NUMBERS_PER_REQUEST):
+            body = self.client().track(build_track_request(numbers[start:start + MAX_NUMBERS_PER_REQUEST]),
+                                       deadline=deadline)
+            try:
+                results.update(parse_track_response(body))
+            except (ValueError, TypeError, AttributeError) as exc:
+                raise CarrierError(f"Unexpected FedEx track response: {exc}", step=STEP_TRACK, status_code=200,
+                                   transaction_id=body.get('transactionId')) from exc
+        return results

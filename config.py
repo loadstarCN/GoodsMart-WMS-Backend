@@ -95,6 +95,10 @@ class Config:
     CARRIER_CREATE_BUDGET_SECONDS = float(os.getenv('CARRIER_CREATE_BUDGET_SECONDS', 90))
     # 建单记录停在 pending 超过这么多分钟按「结果不明」处理（进程被杀等）；实际不短于建单总时限 + 75 秒
     CARRIER_PENDING_STALE_MINUTES = float(os.getenv('CARRIER_PENDING_STALE_MINUTES', 10))
+    # 承运商跟踪（插件支持时）：定时任务的间隔见 scheduler.py（CARRIER_TRACKING_INTERVAL_MINUTES，默认 30，0 = 不跑）。
+    # 只跟建单不超过这么多天的运单；一轮查询的总时限（秒）
+    CARRIER_TRACKING_MAX_DAYS = float(os.getenv('CARRIER_TRACKING_MAX_DAYS', 60))
+    CARRIER_TRACKING_BUDGET_SECONDS = float(os.getenv('CARRIER_TRACKING_BUDGET_SECONDS', 120))
 
 class DevelopmentConfig(Config):
     DEBUG = True # 只在开发环境中启用调试

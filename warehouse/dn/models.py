@@ -506,6 +506,8 @@ class DNCarrierShipment(db.Model):
       面单与运单号都还在，但不能发货，重试取消（或确认作废）后落到 cancelled，承运商明确拒绝取消则回到 active
     一张 DN 同一时刻至多一条 pending / active / unknown / cancelling（部分唯一索引兜底并发）。
     主运单号同时存到发货任务的 tracking_number 上（走现有保存运单号的逻辑）。
+    tracking_*：插件支持跟踪时，定时任务（warehouse/dn/tracking_services.py）查到的跟踪结果；据此自动完成发货 / 签收，
+    做不了的原因记在 tracking_problem。
     """
     __tablename__ = 'dn_carrier_shipments'
 
@@ -602,6 +604,20 @@ class DNCarrierShipment(db.Model):
         nullable=True,
         info={'description': '确认作废人ID'}
     )
+    tracking_status = db.Column(
+        db.String(20), nullable=True,
+        info={'description': '跟踪状态（label_created / in_transit / out_for_delivery / delivered / exception / '
+                             'unknown，见 carrier.integrations.base.TRACK_*；没查到过为空）'})
+    tracking_code = db.Column(db.String(10), nullable=True,
+                              info={'description': '承运商的最新状态码（如 FedEx OC / PU / DL）'})
+    tracking_detail = db.Column(
+        db.JSON, nullable=True,
+        info={'description': '最近一次跟踪结果 {status_text, picked_up_at, delivered_at, estimated_delivery, events[], '
+                             'error}（查询失败时保留上次的结果，只更新 error）'})
+    tracking_synced_at = db.Column(db.DateTime, nullable=True, info={'description': '最近一次查跟踪的时间'})
+    tracking_problem = db.Column(
+        db.String(500), nullable=True,
+        info={'description': '按跟踪自动完成发货 / 签收没做成的原因（之后做成了清空）'})
 
     dn = db.relationship(
         'DN',
@@ -651,6 +667,26 @@ class DNCarrierShipment(db.Model):
             'cancelled_by': self.cancelled_by,
             'dismissed_at': self.dismissed_at.isoformat() if self.dismissed_at else None,
             'dismissed_by': self.dismissed_by,
+            'tracking': self.tracking_payload(),
+        }
+
+    def tracking_payload(self):
+        """跟踪结果（没查过为 None）：{status, code, status_text, picked_up_at, delivered_at, estimated_delivery,
+        events, error, synced_at, problem}"""
+        if self.tracking_synced_at is None and not self.tracking_problem:
+            return None
+        detail = self.tracking_detail or {}
+        return {
+            'status': self.tracking_status,
+            'code': self.tracking_code,
+            'status_text': detail.get('status_text'),
+            'picked_up_at': detail.get('picked_up_at'),
+            'delivered_at': detail.get('delivered_at'),
+            'estimated_delivery': detail.get('estimated_delivery'),
+            'events': detail.get('events') or [],
+            'error': detail.get('error'),
+            'synced_at': self.tracking_synced_at.isoformat() if self.tracking_synced_at else None,
+            'problem': self.tracking_problem,
         }
 
 

@@ -63,7 +63,7 @@ _UNREACHABLE_ERRORS = (
 _stuck_senders = {}
 
 
-def emit(event_type, payload, api_key_id=None):
+def emit(event_type, payload, api_key_id=None, dedupe_key=None):
     """创建 Webhook 事件记录（定向推送）
 
     只为指定的 API Key 创建事件。如果未指定 api_key_id，则不推送
@@ -73,6 +73,8 @@ def emit(event_type, payload, api_key_id=None):
         event_type: 事件类型，如 'dn.delivered', 'asn.completed'
         payload: 事件数据（dict）
         api_key_id: 目标 API Key ID（创建该单据的来源方）
+        dedupe_key: 覆盖键（payload 是完整的最新状态时用，如 dn.tracking_updated 的 'dn:<id>'）：
+            发送前发现同 Key、同类型、同键已有更新的事件，本条作废不发（只送最新的）
     """
     if not api_key_id:
         return
@@ -91,6 +93,7 @@ def emit(event_type, payload, api_key_id=None):
         api_key_id=api_key.id,
         event_type=event_type,
         payload=payload,
+        dedupe_key=dedupe_key,
         status='pending',
     )
     db.session.add(event)
