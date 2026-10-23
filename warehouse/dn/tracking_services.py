@@ -7,7 +7,8 @@ dn.completed）。本模块与具体承运商无关，查询一律经插件（Ca
   （POST /dn/<id>/carrier-shipment/track，不看天数，DN 已完成也能刷新显示）。
 - 承运商已经经手（picked_up_at 有值，或状态是在途 / 派送中 / 已送达）而 DN 还是 packed：以建运单的人的名义完成发货
   （同手动「完成发货」：pending 的发货任务先开始，单证 / 运单 / 计划发货日等校验照旧，推 dn.delivered）。
-- 已送达而 DN 是 delivered：签收发货任务（签收时间 = 承运商的送达时刻，换成仓库当地时间），DN 完成，推 dn.completed。
+- 已送达而 DN 是 delivered：签收发货任务（签收时间 = 承运商的送达时刻，换成服务器本地时间——与 WMS 其他时间列一样是
+  datetime.now() 的口径），DN 完成，推 dn.completed。
 - 自动发货 / 签收做不成（单证没出 / 过期、计划发货日在后……）把原因记在运单的 tracking_problem（配送页显示），
   人处理后下一轮再试；做成了、或这一轮没有要做的就清空。手动完成发货 / 签收照常可用，谁先到算谁。
 - 跟踪结果存到运单记录（tracking_*）；状态 / 扫描记录有变化时推 dn.tracking_updated（只推给创建 DN 的 API Key）。
@@ -29,7 +30,7 @@ from warehouse.carrier.integrations.base import (
 from warehouse.carrier.models import Carrier
 from warehouse.common.locks import lock_row
 from .carrier_services import CarrierShipmentService, _config_number
-from .customs_services import CustomsService, _document_timezone
+from .customs_services import CustomsService
 from .models import DN, DNCarrierShipment
 
 logger = logging.getLogger(__name__)
@@ -61,7 +62,8 @@ def picked_up(result: dict) -> bool:
 
 
 def local_naive(value):
-    """承运商的 UTC ISO 时刻 → 仓库当地时间（naive，与 WMS 其他时间列同一口径）；空 / 纯日期 / 解析不了 → None"""
+    """承运商的 UTC ISO 时刻 → 服务器本地时间（naive，与 WMS 其他时间列的 datetime.now() 同一口径）；
+    空 / 纯日期 / 解析不了 → None"""
     if not value or len(str(value).strip()) <= 10:
         return None
     try:
@@ -70,7 +72,7 @@ def local_naive(value):
         return None
     if moment.tzinfo is None:
         moment = moment.replace(tzinfo=timezone.utc)
-    return moment.astimezone(_document_timezone()).replace(tzinfo=None)
+    return moment.astimezone().replace(tzinfo=None)
 
 
 class AutoActionError(Exception):

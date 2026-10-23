@@ -2,7 +2,7 @@
 
 - 只建了单（OC）：只存跟踪结果，不发货；结果没变不重复推事件
 - 已揽收（PU / 在途）：packed 的 DN 以建运单的人的名义完成发货（推 dn.delivered），再推 dn.tracking_updated
-- 已送达（DL）：签收发货任务（签收时间 = 送达时刻的仓库当地时间），DN 完成；packed 的同一轮先发货再签收
+- 已送达（DL）：签收发货任务（签收时间 = 送达时刻的服务器本地时间），DN 完成；packed 的同一轮先发货再签收
 - 做不成（计划发货日在后 → 16061）记 tracking_problem，改好后下一轮做成并清空
 - 查询失败（HTTP 错误 / 单号级错误）只记 error，保留上次结果
 - 手动刷新 POST /dn/<id>/carrier-shipment/track；没有可跟踪的运单 → 409 16134
@@ -21,7 +21,7 @@ from warehouse.carrier.integrations.fedex.tracking import normalize_track_result
 from warehouse.dn.models import DNCarrierShipment
 from warehouse.dn.tracking_services import CarrierTrackingService
 
-from datetime import date, datetime, timedelta     # helpers 的 import * 会把 datetime 换成模块，放在它后面
+from datetime import date, datetime, timedelta, timezone     # helpers 的 import * 会把 datetime 换成模块，放在它后面
 
 AWB = '794600000001'
 TRACK = '/track/v1/trackingnumbers'
@@ -162,7 +162,8 @@ def test_delivered_on_packed_dn_ships_then_signs(client, access_token, fedex):
     assert (stats['shipped'], stats['signed']) == (1, 1)
     state = _state(client, dn_id, task_id)
     assert (state['dn'], state['task']) == ('completed', 'signed')
-    assert state['signed_at'] == datetime(2026, 10, 25, 21, 0, 0)     # 12:00 UTC → 东京 21:00
+    # 12:00 UTC → 服务器本地时间（与 datetime.now() 同一口径）
+    assert state['signed_at'] == datetime(2026, 10, 25, 12, 0, tzinfo=timezone.utc).astimezone().replace(tzinfo=None)
     assert state['tracking']['delivered_at'] == '2026-10-25T12:00:00+00:00'
     assert [e[0] for e in _events(client, key_id)] == ['dn.delivered', 'dn.completed', 'dn.tracking_updated']
 

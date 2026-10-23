@@ -888,7 +888,7 @@ Track API，FedEx 开发者项目里要开通 Track API）。实现在 `warehous
   `packed` → 以建运单的人的名义完成发货（`pending` 的发货任务先开始；单证、运单、计划发货日等校验与手动「完成发货」相同），推
   `dn.delivered`。
 - **自动签收**：跟踪是 `delivered` 而 DN 是 `delivered` → 签收发货任务（签收时间 = 承运商的送达时刻，换成
-  `DOCUMENT_TIMEZONE` 当地时间），DN 完成，推 `dn.completed`。
+  服务器本地时间，与 WMS 其他时间列同一口径），DN 完成，推 `dn.completed`。
 - 做不成（如 16061 计划发货日在后、16069 单证过期）把原因记在运单的 `tracking_problem`（配送页显示），人处理后下一轮再试；
   做成了清空。手动完成发货 / 签收照常可用，谁先到算谁。
 - **跟踪结果**存在 `dn_carrier_shipments.tracking_*`，运单状态接口的 `shipment.tracking`：

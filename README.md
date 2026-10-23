@@ -1075,7 +1075,7 @@ carrier-agnostic, in `warehouse/dn/tracking_services.py`:
   (a `pending` task is started first; the same checks as a manual *complete* - documents, shipment, expected shipping
   date) and `dn.delivered` is pushed.
 - **Automatic signing**: tracking `delivered` and DN `delivered` → the delivery task is signed (signed time = the
-  carrier's delivery time in `DOCUMENT_TIMEZONE`), the DN completes and `dn.completed` is pushed.
+  carrier's delivery time in the server's local time, like the other WMS timestamps), the DN completes and `dn.completed` is pushed.
 - When a step cannot be done (e.g. 16061 expected shipping date later, 16069 outdated documents) the reason is kept in the
   shipment's `tracking_problem` (shown on the delivery page) and retried next round; it is cleared once done. Manual
   completion / signing still works; whichever comes first wins.
