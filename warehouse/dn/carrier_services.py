@@ -63,7 +63,7 @@ from warehouse.carrier.integrations import display_name, portal_name
 from warehouse.carrier.integrations.base import LABEL_FORMATS, STEP_CREATE, CarrierError, CarrierResponseError, clock
 from warehouse.carrier.models import Carrier
 from warehouse.common.countries import COUNTRY_NAMES_EN
-from .customs_services import CustomsService, DOC_CI, DOC_TYPES, _document_timezone, LOCKED_DN_STATUSES
+from .customs_services import CustomsService, DOC_CI, DOC_PL, DOC_TYPES, _document_timezone, LOCKED_DN_STATUSES
 from .models import DN, DNCarrierShipment, DNDocument
 
 logger = logging.getLogger(__name__)
@@ -829,6 +829,7 @@ class CarrierShipmentService:
             'can_cancel': (target is not None and not CarrierShipmentService.cancel_in_progress(target)
                            and not CustomsService.is_locked(dn)),
             'etd_enabled': bool(adapter is not None and adapter.documents_enabled()),
+            'regulatory_check_enabled': bool(adapter is not None and adapter.trade_requirements_enabled()),
             'default_label_format': adapter.default_label_format() if adapter is not None else None,
             'label_formats': label_formats,
             'declared_value_carriage': customs.declared_value_carriage if customs else None,
@@ -842,6 +843,53 @@ class CarrierShipmentService:
         if alerts is not None:
             payload['alerts'] = alerts
         return payload
+
+    @staticmethod
+    def _trade_document_plan(regulatory: dict, etd_enabled: bool) -> dict:
+        """Classify FedEx's required documents against the PDFs available for this DN."""
+        missing, paper, upload_packing_list = [], [], False
+        for doc in regulatory['documents']:
+            if not doc['required']:
+                continue
+            kind = doc['document_type']
+            title = (doc['name'] + ' ' + str(doc.get('message') or '')).upper()
+            if kind == 'AIR_WAYBILL' or doc.get('completion_type') == 'COMPLETE':
+                continue
+            available = kind in ('COMMERCIAL_INVOICE', 'COMMERCIAL_OR_PRO_FORMA_INVOICE')
+            packing_list = kind == 'PACKING_LIST' or (kind == 'OTHER' and 'PACKING LIST' in title)
+            if doc['support_type'] == 'PRINT_ONLY':
+                paper.append(doc)
+                continue
+            if not etd_enabled:
+                paper.append(doc)
+                continue
+            if not available and not packing_list:
+                missing.append(doc)
+                continue
+            if packing_list:
+                upload_packing_list = True
+        return {'missing_documents': missing, 'paper_documents': paper,
+                'upload_packing_list': upload_packing_list}
+
+    @staticmethod
+    def trade_requirements_preview(dn: DN) -> dict:
+        """Read-only preflight; create queries again so changed goods or destinations are rechecked."""
+        ctx = CarrierShipmentService._collect(dn)
+        if ctx['blockers']:
+            raise ConflictException('Carrier shipment conditions are not met', 16072,
+                                    details={'blockers': ctx['blockers']})
+        adapter = ctx['adapter']
+        if not adapter.trade_requirements_enabled():
+            return {'enabled': False, 'documents': [], 'missing_documents': [], 'paper_documents': []}
+        shipment = dict(ctx['shipment'])
+        shipment['ship_date'] = datetime.now(_document_timezone()).date()
+        try:
+            regulatory = adapter.trade_requirements(shipment, deadline=clock() + 20)
+        except CarrierError as exc:
+            raise _carrier_api_exception(exc, 'regulatory', adapter.code,
+                                         unresolved=None, with_unresolved=True) from exc
+        return {**regulatory, **CarrierShipmentService._trade_document_plan(regulatory, adapter.documents_enabled()),
+                'enabled': True}
 
     # ------------------------------------------------------------------
     # 建单
@@ -901,7 +949,7 @@ class CarrierShipmentService:
         }
 
     @staticmethod
-    def create_shipment(dn: DN, user_id, label_format=None) -> dict:
+    def create_shipment(dn: DN, user_id, label_format=None, supplemental_documents=None) -> dict:
         """POST /dn/<id>/carrier-shipment（三段，见模块说明）。
 
         各段自己提交，不能在外层事务里调用（否则 pending 记录不会先落库、调承运商时还占着锁）。"""
@@ -921,6 +969,7 @@ class CarrierShipmentService:
             raise conflict from exc
 
         state = {'create_sent': False, 'created': None, 'finalized': False}
+        plan['supplemental_documents'] = supplemental_documents or []
         try:
             return CarrierShipmentService._request_and_save(plan, user_id, deadline, state)
         except BaseException as exc:
@@ -976,7 +1025,11 @@ class CarrierShipmentService:
         shipment['ship_date'] = datetime.now(_document_timezone()).date()
         if adapter.documents_enabled():
             ci = current[DOC_CI]
-            shipment['documents'] = {'commercial_invoice': {'content': ci.content, 'file_name': ci.file_name}}
+            pl = current[DOC_PL]
+            shipment['documents'] = {
+                'commercial_invoice': {'content': ci.content, 'file_name': ci.file_name},
+                'packing_list': {'content': pl.content, 'file_name': pl.file_name},
+            }
 
         now = datetime.now()
         record = DNCarrierShipment(
@@ -1015,6 +1068,44 @@ class CarrierShipmentService:
         adapter = CarrierIntegrationService.build(plan['integration'])
         code, name = adapter.code, adapter.name
 
+        if adapter.trade_requirements_enabled():
+            try:
+                regulatory = adapter.trade_requirements(plan['shipment'], deadline=deadline)
+            except CarrierError as exc:
+                CarrierShipmentService._finish(record_id, 'failed', state, reason='regulatory_lookup_failed',
+                                               error_message=exc.message, transaction_id=exc.transaction_id)
+                raise _carrier_api_exception(exc, 'regulatory', code, unresolved=None, with_unresolved=True)
+            plan['regulatory_requirements'] = regulatory
+            document_plan = CarrierShipmentService._trade_document_plan(regulatory, adapter.documents_enabled())
+            required = {(d['document_type'], d['name']) for d in document_plan['missing_documents']}
+            supplied = {(d['document_type'], d['name']) for d in plan['supplemental_documents']}
+            uploadable = {'CERTIFICATE_OF_ORIGIN', 'USMCA_CERTIFICATION_OF_ORIGIN',
+                          'USMCA_COMMERCIAL_INVOICE_CERTIFICATION_OF_ORIGIN', 'PRO_FORMA_INVOICE', 'OTHER'}
+            invalid = supplied - required
+            if invalid or len(supplied) != len(plan['supplemental_documents']):
+                CarrierShipmentService._finish(record_id, 'failed', state, reason='regulatory_documents_invalid')
+                raise ConflictException('Supplemental documents do not match current FedEx requirements', 16072,
+                                        details={'regulatory': regulatory})
+            missing = [d for d in document_plan['missing_documents']
+                       if (d['document_type'], d['name']) not in supplied]
+            if supplied and not adapter.documents_enabled():
+                missing = document_plan['missing_documents']
+            plan['shipment']['upload_packing_list'] = document_plan['upload_packing_list']
+            regulatory['paper_documents'] = document_plan['paper_documents']
+            if supplied:
+                plan['shipment']['documents']['supplemental'] = [
+                    {**item, 'upload_type': item['document_type'] if item['document_type'] in uploadable else 'OTHER'}
+                    for item in plan['supplemental_documents']]
+            if missing:
+                CarrierShipmentService._finish(record_id, 'failed', state, reason='regulatory_documents_missing')
+                raise ConflictException(
+                    "FedEx requires additional trade documents before this shipment can be created.", 16072,
+                    details={'blockers': [
+                        _blocker('REGULATORY_DOCUMENT_REQUIRED', d['name'], document_type=d['document_type'],
+                                 document_url=d['document_url']) for d in missing
+                    ], 'regulatory': regulatory},
+                )
+
         document_ref = None
         if plan['shipment'].get('documents'):
             try:
@@ -1024,6 +1115,9 @@ class CarrierShipmentService:
                 CarrierShipmentService._finish(record_id, 'failed', state, reason='etd_upload_failed',
                                                error_message=exc.message, transaction_id=exc.transaction_id)
                 raise _carrier_api_exception(exc, 'etd_upload', code, unresolved=None, with_unresolved=True)
+
+        primary_document_ref = (document_ref.get('commercial_invoice') if isinstance(document_ref, dict)
+                                else document_ref)
 
         state['create_sent'] = True
         try:
@@ -1039,7 +1133,7 @@ class CarrierShipmentService:
             else:
                 unresolved = CarrierShipmentService._finish(
                     record_id, 'unknown', state, reason='bad_response', error_message=exc.message,
-                    transaction_id=exc.transaction_id, etd_document_id=document_ref)
+                    transaction_id=exc.transaction_id, etd_document_id=primary_document_ref)
             raise BadGatewayException(
                 f"{exc.message}." + (_maybe_created(code) if unresolved else f" The shipment was cancelled in {name}."),
                 16073, details={'carrier': code, 'action': 'create', 'errors': [],
@@ -1052,7 +1146,7 @@ class CarrierShipmentService:
                              "may exist on the %s side", dn_id, name, reason, exc.transaction_id, name)
                 unresolved = CarrierShipmentService._finish(
                     record_id, 'unknown', state, reason=reason, error_message=exc.message,
-                    transaction_id=exc.transaction_id, etd_document_id=document_ref)
+                    transaction_id=exc.transaction_id, etd_document_id=primary_document_ref)
             else:
                 # rejected = 承运商对建单请求本身回了 4xx；not_sent = 请求没发出去（令牌失败、连不上等）
                 if exc.budget_exhausted:
@@ -1063,15 +1157,22 @@ class CarrierShipmentService:
                     reason = 'not_sent'
                 unresolved = CarrierShipmentService._finish(
                     record_id, 'failed', state, reason=reason, error_message=exc.message,
-                    transaction_id=exc.transaction_id, etd_document_id=document_ref)
+                    transaction_id=exc.transaction_id, etd_document_id=primary_document_ref)
             raise _carrier_api_exception(exc, 'create', code, unresolved=unresolved, with_unresolved=True)
 
         # 从这里起承运商那边已有运单：先把运单号独立提交（第 3 段失败 / 进程被杀也留得下号码），之后任何失败都补偿取消
         tracking = result['tracking_number']
+        if plan.get('regulatory_requirements') or document_ref:
+            result['trade_documents'] = {
+                **(result.get('trade_documents') or {}),
+                'regulatory_requirements': plan.get('regulatory_requirements'),
+                'uploaded_documents': (document_ref if isinstance(document_ref, dict)
+                                       else {'commercial_invoice': document_ref} if document_ref else {}),
+            }
         state['created'] = {'tracking_number': tracking, 'transaction_id': result['transaction_id']}
-        CarrierShipmentService._note_created(record_id, tracking, state['created']['transaction_id'], document_ref)
+        CarrierShipmentService._note_created(record_id, tracking, state['created']['transaction_id'], primary_document_ref)
         try:
-            response = CarrierShipmentService._save(plan, adapter, user_id, result, document_ref)
+            response = CarrierShipmentService._save(plan, adapter, user_id, result, primary_document_ref)
         except Exception as exc:
             logger.exception("DN %s: %s shipment %s was created but saving it in WMS failed", dn_id, name, tracking)
             # 补偿取消前另开事务重读记录：提交其实成功（应答丢失等）时记录已是 active —— 不能取消有效运单
@@ -1215,6 +1316,7 @@ class CarrierShipmentService:
         record.label_parts = archive['parts']
         record.label_document_id = label_doc.id
         record.etd_document_id = etd_document_id
+        record.trade_documents = result.get('trade_documents')
         record.transaction_id = result['transaction_id'] or record.transaction_id
         db.session.flush()
         db.session.expire(dn, ['carrier_shipments', 'customs_documents'])

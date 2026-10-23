@@ -5,10 +5,14 @@
 取消 / 确认作废可带目标标识（tracking_number / unresolved_id），与当前记录不符 → 409 16093。
 面单 PDF 用单证下载接口 GET /warehouse/dn/<id>/customs-documents/<label_document_id>/file。
 """
+import io
+
 from flask import request
 from flask_restx import Resource, fields
+from pypdf import PdfReader
+from werkzeug.utils import secure_filename
 
-from extensions.error import ConflictException
+from extensions.error import BadRequestException, ConflictException
 from system.common import permission_required
 from warehouse.common import warehouse_required, get_warehouse_owned, require_actor_user_id
 
@@ -48,6 +52,16 @@ _DELIVERY_EDIT = ["all_access", "company_all_access", "delivery_edit"]
 
 def _owned_dn(dn_id: int) -> DN:
     return get_warehouse_owned(DN, dn_id, what='DN')
+
+
+@api_ns.doc(security="jsonWebToken")
+@api_ns.route('/<int:dn_id>/carrier-shipment/trade-requirements')
+class DNCarrierTradeRequirements(Resource):
+    @permission_required(_READ)
+    @warehouse_required()
+    def get(self, dn_id):
+        """Query FedEx Global Trade for documents required by the current destination and goods."""
+        return CarrierShipmentService.trade_requirements_preview(_owned_dn(dn_id)), 200
 
 
 @api_ns.doc(security="jsonWebToken")
@@ -116,8 +130,32 @@ class DNCarrierShipmentResource(Resource):
         """
         dn = _owned_dn(dn_id)
         body = request.get_json(silent=True)
-        label_format = body.get('label_format') if isinstance(body, dict) else None
-        return CarrierShipmentService.create_shipment(dn, require_actor_user_id(), label_format), 201
+        label_format = body.get('label_format') if isinstance(body, dict) else request.form.get('label_format')
+        files = request.files.getlist('trade_documents')
+        types = request.form.getlist('trade_document_types')
+        names = request.form.getlist('trade_document_names')
+        if len(files) != len(types) or len(files) != len(names) or len(files) > 8:
+            raise BadRequestException('Invalid number of supplemental trade documents', 16161)
+        supplemental = []
+        for file, document_type, document_name in zip(files, types, names):
+            content = file.read(5 * 1024 * 1024 + 1)
+            if (not content.startswith(b'%PDF-') or len(content) > 5 * 1024 * 1024
+                    or not document_name.strip() or len(document_name) > 120):
+                raise BadRequestException('Trade documents must be valid PDF files of at most 5 MB', 16161)
+            try:
+                if not PdfReader(io.BytesIO(content)).pages:
+                    raise ValueError('empty PDF')
+            except Exception as exc:
+                raise BadRequestException('Invalid trade document PDF', 16161) from exc
+            safe_name = secure_filename(file.filename or '') or 'document.pdf'
+            if not safe_name.lower().endswith('.pdf'):
+                raise BadRequestException('Trade document filename must end in .pdf', 16161)
+            supplemental.append({'document_type': document_type.strip().upper(),
+                                 'name': document_name.strip(),
+                                 'file_name': safe_name,
+                                 'content': content})
+        return CarrierShipmentService.create_shipment(
+            dn, require_actor_user_id(), label_format, supplemental_documents=supplemental), 201
 
 
 @api_ns.doc(security="jsonWebToken")

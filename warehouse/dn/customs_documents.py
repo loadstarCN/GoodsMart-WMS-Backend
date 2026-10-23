@@ -19,8 +19,10 @@ from reportlab.lib.units import mm
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.cidfonts import UnicodeCIDFont
 from reportlab.pdfbase.ttfonts import TTFont
-from reportlab.platypus import KeepTogether, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+from reportlab.platypus import Image, KeepTogether, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 from reportlab.platypus.doctemplate import LayoutError
+
+from .customs_signature import SignatureImage
 
 logger = logging.getLogger(__name__)
 
@@ -310,7 +312,7 @@ def _common_pairs(data, meta, commercial: bool):
     return pairs
 
 
-def render_commercial_invoice(data: dict, meta: dict) -> bytes:
+def render_commercial_invoice(data: dict, meta: dict, signature_image: SignatureImage | None = None) -> bytes:
     kit = _Kit()
     currency = data['currency']
     story = [
@@ -358,12 +360,20 @@ def render_commercial_invoice(data: dict, meta: dict) -> bytes:
     story.append(_totals_table(kit, total_rows, bold_labels=('Total Invoice Value',)))
     story.append(Spacer(1, 6 * mm))
 
+    signed_mark = ''
+    if signature_image is not None:
+        scale = min(58 * mm / signature_image.width, 18 * mm / signature_image.height)
+        width = signature_image.width * scale
+        height = signature_image.height * scale
+        signed_mark = Image(io.BytesIO(signature_image.content), width=width, height=height, mask='auto')
     signature = Table([
-        [kit.p('Signature', kit.label), ''],
+        [kit.p('Signature', kit.label), signed_mark],
         [kit.p('Name', kit.label), kit.p(data['signatory_name'] or '', kit.normal)],
         [kit.p('Title', kit.label), kit.p(data['signatory_title'] or '', kit.normal)],
         [kit.p('Date', kit.label), kit.p(meta['invoice_date'], kit.normal)],
-    ], colWidths=[25 * mm, 70 * mm], rowHeights=[12 * mm, None, None, None], hAlign='LEFT')
+    ], colWidths=[25 * mm, 70 * mm], rowHeights=[max(12 * mm, signed_mark.drawHeight + 3 * mm)
+                                                   if signature_image is not None else 12 * mm, None, None, None],
+       hAlign='LEFT')
     signature.setStyle(TableStyle([
         ('VALIGN', (0, 0), (-1, -1), 'BOTTOM'),
         ('LINEBELOW', (1, 0), (1, 0), 0.6, colors.black),

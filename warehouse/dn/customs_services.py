@@ -25,6 +25,7 @@ from extensions.error import BadRequestException, ConflictException, NotFoundExc
 from extensions.transaction import transactional
 from warehouse.common.countries import COUNTRY_NAMES_EN, is_valid_country, normalize_country
 from warehouse.common.locks import lock_row
+from .customs_signature import SignatureUnavailable, company_signature_policy, load_company_signature
 from .models import DN, DNCustoms, DNPackage, DNDocument
 
 DOC_CI = 'commercial_invoice'
@@ -658,7 +659,7 @@ class CustomsService:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _exporter(dn: DN) -> dict:
+    def _exporter(dn: DN, signature_policy=None) -> dict:
         company = dn.warehouse.company
         warehouse = dn.warehouse
         company_country = (company.country_code or '').upper() or None
@@ -686,8 +687,10 @@ class CustomsService:
             'contact_name': company.export_contact_name,
             'tax_id_label': company.tax_id_label,
             'tax_id': company.tax_id,
-            'signatory_name': company.export_signatory_name,
-            'signatory_title': company.export_signatory_title,
+            'signatory_name': (signature_policy.signatory_name if signature_policy
+                               else company.export_signatory_name),
+            'signatory_title': (signature_policy.signatory_title if signature_policy
+                                else company.export_signatory_title),
             'ship_from': ship_from,
         }
 
@@ -867,7 +870,16 @@ class CustomsService:
         gross_total = sum((Decimal(str(p['gross_weight_kg'])) for p in packages), Decimal(0))
 
         # ---- 单据级检查 ----
-        exporter = CustomsService._exporter(dn)
+        signature_policy = None
+        signature_unavailable = False
+        if customs is not None:
+            try:
+                signature_policy = company_signature_policy(dn.warehouse.company_id, dn.id)
+                load_company_signature(dn.warehouse.company_id, dn.id)
+            except SignatureUnavailable as exc:
+                signature_unavailable = True
+                problem('EXPORT_SIGNATURE_UNAVAILABLE', 'error', str(exc), field='company.export_signatory_name')
+        exporter = CustomsService._exporter(dn, signature_policy)
         consignee = CustomsService._consignee(dn, customs)
         recipient_country = None
         if customs is not None:
@@ -979,8 +991,11 @@ class CustomsService:
         }
         # 当前单证与现在的数据不一致 → 要重新签发（不自动作废；发货前 assert_ready_to_ship 拦）
         if customs is not None and current_docs:
-            hashes = CustomsService._content_hashes(dn, CustomsService._document_data(dn, view))
-            view['documents_outdated'] = any(doc.data_sha256 not in hashes for doc in current_docs.values())
+            if signature_unavailable:
+                view['documents_outdated'] = True
+            else:
+                hashes = CustomsService._content_hashes(dn, CustomsService._document_data(dn, view))
+                view['documents_outdated'] = any(doc.data_sha256 not in hashes for doc in current_docs.values())
         return view
 
     @staticmethod
@@ -1092,6 +1107,9 @@ class CustomsService:
             data['totals']['insurance'] = format_money(totals['insurance'], currency)
         if customs.declared_value_carriage is not None:
             data['declared_value_carriage'] = format_money(customs.declared_value_carriage, currency)
+        signature = load_company_signature(dn.warehouse.company_id, dn.id)
+        if signature is not None:
+            data['signature_sha256'] = signature.sha256
         return data
 
     @staticmethod
@@ -1122,6 +1140,12 @@ class CustomsService:
             )
 
         data = CustomsService._document_data(dn, view)
+        try:
+            signature = load_company_signature(dn.warehouse.company_id, dn.id)
+        except SignatureUnavailable as exc:
+            raise ConflictException(str(exc), 16068) from exc
+        if signature is not None and data.get('signature_sha256') != signature.sha256:
+            raise ConflictException('The exporter signature changed while issuing documents; retry.', 16068)
         data_sha256 = _data_hash(data)
 
         current = CustomsService.current_documents(dn)
@@ -1149,7 +1173,7 @@ class CustomsService:
             (DOC_PL, 'PL', render_packing_list),
         ):
             try:
-                content = render(data, meta)
+                content = render(data, meta, signature) if doc_type == DOC_CI else render(data, meta)
             except DocumentLayoutError as exc:
                 # 某块文字（几乎总是收件人：各字段都很长且多为 CJK）比一页还高，reportlab 排不下。
                 # 整个事务回滚（上面作废的旧单证也恢复），返回 409 让用户缩短收件人信息

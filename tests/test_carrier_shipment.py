@@ -42,6 +42,7 @@ API_KEY = 'test-fedex-api-key'
 SECRET = 'test-fedex-secret-key'
 ACCOUNT = '000000000'
 FEDEX_SETTINGS = {'environment': 'sandbox', 'account_number': ACCOUNT, 'etd_enabled': False,
+                  'regulatory_check_enabled': False,
                   'duties_payment_type': 'RECIPIENT'}
 
 
@@ -613,6 +614,161 @@ def test_etd_uploads_current_ci_and_references_it(client, access_token, fedex):
     # 上传在建单之前
     paths = [c['path'] for c in fedex.calls]
     assert paths.index('/sandbox/documents/v1/etds/upload') < paths.index('/ship/v1/shipments')
+
+
+def test_regulatory_check_uploads_required_packing_list_and_preserves_paper_copies(client, access_token, fedex):
+    _set_fedex(client, etd_enabled=True, regulatory_check_enabled=True)
+    dn_id, _task_id = _ready(client, access_token)
+    fedex.set('/globaltrade/v1/shipments/regulatorydetails/retrieve', (200, {
+        'transactionId': 'tx-trade-1',
+        'output': {'countryDetails': {'countryCode': 'DE', 'category': 'IMPORT', 'shipmentDetails': {
+            'regulatoryDocuments': [
+                {'documentType': 'COMMERCIAL_INVOICE', 'allowability': 'REQUIRED',
+                 'localizedAttributes': {'name': 'Commercial Invoice'}},
+                {'documentType': 'OTHER', 'allowability': 'REQUIRED', 'supportType': 'FILLABLE',
+                 'localizedAttributes': {'name': 'Packing List'}},
+            ],
+        }}},
+    }))
+    fedex.set('/sandbox/documents/v1/etds/upload',
+              (201, {'output': {'meta': {'docId': 'ci-id'}}}),
+              (201, {'output': {'meta': {'docId': 'pl-id'}}}))
+    body = _ship_body()
+    completed = body['output']['transactionShipments'][0]['completedShipmentDetail']
+    completed['completedEtdDetail'] = {'type': 'ELECTRONIC_DOCUMENTS_WITH_ORIGINALS'}
+    completed['documentRequirements'] = {'requiredDocuments': ['COMMERCIAL_INVOICE'],
+                                         'generationDetails': [{'type': 'COMMERCIAL_INVOICE',
+                                                                'minimumCopiesRequired': 2}]}
+    fedex.set('/ship/v1/shipments', (200, body))
+
+    response = _create(client, access_token, dn_id)
+    assert response.status_code == 201, response.get_json()
+    lookup = fedex.of('/globaltrade/v1/shipments/regulatorydetails/retrieve')[0]['json']
+    assert lookup['originAddress']['countryCode'] == 'JP'
+    assert lookup['destinationAddress']['countryCode'] == 'DE'
+    assert lookup['customsClearanceDetail']['commodities'][0]['harmonizedCode']
+    uploads = fedex.of('/sandbox/documents/v1/etds/upload')
+    assert [json.loads(upload['data']['document'])['meta']['shipDocumentType'] for upload in uploads] == [
+        'COMMERCIAL_INVOICE', 'OTHER']
+    attached = fedex.ship_request()['requestedShipment']['shipmentSpecialServices']['etdDetail']['attachedDocuments']
+    assert [(item['documentType'], item['documentId']) for item in attached] == [
+        ('COMMERCIAL_INVOICE', 'ci-id'), ('OTHER', 'pl-id')]
+    trade = response.get_json()['shipment']['trade_documents']
+    assert trade['regulatory_requirements']['transaction_id'] == 'tx-trade-1'
+    assert trade['uploaded_documents'] == {'commercial_invoice': 'ci-id', 'packing_list': 'pl-id'}
+    assert trade['etd_type'] == 'ELECTRONIC_DOCUMENTS_WITH_ORIGINALS'
+    assert trade['generation_details'][0]['minimum_copies_required'] == 2
+    assert response.get_json()['shipment']['etd_document_id'] == 'ci-id'
+    assert _get(client, access_token, dn_id)['shipment']['trade_documents'] == trade
+
+
+def test_regulatory_check_blocks_missing_document_before_upload_or_ship(client, access_token, fedex):
+    _set_fedex(client, etd_enabled=True, regulatory_check_enabled=True)
+    dn_id, _task_id = _ready(client, access_token)
+    fedex.set('/globaltrade/v1/shipments/regulatorydetails/retrieve', (200, {
+        'output': {'countryDetails': {'countryCode': 'DE', 'shipmentDetails': {
+            'regulatoryDocuments': {'documentType': 'CERTIFICATE_OF_ORIGIN', 'allowability': 'REQUIRED',
+                                    'documentUrl': 'https://example.invalid/certificate',
+                                    'localizedAttributes': {'name': 'Certificate of Origin'}},
+        }}},
+    }))
+    response = _create(client, access_token, dn_id)
+    assert response.status_code == 409 and response.get_json()['code'] == 16072
+    assert response.get_json()['details']['blockers'][0]['document_type'] == 'CERTIFICATE_OF_ORIGIN'
+    assert fedex.of('/sandbox/documents/v1/etds/upload') == []
+    assert fedex.of('/ship/v1/shipments') == []
+    assert _states(client, dn_id) == [('failed', 'regulatory_documents_missing', None)]
+
+
+def test_regulatory_preview_lists_requirements_without_creating_shipment(client, access_token, fedex):
+    _set_fedex(client, etd_enabled=True, regulatory_check_enabled=True)
+    dn_id, _task_id = _ready(client, access_token)
+    fedex.set('/globaltrade/v1/shipments/regulatorydetails/retrieve', (200, {
+        'output': {'userMessages': [{'code': 'NOTICE', 'text': 'Check local import controls'}],
+                   'countryDetails': {'countryCode': 'DE', 'shipmentDetails': {
+            'regulatoryDocuments': [
+                {'documentType': 'OTHER', 'allowability': 'REQUIRED', 'supportType': 'PRINT_ONLY',
+                 'localizedAttributes': {'name': 'Packing List'}},
+                {'documentType': 'CERTIFICATE_OF_ORIGIN', 'allowability': 'REQUIRED',
+                 'localizedAttributes': {'name': 'Certificate of Origin'}},
+            ],
+        }}},
+    }))
+    response = client.get(f'/dn/{dn_id}/carrier-shipment/trade-requirements', headers=_h(access_token))
+    assert response.status_code == 200, response.get_json()
+    preview = response.get_json()
+    assert preview['enabled'] is True
+    assert preview['upload_packing_list'] is False
+    assert preview['messages'] == ['Check local import controls']
+    assert [item['name'] for item in preview['paper_documents']] == ['Packing List']
+    assert [item['document_type'] for item in preview['missing_documents']] == ['CERTIFICATE_OF_ORIGIN']
+    assert fedex.of('/ship/v1/shipments') == []
+    assert _counts(client, dn_id)['shipments'] == 0
+
+
+def test_regulatory_check_keeps_paper_requirements_when_etd_is_off(client, access_token, fedex):
+    _set_fedex(client, etd_enabled=False, regulatory_check_enabled=True)
+    dn_id, _task_id = _ready(client, access_token)
+    fedex.set('/globaltrade/v1/shipments/regulatorydetails/retrieve', (200, {
+        'output': {'countryDetails': {'countryCode': 'DE', 'shipmentDetails': {
+            'regulatoryDocuments': {'documentType': 'CERTIFICATE_OF_ORIGIN', 'allowability': 'REQUIRED',
+                                    'localizedAttributes': {'name': 'Certificate of Origin'}},
+        }}},
+    }))
+    response = _create(client, access_token, dn_id)
+    assert response.status_code == 201, response.get_json()
+    paper = response.get_json()['shipment']['trade_documents']['regulatory_requirements']['paper_documents']
+    assert [item['document_type'] for item in paper] == ['CERTIFICATE_OF_ORIGIN']
+    assert fedex.of('/sandbox/documents/v1/etds/upload') == []
+
+
+def test_regulatory_document_can_be_supplied_with_shipment(client, access_token, fedex):
+    _set_fedex(client, etd_enabled=True, regulatory_check_enabled=True)
+    dn_id, _task_id = _ready(client, access_token)
+    fedex.set('/globaltrade/v1/shipments/regulatorydetails/retrieve', (200, {
+        'output': {'countryDetails': {'countryCode': 'DE', 'shipmentDetails': {
+            'regulatoryDocuments': {'documentType': 'CERTIFICATE_OF_ORIGIN', 'allowability': 'REQUIRED',
+                                    'localizedAttributes': {'name': 'Certificate of Origin'}},
+        }}},
+    }))
+    fedex.set('/sandbox/documents/v1/etds/upload',
+              (201, {'output': {'meta': {'docId': 'ci-id'}}}),
+              (201, {'output': {'meta': {'docId': 'co-id'}}}))
+    response = client.post(f'/dn/{dn_id}/carrier-shipment', headers=_h(access_token), data={
+        'label_format': 'A4',
+        'trade_document_types': 'CERTIFICATE_OF_ORIGIN',
+        'trade_document_names': 'Certificate of Origin',
+        'trade_documents': (io.BytesIO(_label_pdf('ORIGIN')), 'origin.pdf', 'application/pdf'),
+    }, content_type='multipart/form-data')
+    assert response.status_code == 201, response.get_json()
+    uploads = fedex.of('/sandbox/documents/v1/etds/upload')
+    assert [json.loads(u['data']['document'])['meta']['shipDocumentType'] for u in uploads] == [
+        'COMMERCIAL_INVOICE', 'CERTIFICATE_OF_ORIGIN']
+    attached = fedex.ship_request()['requestedShipment']['shipmentSpecialServices']['etdDetail']['attachedDocuments']
+    assert [(d['documentType'], d['documentId']) for d in attached] == [
+        ('COMMERCIAL_INVOICE', 'ci-id'), ('CERTIFICATE_OF_ORIGIN', 'co-id')]
+    assert response.get_json()['shipment']['trade_documents']['uploaded_documents']['supplemental'] == [
+        {'document_type': 'CERTIFICATE_OF_ORIGIN', 'name': 'Certificate of Origin', 'document_id': 'co-id'}]
+
+
+def test_supplemental_document_must_match_current_requirement(client, access_token, fedex):
+    _set_fedex(client, etd_enabled=True, regulatory_check_enabled=True)
+    dn_id, _task_id = _ready(client, access_token)
+    fedex.set('/globaltrade/v1/shipments/regulatorydetails/retrieve', (200, {
+        'output': {'countryDetails': {'countryCode': 'DE', 'shipmentDetails': {
+            'regulatoryDocuments': {'documentType': 'CERTIFICATE_OF_ORIGIN', 'allowability': 'REQUIRED',
+                                    'localizedAttributes': {'name': 'Certificate of Origin'}},
+        }}},
+    }))
+    response = client.post(f'/dn/{dn_id}/carrier-shipment', headers=_h(access_token), data={
+        'trade_document_types': 'OTHER',
+        'trade_document_names': 'Unrelated file',
+        'trade_documents': (io.BytesIO(_label_pdf('UNRELATED')), 'unrelated.pdf', 'application/pdf'),
+    }, content_type='multipart/form-data')
+    assert response.status_code == 409
+    assert _states(client, dn_id) == [('failed', 'regulatory_documents_invalid', None)]
+    assert fedex.of('/sandbox/documents/v1/etds/upload') == []
+    assert fedex.of('/ship/v1/shipments') == []
 
 
 def test_duties_paid_by_sender_has_payor(client, access_token, fedex):

@@ -29,6 +29,7 @@ MIN_REQUEST_SECONDS = 5
 # CarrierError.step：出错的是哪一步
 STEP_AUTH = 'auth'              # 取访问令牌
 STEP_DOCUMENTS = 'documents'    # 上传电子单证（建单前）
+STEP_REGULATORY = 'regulatory'  # 查询目的地和货物的单证要求
 STEP_CREATE = 'create'          # 建单
 STEP_CANCEL = 'cancel'          # 取消
 STEP_TEST = 'test'              # 测试连接
@@ -287,6 +288,12 @@ class CarrierAdapter:
     def documents_enabled(self) -> bool:
         """建单前把 CI 电子提交给承运商（无纸化 / 电子贸易单证）"""
         return False
+
+    def trade_requirements_enabled(self) -> bool:
+        return False
+
+    def trade_requirements(self, shipment: dict, *, deadline) -> dict:
+        raise NotImplementedError
 
     # ------------------------------------------------------------------
     # 建单 / 取消 / 面单 / 测试连接（子类实现）

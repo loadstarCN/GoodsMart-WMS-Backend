@@ -572,6 +572,8 @@ class DNCarrierShipment(db.Model):
         info={'description': '面单（dn_documents.shipping_label）'}
     )
     etd_document_id = db.Column(db.String(100), nullable=True, info={'description': 'ETD 上传的 CI 文档 ID'})
+    trade_documents = db.Column(db.JSON, nullable=True,
+                                info={'description': '承运商返回的 ETD/EWO 与按目的地要求的单证、纸质份数'})
     transaction_id = db.Column(db.String(100), nullable=True, info={'description': '建单请求的承运商 transactionId'})
     cancel_transaction_id = db.Column(db.String(100), nullable=True,
                                       info={'description': '取消请求的承运商 transactionId（最近一次）'})
@@ -656,6 +658,7 @@ class DNCarrierShipment(db.Model):
             'label_content_type': self.label_document.content_type if self.label_document else None,
             'label_parts': self.label_parts or [],
             'etd_document_id': self.etd_document_id,
+            'trade_documents': self.trade_documents,
             'transaction_id': self.transaction_id,
             'reason': self.reason,
             'sender_country': self.sender_country,

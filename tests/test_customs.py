@@ -4,6 +4,7 @@ from .test_isolation_outbound import _make_company_b
 
 import base64
 import hashlib
+import io
 import re
 import zlib
 from datetime import date, datetime   # 放在 helpers 之后：helpers 以模块名导出了 datetime
@@ -1100,6 +1101,63 @@ def _vera_ttf():
     import os
     import reportlab
     return os.path.join(os.path.dirname(reportlab.__file__), 'fonts', 'Vera.ttf')
+
+
+def test_private_company_signature_is_embedded_and_versioned(client, access_token, tmp_path, monkeypatch):
+    from PIL import Image as PILImage, ImageDraw
+    from pypdf import PdfReader
+    from warehouse.dn.customs_signature import load_company_signature
+
+    old_dn_id, _task_id = _export_dn_ready(client, access_token)
+    old_ci_result = _issue(client, access_token, old_dn_id)
+    assert old_ci_result.status_code == 201, old_ci_result.get_json()
+    with client.application.app_context():
+        company_id = get_company().id
+    signature_path = tmp_path / 'signature.png'
+
+    def write_signature(offset):
+        image = PILImage.new('RGBA', (360, 100), (255, 255, 255, 0))
+        ImageDraw.Draw(image).line([(10, 75), (170, 15 + offset), (340, 70)], fill=(0, 0, 0, 255), width=5)
+        image.save(signature_path)
+
+    write_signature(0)
+    monkeypatch.setitem(client.application.config, 'CUSTOMS_SIGNATURE_COMPANY_ID', str(company_id))
+    monkeypatch.setitem(client.application.config, 'CUSTOMS_SIGNATURE_FROM_DN_ID', str(old_dn_id + 1))
+    monkeypatch.setitem(client.application.config, 'CUSTOMS_SIGNATURE_SIGNATORY_NAME', 'New Signer')
+    monkeypatch.setitem(client.application.config, 'CUSTOMS_SIGNATURE_SIGNATORY_TITLE', 'Legal Representative')
+    monkeypatch.setitem(client.application.config, 'CUSTOMS_SIGNATURE_PATH', str(signature_path))
+    with client.application.app_context():
+        assert load_company_signature(company_id + 1, old_dn_id + 1) is None
+        assert load_company_signature(company_id, old_dn_id) is None
+    old_view = client.get(f'/dn/{old_dn_id}/customs', headers=_h(access_token)).get_json()
+    assert old_view['documents_outdated'] is False
+    assert old_view['exporter']['signatory_name'] == 'Taro Example'
+
+    dn_id, _task_id = _export_dn_ready(client, access_token)
+    new_view = client.get(f'/dn/{dn_id}/customs', headers=_h(access_token)).get_json()
+    assert new_view['exporter']['signatory_name'] == 'New Signer'
+    assert new_view['exporter']['signatory_title'] == 'Legal Representative'
+    first = _issue(client, access_token, dn_id)
+    assert first.status_code == 201, first.get_json()
+    ci_id = first.get_json()['documents'][0]['id']
+    ci = client.get(f'/dn/{dn_id}/customs-documents/{ci_id}/file', headers=_h(access_token)).data
+    pdf = PdfReader(io.BytesIO(ci))
+    assert pdf.pages[-1].images
+    assert 'New Signer' in pdf.pages[-1].extract_text()
+    assert client.get(f'/dn/{dn_id}/customs', headers=_h(access_token)).get_json()['documents_outdated'] is False
+
+    write_signature(10)
+    view = client.get(f'/dn/{dn_id}/customs', headers=_h(access_token)).get_json()
+    assert view['documents_outdated'] is True
+    second = _issue(client, access_token, dn_id)
+    assert second.status_code == 201, second.get_json()
+    assert second.get_json()['version'] == 2
+
+    signature_path.unlink()
+    assert client.get(f'/dn/{old_dn_id}/customs', headers=_h(access_token)).get_json()['documents_outdated'] is False
+    view = client.get(f'/dn/{dn_id}/customs', headers=_h(access_token)).get_json()
+    assert any(p['code'] == 'EXPORT_SIGNATURE_UNAVAILABLE' for p in view['problems'])
+    assert _issue(client, access_token, dn_id).status_code == 409
 
 
 @pytest.mark.parametrize('font_path', [None, 'vera'])

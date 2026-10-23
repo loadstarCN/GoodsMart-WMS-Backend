@@ -551,6 +551,7 @@ the issued documents (`void_reason: packages_changed`).
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `DOCUMENT_TIMEZONE` | `Asia/Tokyo` | Time zone of the invoice date |
+| `CUSTOMS_SIGNATURE_COMPANY_ID`, `CUSTOMS_SIGNATURE_FROM_DN_ID`, `CUSTOMS_SIGNATURE_SIGNATORY_NAME`, `CUSTOMS_SIGNATURE_SIGNATORY_TITLE`, `CUSTOMS_SIGNATURE_PATH` | (unset) | Optional company and first eligible DN ID, signer name/title, and absolute path to its authorized CI signature PNG. Keep the image outside the source checkout, readable only by the backend process. All five values are required. Earlier DNs keep the company's existing signer and unsigned CI. On eligible DNs, changing the image marks previously issued documents outdated. |
 | `CUSTOMS_PDF_FONT_PATH` | (unset) | TrueType font for the documents (`.ttf`, or the first font of a `.ttc`; CFF-outline OTF such as Noto Sans CJK is not supported). When set, all text is printed with it and the used glyphs are embedded in the PDF; to embed e.g. Japanese consignee text, pick a font with those glyphs (such as IPAexGothic). Characters the font lacks, and characters Helvetica cannot print when unset, fall back to reportlab's built-in Japanese CID font (not embedded; relies on the viewer's fonts) |
 
 ## Carrier Integrations (automatic shipments)

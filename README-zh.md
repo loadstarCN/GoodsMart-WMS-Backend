@@ -471,6 +471,7 @@ DN 须为 `picked` 或 `packed`（否则 409 `16067`）。请求体 `{"packages"
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
 | `DOCUMENT_TIMEZONE` | `Asia/Tokyo` | 单证日期所用时区 |
+| `CUSTOMS_SIGNATURE_COMPANY_ID`、`CUSTOMS_SIGNATURE_FROM_DN_ID`、`CUSTOMS_SIGNATURE_SIGNATORY_NAME`、`CUSTOMS_SIGNATURE_SIGNATORY_TITLE`、`CUSTOMS_SIGNATURE_PATH` | （不设） | 可选的出口公司 ID、首个启用签名的 DN ID、签署人姓名和职务，以及授权签名 PNG 的绝对路径；五项须同时配置。图片须保存在源码目录之外、仅后端进程可读。较早的 DN 维持原签署人和未签名 CI；启用后的 DN 更换签名图片会使已签发单证显示为过期。 |
 | `CUSTOMS_PDF_FONT_PATH` | （不设） | 单证用的 TrueType 字体（`.ttf`，或 `.ttc` 的第 1 个字体；不支持 CFF 轮廓的 OTF，如 Noto Sans CJK）。设了就用它印全部文字，字体子集嵌入 PDF；要让收件人的日文等也嵌入，选带这些字形的字体（如 IPAexGothic）。字体里没有的字符、以及不设时 Helvetica 印不出的字符，退回 reportlab 内置的日文 CID 字体（不嵌入，依赖阅读器的字体） |
 
 ## 承运商对接（自动建运单）

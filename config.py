@@ -98,6 +98,12 @@ class Config:
     # 出口单证（商业发票 / 装箱单）：单证日期所用时区；可选 TTF 字体（不设用 Helvetica，非拉丁字符退回内置日文 CID 字体）
     DOCUMENT_TIMEZONE = os.getenv('DOCUMENT_TIMEZONE', 'Asia/Tokyo')
     CUSTOMS_PDF_FONT_PATH = os.getenv('CUSTOMS_PDF_FONT_PATH') or None
+    # The CI signature image is a private runtime file, scoped to one exporter company.
+    CUSTOMS_SIGNATURE_COMPANY_ID = os.getenv('CUSTOMS_SIGNATURE_COMPANY_ID') or None
+    CUSTOMS_SIGNATURE_PATH = os.getenv('CUSTOMS_SIGNATURE_PATH') or None
+    CUSTOMS_SIGNATURE_FROM_DN_ID = os.getenv('CUSTOMS_SIGNATURE_FROM_DN_ID') or None
+    CUSTOMS_SIGNATURE_SIGNATORY_NAME = os.getenv('CUSTOMS_SIGNATURE_SIGNATORY_NAME') or None
+    CUSTOMS_SIGNATURE_SIGNATORY_TITLE = os.getenv('CUSTOMS_SIGNATURE_SIGNATORY_TITLE') or None
 
     # 承运商对接（自动建运单）：账号 / 密钥 / 服务等按承运商在「承运商」编辑页设置（carrier_integrations，密钥用
     # SETTINGS_ENCRYPTION_KEY 加密），这里只放与承运商无关的时限。插件见 warehouse/carrier/integrations。

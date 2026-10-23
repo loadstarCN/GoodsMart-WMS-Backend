@@ -412,15 +412,32 @@ def build_ship_request(*, account_number, settings, label, ship_date, shipper, r
     if invoice.get('declared_value') is not None:
         requested['totalDeclaredValue'] = _money(invoice['declared_value'], currency)
     if etd_document_id:
+        document_ids = (etd_document_id if isinstance(etd_document_id, dict)
+                        else {'commercial_invoice': etd_document_id})
+        attached_documents = [{
+            'documentType': ETD_DOCUMENT_TYPE,
+            'documentReference': str(invoice['invoice_number'])[:MAX_INVOICE_REFERENCE],
+            'description': 'Commercial Invoice',
+            'documentId': document_ids['commercial_invoice'],
+        }]
+        if document_ids.get('packing_list'):
+            attached_documents.append({
+                'documentType': 'OTHER',
+                'documentReference': str(invoice['invoice_number'])[:MAX_INVOICE_REFERENCE],
+                'description': 'Packing List',
+                'documentId': document_ids['packing_list'],
+            })
+        for document in document_ids.get('supplemental', []):
+            attached_documents.append({
+                'documentType': document['document_type'],
+                'documentReference': str(invoice['invoice_number'])[:MAX_INVOICE_REFERENCE],
+                'description': document['name'][:100],
+                'documentId': document['document_id'],
+            })
         requested['shipmentSpecialServices'] = {
             'specialServiceTypes': [ETD_SPECIAL_SERVICE],
             'etdDetail': {
-                'attachedDocuments': [{
-                    'documentType': ETD_DOCUMENT_TYPE,
-                    'documentReference': str(invoice['invoice_number'])[:MAX_INVOICE_REFERENCE],
-                    'description': 'Commercial Invoice',
-                    'documentId': etd_document_id,
-                }],
+                'attachedDocuments': attached_documents,
             },
         }
     return {
@@ -522,6 +539,29 @@ def parse_ship_response(body: dict) -> dict:
     documents.sort(key=_document_rank)
 
     amount, currency = _net_charge(completed)
+    requirements = completed.get('documentRequirements') or {}
+    etd = completed.get('completedEtdDetail') or {}
+    generation = []
+    for item in requirements.get('generationDetails') or []:
+        if not isinstance(item, dict):
+            continue
+        copies = item.get('minimumCopiesRequired')
+        try:
+            copies = max(0, int(copies)) if copies is not None else None
+        except (TypeError, ValueError):
+            copies = None
+        generation.append({
+            'type': item.get('type'),
+            'minimum_copies_required': copies,
+            'letterhead': item.get('letterhead'),
+            'electronic_signature': item.get('electronicSignature'),
+        })
+    trade_documents = {
+        'etd_type': etd.get('type'),
+        'required_documents': requirements.get('requiredDocuments') or [],
+        'generation_details': generation,
+        'prohibited_documents': requirements.get('prohibitedDocuments') or [],
+    } if requirements or etd else None
     return {
         'tracking_number': str(master),
         'package_tracking_numbers': package_tracking,
@@ -532,6 +572,7 @@ def parse_ship_response(body: dict) -> dict:
         'documents': documents,
         'transaction_id': body.get('transactionId'),
         'alerts': _alerts(output, shipment),
+        'trade_documents': trade_documents,
     }
 
 

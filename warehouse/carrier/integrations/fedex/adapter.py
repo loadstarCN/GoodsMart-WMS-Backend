@@ -8,10 +8,12 @@ import logging
 import re
 
 from ..base import (
-    FIELD_BOOLEAN, FIELD_SECRET, FIELD_SELECT, FIELD_TEXT, STEP_DOCUMENTS, STEP_PICKUP, STEP_PICKUP_CANCEL, STEP_TRACK,
+    FIELD_BOOLEAN, FIELD_SECRET, FIELD_SELECT, FIELD_TEXT, STEP_DOCUMENTS, STEP_REGULATORY,
+    STEP_PICKUP, STEP_PICKUP_CANCEL, STEP_TRACK,
     CarrierAdapter, CarrierError, CarrierResponseError, option, setting,
 )
 from .client import FedexClient
+from .regulatory import build_regulatory_request, parse_regulatory_response
 from .pickup import (
     MAX_REMARKS, PickupRequestError, build_availability_request, build_cancel_request, build_create_request,
     parse_availability_response, parse_cancel_response, parse_create_response, pickup_contact,
@@ -165,11 +167,17 @@ class FedexAdapter(CarrierAdapter):
         setting('etd_enabled', FIELD_BOOLEAN, group='shipping', default=False,
                 label=_label('Send the commercial invoice electronically (ETD)', '电子提交商业发票（ETD）',
                              'インボイスを電子送信（ETD）'),
-                help=_label('The invoice is uploaded to FedEx before the shipment is created; you do not need to '
-                            'attach paper copies. The FedEx account must have ETD enabled.',
-                            '建运单前把 CI 上传给 FedEx，不用再随货附纸质发票。需要 FedEx 账号已开通 ETD。',
-                            '出荷前にインボイスを FedEx へアップロードし、紙の添付が不要になります。'
-                            'FedEx アカウントで ETD の利用が必要です。')),
+                help=_label('Upload the invoice before creating a shipment. Some destinations still require paper '
+                            'copies (EWO). The FedEx account must have ETD enabled.',
+                            '建单前上传 CI。部分目的地仍需随货附纸质单证（EWO）；FedEx 账号须开通 ETD。',
+                            '出荷前にインボイスをアップロードします。仕向地によっては紙の書類（EWO）も必要です。')),
+        setting('regulatory_check_enabled', FIELD_BOOLEAN, group='shipping', default=False,
+                label=_label('Check required trade documents with FedEx', '向 FedEx 查询所需报关单证',
+                             'FedExで必要な通関書類を確認'),
+                help=_label('Before creating a shipment, query the Global Trade API for this destination and '
+                            'commodity. The FedEx API project must include Global Trade API.',
+                            '建单前按目的地和商品查询 Global Trade API；FedEx API 项目需开通该接口。',
+                            '出荷前に仕向地と品目に基づいてGlobal Trade APIへ照会します。')),
         setting('default_label_format', FIELD_SELECT, group='label', default='A4',
                 label=_label('Default label printer', '默认面单打印方式', '既定のラベル印刷'),
                 options=[option('A4', 'Plain paper (A4)', '普通打印机（A4 纸）', '普通紙（A4）'),
@@ -223,6 +231,17 @@ class FedexAdapter(CarrierAdapter):
 
     def documents_enabled(self) -> bool:
         return self.settings.get('etd_enabled') is True
+
+    def trade_requirements_enabled(self) -> bool:
+        return self.settings.get('regulatory_check_enabled') is True
+
+    def trade_requirements(self, shipment: dict, *, deadline) -> dict:
+        request = build_regulatory_request(shipment, self.service_type())
+        body = self.client().retrieve_regulatory_details(request, deadline=deadline)
+        try:
+            return parse_regulatory_response(body)
+        except (ValueError, TypeError, AttributeError) as exc:
+            raise CarrierError(f"Unexpected FedEx Global Trade response: {exc}", step=STEP_REGULATORY) from exc
 
     @property
     def duties_payment_type(self) -> str:
@@ -291,15 +310,31 @@ class FedexAdapter(CarrierAdapter):
     # 建单 / 取消 / 面单 / 测试连接
     # ------------------------------------------------------------------
 
-    def upload_documents(self, shipment: dict, *, deadline) -> str:
-        invoice = shipment['documents']['commercial_invoice']
-        uploaded = self.client().upload_etd_document(
-            invoice['content'], invoice['file_name'], shipment['shipper']['country_code'],
-            shipment['recipient']['country_code'], deadline=deadline)
-        document_id = ((uploaded.get('output') or {}).get('meta') or {}).get('docId')
-        if not document_id:
-            raise CarrierError("FedEx trade document upload returned no docId", step=STEP_DOCUMENTS)
-        return document_id
+    def upload_documents(self, shipment: dict, *, deadline):
+        references = {}
+        documents = [('commercial_invoice', 'COMMERCIAL_INVOICE')]
+        if shipment.get('upload_packing_list'):
+            documents.append(('packing_list', 'OTHER'))
+        for key, document_type in documents:
+            document = shipment['documents'][key]
+            uploaded = self.client().upload_etd_document(
+                document['content'], document['file_name'], shipment['shipper']['country_code'],
+                shipment['recipient']['country_code'], doc_type=document_type, deadline=deadline)
+            document_id = ((uploaded.get('output') or {}).get('meta') or {}).get('docId')
+            if not document_id:
+                raise CarrierError(f"FedEx {key} upload returned no docId", step=STEP_DOCUMENTS)
+            references[key] = document_id
+        for document in shipment['documents'].get('supplemental', []):
+            uploaded = self.client().upload_etd_document(
+                document['content'], document['file_name'], shipment['shipper']['country_code'],
+                shipment['recipient']['country_code'], doc_type=document['upload_type'], deadline=deadline)
+            document_id = ((uploaded.get('output') or {}).get('meta') or {}).get('docId')
+            if not document_id:
+                raise CarrierError('FedEx supplemental document upload returned no docId', step=STEP_DOCUMENTS)
+            references.setdefault('supplemental', []).append({
+                'document_type': document['upload_type'], 'name': document['name'], 'document_id': document_id,
+            })
+        return references if len(references) > 1 else references['commercial_invoice']
 
     def create_shipment(self, shipment: dict, label: dict, *, deadline, document_ref=None) -> dict:
         request = build_ship_request(

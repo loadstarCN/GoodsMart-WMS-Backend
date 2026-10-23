@@ -20,7 +20,7 @@ import time
 import requests
 
 from ..base import (
-    STEP_AUTH, STEP_CANCEL, STEP_CREATE, STEP_DOCUMENTS, STEP_PICKUP, STEP_PICKUP_AVAILABILITY, STEP_PICKUP_CANCEL,
+    STEP_AUTH, STEP_CANCEL, STEP_CREATE, STEP_DOCUMENTS, STEP_REGULATORY, STEP_PICKUP, STEP_PICKUP_AVAILABILITY, STEP_PICKUP_CANCEL,
     STEP_TRACK, CarrierError, request_timeout,
 )
 
@@ -31,6 +31,7 @@ OAUTH_PATH = '/oauth/token'
 SHIP_PATH = '/ship/v1/shipments'
 CANCEL_PATH = '/ship/v1/shipments/cancel'
 ETD_UPLOAD_PATH = '/documents/v1/etds/upload'
+REGULATORY_PATH = '/globaltrade/v1/shipments/regulatorydetails/retrieve'
 PICKUP_PATH = '/pickup/v1/pickups'
 PICKUP_CANCEL_PATH = '/pickup/v1/pickups/cancel'
 PICKUP_AVAILABILITY_PATH = '/pickup/v1/pickups/availabilities'
@@ -41,12 +42,14 @@ TOKEN_REQUEST = 'OAuth token request'
 CREATE_SHIPMENT = 'create shipment'
 CANCEL_SHIPMENT = 'cancel shipment'
 ETD_UPLOAD = 'trade document upload'
+REGULATORY_LOOKUP = 'regulatory details lookup'
 CREATE_PICKUP = 'create pickup'
 CANCEL_PICKUP = 'cancel pickup'
 PICKUP_AVAILABILITY = 'pickup availability'
 TRACK = 'track shipments'
 _STEPS = {TOKEN_REQUEST: STEP_AUTH, CREATE_SHIPMENT: STEP_CREATE, CANCEL_SHIPMENT: STEP_CANCEL,
-          ETD_UPLOAD: STEP_DOCUMENTS, CREATE_PICKUP: STEP_PICKUP, CANCEL_PICKUP: STEP_PICKUP_CANCEL,
+          ETD_UPLOAD: STEP_DOCUMENTS, REGULATORY_LOOKUP: STEP_REGULATORY,
+          CREATE_PICKUP: STEP_PICKUP, CANCEL_PICKUP: STEP_PICKUP_CANCEL,
           PICKUP_AVAILABILITY: STEP_PICKUP_AVAILABILITY, TRACK: STEP_TRACK}
 
 TOKEN_REFRESH_MARGIN_SECONDS = 60
@@ -279,6 +282,11 @@ class FedexClient:
             ok_statuses=(200, 201),
             deadline=deadline,
         )
+
+    def retrieve_regulatory_details(self, payload: dict, deadline=None) -> dict:
+        """FedEx Global Trade API: read required documents before creating a shipment."""
+        return self._call('POST', f"{self.api_base}{REGULATORY_PATH}", REGULATORY_LOOKUP,
+                          json_body=payload, deadline=deadline)
 
     def pickup_availability(self, payload: dict, deadline=None) -> dict:
         """POST /pickup/v1/pickups/availabilities（只查询，不预约）"""
