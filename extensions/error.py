@@ -47,8 +47,24 @@ from werkzeug.exceptions import HTTPException
 #             details {pickup_id, status, reason, pickup_date}
 # 16135  400  承运商对接方式（waybill_method / pickup_method / tracking_method）、集荷安排 pickup_schedule、公开查询页
 #             tracking_url_template、自动签收天数 auto_sign_days 不合法，或所选方式现在不可选（api 要在线对接已启用且插件
-#             支持；file 第二期）：field = 字段名（pickup_schedule.weekdays 等）
+#             支持；file 要有文件预设或模板）；文件方式的 file_preset（预设不存在）/ file_template（合并后的模板不合法）/
+#             file_account（不是模板声明的账号项、不是文字、超长）不合法：field = 字段名（pickup_schedule.weekdays、
+#             file_template.export.columns[3].value、file_account.<key> 等）
 # 16136  400  手工完成发货的 shipped_at（实际交承运商的时刻）晚于现在：field shipped_at（格式不对为 16050）
+# 16137  409  文件方式导出：有行有问题，整批不导出、不建记录：details {rows: [{dn_id, order_number, problems: [{column
+#             （列名 / options.<key> / null）, column_index?, code, message, ...}]}], total}；code 见 README
+#             （DN_NOT_FOUND / OTHER_WAREHOUSE / NOT_PACKED / OTHER_CARRIER / WAYBILL_EXISTS / OPTION_INVALID / REQUIRED /
+#             TOO_LONG / UNENCODABLE / CHARACTER_NOT_ALLOWED …）
+# 16138  400 / 409  文件方式用不了：400 = 请求不合法（carrier_id / dn_ids / warehouse_id / dry_run / limit 不合法，导入文件
+#             没有 / 为空 / 超过 5 MB / 读不了）；409 = 承运商不是文件方式、没有可用的模板、必填账号项没填、模板不能导入：
+#             field = carrier_id / dn_ids / file / file_account.<key> …
+# 16139  400  运单服务选项不合法（PUT /dn/<id>/shipping-options：不是承运商声明的键、select 值不在列表、日期 / 金额 /
+#             文字格式不对；创建 DN 的 shipping_options 同样校验已声明键的取值）：field = options.<key> / options /
+#             shipping_options.<key>
+# 14019  400  出口资料 / 结构化地址（收件人、仓库、DN 的 ship_to）的字段不是文字或超长，zip_code 与 postal_code 不一致：
+#             field = 字段名（ship_to.latin.name 等）；14020 = 国家代码不是有效的 ISO 3166-1 alpha-2
+# 16076 另有 reason SHIPPING_OPTIONS_LOCKED（建运单 / 导出后改运单服务选项）/ SHIP_TO_LOCKED（建运单 / 导出后改 DN 的
+#             收件地址 PUT /dn/<id>/ship-to）；16075 另用于作废导出时没有已导出的文件运单（details.waybill）
 # 16117  409  单证排不下：某块文字比一页还高（实际是收件人各字段都很长，如各约 240 个 CJK 字符），reportlab LayoutError。
 #             不签发、不作废旧单证，请缩短收件人信息：details {document: 'CI' | 'PL', reason: 'LAYOUT_OVERFLOW'}
 #
@@ -165,6 +181,9 @@ CARRIER_BIZ_CODES = {
     16077: "label_format 不合法或该承运商不支持（400）",
     16078: "运单号与有效自动运单不一致，或有自动运单时新建 / 删除发货任务（409）",
     16079: "有进行中 / 结果不明的建单记录：不能再建单、不能保存运单号（409，details.unresolved）",
+    16137: "文件方式导出有行有问题，整批不导出（409，details.rows）",
+    16138: "文件方式用不了：请求 / 导入文件不合法（400）或承运商不是文件方式 / 模板不全（409），field",
+    16139: "运单服务选项不合法（400，field = options.<key>）",
     16124: "承运商在线对接的设置不合法（400，field）",
     16125: "承运商还有未结束的自动运单，不能删除对接或换插件（409，details.shipments）",
 }

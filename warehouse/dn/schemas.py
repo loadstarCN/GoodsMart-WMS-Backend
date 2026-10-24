@@ -7,6 +7,7 @@ from warehouse.carrier.schemas import carrier_simple_model,carrier_model
 from warehouse.recipient.schemas import recipient_base_model,recipient_model
 from warehouse.warehouse.schemas import warehouse_simple_model,warehouse_model
 from warehouse.shipping.stage import STAGES, shipping_of
+from warehouse.common.address_format import dn_ship_to
 from .models import DN, DNDocument, _user_ref
 
 # 定义 DN 命名空间（类似于 ASN 的 api_ns）
@@ -134,7 +135,18 @@ dn_detail_input_model = api_ns.model('DNDetailInput', dn_detail_input_fields)
 dn_fields = {
     'id': fields.Integer(readOnly=True, description='DN ID'),
     'recipient_id': fields.Integer(required=True, description='ID of the associated recipient'),
-    'shipping_address': fields.String(required=True, description='Shipping address for the DN'),
+    'shipping_address': fields.String(required=True, description='Shipping address for the DN (one line; generated '
+                                                                 'in the country format when only ship_to is given)'),
+    # 结构化收件地址快照与运单服务选项（doc/shipping-flow.md §6.2 / §6.4）
+    'ship_to': fields.Raw(description='Structured ship-to address snapshot {country, postal_code, admin_area, '
+                                      'locality, dependent_locality, address_line1, address_line2, organization, '
+                                      'name, phone, email, latin: {name, organization, address_line1, address_line2, '
+                                      "locality, admin_area}}; omitted on create = copied from the recipient's "
+                                      'structured fields (null for recipients without them)'),
+    'shipping_options': fields.Raw(description='Shipping service options {key: value} (delivery_date, '
+                                               'delivery_time_slot, invoice_type, cod_amount, cool_type ...; see the '
+                                               "carrier's service_options); locked once a waybill is created / "
+                                               'exported'),
     'expected_shipping_date': fields.Date(required=True, description='Expected shipping date'),
     'carrier_id': fields.Integer(description='ID of the carrier company'),
     'dn_type': fields.String(description='Type of DN', enum=DN.DN_TYPES),
@@ -226,6 +238,12 @@ asn_full_fields.update({
         description='Customs snapshot (export shipments only)'
     ),
     'packages': fields.List(fields.Nested(dn_package_model), readOnly=True, description='Packages'),
+    'ship_to_effective': fields.Raw(
+        readOnly=True,
+        attribute=lambda x: dn_ship_to(x),
+        description='The ship-to address used for labels / carrier files: ship_to, else the recipient structured '
+                    'fields, else address_line1 = shipping_address with the recipient name / phone / postal code'
+    ),
     'customs_documents': fields.List(
         fields.Nested(dn_document_meta_model), readOnly=True,
         description='Documents (commercial invoice / packing list / carrier shipping label), newest first'
@@ -284,13 +302,13 @@ def _list_shipping(dn) -> dict:
 dn_list_model = api_ns.inherit('DNListItem', dn_base_model, {
     'shipping_stage': fields.String(
         readOnly=True, enum=list(STAGES), attribute=lambda x: _list_shipping(x).get('stage'),
-        description='preparing / awaiting_waybill / awaiting_pickup / awaiting_handover / in_transit / exception / '
-                    'delivered / closed'),
+        description='preparing / awaiting_waybill / awaiting_number / awaiting_pickup / awaiting_handover / '
+                    'in_transit / exception / delivered / closed'),
     'shipping': fields.Raw(
         readOnly=True,
-        attribute=lambda x: {k: _list_shipping(x).get(k) for k in ('carrier_name', 'tracking_number')},
-        description='{carrier_name, tracking_number}: carrier of the current delivery task (else of the DN) and the '
-                    'tracking number of the active waybill (else of the delivery task)'),
+        attribute=lambda x: {k: _list_shipping(x).get(k) for k in ('carrier_id', 'carrier_name', 'tracking_number')},
+        description='{carrier_id, carrier_name, tracking_number}: carrier of the current delivery task (else of the '
+                    'DN) and the tracking number of the active waybill (else of the delivery task)'),
 })
 dn_pagination_model = create_pagination_model(api_ns, dn_list_model)
 

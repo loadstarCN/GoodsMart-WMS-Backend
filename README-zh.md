@@ -149,12 +149,14 @@ GoodsMart-WMS-Backend/
 │   ├── inventory/             # 库存管理
 │   ├── inventory_snapshot/    # 库存快照
 │   ├── supplier/              # 供应商管理
-│   ├── carrier/               # 承运商管理、在线对接插件（integrations/）
+│   ├── carrier/               # 承运商管理、在线对接插件（integrations/）、文件方式预设（presets/）
 │   ├── recipient/             # 收货人管理
 │   ├── asn/                   # 入库：ASN（预到货通知）
 │   ├── sorting/               # 入库：分拣
 │   ├── putaway/               # 入库：上架
 │   ├── dn/                    # 出库：DN（发货通知）
+│   ├── shipping/              # 出库：发货核心、流程汇总、发货阶段、运单服务选项
+│   ├── country_rules/         # 国家规则包（报关检查、地址格式、电话写法）
 │   ├── picking/               # 出库：拣货
 │   ├── packing/               # 出库：打包
 │   ├── delivery/              # 出库：发货
@@ -199,8 +201,9 @@ GoodsMart-WMS-Backend/
 - 拣货
 - 打包
 - 发货（含运单号；承运商设了在线对接时可自动建运单，内置 FedEx）
-- 每张 DN 的发货流程（`GET /warehouse/dn/<id>/shipping-flow`）：国内 / 跨境、承运商对接方式（API / 手工）、手填运单与手工揽收、
-  自动签收——见「发货流程」
+- 每张 DN 的发货流程（`GET /warehouse/dn/<id>/shipping-flow`）：国内 / 跨境、承运商对接方式（API / 文件 / 手工）、手填运单与
+  手工揽收、没有 API 的承运商用 CSV 导出 / 导回（ヤマト B2クラウド、佐川 e飛伝Ⅲ、日本郵便 ゆうプリR 预设）、结构化国际地址、
+  国家规则包、运单服务选项、自动签收——见「发货流程」
 - 代收付款管理
 
 ### 库存运营
@@ -485,15 +488,16 @@ DN 须为 `picked` 或 `packed`（否则 409 `16067`）；箱子归发货，国�
 ## 发货流程（国内 / 跨境）
 
 一张出库单一条流程：下单 → 拣货 → 打包 →（要报关时）报关单证 → 运单 → 揽收 → 交承运商 → 运输中 → 签收。设计见
-`doc/shipping-flow.md`；第一期（本版本）做了承运商对接方式、国内 / 跨境判断、手填运单与手工揽收、来源与实际时刻、按规则
-自动签收和流程汇总接口。设计不假设国家、承运商或是否签了 API 合同：没有 API 的承运商也能手工走完整个流程。
+`doc/shipping-flow.md`；第一期做了承运商对接方式、国内 / 跨境判断、手填运单与手工揽收、来源与实际时刻、按规则自动签收和流程
+汇总接口；第二期加了文件方式（CSV 导出 / 导回）、结构化国际地址、国家规则包和运单服务选项。设计不假设国家、承运商或是否签了 API 合同：没有 API 的承运商也能手工走完整个流程。
 
 ### 国内 / 跨境（route）
 
 `warehouse/shipping/route.py` 按 DN 判断：
 
 - 发货国 `origin_country` = 仓库的 `country_code`，没有用公司的。
-- 收件国 `destination_country` = 报关快照的收件国（`recipient_country`，没有用 `consignee.country`）→ 收件人的 `country`。
+- 收件国 `destination_country` = 报关快照的收件国（`recipient_country`，没有用 `consignee.country`）→ DN 收件地址快照的
+  `ship_to.country` → 收件人的 `country`。
 - `international` = 发货国 ≠ 收件国（任一方未知按国内）。
 - `requires_customs` = 跨境且不在同一关税同盟（`warehouse/common/customs_unions.py`，默认登记 EU）；**有报关快照的 DN
   一律要报关**（来源系统明确给了报关数据）。
@@ -507,17 +511,19 @@ DN 须为 `picked` 或 `packed`（否则 409 `16067`）；箱子归发货，国�
 
 | 字段 | 取值（默认） | 说明 |
 |------|--------------|------|
-| `waybill_method` | `api` / `file`（第二期）/ `manual`（`manual`） | `api`：插件建单；`manual`：手填 / 扫码运单号，面单在承运商网站或软件打 |
+| `waybill_method` | `api` / `file` / `manual`（`manual`） | `api`：插件建单；`file`：按承运商软件的格式导出 CSV、导回运单号（见「文件方式」）；`manual`：手填 / 扫码运单号，面单在承运商网站或软件打 |
 | `pickup_method` | `api` / `manual` / `scheduled` / `dropoff` / `none`（`none`） | `api`：插件预约；`manual`：电话 / 网站约好后在 WMS 记一笔；`scheduled`：定期集荷；`dropoff`：自送网点；`none`：不管揽收 |
 | `pickup_schedule` | json 或 `null` | `scheduled` 时：`{weekdays: [1..7]（ISO，1 = 周一）, ready_time: "HH:MM", close_time: "HH:MM"}` |
 | `pickup_contact` | ≤ 255 字 | 约揽收的电话 / 网址 / 说明（`manual` 时显示） |
 | `tracking_method` | `api` / `link` / `none`（`link`） | `api`：插件定时查（揽收后自动交承运商、送达后自动签收）；`link`：只给公开查询页链接 |
 | `tracking_url_template` | 带 `{tracking_number}` 的 URL，≤ 500 | 公开查询页；为空用插件内置的（FedEx：`https://www.fedex.com/fedextrack/?trknbr={tracking_number}`） |
 | `auto_sign_days` | 1–90 或 `null`（关） | 交承运商后这么多天还没签收、且运单没有 API 跟踪时自动视为签收 |
+| `file_preset` / `file_template` / `file_account` | 文字 / json / json | 文件方式的设置（见「文件方式」，迁移 `a7c4e2f9b3d1`） |
 
 - `GET /warehouse/carrier/`（列表）与 `GET / PUT /warehouse/carrier/<id>` 返回这些字段和只读的
   `available_methods: {waybill: [...], pickup: [...], tracking: [...]}`：`api` 只在承运商的在线对接已启用、且插件声明了
-  对应能力（`supports_waybill` / `supports_pickup` / `supports_tracking`）时出现；`file` 暂不可选。
+  对应能力（`supports_waybill` / `supports_pickup` / `supports_tracking`）时出现；`file` 在设了文件预设 / 模板后出现（可以在同一个
+  请求里设）。
 - `POST` / `PUT` 校验：取值不合法、方式现在不可选、`pickup_schedule` / `tracking_url_template`（须为
   `http(s)://…{tracking_number}…`）/ `auto_sign_days` 不合法 → 400 `16135`（`field` 指明哪一项，如 `waybill_method`、
   `pickup_schedule.weekdays`）。没改的方式不重新校验（对接停用后照样能保存承运商的其它资料）。
@@ -531,8 +537,8 @@ DN 须为 `picked` 或 `packed`（否则 409 `16067`）；箱子归发货，国�
 ### 运单：插件 / 手填 / 文件
 
 `dn_carrier_shipments` 现在记一张 DN 的所有运单，`source` 区分来源：`api`（插件建的）、`manual`（手填 / 扫码）、
-`file`（文件导出导入，第二期）。一张 DN 同一时刻仍至多一条未结束的运单记录（`pending` / `active` / `unknown` /
-`cancelling`，部分唯一索引，不分来源）。`carrier`（插件代码）改为可空；`carrier_data`（json）留给插件 / 文件模板。
+`file`（文件导出导入，见「文件方式」）。一张 DN 同一时刻仍至多一条未结束的运单记录（`pending` / `active` / `unknown` /
+`cancelling` / `exported`，部分唯一索引，不分来源）。`carrier`（插件代码）改为可空；`carrier_data`（json）留给插件 / 文件模板。
 
 - 保存运单号（`PUT /warehouse/delivery/<task_id>/tracking`、`PUT /warehouse/delivery/<task_id>`、完成发货时带
   `tracking_number`）同时写一条 `manual` 运单记录：`status: active`，`carrier_id` = 任务的承运商，`carrier` = 该承运商在线对接的
@@ -626,10 +632,16 @@ DN 须为 `picked` 或 `packed`（否则 409 `16067`）；箱子归发货，国�
   label_document_id, label_download_path, shipment（同 `carrier-shipment.shipment`，没有当前运单时为最近一张已取消的插件运单）,
   unresolved, can_create, blockers[]}；`pickup` {method, pickup（揽收记录或 null）, contact, schedule}；`handover`
   {delivery_task_id, actual_shipping_date}；`transit` {tracking（运单的跟踪结果或 null）, tracking_url, tracked_by_api}；
-  `delivered` {estimated_delivery, auto_sign_days, auto_sign_at}。
+  `delivered` {estimated_delivery, auto_sign_days, auto_sign_at}。第二期：`waybill` 另有 `export`（只在文件运单已导出、待导回运单号时
+  给：{exported_at（带偏移）, batch_id, file_name, export_count, exported_by: {id, user_name}}，否则 null；文件运单的
+  `shipment.file` 另有 {preset, exported_at, export_count, import_batch_id, imported_at}）和 `options`（{values, schema, defaults,
+  locked, locked_reason, locked_message}，见「运单服务选项」）；`service_name` 为服务的显示名（文件运单为模板 `service_option` 的
+  名称）；交承运商后还挂着的「已约」揽收为 `done`，`summary.pickup.done: true`、`summary.handed_over: true`（不再提示重约）。
 - `actions[].key`：`create_waybill`、`enter_tracking`、`cancel_waybill`、`dismiss_waybill`、`print_label`、`book_pickup`、
   `record_pickup`、`cancel_pickup`、`complete_shipping`、`refresh_tracking`、`open_tracking`、`sign`、`issue_documents`、
-  `edit_packages`（`export_file` / `import_numbers` 第二期）。`enabled: false` 时带 `reason`（英文）和翻译用的 `reason_code`（`DN_SHIPPED`、`NOT_PICKED`、`NOT_PACKED`、`NO_WAYBILL`、
+  `edit_packages`、`export_file`、`import_numbers`、`discard_export`。运单方式为 `file` 时运单步骤给 `export_file`（单张导出；
+  已导出的带 `re_export: true`）、`import_numbers`（批量导回）和（已导出时）`discard_export`（带 `shipment_id`），都带
+  `carrier_id`；新增原因码 `FILE_NOT_CONFIGURED`（没有可用的模板 / 账号项没填）、`WAYBILL_EXISTS`。`enabled: false` 时带 `reason`（英文）和翻译用的 `reason_code`（`DN_SHIPPED`、`NOT_PICKED`、`NOT_PACKED`、`NO_WAYBILL`、
   `PICKUP_EXISTS`、`NO_OPEN_TASK`、`WAYBILL_UNRESOLVED`……见 `warehouse/shipping/flow.py` 的 `REASON_CODES`；也可能是建运单 /
   预约揽收的拦截码或报关问题码）；部分操作带要操作的对象 id
   （`delivery_task_id`、`pickup_id`、`document_id`、`url`）。界面按 key 接到已有接口。
@@ -641,12 +653,168 @@ DN 须为 `picked` 或 `packed`（否则 409 `16067`）；箱子归发货，国�
 `stage`（以及 DN 列表的 `shipping_stage`）用 SQL 判定（`warehouse/shipping/stage.py`），流程接口与列表同一口径：`closed`（DN
 关闭 / 取消）、`delivered`（已签收）、`preparing`（待处理 / 拣货中 / 已拣货）、`exception`（插件运单结果不明、跟踪异常或自动步骤
 被挡、揽收结果不明）、`in_transit`（已交承运商、未签收），打包完的 DN 再分 `awaiting_waybill`（还没有运单 / 运单号）、
-`awaiting_pickup`（承运商要逐票约揽收——`api` / `manual`——而运单还没被揽收占着）、`awaiting_handover`。`awaiting_number`
-（已导出待导回）第二期才有。
+`awaiting_pickup`（承运商要逐票约揽收——`api` / `manual`——而运单还没被揽收占着）、`awaiting_handover`；`awaiting_number`
+= 文件运单已导出、还没导回运单号（任务上也没有运单号）。
 
-- `GET /warehouse/dn/` 每行带 `shipping_stage` 与 `shipping: {carrier_name, tracking_number}`（整页一条查询算好）；
+- `GET /warehouse/dn/` 每行带 `shipping_stage` 与 `shipping: {carrier_id, carrier_name, tracking_number}`（整页一条查询算好）；
   `?shipping_stage=<stage>` 按它筛选（不认识的阶段 400）。
 - `GET /warehouse/delivery/` 每行带 `shipping_stage`（所属 DN 的阶段）。
+
+### 文件方式（不需要 API 合同）
+
+没有 API 合同的承运商用它自己的发货软件：WMS 按软件的导入格式导出 CSV，在软件里打完面单，再把带运单号的 CSV 导回
+（迁移 `a7c4e2f9b3d1`）。
+
+**预设**：`GET /warehouse/carrier/file-presets`（`carrier_read`）列出 `warehouse/carrier/presets/<国家>/<代码>.json` 里的预设
+（欢迎社区补充，同一结构，带 `version` 与 `sources`）：`[{code, name: {en-US, zh-CN, ja-JP}, country, version, notes, verified,
+sources[], tracking_url_template, tracking_url_fallback, tracking_url_notes, service_option, service_options[],
+account_fields[], columns: [{header, required, max_length}], export: {encoding, delimiter, quoting, header, line_ending,
+length_unit, charset}, import: {encoding, encoding_fallbacks, header_rows, reference_column, tracking_column,
+tracking_normalize} | null}]`。第一批三份都**还没在承运商软件里实测**（`verified: false`）：
+
+| 代码 | 软件 | 列数 | 说明 |
+|------|------|------|------|
+| `jp.yamato_b2cloud` | ヤマト B2クラウド「基本レイアウト」 | 95 | Shift_JIS，长度按 Shift_JIS 字节，只收 JIS 第1・第2水准的字（`charset: jis_x0208`）；导回 =「発行済データの検索 → 外部ファイル出力」（第 1 列匹配键、第 4 列运单号）；账号项 `billing_customer_code` / `billing_class_code` / `freight_mgmt_no`；查询页 `https://member.kms.kuronekoyamato.co.jp/parcel/detail?pno={tracking_number}` |
+| `jp.sagawa_ehiden3` | 佐川 e飛伝Ⅲ「標準_飛脚宅配便_CSV_ヘッダ有」 | 74 | 住所 / 名称为全角字段（`zenkaku` 过滤器）；导回 = 出荷履歴（UTF-8，读不了按 Shift_JIS；削除区分 = 2 的行跳过）；保留旧查询页，`tracking_url_fallback` = `https://e-customer.sagawa-exp.co.jp/k2k`（佐川查询服务受限期间没有带单号的深链） |
+| `jp.japanpost_yupri_r` | 日本郵便 ゆうパックプリントR「標準フォーマットv3」（明細数 = 1） | 87 | 无表头、每个字段都加双引号；导回 = 新ＤＥＮＦＤ確定（第 8 列匹配键、第 7 列运单号）；查询页 `https://trackings.post.japanpost.jp/services/srv/search/direct?reqCodeNo1={tracking_number}` |
+
+**承运商设置**（`GET / PUT /warehouse/carrier/<id>`）：`file_preset`（预设代码或 `null`）、`file_template`（在预设基础上改的部分——
+对象逐键合并、列表整个替换、`null` 删掉该键；没有预设时是完整模板；`null` = 完全用预设）、`file_account`（模板 `account_fields`
+声明的账号项 `{key: 文字}`），以及只读的 `file_mode: {configured, ready, preset: {code, name, verified, exists} | null, error,
+service_options, account_fields, missing_account_fields, can_import, tracking_url_template, tracking_url_fallback, encoding}`。
+只读的 `service_options` 是这家承运商的 DN 运单服务选项按它校验的声明（运单方式 `file` 用文件模板的，否则用在线对接插件的；
+没有为 `[]`）。设了预设 / 模板后 `available_methods.waybill` 才给 `file`；`file_preset` 与 `waybill_method: file` 可以在同一个请求里设。
+不合法 → 400 `16135`，带 `field`（`file_preset`、`file_template.export.columns[3].value`、`file_account.<key>`；方式还是
+`file` 时去掉模板 → `file_preset`）。承运商自己没填查询页、插件也没有时，用文件模板的查询页。
+
+**模板**（与预设同一结构；`shift_jis` 一律按 cp932 读写）：
+
+```
+{code, name{语言}, country, version, sources[], notes, verified, tracking_url_template, tracking_url_fallback?,
+ service_option?（哪个服务选项代表服务种类：记到运单的 service_type / service_name）,
+ export: {format: 'csv', encoding: 'cp932' | 'utf-8' | 'utf-8-sig', delimiter, quoting: 'minimal' | 'all',
+          header: bool, line_ending: '\r\n' | '\n', length_unit: 'chars' | 'sjis_bytes', row_unit: 'dn',
+          charset?: 'jis_x0208', columns: [{header, value, required?, max_length?, notes?}]},
+ import: {encoding, encoding_fallbacks[], delimiter?, header_rows, reference_column（1 起的列号）, reference_value: 'DN{dn.id}',
+          reference_parse: '^DN(\\d+)$', tracking_column, tracking_normalize: 'digits' | null,
+          skip_rows_when?: {column, equals}},
+ service_options: [{key, kind: 'select' | 'date' | 'money' | 'text', label{语言}, values?[{value, label}], default?, help?}],
+ account_fields: [{key, label{语言}, required, help?}]}
+```
+
+`value` 是字面量加 `{变量|过滤器:参数|…}`（`{{` / `}}` 为字面的花括号）。变量：`dn.id`、`dn.order_number`、`dn.remark`、
+`dn.expected_shipping_date`、`dn.special_handling`、`dn.packaging_info`、`ship_date`（仓库时区的今天）、`ship_to.*` /
+`shipper.*`（结构化地址字段，见下，另有 `contact`、`address_text`、`country_name`、`latin.<字段>`）、`goods.summary`（商品名，
+「 / 」分隔）、`goods.first_name`、`goods.quantity`、`goods.count`、`package.count`（没录箱子为空）、`package.total_weight_kg`、
+`options.<key>`（DN 的运单服务选项，没设的用默认值）、`carrier.account.<key>`、`carrier.name`、`carrier.code`。过滤器：`digits`、
+`truncate:n`、`truncate_bytes:n`（按 cp932 字节，不切断双字节字）、`slice:a:b`、`date:%Y/%m/%d`（空值输出空串）、`default:x`、
+`map:k=v,k=v`、`upper`、`zenkaku`（半角转全角）、`nospace`（去半角 / 全角空格）、`jp_phone`（`+81 …` → 0 开头的国内号码，全角数字
+转半角）、`int`。保存模板时不认识的变量 / 过滤器直接拒绝。匹配键一律写 `DN{dn.id}`（订单号可能为空、不唯一、超长），订单号另放在
+面单上看得到的备注列。
+
+**导出**——`POST /warehouse/dn/carrier-files/export`（`packing_edit` / `delivery_edit`），JSON
+`{carrier_id, dn_ids: [...]（1–500）, warehouse_id?}`（仓库 = `X-WAREHOUSE-ID` / 请求体的 `warehouse_id`，都没有用第一张 DN 的）：
+
+- 200：文件——`Content-Disposition: attachment; filename="<承运商代码>_<YYYYmmdd-HHMMSS>.csv"`，按模板编码的字节（cp932 时
+  `text/csv; charset=Shift_JIS`），响应头 `X-Batch-Id` / `X-Row-Count`。每张 DN 建一条 `file` 运单记录，`status: exported`
+  （新的**未结束**状态：一张 DN 仍至多一条未结束记录）、带 `file_batch_id`；已是 `exported` 的 DN 重新导出时记录不变、换批次。
+  记一个导出批次（`carrier_file_batches`）。
+- 先逐行检查，**任何一行有问题整批不导出**（不出文件、不建记录）：409 `16137`
+  `details {rows: [{dn_id, order_number, problems: [{column, column_index?, code, message, …}]}], total}`。DN 级的 code：
+  `DN_NOT_FOUND`、`OTHER_WAREHOUSE`、`NOT_PACKED`、`DN_SHIPPED`、`DN_CLOSED`、`NO_OPEN_TASK`、`CARRIER_NOT_SET`、
+  `OTHER_CARRIER`（发货任务的承运商——没有用 DN 的——须是这家）、`WAYBILL_EXISTS`（已有别的未结束运单）、`TRACKING_NUMBER_EXISTS`、
+  `OPTION_INVALID`（`column: options.<key>`）；列级的 code（`column` = 列名）：`REQUIRED`、`TOO_LONG`（带 `length`、`max_length`、
+  `length_unit`——姓名 / 地址超长不静默截断）、`UNENCODABLE`（`characters`）、`CHARACTER_NOT_ALLOWED`（`charset: jis_x0208` 时
+  不在 JIS 第1・第2水准的字）。字段内换行换成空格。
+- 400 `16138`：`carrier_id` / `dn_ids` / `warehouse_id` 不合法（`field`）；409 `16138`：承运商的 `waybill_method` 不是 `file`、
+  模板用不了、必填账号项没填（`field: file_account.<key>`、`details.missing_account_fields`）。
+
+**导入**——`POST /warehouse/dn/carrier-files/import`（`packing_edit` / `delivery_edit`），multipart：`file`（≤ 5 MB、≤ 5000 行）、
+`carrier_id`、`dry_run`（默认 `true` / `false`）、`warehouse_id?`：
+
+```json
+{ "dry_run": true, "file_name": "b2.csv", "encoding": "cp932", "batch_id": null,
+  "rows": [{"line": 2, "reference": "DN163", "dn_id": 163, "order_number": "SHP-1", "tracking_numbers": ["401234567890"],
+            "result": "matched", "message": null, "primary": true}, "..."],
+  "summary": {"matched": 2, "not_found": 1, "already_has_number": 0, "same_number": 0, "invalid": 0, "skipped": 0,
+              "dns": {"matched": 1, "not_found": 1, "already_has_number": 0, "same_number": 0, "invalid": 0}} }
+```
+
+- 按 `import.encoding` 与 `encoding_fallbacks` 解码（候选里有 UTF-8 时，有 BOM 或是合法 UTF-8 就按 UTF-8）；`header_rows`
+  只在它不像数据行时跳过；`skip_rows_when` 的行计入 `summary.skipped`；匹配键按 `reference_parse` 解析，运单号按
+  `tracking_normalize` 规范化（`digits` 去掉连字符）。
+- 一张 DN 多行（多件）= 多个运单号：第一个为主单号，其余进 `package_tracking_numbers`。
+- `result`：`matched`（会写入 / 已写入）、`not_found`（本公司 / 本仓库没有这张 DN，或匹配键不是 `DN<id>`）、`already_has_number`
+  （DN 已有不同的运单号，需人工决定）、`same_number`（已导入过，忽略）、`invalid`（没有运单号、DN 已关闭、承运商不同、插件运单
+  结果不明、号码已属于别的 DN、没有未完成的发货任务、没导出过就已发货）。
+- `dry_run: false`：逐张 DN 加锁后重新判断，在一个事务里写入 `matched` 的：`exported` 记录 → `active`（没导出过的 DN 直接建
+  `file` 运单），主单号写到发货任务上（任务没有承运商时一并设上）——与保存运单号同一套逻辑，跟踪（`tracks_any_number`）、
+  揽收、流程都与其它运单一样。记一个导入批次（`batch_id`）。
+- 400 `16138`：没有文件 / 文件为空 / 超过 5 MB / 读不了（`field: file`），`dry_run` / `carrier_id` 不合法；409 `16138`：
+  不是文件方式 / 模板不能导入。
+
+**作废导出**——`POST /warehouse/dn/<id>/carrier-shipment/discard-export`：已导出的记录 → `cancelled`（`reason: discarded`；只改
+WMS，在承运商软件里打过的请在那边删掉）；200 = `GET …/carrier-shipment` 的内容加 `waybill`（任一来源的当前运单或 `null`）；
+没有可作废的 → 409 `16075`。已导出期间手填了运单号 → 这次导出作废（`reason: replaced`）；`file` 运单的换号 / 清空与手填的相同。
+
+**批次**——`GET /warehouse/dn/carrier-files/batches?carrier_id=&warehouse_id=&limit=`（`dn_read` / …）：新的在前，
+`[{id, carrier_id, warehouse_id, kind: export | import, file_name, row_count, summary, created_at, created_by,
+created_by_user}]`（不存文件内容）。
+
+### 结构化地址
+
+收件人、仓库、DN 的收件地址快照，以及交给插件 / 文件模板的 `ship_to` / `shipper` 用同一组字段名：`country`（ISO 3166-1
+alpha-2）、`postal_code`、`admin_area`（州 / 省 / 都道府县）、`locality`（市区町村）、`dependent_locality`、`address_line1`、
+`address_line2`、`organization`、`name`、`phone`、`email`，以及拉丁转写 `latin: {name, organization, address_line1,
+address_line2, locality, admin_area}`（跨境面单用；没有时用本地文字或报关快照里的英文收件人）。
+
+- **收件人**（`/warehouse/recipient/`）：新增 `admin_area`、`locality`、`dependent_locality`、`address_line1`、`address_line2`、
+  `organization`、`latin`；`zip_code` 就是 `postal_code`（两个名字都收、都返回；两个都给且不同 → 400 `14019`）。`null` 清空。
+  只给了结构化字段（没给 `address`）时按国家格式生成单行的 `address`（结构化字段改了会重新生成）。
+- **仓库**（`/warehouse/warehouse/`）：`admin_area`、`locality`、`address_line1`、`address_line2`、`latin`（`postal_code` ≡
+  `zip_code`）；`address` 同样生成；`address_en` 保留为拉丁地址的单行写法，为空时由 `latin` 生成。
+- **DN**：`ship_to`（json 快照）与 `shipping_options`（json）。`POST /warehouse/dn/` 接受 `ship_to`；没给时从收件人的结构化字段
+  拷贝（没有结构化字段的旧收件人 → `null`）。`shipping_address` 照收；只给了 `ship_to` 时按国家格式生成（都没有 → 400
+  `40000`）。`PUT`（pending 的 DN）可以替换 `ship_to` / `shipping_options`。打包后用 `GET / PUT /warehouse/dn/<id>/ship-to`
+  （`{ship_to}` → `{ship_to, ship_to_effective, shipping_address, locked, locked_reason, locked_message}`）改快照（如承运商文件报
+  地址超长时改短），`shipping_address` 按新地址重新生成，报关快照不动。锁定同运单服务选项：有 `api` 运单或 `file` 运单
+  （exported / active）→ 409 `16076`（`details.reason: SHIP_TO_LOCKED`），已发货 → 409 `16065`，已关闭 → 400 `16001`；
+  手填运单号不锁。DN 详情返回 `ship_to`、`shipping_options` 和
+  `ship_to_effective`（面单 / 文件实际用的地址：`ship_to`，没有用收件人的结构化字段，再没有 `address_line1` = `shipping_address`
+  加收件人的姓名 / 电话 / 邮编）。route 的收件国：报关快照的 → `ship_to.country` → 收件人的。
+- 字段不合法 → 400 `14019`（不是文字 / 超长，`field` 如 `ship_to.latin.name`）/ `14020`（国家代码）。不认识的键忽略；空值可以传
+  `null`。
+- 排版：`warehouse/common/address_format.py` 的 `format_lines(address, style='local' | 'latin')` / `format_single_line(...)`，按国家
+  规则包（日本：〒邮编 / 都道府県市区町村 / 番地・建物；美国：街道 / `City, ST ZIP`；其它：街道 / 城市 州 邮编 / 国家）。
+- 插件：`shipper` / `recipient` 原来的键照旧（FedEx 不变），另带 `local`（结构化地址）与 `latin`；国内件的收件人地址行 / 城市 /
+  州取自 `ship_to`。
+
+### 国家规则包
+
+`warehouse/country_rules/`：`base.py`（`CountryRules`：`customs_line_problems(line)`、`customs_problems(ctx)`、
+`exporter_tax_label`、`address_format`（local / latin 的行模板）、`phone_normalize`）、`registry.py`（`rules_for(国家)`，没登记的
+国家用默认规则；第三方包经 entry point 组 `goodsmart_wms.country_rules` 登记）、`jp.py`、`us.py`。核心只调注册表。日本的报关检查
+（9 位输出统计品目番号 `JP_EXPORT_CODE_MISMATCH` / `JP_EXPORT_CODE_MISSING` / `JP_EXPORT_VALUE_UNVERIFIED`）搬进 `jp.py`，文案不变；
+在出口国（仓库的国家，没有用公司的）是日本时参与。日本出口方没设 `tax_id_label` 时单证改印 `Corporate No.`（默认规则：`Tax ID`）；
+以前印 `Tax ID` 签发的单证不算过期。
+
+### 运单服务选项
+
+插件（`CarrierAdapter.service_options`，FedEx 为空）与文件模板（`service_options`）声明选项，如 `delivery_date`、
+`delivery_time_slot`、`invoice_type`、`cod_amount`、`cool_type`。按 DN 的承运商取（`waybill_method: file` 用文件模板的，否则用在线
+对接插件的）。
+
+- `GET /warehouse/dn/<id>/shipping-options` → `{options, values, schema, defaults, locked, locked_reason, locked_message}`；
+  `PUT {options: {...}}`（`packing_edit` / `delivery_edit`）整体替换 → 200 同样的内容。不是声明的键 / select 值不在列表 /
+  日期（`YYYY-MM-DD`）/ 金额（≥ 0、最多 2 位小数）/ 文字不合法 → 400 `16139`（`field: options.<key>`；没带 `options` →
+  `field: options`）。
+- 有 `api` 运单或 `file` 运单（exported / active）后锁定 → 409 `16076`（`details.reason: SHIPPING_OPTIONS_LOCKED`，
+  `carrier_shipment`）；已发货 → 409 `16065`。手填运单号不锁。
+- `POST /warehouse/dn/` 可带 `shipping_options`：已声明的键按类型校验（400 `16139`，`field: shipping_options.<key>`），没声明的
+  照收（承运商以后还可能换）；导出 / 建单时不用没声明的键。
+- 建单时交给插件 `shipment['options']`（只含声明了的键）；导出时作为 `{options.<key>}`；已存的值不合法时导出报 `OPTION_INVALID`。
+- 文件运单显示服务名称：`shipment.service_type` = 模板 `service_option` 那个选项的值，`service_name` = 它的名称（`service_label`
+  带各语言）。
 
 ## 承运商对接（自动建运单）
 
@@ -911,6 +1079,7 @@ DN 发货前可取消（发货后 409 `16065`；没有可取消的 409 `16075`�
 | `supports_pickup` / `supports_tracking` | 预约揽收 / 查跟踪（见「上门揽收」/「跟踪」） |
 | `tracks_any_number` | 能查不是本插件建的运单号（手填 / 文件导回的运单也照常跟踪）；FedEx 为 `True` |
 | `tracking_url_template` | 公开查询页，`{tracking_number}` 占位；承运商自己没填 `tracking_url_template` 时用它 |
+| `service_options` | DN 可带的运单服务选项（`({key, kind: select / date / money / text, label, values?, default?, help?}, …)`，默认为空）；WMS 校验后交给插件 `shipment['options']` |
 
 设置项 `setting(key, kind, *, label, required=False, default=None, options=None, help=None, group='account', placeholder=None)`：
 
@@ -922,7 +1091,8 @@ DN 发货前可取消（发货后 409 `16065`；没有可取消的 409 `16075`�
 - 约定的键：`default_label_format`（建单不指定时的打印方式）、`service_type`（记到建单记录上，`service_name()` 给显示名）。
 
 方法（`shipment` 是 WMS 交给插件的一票货，纯数据：`reference`、`ship_date`、`route`、`shipper`、`recipient`、`packages[]`、
-`commodities[]`、`invoice`、`documents`，字段见 `CarrierAdapter` 的文档字符串；不要报关（`route.requires_customs` 为假）时
+`commodities[]`、`invoice`、`documents`、`options`，字段见 `CarrierAdapter` 的文档字符串；`shipper` / `recipient` 另带 `local`
+（结构化地址）与 `latin`；不要报关（`route.requires_customs` 为假）时
 `commodities` / `invoice` / `documents` 为 `None`）：
 
 | 方法 | 约定 |
@@ -1163,7 +1333,7 @@ stdout_logfile=/var/log/wms-api.out.log
 | 库存错误 | 15000-15999 | 400 | 库存相关错误 |
 | 状态错误 | 16000-16999 | 400 | 状态流转错误 |
 
-出口单证相关业务码：`14019` 出口资料文本超长、`14020` 国家代码不合法、`16063` 报关结构不合法、`16064` 报关行商品编码不在 DN 明细或重复、`16065` 已发货不可改（409）、`16066` 箱子数据不合法、`16067` 当前状态不能改箱子（409）、`16068` 单证条件不全（409，`details.problems`）、`16070` 不是海外单（409）、`16071` 单证不存在（404）、`16117` 单证排不下——某块文字（通常是收件人信息）一页放不下，请缩短（409，`details {document, reason: LAYOUT_OVERFLOW}`）。承运商运单（自动建运单）：`16072` 建单 / 取消的前置条件不满足（409，`details.blockers`）、`16073` 承运商返回错误或结果不明（502，`details.errors` / `transaction_id` / `maybe_processed`）、`16074` 承运商超时或时间预算用完（504，`details.budget_exhausted`）、`16075` 没有可取消 / 可确认作废的运单记录（409，`details.unresolved`）、`16076` 有进行中 / 有效 / 结果不明 / 取消中的运单时不能改箱子或报关数据，也不能签发数据有变化的单证（409，`details {reason: CARRIER_SHIPMENT_OPEN | DOCUMENT_DATA_CHANGED, status, carrier, carrier_shipment {id, status, tracking_number}}`）、`16077` `label_format` 不合法或该承运商不支持（400）、`16078` 运单号 / 承运商与有效的自动运单不一致，或有自动运单时新建 / 删除发货任务（409）、`16079` 有结果不明 / 进行中的建单记录，或运单正在取消 / 取消结果不明——不能建单、存运单号、发货（409，`details.unresolved`）、`16093` 取消 / 确认作废请求里的目标与当前记录不符（409，`details {expected, actual}`）、`16094` 确认作废带运单号的记录时承运商没有确认已取消 / 不存在（409）、`16095` 承运商已建好运单但 WMS 写库失败，已补偿处理（502，`details {error, compensation, unresolved, …}`）。承运商在线对接：`16124` 对接设置不合法（400，`field`：`adapter` / `enabled` / `settings.<key>` / `secrets.<key>`）、`16125` 承运商还有未结束的自动运单，不能删除对接或换插件（409，`details.shipments`）。上门揽收：`16130` 前置条件不满足（409，`details.blockers`）、`16131` 预约参数不合法（400，`field`）、`16132` 所选运单不能预约（409，`details.shipments[{shipment_id, tracking_number, reason}]`）、`16133` 当前状态不能取消 / 作废（409，`details {pickup_id, status, reason, pickup_date}`）；跟踪：`16134` 没有能经 API 跟踪的有效运单（409）；承运商报错 / 超时同运单（`16073` / `16074`，`details.action` 为 `pickup` / `pickup_cancel` / `pickup_availability`）。已不再使用：`16069`（原：完成发货时单证缺失或已过期；完成发货不再查单证）；单证不再印运单号和承运商：`16080`（原：完成发货时运单号与 CI 上印的 AWB 不一致）、`16092`（原：完成发货时承运商与 CI 上印的不一致）。发货任务：`16090` DN 已有未完成的发货任务（409，`details {delivery_task_id, status}`）、`16091` 有报关快照或运单记录的 DN 不是当前发货任务（409，`details {delivery_task_id, current_status}`）、`16136` `shipped_at` 晚于现在（400，`field: shipped_at`；格式不对为 `16050`）。发货流程：`16135` 承运商对接方式 / 集荷安排 / 查询页 / `auto_sign_days` 不合法，或所选方式现在不可选（400，`field`）；`16130` 另有 `PICKUP_METHOD_NOT_API`；`16131` 手工揽收另有 `field` `warehouse_id` / `confirmation_code`；建运单的 blocker `SCOPE_NOT_SUPPORTED` / `CUSTOMS_DATA_MISSING` / `CUSTOMS_NOT_SUPPORTED` / `WAYBILL_NOT_SUPPORTED` 取代 `NOT_EXPORT`。错误响应可能带结构化的 `details`。
+出口单证相关业务码：`14019` 出口资料文本超长、`14020` 国家代码不合法、`16063` 报关结构不合法、`16064` 报关行商品编码不在 DN 明细或重复、`16065` 已发货不可改（409）、`16066` 箱子数据不合法、`16067` 当前状态不能改箱子（409）、`16068` 单证条件不全（409，`details.problems`）、`16070` 不是海外单（409）、`16071` 单证不存在（404）、`16117` 单证排不下——某块文字（通常是收件人信息）一页放不下，请缩短（409，`details {document, reason: LAYOUT_OVERFLOW}`）。承运商运单（自动建运单）：`16072` 建单 / 取消的前置条件不满足（409，`details.blockers`）、`16073` 承运商返回错误或结果不明（502，`details.errors` / `transaction_id` / `maybe_processed`）、`16074` 承运商超时或时间预算用完（504，`details.budget_exhausted`）、`16075` 没有可取消 / 可确认作废的运单记录（409，`details.unresolved`）、`16076` 有进行中 / 有效 / 结果不明 / 取消中的运单时不能改箱子或报关数据，也不能签发数据有变化的单证（409，`details {reason: CARRIER_SHIPMENT_OPEN | DOCUMENT_DATA_CHANGED, status, carrier, carrier_shipment {id, status, tracking_number}}`）、`16077` `label_format` 不合法或该承运商不支持（400）、`16078` 运单号 / 承运商与有效的自动运单不一致，或有自动运单时新建 / 删除发货任务（409）、`16079` 有结果不明 / 进行中的建单记录，或运单正在取消 / 取消结果不明——不能建单、存运单号、发货（409，`details.unresolved`）、`16093` 取消 / 确认作废请求里的目标与当前记录不符（409，`details {expected, actual}`）、`16094` 确认作废带运单号的记录时承运商没有确认已取消 / 不存在（409）、`16095` 承运商已建好运单但 WMS 写库失败，已补偿处理（502，`details {error, compensation, unresolved, …}`）。承运商在线对接：`16124` 对接设置不合法（400，`field`：`adapter` / `enabled` / `settings.<key>` / `secrets.<key>`）、`16125` 承运商还有未结束的自动运单，不能删除对接或换插件（409，`details.shipments`）。上门揽收：`16130` 前置条件不满足（409，`details.blockers`）、`16131` 预约参数不合法（400，`field`）、`16132` 所选运单不能预约（409，`details.shipments[{shipment_id, tracking_number, reason}]`）、`16133` 当前状态不能取消 / 作废（409，`details {pickup_id, status, reason, pickup_date}`）；跟踪：`16134` 没有能经 API 跟踪的有效运单（409）；承运商报错 / 超时同运单（`16073` / `16074`，`details.action` 为 `pickup` / `pickup_cancel` / `pickup_availability`）。已不再使用：`16069`（原：完成发货时单证缺失或已过期；完成发货不再查单证）；单证不再印运单号和承运商：`16080`（原：完成发货时运单号与 CI 上印的 AWB 不一致）、`16092`（原：完成发货时承运商与 CI 上印的不一致）。发货任务：`16090` DN 已有未完成的发货任务（409，`details {delivery_task_id, status}`）、`16091` 有报关快照或运单记录的 DN 不是当前发货任务（409，`details {delivery_task_id, current_status}`）、`16136` `shipped_at` 晚于现在（400，`field: shipped_at`；格式不对为 `16050`）。发货流程：`16135` 承运商对接方式 / 集荷安排 / 查询页 / `auto_sign_days` / 文件方式设置（`file_preset`、`file_template.<位置>`、`file_account.<key>`）不合法，或所选方式现在不可选（400，`field`）；文件方式：`16137` 有行有问题、整批不导出（409，`details.rows[{dn_id, order_number, problems[{column, code, message}]}]`）、`16138` 文件方式用不了：请求 / 导入文件不合法（400）或承运商不是文件方式 / 模板不全（409），带 `field`；`16139` 运单服务选项不合法（400，`field: options.<key>`）；`16076` 另有 `details.reason: SHIPPING_OPTIONS_LOCKED` / `SHIP_TO_LOCKED`，`16075` 另用于没有可作废的已导出文件运单（`details.waybill`）；结构化地址用 `14019`（不是文字 / 超长 / `zip_code` 与 `postal_code` 不同）与 `14020`（国家代码）；`16130` 另有 `PICKUP_METHOD_NOT_API`；`16131` 手工揽收另有 `field` `warehouse_id` / `confirmation_code`；建运单的 blocker `SCOPE_NOT_SUPPORTED` / `CUSTOMS_DATA_MISSING` / `CUSTOMS_NOT_SUPPORTED` / `WAYBILL_NOT_SUPPORTED` 取代 `NOT_EXPORT`。错误响应可能带结构化的 `details`。
 
 作业流程（见上文「作业流程规则」）：`16110` DN 有未结束的承运商运单，请先取消运单（409）、`16111` 调整单已取消（409）、`16112` 调整单当前状态不能取消（409）、`16113` 调整明细无法执行：库位上已没有该商品 / 明细没有库位（409）、`16114` 盘点单有未录入的明细（409，`details.detail_ids`）、`16115` 数值字段不合法（400，`field`）、`16116` 分拣任务的 ASN 不能改（409）、`16120` 移库来源库位没有这个商品（404）、`16121` 同一个 `client_batch_id` 已提交过不同的明细（409，`details {client_batch_id, batch_id}`）、`16122` 修改过调整单明细的人不能审批（409）、`16123` `client_batch_id` 不合法（400）、`44009` 库位有历史记录，请改用停用（409）。任务：`16088` 任务已停用（所属 DN / ASN 已取消，409）、`16089` 拣货一件都没拣不能完成（409）。
 

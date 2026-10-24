@@ -5,6 +5,7 @@ from extensions.error import BadRequestException
 from system.common import paginate,permission_required
 from system.common.permissions import get_actor_company_id
 from warehouse.carrier.integration_services import CarrierIntegrationService
+from warehouse.carrier.presets import describe as describe_file_presets
 from warehouse.carrier.services import CarrierService
 from warehouse.common import get_company_owned, require_actor_user_id
 from .models import Carrier
@@ -108,6 +109,23 @@ class CarrierIntegrationList(Resource):
         fields: [{key, kind: text|secret|select|boolean, label: {locale: text}, required, default, options, help,
         group: account|shipping|label}]}]"""
         return CarrierIntegrationService.available()
+
+
+@api_ns.doc(security="jsonWebToken")
+@api_ns.route('/file-presets', '/file-presets/')
+class CarrierFilePresetList(Resource):
+
+    @permission_required(["all_access", "company_all_access", "carrier_read"])
+    def get(self):
+        """File presets for carriers without an API contract (waybill_method file, doc/shipping-flow.md §6.1):
+        [{code, name: {en-US, zh-CN, ja-JP}, country, version, notes, verified (false = not tested in the carrier
+        software yet), sources[], tracking_url_template, tracking_url_fallback, tracking_url_notes, service_option,
+        service_options: [{key, kind: select|date|money|text, label, values?, default?, help?}],
+        account_fields: [{key, label, required, help?}], columns: [{header, required, max_length}],
+        export: {encoding, delimiter, quoting, header, line_ending, length_unit, charset},
+        import: {encoding, encoding_fallbacks, header_rows, reference_column, tracking_column, tracking_normalize}
+        | null}]"""
+        return describe_file_presets(), 200
 
 
 @api_ns.doc(security="jsonWebToken")

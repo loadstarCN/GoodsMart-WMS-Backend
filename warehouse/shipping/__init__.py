@@ -6,4 +6,5 @@
 - stage：列表用的发货阶段（SQL 判定）
 - flow：出库单流程汇总（GET /warehouse/dn/<id>/shipping-flow）
 - auto_sign：自动视为签收（carriers.auto_sign_days）
+- options：运单服务选项（DN.shipping_options，按承运商声明的 service_options 校验，建运单 / 导出后锁定）
 """

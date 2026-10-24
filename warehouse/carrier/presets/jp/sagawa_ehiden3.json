@@ -1,0 +1,836 @@
+{
+  "code": "jp.sagawa_ehiden3",
+  "name": {
+    "en-US": "Sagawa Express – e-Hiden III (standard CSV with header)",
+    "zh-CN": "佐川急便 e飛伝Ⅲ（标准 CSV，含表头）",
+    "ja-JP": "佐川急便 e飛伝Ⅲ（標準_飛脚宅配便_CSV_ヘッダ有）"
+  },
+  "country": "JP",
+  "version": "e飛伝Ⅲ 操作マニュアル（飛脚宅配便）更新日 2026/09/28 — 付録 a-1 送り状データ取込レイアウト（74項目）/ a-9 出荷履歴データ出力レイアウト（91項目）",
+  "verified": false,
+  "sources": [
+    "https://e-hiden3.sagawa-exp.co.jp/help_nsx/manual-takuhai.pdf",
+    "https://e-hiden3.sagawa-exp.co.jp/help_nsx/qa-all.html",
+    "https://manual.sokuhan.jp/downloads/ehiden3.pdf",
+    "https://help.thebase.in/hc/ja/articles/4407887097369",
+    "https://userguide.bcart.jp/management/conf/external/conf_case_ehiden3/",
+    "https://docs.channel.io/logikura_help/ja/articles/e%E9%A3%9B%E4%BC%9D3%E3%81%A7%E9%80%81%E3%82%8A%E7%8A%B6%E3%82%92%E7%99%BA%E8%A1%8C%E3%81%99%E3%82%8B-393a054d",
+    "https://internet.watch.impress.co.jp/docs/news/2150814.html",
+    "https://www.lnews.jp/2026/10/s1023703.html"
+  ],
+  "notes": "【导入步骤】佐川スマートクラブ →「送り状発行（e飛伝Ⅲ）」→「宅配便送り状」→「送り状データ取込」（或「送り状データ取込簡易版」）→ 服务选飛脚宅配便 → テンプレート选「共通テンプレートを使用」→「標準_飛脚宅配便_CSV_ヘッダ有」→ 选文件 → 选出荷日 →「直接取込」→ 确认后「登録」→ 印刷。单个文件最多 1,000 行（含表头），一次最多生成 1,000 件（件数×個数）。表头文字取自官方 a-1 项目名（去掉「（必須）」标注），共通テンプレート 按位置读取；可用「テンプレート出力」下载官方表头核对。【适用范围】仅 e飛伝Ⅲ（及 e飛伝ⅢEvo 共用布局，未单独核实）；e飛伝Ⅱ/e飛伝Pro 的区分值不同（スピード、クール、決済種別、時間帯シール等），不可混用。【字符/长度】住所・名称为全角字段，半角会被自动转全角，因此 16 字即上限（max_length 按 Shift_JIS 字节=32 表示）；为长度校验一致，导出前先 |zenkaku。支持 JIS 第1/2水准 + IBM/NEC 扩展字 → 用 CP932 编码。若住所1~3 任一超过16字，e飛伝在「フィールドごとに改行」模式下会报错；在「結合する」模式下合并后每16字自动换行（共通テンプレート直接取込的默认模式未在手册中写明，需实测）。【重要事件】2026-09-30 佐川「お荷物問い合わせサービス」遭未授权访问（最多约5,323万件个人信息可能外泄），10-23 网页查询恢复，但「お荷物問い合わせAPI」「飛脚宅配便受付」等仍停止（LNEWS 10-23）。e飛伝Ⅲ 本身是否受影响未见报道。【多件】出荷個数≥2 时会有多张面单/多个送り状No.，回填时同一 お客様管理番号 可能对应多行。",
+  "tracking_url_template": "https://k2k.sagawa-exp.co.jp/p/web/okurijosearch.do?okurijoNo={tracking_number}",
+  "tracking_url_notes": "2026-10-25 实测：此 URL 仍可访问，但页面显示「お荷物問い合わせサービスは現在システムを停止」。佐川官网首页的日文查询入口现已改为 https://e-customer.sagawa-exp.co.jp/k2k（新 SPA，表单字段 tracking_number，通过 POST 提交，GET 参数 ?tracking_number= 不会自动查询，即暂无可深链的 URL）。建议：模板暂保留旧 URL，并在 UI 中同时提供 https://e-customer.sagawa-exp.co.jp/k2k 作为手动查询入口；上线前复测。",
+  "tracking_url_fallback": "https://e-customer.sagawa-exp.co.jp/k2k",
+  "service_option": "speed",
+  "export": {
+    "format": "csv",
+    "encoding": "cp932",
+    "encoding_notes": "用 cp932。官方 FAQ 说明 Excel 另存的「CSV(コンマ区切り)」（即 Shift_JIS）可以导入，e飛伝Ⅲ 自己输出的 UTF-8 也可再导入；为兼容 Excel 编辑与 e飛伝Pro 用户，选 Shift_JIS。",
+    "delimiter": ",",
+    "quoting": "minimal",
+    "header": true,
+    "line_ending": "\r\n",
+    "length_unit": "sjis_bytes",
+    "row_unit": "dn",
+    "columns": [
+      {
+        "header": "お届け先コード取得区分",
+        "value": "",
+        "required": false,
+        "max_length": 1,
+        "notes": "使用住所録时：0飛脚宅配便/1サービス共通。"
+      },
+      {
+        "header": "お届け先コード",
+        "value": "",
+        "required": false,
+        "max_length": 12
+      },
+      {
+        "header": "お届け先電話番号",
+        "value": "{ship_to.phone|jp_phone}",
+        "required": false,
+        "max_length": 14,
+        "notes": "半角数字+ハイフン，≤14。官方未标必填但强烈建议填写。"
+      },
+      {
+        "header": "お届け先郵便番号",
+        "value": "{ship_to.postal_code|digits}",
+        "required": false,
+        "max_length": 8,
+        "notes": "半角数字+ハイフン 8。"
+      },
+      {
+        "header": "お届け先住所１",
+        "value": "{ship_to.admin_area|zenkaku}{ship_to.locality|zenkaku}",
+        "required": true,
+        "max_length": 32,
+        "notes": "必须。全角16字（半角会被转为全角）。住所1～3 合计 48 全角字。"
+      },
+      {
+        "header": "お届け先住所２",
+        "value": "{ship_to.dependent_locality|zenkaku}{ship_to.address_line1|zenkaku}",
+        "required": false,
+        "max_length": 32,
+        "notes": "全角16字。"
+      },
+      {
+        "header": "お届け先住所３",
+        "value": "{ship_to.address_line2|zenkaku}",
+        "required": false,
+        "max_length": 32,
+        "notes": "全角16字。"
+      },
+      {
+        "header": "お届け先名称１",
+        "value": "{ship_to.name|zenkaku}",
+        "required": true,
+        "max_length": 32,
+        "notes": "必须。全角16字。"
+      },
+      {
+        "header": "お届け先名称２",
+        "value": "{ship_to.organization|zenkaku}",
+        "required": false,
+        "max_length": 32,
+        "notes": "全角16字。"
+      },
+      {
+        "header": "お客様管理番号",
+        "value": "DN{dn.id}",
+        "required": false,
+        "max_length": 16,
+        "notes": "半角16。WMS 回填匹配键（出荷履歴第19列）。"
+      },
+      {
+        "header": "お客様コード",
+        "value": "{carrier.account.customer_code}",
+        "required": false,
+        "max_length": 12,
+        "notes": "半角数字12；空=默认契约。"
+      },
+      {
+        "header": "部署ご担当者コード取得区分",
+        "value": "",
+        "required": false,
+        "max_length": 1
+      },
+      {
+        "header": "部署ご担当者コード",
+        "value": "",
+        "required": false,
+        "max_length": 4
+      },
+      {
+        "header": "部署ご担当者名称",
+        "value": "",
+        "required": false,
+        "max_length": 32,
+        "notes": "荷送人的部署/担当者，全角16。"
+      },
+      {
+        "header": "荷送人電話番号",
+        "value": "{carrier.account.shipper_phone}",
+        "required": false,
+        "max_length": 14,
+        "notes": "用于从已登录的荷送人中选择（多荷送人时）；空=默认荷送人。"
+      },
+      {
+        "header": "ご依頼主コード取得区分",
+        "value": "",
+        "required": false,
+        "max_length": 1
+      },
+      {
+        "header": "ご依頼主コード",
+        "value": "",
+        "required": false,
+        "max_length": 12
+      },
+      {
+        "header": "ご依頼主電話番号",
+        "value": "{shipper.phone|jp_phone}",
+        "required": false,
+        "max_length": 14
+      },
+      {
+        "header": "ご依頼主郵便番号",
+        "value": "{shipper.postal_code|digits}",
+        "required": false,
+        "max_length": 8
+      },
+      {
+        "header": "ご依頼主住所１",
+        "value": "{shipper.admin_area|zenkaku}{shipper.locality|zenkaku}",
+        "required": false,
+        "max_length": 32,
+        "notes": "全角16字。"
+      },
+      {
+        "header": "ご依頼主住所２",
+        "value": "{shipper.dependent_locality|zenkaku}{shipper.address_line1|zenkaku}{shipper.address_line2|zenkaku}",
+        "required": false,
+        "max_length": 32,
+        "notes": "全角16字（依頼主只有2行住所）。"
+      },
+      {
+        "header": "ご依頼主名称１",
+        "value": "{shipper.name|zenkaku}",
+        "required": false,
+        "max_length": 32,
+        "notes": "全角16字。代发货（3PL）时填货主店铺名。"
+      },
+      {
+        "header": "ご依頼主名称２",
+        "value": "",
+        "required": false,
+        "max_length": 32
+      },
+      {
+        "header": "荷姿",
+        "value": "{carrier.account.package_type_code}",
+        "required": false,
+        "max_length": 3,
+        "notes": "001箱類/002バッグ類/003スーツケース/004封筒類/005ゴルフバッグ/006スキー/007スノーボード/008その他。"
+      },
+      {
+        "header": "品名１",
+        "value": "{goods.summary|truncate_bytes:32}",
+        "required": false,
+        "max_length": 32,
+        "notes": "全角16/半角32；全半角混在会整体转全角→按16字截断最安全。"
+      },
+      {
+        "header": "品名２",
+        "value": "",
+        "required": false,
+        "max_length": 32
+      },
+      {
+        "header": "品名３",
+        "value": "",
+        "required": false,
+        "max_length": 32
+      },
+      {
+        "header": "品名４",
+        "value": "",
+        "required": false,
+        "max_length": 32
+      },
+      {
+        "header": "品名５",
+        "value": "",
+        "required": false,
+        "max_length": 32
+      },
+      {
+        "header": "荷札荷姿",
+        "value": "",
+        "required": false,
+        "max_length": 3
+      },
+      {
+        "header": "荷札品名１",
+        "value": "",
+        "required": false,
+        "max_length": 32
+      },
+      {
+        "header": "荷札品名２",
+        "value": "",
+        "required": false,
+        "max_length": 32
+      },
+      {
+        "header": "荷札品名３",
+        "value": "",
+        "required": false,
+        "max_length": 32
+      },
+      {
+        "header": "荷札品名４",
+        "value": "",
+        "required": false,
+        "max_length": 32
+      },
+      {
+        "header": "荷札品名５",
+        "value": "",
+        "required": false,
+        "max_length": 32
+      },
+      {
+        "header": "荷札品名６",
+        "value": "",
+        "required": false,
+        "max_length": 32
+      },
+      {
+        "header": "荷札品名７",
+        "value": "",
+        "required": false,
+        "max_length": 32
+      },
+      {
+        "header": "荷札品名８",
+        "value": "",
+        "required": false,
+        "max_length": 32
+      },
+      {
+        "header": "荷札品名９",
+        "value": "",
+        "required": false,
+        "max_length": 32
+      },
+      {
+        "header": "荷札品名１０",
+        "value": "",
+        "required": false,
+        "max_length": 32
+      },
+      {
+        "header": "荷札品名１１",
+        "value": "",
+        "required": false,
+        "max_length": 32
+      },
+      {
+        "header": "出荷個数",
+        "value": "{package.count|default:1}",
+        "required": false,
+        "max_length": 3
+      },
+      {
+        "header": "スピード指定",
+        "value": "{options.speed|default:000}",
+        "required": false,
+        "max_length": 3,
+        "notes": "000飛脚宅配便/003飛脚航空便（翌日中）/004飛脚航空便（翌日午前中）/005飛脚ジャストタイム便（仅法人收件）。"
+      },
+      {
+        "header": "クール便指定",
+        "value": "{options.cool_type|default:001}",
+        "required": false,
+        "max_length": 3,
+        "notes": "001指定なし/002クール（冷蔵）/003クール（冷凍）。"
+      },
+      {
+        "header": "配達日",
+        "value": "{options.delivery_date|date:%Y%m%d}",
+        "required": false,
+        "max_length": 8,
+        "notes": "YYYYMMDD。"
+      },
+      {
+        "header": "配達指定時間帯",
+        "value": "{options.delivery_time_slot}",
+        "required": false,
+        "max_length": 2,
+        "notes": "01午前中/12/14/16/18/19（6時間帯契约）/04＝18～21（5時間帯契约）；时间段服务仅限个人收件。"
+      },
+      {
+        "header": "配達指定時間（時分）",
+        "value": "",
+        "required": false,
+        "max_length": 4,
+        "notes": "仅ジャストタイム便，HHMM（30分单位）。"
+      },
+      {
+        "header": "代引金額",
+        "value": "{options.cod_amount}",
+        "required": false,
+        "max_length": 7,
+        "notes": "整数日元；有代引时需同时填 決済種別。"
+      },
+      {
+        "header": "消費税",
+        "value": "{options.cod_tax_amount}",
+        "required": false,
+        "max_length": 6
+      },
+      {
+        "header": "決済種別",
+        "value": "{options.cod_payment_type}",
+        "required": false,
+        "max_length": 1,
+        "notes": "0指定なし/1全て可/2現金のみ/3キャッシュレス。"
+      },
+      {
+        "header": "保険金額",
+        "value": "",
+        "required": false,
+        "max_length": 8
+      },
+      {
+        "header": "指定シール１",
+        "value": "",
+        "required": false,
+        "max_length": 3,
+        "notes": "001冷蔵/002冷凍/004営業所受取/005指定日配達/008～010eコレクト/011取扱注意/012貴重品/013天地無用/017航空便/018ジャストタイム/020～026時間帯指定。BASE 等会按时间段填020～026，官方未要求，默认留空。"
+      },
+      {
+        "header": "指定シール２",
+        "value": "",
+        "required": false,
+        "max_length": 3
+      },
+      {
+        "header": "指定シール３",
+        "value": "",
+        "required": false,
+        "max_length": 3
+      },
+      {
+        "header": "営業所受取",
+        "value": "",
+        "required": false,
+        "max_length": 1,
+        "notes": "0通常出荷/1営業所受取。"
+      },
+      {
+        "header": "SRC区分",
+        "value": "",
+        "required": false,
+        "max_length": 1
+      },
+      {
+        "header": "営業所受取営業所コード",
+        "value": "",
+        "required": false,
+        "max_length": 4
+      },
+      {
+        "header": "元着区分",
+        "value": "{options.invoice_type|default:1}",
+        "required": false,
+        "max_length": 1,
+        "notes": "1元払/2着払。"
+      },
+      {
+        "header": "メールアドレス",
+        "value": "",
+        "required": false,
+        "max_length": 100
+      },
+      {
+        "header": "ご不在時連絡先",
+        "value": "",
+        "required": false,
+        "max_length": 14
+      },
+      {
+        "header": "出荷日",
+        "value": "{ship_date|date:%Y%m%d}",
+        "required": false,
+        "max_length": 8,
+        "notes": "YYYYMMDD；取込画面上也要选择出荷日（以画面为准，待实测）。"
+      },
+      {
+        "header": "お問い合せ送り状No.",
+        "value": "",
+        "required": false,
+        "max_length": 12,
+        "notes": "仅「ユーザ採番」契约使用；空=系统自动采番。"
+      },
+      {
+        "header": "出荷場印字区分",
+        "value": "",
+        "required": false,
+        "max_length": 1
+      },
+      {
+        "header": "集約解除指定",
+        "value": "",
+        "required": false,
+        "max_length": 1
+      },
+      {
+        "header": "編集０１",
+        "value": "{dn.order_number|truncate_bytes:32}",
+        "required": false,
+        "max_length": 32,
+        "notes": "自由项，会出现在出荷履歴第56列；此处放客户订单号（假设 ASCII；含全角字符时上限变为16字）。"
+      },
+      {
+        "header": "編集０２",
+        "value": "",
+        "required": false,
+        "max_length": 32
+      },
+      {
+        "header": "編集０３",
+        "value": "",
+        "required": false,
+        "max_length": 32
+      },
+      {
+        "header": "編集０４",
+        "value": "",
+        "required": false,
+        "max_length": 32
+      },
+      {
+        "header": "編集０５",
+        "value": "",
+        "required": false,
+        "max_length": 32
+      },
+      {
+        "header": "編集０６",
+        "value": "",
+        "required": false,
+        "max_length": 32
+      },
+      {
+        "header": "編集０７",
+        "value": "",
+        "required": false,
+        "max_length": 32
+      },
+      {
+        "header": "編集０８",
+        "value": "",
+        "required": false,
+        "max_length": 32
+      },
+      {
+        "header": "編集０９",
+        "value": "",
+        "required": false,
+        "max_length": 32
+      },
+      {
+        "header": "編集１０",
+        "value": "",
+        "required": false,
+        "max_length": 32
+      }
+    ]
+  },
+  "import": {
+    "source": "e飛伝Ⅲ「出荷履歴一覧」→ 勾选 →「データ出力」→ 共通テンプレート「標準_飛脚宅配便_CSV_ヘッダ有」→ CSV出力形式（ダブルコーテーション有/無 皆可）→「直接出力」（可查询过去13个月）",
+    "encoding": "utf-8-sig",
+    "encoding_fallbacks": [
+      "cp932"
+    ],
+    "encoding_notes": "e飛伝Ⅲ 默认以 UTF-8 输出；若在「環境設定」勾选「従来の文字コードで出力」则为 Shift_JIS。实现时先试 UTF-8(BOM 可有可无)，失败再用 CP932。",
+    "header_rows": 1,
+    "reference_column": 19,
+    "reference_header": "お客様管理番号",
+    "reference_value": "DN{dn.id}",
+    "reference_parse": "^DN(\\d+)$",
+    "tracking_column": 1,
+    "tracking_header": "お問い合せ送り状No.",
+    "tracking_normalize": "digits",
+    "skip_rows_when": {
+      "column": 84,
+      "header": "削除区分",
+      "equals": "2"
+    },
+    "notes": "a-9 出荷履歴データ出力レイアウト 共91列：1 お問い合せ送り状No.、3 出荷日、19 お客様管理番号、56 編集０１、66 出荷個数、84 削除区分（0出荷/2削除）。削除区分=2 的行应忽略。日期默认带斜杠（可在独自テンプレート中设置无斜杠）。"
+  },
+  "service_options": [
+    {
+      "key": "invoice_type",
+      "kind": "select",
+      "label": {
+        "en-US": "Freight payment",
+        "zh-CN": "运费支付方式（元着区分）",
+        "ja-JP": "元着区分"
+      },
+      "values": [
+        {
+          "value": "1",
+          "label": {
+            "en-US": "Prepaid (motobarai)",
+            "zh-CN": "寄付（元払）",
+            "ja-JP": "元払"
+          }
+        },
+        {
+          "value": "2",
+          "label": {
+            "en-US": "Collect (chakubarai)",
+            "zh-CN": "到付（着払）",
+            "ja-JP": "着払"
+          }
+        }
+      ],
+      "default": "1"
+    },
+    {
+      "key": "speed",
+      "kind": "select",
+      "label": {
+        "en-US": "Service speed",
+        "zh-CN": "速度（スピード指定）",
+        "ja-JP": "スピード指定"
+      },
+      "values": [
+        {
+          "value": "000",
+          "label": {
+            "en-US": "Hikyaku Takuhaibin (standard)",
+            "zh-CN": "飞脚宅配便（标准）",
+            "ja-JP": "飛脚宅配便"
+          }
+        },
+        {
+          "value": "003",
+          "label": {
+            "en-US": "Hikyaku Air (next day)",
+            "zh-CN": "飞脚航空便（次日）",
+            "ja-JP": "飛脚航空便（翌日中配達）"
+          }
+        },
+        {
+          "value": "004",
+          "label": {
+            "en-US": "Hikyaku Air (next morning)",
+            "zh-CN": "飞脚航空便（次日上午）",
+            "ja-JP": "飛脚航空便（翌日午前中配達）"
+          }
+        },
+        {
+          "value": "005",
+          "label": {
+            "en-US": "Hikyaku Just Time (business recipients only)",
+            "zh-CN": "飞脚准时便（仅法人收件）",
+            "ja-JP": "飛脚ジャストタイム便"
+          }
+        }
+      ],
+      "default": "000"
+    },
+    {
+      "key": "cool_type",
+      "kind": "select",
+      "label": {
+        "en-US": "Cool service",
+        "zh-CN": "冷链",
+        "ja-JP": "クール便指定"
+      },
+      "values": [
+        {
+          "value": "001",
+          "label": {
+            "en-US": "None",
+            "zh-CN": "无",
+            "ja-JP": "指定なし"
+          }
+        },
+        {
+          "value": "002",
+          "label": {
+            "en-US": "Chilled",
+            "zh-CN": "冷藏",
+            "ja-JP": "飛脚クール便（冷蔵）"
+          }
+        },
+        {
+          "value": "003",
+          "label": {
+            "en-US": "Frozen",
+            "zh-CN": "冷冻",
+            "ja-JP": "飛脚クール便（冷凍）"
+          }
+        }
+      ],
+      "default": "001"
+    },
+    {
+      "key": "delivery_time_slot",
+      "kind": "select",
+      "label": {
+        "en-US": "Delivery time slot",
+        "zh-CN": "配送时间段",
+        "ja-JP": "配達指定時間帯"
+      },
+      "values": [
+        {
+          "value": "",
+          "label": {
+            "en-US": "Not specified",
+            "zh-CN": "不指定",
+            "ja-JP": "指定なし"
+          }
+        },
+        {
+          "value": "01",
+          "label": {
+            "en-US": "Morning",
+            "zh-CN": "上午",
+            "ja-JP": "午前中"
+          }
+        },
+        {
+          "value": "12",
+          "label": {
+            "en-US": "12:00–14:00",
+            "zh-CN": "12～14时",
+            "ja-JP": "12:00～14:00"
+          }
+        },
+        {
+          "value": "14",
+          "label": {
+            "en-US": "14:00–16:00",
+            "zh-CN": "14～16时",
+            "ja-JP": "14:00～16:00"
+          }
+        },
+        {
+          "value": "16",
+          "label": {
+            "en-US": "16:00–18:00",
+            "zh-CN": "16～18时",
+            "ja-JP": "16:00～18:00"
+          }
+        },
+        {
+          "value": "18",
+          "label": {
+            "en-US": "18:00–20:00 (6-slot contracts)",
+            "zh-CN": "18～20时（6时段契约）",
+            "ja-JP": "18:00～20:00（6時間帯）"
+          }
+        },
+        {
+          "value": "19",
+          "label": {
+            "en-US": "19:00–21:00 (6-slot contracts)",
+            "zh-CN": "19～21时（6时段契约）",
+            "ja-JP": "19:00～21:00（6時間帯）"
+          }
+        },
+        {
+          "value": "04",
+          "label": {
+            "en-US": "18:00–21:00 (5-slot contracts)",
+            "zh-CN": "18～21时（5时段契约）",
+            "ja-JP": "18:00～21:00（5時間帯）"
+          }
+        }
+      ],
+      "default": ""
+    },
+    {
+      "key": "cod_payment_type",
+      "kind": "select",
+      "label": {
+        "en-US": "COD payment method",
+        "zh-CN": "代收付款方式（決済種別）",
+        "ja-JP": "決済種別"
+      },
+      "values": [
+        {
+          "value": "",
+          "label": {
+            "en-US": "Not COD",
+            "zh-CN": "非代收",
+            "ja-JP": "指定なし"
+          }
+        },
+        {
+          "value": "1",
+          "label": {
+            "en-US": "Any (cash or cashless)",
+            "zh-CN": "均可",
+            "ja-JP": "全て可"
+          }
+        },
+        {
+          "value": "2",
+          "label": {
+            "en-US": "Cash only",
+            "zh-CN": "仅现金",
+            "ja-JP": "現金のみ"
+          }
+        },
+        {
+          "value": "3",
+          "label": {
+            "en-US": "Cashless only",
+            "zh-CN": "仅无现金",
+            "ja-JP": "キャッシュレス"
+          }
+        }
+      ],
+      "default": ""
+    },
+    {
+      "key": "delivery_date",
+      "kind": "date",
+      "label": {
+        "en-US": "Delivery date",
+        "zh-CN": "指定送达日",
+        "ja-JP": "配達日"
+      }
+    },
+    {
+      "key": "cod_amount",
+      "kind": "money",
+      "label": {
+        "en-US": "COD amount",
+        "zh-CN": "代收金额",
+        "ja-JP": "代引金額"
+      }
+    },
+    {
+      "key": "cod_tax_amount",
+      "kind": "money",
+      "label": {
+        "en-US": "Consumption tax within COD",
+        "zh-CN": "代收金额中消费税",
+        "ja-JP": "消費税"
+      }
+    }
+  ],
+  "account_fields": [
+    {
+      "key": "customer_code",
+      "label": {
+        "en-US": "Customer code",
+        "zh-CN": "客户代码（お客様コード）",
+        "ja-JP": "お客様コード"
+      },
+      "required": false,
+      "help": {
+        "en-US": "12 digits. Leave blank to use the default contract of the Smart Club ID.",
+        "zh-CN": "12位数字；留空则使用该スマートクラブID的默认契约。",
+        "ja-JP": "半角数字12桁。空白の場合は既定の契約。"
+      }
+    },
+    {
+      "key": "shipper_phone",
+      "label": {
+        "en-US": "Registered shipper phone",
+        "zh-CN": "已登记荷送人电话",
+        "ja-JP": "荷送人電話番号"
+      },
+      "required": false,
+      "help": {
+        "en-US": "Selects one of the 荷送人 registered in e-Hiden III when there are several.",
+        "zh-CN": "e飛伝Ⅲ 中登记了多个荷送人时用于选择。",
+        "ja-JP": "複数の荷送人を登録している場合の選択用。"
+      }
+    },
+    {
+      "key": "package_type_code",
+      "label": {
+        "en-US": "Default package type",
+        "zh-CN": "默认包装形态（荷姿）",
+        "ja-JP": "荷姿"
+      },
+      "required": false,
+      "help": {
+        "en-US": "001 boxes … 008 other; blank = e-Hiden default.",
+        "zh-CN": "001箱類～008その他；留空=e飛伝默认。",
+        "ja-JP": "001箱類～008その他。"
+      }
+    }
+  ]
+}

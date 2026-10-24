@@ -66,6 +66,16 @@ class Warehouse(db.Model):
         nullable=True,
         info={'description': '仓库联系人（英文）'}
     )
+    # 结构化地址（doc/shipping-flow.md §6.2，发件人 / 揽收地点用；字段见 warehouse/common/address_format.py）。
+    # 单行的 address 保留（只给了结构化字段时按国家格式生成），address_en 作为拉丁地址的单行写法保留
+    admin_area = db.Column(db.String(100), nullable=True, info={'description': '州 / 省 / 都道府县'})
+    locality = db.Column(db.String(100), nullable=True, info={'description': '城市 / 市区町村'})
+    address_line1 = db.Column(db.String(255), nullable=True, info={'description': '街道 / 番地'})
+    address_line2 = db.Column(db.String(255), nullable=True, info={'description': '建筑 / 房间'})
+    latin = db.Column(
+        db.JSON, nullable=True,
+        info={'description': '拉丁转写 {name, organization, address_line1, address_line2, locality, admin_area}'}
+    )
     company_id = db.Column(
         db.Integer, 
         db.ForeignKey('companies.id', ondelete='RESTRICT'),  # 阻止公司删除

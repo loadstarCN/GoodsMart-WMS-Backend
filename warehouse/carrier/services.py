@@ -1,6 +1,7 @@
 from extensions.db import *
 from extensions.transaction import transactional
 from warehouse.common.references import ensure_not_referenced
+from . import file_settings
 from .methods import parse_settings
 from .models import Carrier
 
@@ -52,9 +53,11 @@ class CarrierService:
         """
         创建新 Carrier。对接方式等（waybill_method / pickup_method / tracking_method / pickup_schedule /
         pickup_contact / tracking_url_template / auto_sign_days）按 warehouse/carrier/methods.py 校验（400 16135）；
-        新建时还没有在线对接，api 方式不能选。
+        新建时还没有在线对接，api 方式不能选。文件方式（file_preset / file_template / file_account）按
+        warehouse/carrier/file_settings.py 校验（400 16135）；同一请求里设了预设就可以选 waybill_method = file。
         """
-        methods = parse_settings(data, None)
+        files = file_settings.parse(data, None)
+        methods = parse_settings(data, None, file_configured=files['template'] is not None)
         new_carrier = Carrier(
             name=data['name'],
             code=data.get('code'),
@@ -67,6 +70,7 @@ class CarrierService:
             is_active=data.get('is_active', True),
             created_by=created_by_id,
             **methods,
+            **files['values'],
         )
         db.session.add(new_carrier)
         # db.session.commit()
@@ -80,7 +84,8 @@ class CarrierService:
         （field 指明哪一项），没改的方式不重新校验。
         """
         carrier = CarrierService.get_carrier(carrier_id)
-        methods = parse_settings(data, carrier)
+        files = file_settings.parse(data, carrier)
+        methods = parse_settings(data, carrier, file_configured=files['template'] is not None)
 
         carrier.name = data.get('name', carrier.name)
         carrier.code = data.get('code', carrier.code)
@@ -90,7 +95,7 @@ class CarrierService:
         carrier.email = data.get('email', carrier.email)
         carrier.contact = data.get('contact', carrier.contact)
         carrier.is_active = data.get('is_active', carrier.is_active)
-        for field, value in methods.items():
+        for field, value in {**methods, **files['values']}.items():
             setattr(carrier, field, value)
         # company_id 不可通过更新修改（归属固定）
 

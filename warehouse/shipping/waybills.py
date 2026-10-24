@@ -1,6 +1,8 @@
 """运单记录（dn_carrier_shipments，与来源无关）与手填运单号的 manual 记录（doc/shipping-flow.md §4）。
 
-- 一张 DN 同一时刻至多一条未结束的运单记录（pending / active / unknown / cancelling，部分唯一索引兜底，不分来源）。
+- 一张 DN 同一时刻至多一条未结束的运单记录（pending / active / unknown / cancelling / exported，部分唯一索引兜底，
+  不分来源）。exported 只有文件方式（source = file）的运单有：已导出给承运商软件、还没导回运单号
+  （导出 / 导入见 warehouse/dn/carrier_file_services.py）。
 - api 运单（插件建的）的状态机、锁定规则（16078 / 16079、换号先取消）在 warehouse/dn/carrier_services.py，只对 api 生效。
 - manual 运单：发货任务上的运单号（保存运单号 / 修改发货任务 / 完成发货时填的）同时写一条 source = manual 的记录，
   只有 active / cancelled 两种状态，不调承运商：
@@ -9,6 +11,8 @@
   - 有未结束的 api 运单时不写（运单号由 api 运单定，保存时已按它校验）。
   记录的 carrier_id = 发货任务的承运商，carrier = 该承运商在线对接的插件代码（没有对接为空），created_by = 操作人。
   有了记录，揽收（manual / api 预约）可以带上它，插件 tracks_any_number 时照常跟踪。
+- file 运单（导回的运单号）换号 / 清空与 manual 相同：手填了别的号码 → file 记录 cancelled（replaced）+ 新号码一条
+  manual active；清空 → cancelled（cleared）；还在 exported 时手填了号码 → exported 记录 replaced（不再等导回）。
 调用方应先锁 DN 行（与保存运单号、建运单同一把锁）。
 """
 import logging
@@ -35,6 +39,17 @@ def current_waybill(dn: DN):
     return (
         DNCarrierShipment.query
         .filter(DNCarrierShipment.dn_id == dn.id, DNCarrierShipment.status.in_(OPEN_STATUSES))
+        .order_by(DNCarrierShipment.id.desc())
+        .first()
+    )
+
+
+def exported_waybill(dn: DN):
+    """已导出、待导回运单号的文件运单（source = file、status = exported）；没有为 None"""
+    return (
+        DNCarrierShipment.query
+        .filter(DNCarrierShipment.dn_id == dn.id, DNCarrierShipment.source == SOURCE_FILE,
+                DNCarrierShipment.status == 'exported')
         .order_by(DNCarrierShipment.id.desc())
         .first()
     )
@@ -71,12 +86,12 @@ def _close(record: DNCarrierShipment, reason: str, user_id, now):
 
 
 def sync_manual(task, user_id):
-    """发货任务（当前任务）的运单号 / 承运商变了之后，让 manual 运单记录跟上（见模块说明）。DN 应已加锁。
-    → 现在的 manual 记录（没有为 None）"""
+    """发货任务（当前任务）的运单号 / 承运商变了之后，让 manual / file 运单记录跟上（见模块说明）。DN 应已加锁。
+    → 现在的运单记录（号码相同的 manual / file 记录，或新写的 manual 记录；没有为 None）"""
     dn = task.dn
     record = current_waybill(dn)
-    if record is not None and record.source != SOURCE_MANUAL:
-        # api（或第二期 file）运单：运单号由它定，不另写 manual 记录
+    if record is not None and record.source == SOURCE_API:
+        # api 运单：运单号由它定，不另写 manual 记录
         return None
     number = (task.tracking_number or '').strip() or None
     now = datetime.now()
@@ -88,10 +103,13 @@ def sync_manual(task, user_id):
                 record.updated_at = now
                 db.session.flush()
             return record
+        if record.status == 'exported' and number is None and record.carrier_id == task.carrier_id:
+            # 已导出待导回、任务上本来就没有号码：清空不影响它（换了承运商则作废这次导出）
+            return None
         _close(record, 'replaced' if number is not None else 'cleared', user_id, now)
         db.session.flush()
-        logger.info("DN %s: manual waybill %s (record %s) %s by user %s", dn.id, record.tracking_number, record.id,
-                    record.reason, user_id)
+        logger.info("DN %s: %s waybill %s (record %s) %s by user %s", dn.id, record.source, record.tracking_number,
+                    record.id, record.reason, user_id)
     if number is None:
         return None
     # 不用 task.carrier：同一事务里刚改过 carrier_id 时关系属性还是旧对象

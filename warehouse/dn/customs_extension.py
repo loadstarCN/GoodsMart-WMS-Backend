@@ -15,6 +15,7 @@ import re
 from decimal import Decimal, ROUND_FLOOR
 
 from extensions.error import ConflictException
+from warehouse.common.address_format import dn_ship_to, latin_view, warehouse_address
 from warehouse.common.countries import COUNTRY_NAMES_EN
 from .customs_services import CustomsService, DOC_CI, DOC_PL, DOC_TYPES
 
@@ -83,7 +84,10 @@ class CustomsExtension:
         else:
             text, postal = company.address_en, company.zip_code
         country = CustomsExtension.sender_country(dn)
+        local = warehouse_address(warehouse)
         return {
+            'local': local,
+            'latin': latin_view(local),
             'company_name': exporter['legal_name_en'],
             'person_name': company.export_contact_name or warehouse.contact_name_en,
             'phone': exporter['phone'],
@@ -158,6 +162,16 @@ class CustomsExtension:
         consignee = view['consignee'] or {}
         country = view['recipient_country']
         recipient = CustomsExtension.recipient(customs, consignee, country) if country else None
+        if recipient is not None:
+            # 结构化地址：本地文字用 DN 的收件地址，拉丁文字用报关快照的 consignee（英文）
+            recipient['local'] = dn_ship_to(dn)
+            recipient['latin'] = {
+                'country': recipient['country_code'], 'postal_code': consignee.get('postal_code'),
+                'admin_area': consignee.get('state'), 'locality': consignee.get('city'),
+                'address_line1': consignee.get('address_line1'), 'address_line2': consignee.get('address_line2'),
+                'organization': consignee.get('company'), 'name': consignee.get('name'),
+                'phone': consignee.get('phone'),
+            }
         if not (consignee.get('name') or consignee.get('company')):
             blockers.append(_blocker('RECIPIENT_NAME_MISSING', "Consignee name and company are both missing",
                                      field='consignee.name'))

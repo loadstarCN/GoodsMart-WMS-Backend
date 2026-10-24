@@ -16,7 +16,8 @@ actions[].key 见 ACTION_KEYS；enabled = false 时带 reason（英文句子）�
 """
 from datetime import datetime
 
-from warehouse.carrier.methods import methods_of, tracking_url as carrier_tracking_url
+from warehouse.carrier import file_settings
+from warehouse.carrier.methods import methods_of, tracking_url as carrier_tracking_url, tracking_url_template
 from warehouse.dn.carrier_services import CarrierShipmentService
 from warehouse.dn.customs_services import DOC_TYPES, CustomsService
 from warehouse.dn.models import CarrierPickup
@@ -25,6 +26,7 @@ from warehouse.dn.services import event_time
 from warehouse.dn.tracking_services import local_naive
 
 from extensions.db import db
+from . import options as shipping_options
 from .auto_sign import auto_sign_at, tracked_by_api
 from .common import current_delivery_task, is_locked, local_today
 from .route import shipping_route
@@ -34,13 +36,15 @@ from .waybills import current_waybill
 STEP_KEYS = ('ordered', 'picking', 'packing', 'documents', 'waybill', 'pickup', 'handover', 'transit', 'delivered')
 STATES = ('done', 'current', 'todo', 'warning', 'blocked', 'skipped')
 ACTION_KEYS = ('create_waybill', 'enter_tracking', 'cancel_waybill', 'dismiss_waybill', 'print_label', 'export_file',
-               'import_numbers', 'book_pickup', 'record_pickup', 'cancel_pickup', 'complete_shipping',
-               'refresh_tracking', 'open_tracking', 'sign', 'issue_documents', 'edit_packages')
+               'import_numbers', 'discard_export', 'book_pickup', 'record_pickup', 'cancel_pickup',
+               'complete_shipping', 'refresh_tracking', 'open_tracking', 'sign', 'issue_documents', 'edit_packages')
 
 # 操作不能做的原因码（actions[].reason_code）；另外也会用建运单 / 预约揽收的拦截码（blockers[].code）与报关问题码
 REASON_CODES = ('DN_SHIPPED', 'NOT_PICKED', 'NOT_PACKED', 'WAYBILL_SUBMITTED', 'WAYBILL_UNRESOLVED', 'NO_OPEN_TASK',
                 'API_WAYBILL_OPEN', 'CANNOT_CANCEL', 'REQUEST_IN_PROGRESS', 'WAYBILL_CANCELLED', 'NO_WAYBILL',
-                'PICKUP_EXISTS', 'PICKUP_DATE_PASSED', 'WAYBILL_NOT_ACTIVE', 'NOT_HANDED_OVER', 'NOT_AVAILABLE')
+                'PICKUP_EXISTS', 'PICKUP_DATE_PASSED', 'WAYBILL_NOT_ACTIVE', 'NOT_HANDED_OVER', 'NOT_AVAILABLE',
+                # 文件方式（第二期）：没有可用的文件模板 / 必填账号项没填、已有别的运单
+                'FILE_NOT_CONFIGURED', 'WAYBILL_EXISTS')
 
 PREPARING_STATUSES = ('pending', 'in_progress')
 PICKED_OR_LATER = ('picked', 'packed', 'delivered', 'completed')
@@ -280,6 +284,7 @@ class ShippingFlowService:
         source = record.source if record is not None else ('manual' if f['tracking_number'] else None)
         # 当前运单（任一来源）；没有时给最近一张已取消的插件运单（界面显示「运单已取消」）
         payload = CarrierShipmentService.shipment_payload(record) if record is not None else status['shipment']
+        exported = record is not None and record.source == 'file' and record.status == 'exported'
         summary = {
             'method': methods['waybill'],
             'tracking_number': f['tracking_number'],
@@ -292,6 +297,10 @@ class ShippingFlowService:
             'unresolved': unresolved,
             'can_create': status['can_create'],
             'blockers': status['blockers'],
+            # 文件方式：已导出给承运商软件、待导回运单号（stage awaiting_number）时的导出信息，否则 None
+            'export': ShippingFlowService._export_info(record) if exported else None,
+            # 运单服务选项（建运单 / 导出后锁定）：{values, schema, defaults, locked, locked_reason, locked_message}
+            'options': shipping_options.payload(dn, shipping_options.schema_for(carrier)),
         }
         actions = ShippingFlowService._waybill_actions(f, record, payload)
         at = record.created_at if record is not None else None
@@ -311,6 +320,9 @@ class ShippingFlowService:
             return _step('waybill', 'warning', at, step_source, summary, actions)
         if f['tracking_number']:
             return _step('waybill', 'done', at, step_source, summary, actions)
+        if exported:
+            # 已导出、等承运商软件打完单把运单号导回（发货后才导回也可以）
+            return _step('waybill', 'current', record.updated_at or record.created_at, 'warehouse', summary, actions)
         if dn.status in SHIPPED:
             return _step('waybill', 'skipped', summary=summary)
         if dn.status != 'packed':
@@ -336,6 +348,8 @@ class ShippingFlowService:
             else:
                 actions.append(_action('create_waybill', False, "A previous carrier shipment request is unresolved",
                                        'WAYBILL_UNRESOLVED'))
+        if methods['waybill'] == 'file':
+            actions.extend(ShippingFlowService._file_actions(f, record))
         api_open = CarrierShipmentService.open_shipment(dn)
         if is_locked(dn):
             actions.append(_action('enter_tracking', False, "The DN has been shipped; the tracking number is locked",
@@ -360,6 +374,64 @@ class ShippingFlowService:
             actions.append(_action('print_label', record is not None and record.status in ('active', 'cancelling'),
                                    "The shipment has been cancelled", 'WAYBILL_CANCELLED',
                                    document_id=payload['label_document_id']))
+        return actions
+
+    @staticmethod
+    def _export_info(record) -> dict:
+        """已导出、待导回运单号的文件运单 → {exported_at（最近一次导出，带偏移）, batch_id, file_name, export_count,
+        exported_by: {id, user_name} | None}"""
+        from warehouse.dn.models import CarrierFileBatch, _user_ref
+        batch = db.session.get(CarrierFileBatch, record.file_batch_id) if record.file_batch_id else None
+        data = record.carrier_data if isinstance(record.carrier_data, dict) else {}
+        at = batch.created_at if batch is not None and batch.created_at else (record.updated_at or record.created_at)
+        return {
+            'exported_at': event_time(at),
+            'batch_id': record.file_batch_id,
+            'file_name': batch.file_name if batch is not None else None,
+            'export_count': int(data.get('export_count') or 1),
+            'exported_by': _user_ref(batch.created_by if batch is not None else record.created_by),
+        }
+
+    @staticmethod
+    def _file_actions(f, record) -> list:
+        """文件方式的运单操作：export_file（单张导出，已导出的可以重新导出）/ import_numbers（导回运单号，批量接口）/
+        discard_export（作废导出，只有已导出时才有）。都带 carrier_id；接到 POST /dn/carrier-files/export、
+        /dn/carrier-files/import、/dn/<id>/carrier-shipment/discard-export。"""
+        dn, task, carrier = f['dn'], f['task'], f['carrier']
+        template = file_settings.template_of(carrier)
+        missing = file_settings.missing_account_fields(template, carrier.file_account) if template else []
+        exported = record is not None and record.source == 'file' and record.status == 'exported'
+        code = None
+        if template is None:
+            reason, code = "The carrier has no usable file template (set a file preset in the carrier settings)", \
+                'FILE_NOT_CONFIGURED'
+        elif missing:
+            reason, code = f"Fill in the carrier's account fields first: {', '.join(missing)}", 'FILE_NOT_CONFIGURED'
+        elif is_locked(dn):
+            reason, code = "The DN has been shipped", 'DN_SHIPPED'
+        elif dn.status != 'packed':
+            reason, code = "The DN must be packed first", 'NOT_PACKED'
+        elif task is None or task.status not in OPEN_TASK_STATUSES:
+            reason, code = "The DN has no open delivery task", 'NO_OPEN_TASK'
+        elif (record is not None and not exported) or (record is None and task.tracking_number):
+            reason, code = "The DN already has a waybill", 'WAYBILL_EXISTS'
+        else:
+            reason = None
+        carrier_id = carrier.id if carrier is not None else None
+        actions = [_action('export_file', reason is None, reason, code, carrier_id=carrier_id,
+                           re_export=True if exported else None)]
+        if template is None or not template.get('import'):
+            import_reason, import_code = ("The carrier's file template cannot import tracking numbers",
+                                          'FILE_NOT_CONFIGURED')
+        elif not exported and (f['tracking_number'] or is_locked(dn)):
+            import_reason, import_code = (("The DN already has a waybill", 'WAYBILL_EXISTS') if f['tracking_number']
+                                          else ("The DN has been shipped", 'DN_SHIPPED'))
+        else:
+            import_reason, import_code = None, None
+        actions.append(_action('import_numbers', import_reason is None, import_reason, import_code,
+                               carrier_id=carrier_id))
+        if exported:
+            actions.append(_action('discard_export', shipment_id=record.id))
         return actions
 
     # ------------------------------------------------------------------
@@ -403,6 +475,11 @@ class ShippingFlowService:
             if status == 'pending':
                 return _step('pickup', 'current', record.created_at, source, summary, actions)
             if status == 'scheduled':
+                if handed:
+                    # 交承运商后，还挂着的「已约」揽收按已完成显示（不再提示重约）
+                    summary['pickup']['done'] = True
+                    summary['handed_over'] = True
+                    return _step('pickup', 'done', record.created_at, source, summary, actions)
                 if record.pickup_date < today and not handed:
                     f['problems'].append(_problem('PICKUP_DATE_PASSED', 'warning',
                                                   f"The pickup date {record.pickup_date.isoformat()} has passed but the "
@@ -521,15 +598,11 @@ class ShippingFlowService:
 
     @staticmethod
     def _has_url_template(f) -> bool:
-        """有公开查询页模板（承运商设置的，或在线对接插件内置的）"""
+        """有公开查询页模板（承运商设置的，或在线对接插件内置的，或文件模板 / 预设的）"""
         carrier = f['carrier']
         if carrier is None:
             return False
-        if (carrier.tracking_url_template or '').strip():
-            return True
-        from warehouse.carrier.methods import plugin_of
-        cls = plugin_of(carrier)
-        return bool(cls is not None and cls.tracking_url_template)
+        return bool(tracking_url_template(carrier))
 
     @staticmethod
     def _delivered(f):

@@ -1,7 +1,8 @@
 """承运商每项能力的对接方式（doc/shipping-flow.md §2）：运单 waybill_method、揽收 pickup_method、跟踪 tracking_method。
 
 没有 API 合同也能完整走流程：每项能力各自选方式。
-- waybill_method：api（插件建单）/ file（文件导出导入，第二期，现在不能选）/ manual（手填 / 扫码运单号）
+- waybill_method：api（插件建单）/ file（按承运商软件的格式导出 CSV、导回运单号；要设了文件预设或模板，
+  见 warehouse/carrier/file_settings.py）/ manual（手填 / 扫码运单号）
 - pickup_method：api（插件预约）/ manual（电话 / 网站约好后在 WMS 记一笔）/ scheduled（定期集荷，不用逐票预约）/
   dropoff（自送网点）/ none（不管揽收）
 - tracking_method：api（插件定时查：揽收后自动交承运商、送达后自动签收）/ link（只给公开查询页链接）/ none
@@ -10,7 +11,8 @@
   （对接停用后再保存承运商的其它资料不报错；停用期间已建的运单照样能跟踪 / 取消）。
 - 设置在线对接时自动跟上：新建 / 重新启用 / 换插件后，还是默认值（manual / none / link）的项改成 api（插件支持的）；
   删掉对接时 api 的项退回默认值。
-- 公开查询页：承运商设置的 tracking_url_template，没填用插件内置的；{tracking_number} 换成运单号（URL 编码）。
+- 公开查询页：承运商设置的 tracking_url_template，没填用插件内置的，再没有用文件模板（预设）的；
+  {tracking_number} 换成运单号（URL 编码）。
 """
 import re
 from datetime import datetime
@@ -18,12 +20,13 @@ from urllib.parse import quote
 
 from extensions.error import BadRequestException
 
+from . import file_settings
 from .integrations import adapter_class
 
 METHOD_INVALID = 16135          # 400 对接方式 / 揽收安排 / 查询页 / 自动签收天数不合法（field）
 
 DEFAULT_METHODS = {'waybill': 'manual', 'pickup': 'none', 'tracking': 'link'}
-# 不用 API 也能选的方式（file 第二期才开放）
+# 不用 API 也能选的方式（file 另要有文件预设 / 模板）
 BASE_METHODS = {
     'waybill': ('manual',),
     'pickup': ('manual', 'scheduled', 'dropoff', 'none'),
@@ -54,13 +57,17 @@ def integration_enabled(carrier) -> bool:
     return bool(integration is not None and integration.enabled and adapter_class(integration.adapter) is not None)
 
 
-def available_methods(carrier) -> dict:
-    """{waybill: [...], pickup: [...], tracking: [...]}：现在能选的方式（api 在前）"""
+def available_methods(carrier, file_configured=None) -> dict:
+    """{waybill: [...], pickup: [...], tracking: [...]}：现在能选的方式（api 在前，运单再 file）。
+    file_configured：保存时按请求里的文件设置算（None = 按承运商现在的设置）"""
     cls = plugin_of(carrier) if integration_enabled(carrier) else None
+    if file_configured is None:
+        file_configured = file_settings.configured(carrier)
     result = {}
     for kind, base in BASE_METHODS.items():
         api = cls is not None and bool(getattr(cls, CAPABILITY[kind], False))
-        result[kind] = (['api'] if api else []) + list(base)
+        extra = ['file'] if kind == 'waybill' and file_configured else []
+        result[kind] = (['api'] if api else []) + extra + list(base)
     return result
 
 
@@ -77,14 +84,23 @@ def tracking_url(carrier, tracking_number, adapter_code=None):
     number = str(tracking_number or '').strip()
     if not number:
         return None
+    template = tracking_url_template(carrier, adapter_code)
+    if not template:
+        return None
+    return template.replace(TRACKING_PLACEHOLDER, quote(number, safe=''))
+
+
+def tracking_url_template(carrier, adapter_code=None):
+    """查询页模板：承运商设置的 → 插件内置的（adapter_code 指定插件时优先用它的）→ 文件模板（预设）的；没有为 None"""
     template = (getattr(carrier, 'tracking_url_template', None) or '').strip() if carrier is not None else ''
     if not template:
         cls = adapter_class(adapter_code) if adapter_code else None
         cls = cls or plugin_of(carrier)
         template = (getattr(cls, 'tracking_url_template', None) or '') if cls is not None else ''
-    if not template:
-        return None
-    return template.replace(TRACKING_PLACEHOLDER, quote(number, safe=''))
+    if not template and carrier is not None:
+        file_template = file_settings.template_of(carrier)
+        template = (file_template or {}).get('tracking_url_template') or ''
+    return template or None
 
 
 # ------------------------------------------------------------------
@@ -154,12 +170,14 @@ def parse_auto_sign_days(value):
     return value
 
 
-def parse_settings(data: dict, carrier=None) -> dict:
+def parse_settings(data: dict, carrier=None, file_configured=None) -> dict:
     """请求体里的对接方式相关字段 → 要写入的值（只含请求里带了的键）。
-    carrier 为现在的承运商（新建时为 None）：方式没改时不重新校验 api 是否可选。"""
+    carrier 为现在的承运商（新建时为 None）：方式没改时不重新校验 api 是否可选。
+    file_configured：保存后有没有文件模板（同一个请求里设预设并选 file 也行；None = 按承运商现在的）。
+    运单方式保存后是 file 却没有文件模板 → 400 16135（field file_preset）。"""
     if not isinstance(data, dict):
         return {}
-    available = available_methods(carrier)
+    available = available_methods(carrier, file_configured)
     current = methods_of(carrier)
     values = {}
     for kind, field in FIELDS.items():
@@ -175,6 +193,11 @@ def parse_settings(data: dict, carrier=None) -> dict:
             if value not in available[kind]:
                 raise _invalid(_unavailable_message(kind, value, carrier), field)
         values[field] = value
+    waybill = values.get('waybill_method', current['waybill'])
+    touched = any(key in data for key in ('waybill_method', 'file_preset', 'file_template'))
+    if waybill == 'file' and file_configured is False and touched:
+        raise _invalid("waybill_method file needs a file preset or template; it cannot be removed while the "
+                       "waybill method is file", 'file_preset')
     if 'pickup_schedule' in data:
         values['pickup_schedule'] = parse_pickup_schedule(data['pickup_schedule'])
     if 'pickup_contact' in data:
@@ -194,7 +217,8 @@ def _all_methods(kind):
 
 def _unavailable_message(kind, value, carrier) -> str:
     if value == 'file':
-        return "waybill_method file (export / import files) is not available yet"
+        return ("waybill_method file needs a file preset or template: set file_preset "
+                "(GET /warehouse/carrier/file-presets) or file_template")
     if value == 'api':
         what = {'waybill': 'create shipments', 'pickup': 'book pickups', 'tracking': 'track shipments'}[kind]
         if plugin_of(carrier) is None:

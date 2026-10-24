@@ -3,9 +3,33 @@ from extensions.error import BadRequestException
 from extensions.transaction import transactional
 from warehouse.staff.models import Staff
 from warehouse.staff.services import StaffService
+from warehouse.common.address_format import (
+    WAREHOUSE_ADDRESS_LIMITS, format_single_line, is_structured, parse_columns, postal_code_of,
+)
 from warehouse.common.export_profile import WAREHOUSE_EXPORT_FIELDS, normalize_export_profile
 from warehouse.common.references import ensure_not_referenced
 from .models import Warehouse
+
+
+def _apply_address(warehouse: Warehouse, data: dict, structured: dict, has_postal: bool, postal_code):
+    """结构化地址：只改请求里带了的；改了结构化地址而没给单行 address 时按国家格式重新生成 address；
+    给了 latin 而仓库还没有英文单行地址（address_en）、请求里也没给时，由 latin 生成 address_en。"""
+    if has_postal:
+        warehouse.zip_code = postal_code
+    for field, value in structured.items():
+        setattr(warehouse, field, value)
+    address = {
+        'country': warehouse.country_code, 'postal_code': warehouse.zip_code, 'admin_area': warehouse.admin_area,
+        'locality': warehouse.locality, 'address_line1': warehouse.address_line1,
+        'address_line2': warehouse.address_line2,
+    }
+    changed = any(key in structured for key in WAREHOUSE_ADDRESS_LIMITS) or has_postal
+    if 'address' not in data and changed and is_structured(address):
+        warehouse.address = format_single_line(address, 'local', limit=255) or warehouse.address
+    if structured.get('latin') and 'address_en' not in data and not (warehouse.address_en or '').strip():
+        latin = {**address, 'latin': structured['latin']}
+        warehouse.address_en = format_single_line(latin, 'latin', limit=500) or None
+
 
 class WarehouseService:
 
@@ -56,6 +80,8 @@ class WarehouseService:
         创建新 Warehouse
         """
         export_profile = normalize_export_profile(data, WAREHOUSE_EXPORT_FIELDS)
+        structured = parse_columns(data, WAREHOUSE_ADDRESS_LIMITS)
+        has_postal, postal_code = postal_code_of(data)
         manager_id = data.get('manager_id')
         manager = None  # 显式初始化
         if manager_id:
@@ -68,7 +94,7 @@ class WarehouseService:
             name=data['name'],
             address=data.get('address'),
             phone=data.get('phone'),
-            zip_code=data.get('zip_code'),
+            zip_code=postal_code,
             default_currency=data.get('default_currency'),
             company_id=data['company_id'],
             manager_id=data.get('manager_id'),
@@ -78,6 +104,9 @@ class WarehouseService:
         # 出口资料只设请求体里给了的字段（country_code 不给时走列默认值）
         for field, value in export_profile.items():
             setattr(new_warehouse, field, value)
+        if new_warehouse.country_code is None and 'country_code' not in export_profile:
+            new_warehouse.country_code = 'JP'          # 列默认值（生成地址时就要用到国家）
+        _apply_address(new_warehouse, data, structured, has_postal, postal_code)
 
         db.session.add(new_warehouse)
         db.session.flush()  # 确保新对象的 ID 被分配
@@ -97,6 +126,8 @@ class WarehouseService:
         """
         warehouse = WarehouseService.get_warehouse(warehouse_id)
         export_profile = normalize_export_profile(data, WAREHOUSE_EXPORT_FIELDS)
+        structured = parse_columns(data, WAREHOUSE_ADDRESS_LIMITS)
+        has_postal, postal_code = postal_code_of(data)
 
         manager = None
         new_manager_id = data.get('manager_id')
@@ -117,13 +148,13 @@ class WarehouseService:
         warehouse.name = data.get('name', warehouse.name)
         warehouse.address = data.get('address', warehouse.address)
         warehouse.phone = data.get('phone', warehouse.phone)
-        warehouse.zip_code = data.get('zip_code', warehouse.zip_code)
         warehouse.default_currency = data.get('default_currency', warehouse.default_currency)
         if 'manager_id' in data:
             warehouse.manager_id = new_manager_id
         warehouse.is_active = data.get('is_active', warehouse.is_active)
         for field, value in export_profile.items():
             setattr(warehouse, field, value)
+        _apply_address(warehouse, data, structured, has_postal, postal_code)
 
         db.session.add(warehouse)
         db.session.flush()  # 确保新对象的 ID 被分配

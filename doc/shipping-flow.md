@@ -145,42 +145,118 @@ tracking_url_template = None              # 公开查询页，如 'https://www.f
 - `stage`（列表用的阶段）：`preparing`（作业中）/ `awaiting_waybill` / `awaiting_number`（第二期：已导出待导回）/
   `awaiting_pickup` / `awaiting_handover` / `in_transit` / `exception`（运单结果不明、跟踪异常、自动步骤被挡）/
   `delivered` / `closed`。
-- DN 列表接口返回每行的 `shipping_stage`（含承运商名、运单号），支持 `shipping_stage=` 筛选（SQL 判定，与上面同一口径）。
+- DN 列表接口返回每行的 `shipping_stage` 与 `shipping {carrier_id, carrier_name, tracking_number}`（承运商 = 当前发货任务的，
+  没有用 DN 的），支持 `shipping_stage=` 筛选（SQL 判定，与上面同一口径）。
 
 ## 6. 第二期
 
 ### 6.1 文件方式（不需要 API 合同）
 
-- `carriers.file_preset`（预设代码，如 `jp.yamato_b2cloud`）+ `carriers.file_template`（json，可在预设基础上改）：
-  `{format: 'csv', encoding: 'shift_jis' | 'utf-8' | 'utf-8-sig', delimiter: ',', header: true,
-    columns: [{header, value}], import: {encoding, header_rows, reference_column, tracking_column}}`。
-  `value` 是模板：`{recipient.postal_code}`、`{ship_to.admin_area}`、`{dn.order_number}`、字面量，支持少量过滤器
-  （`|digits`、`|truncate:n`、`|date:%Y/%m/%d`、`|default:x`、`|map:k=v,k=v`）。
-- 预设放在 `warehouse/carrier/presets/<country>/<carrier>.json`（开源社区可补充），带版本与来源说明。
-- 导出：`POST /warehouse/dn/carrier-files/export {carrier_id, dn_ids}` → 文件下载；每张 DN 建 `file` 运单记录
-  （`status = 'exported'`，无运单号，记导出批次）。`exported` 属于未结束状态；可以重新导出或作废（只改本地）。
-- 导入：`POST /warehouse/dn/carrier-files/import`（multipart，`carrier_id`）→ 按参考号（订单号 / DN 号）匹配，写运单号，
-  `exported` → `active`，同步到发货任务；返回逐行结果（匹配 / 未找到 / 已有运单号 / 格式错误），先预览后确认。
-- 列表工作队列：「待建运单」批量导出，「待导回」批量导入。
+- 承运商的文件设置：`carriers.file_preset`（预设代码，如 `jp.yamato_b2cloud`）、`carriers.file_template`（json，
+  在预设基础上改的部分；为空 = 完全用预设）、`carriers.file_account`（json，预设 `account_fields` 声明的账号项，
+  如ヤマト的請求先顧客コード）。`waybill_method = 'file'` 要求有预设或模板。
+- 模板（预设文件同一结构，草稿见调研结果）：
+  ```
+  {code, name{语言}, country, version, sources[], notes, tracking_url_template, tracking_url_fallback?,
+   export: {format: 'csv', encoding: 'cp932' | 'utf-8' | 'utf-8-sig', delimiter, quoting: 'minimal' | 'all',
+            header: bool, line_ending: '\r\n', length_unit: 'chars' | 'sjis_bytes', row_unit: 'dn',
+            columns: [{header, value, required?, max_length?, notes?}]},
+   import: {encoding, encoding_fallbacks[], header_rows, reference_column(1 起的列号), reference_value: 'DN{dn.id}',
+            reference_parse: '^DN(\\d+)$', tracking_column, tracking_normalize: 'digits' | null,
+            skip_rows_when?: {column, equals}},
+   service_options: [{key, kind: 'select' | 'date' | 'money' | 'text', label{语言}, values?[{value, label}]}],
+   account_fields: [{key, label{语言}, required, help?}]}
+  ```
+  预设里写的 `shift_jis` 一律按 cp932 读写（Python 的 shift_jis 编不了「～」「①」等）。
+- 模板变量：`{dn.id}` `{dn.order_number}` `{ship_date}` `{ship_to.*}` `{shipper.*}`（结构化地址字段，见 6.2）
+  `{goods.summary}` `{package.count}` `{package.total_weight_kg}` `{options.<key>}` `{carrier.account.<key>}`、字面量。
+  过滤器：`|digits` `|truncate:n` `|truncate_bytes:n`（按 cp932 字节，不切断双字节字）`|slice:a:b` `|date:%Y/%m/%d`
+  （空值输出空串）`|default:x` `|map:k=v,k=v` `|upper` `|zenkaku`（半角转全角）`|nospace`（去半角 / 全角空格）
+  `|jp_phone`（+81 → 0 开头国内号码，全角数字转半角）`|int`。
+- 导出前逐行检查：必填为空、超长（按 `length_unit`；地址 / 姓名超长不静默截断，报错让人改）、编码不了的字符、
+  字段内换行（替换为空格）。有问题的行不导出，整批返回逐行问题。
+- 匹配键：导出的「お客様管理番号」类列一律写 `DN{dn.id}`（订单号可能为空、不唯一、超长），订单号另放在面单上看得到的
+  备注列。
+- 预设放在 `warehouse/carrier/presets/<country>/<code>.json`（开源社区可补充），带版本与来源说明。第一批：
+  `jp/yamato_b2cloud`、`jp/sagawa_ehiden3`、`jp/japanpost_yupri_r`（均标注「未在承运商软件实测」）。
+- 导出：`POST /warehouse/dn/carrier-files/export {carrier_id, dn_ids, options?}` → 文件下载（文件名带承运商与时间）。
+  每张 DN 建 `file` 运单记录：`status = 'exported'`（新状态，属于未结束状态），无运单号，记导出批次
+  `carrier_file_batches`（id、carrier_id、warehouse_id、kind export / import、file_name、row_count、summary json、
+  created_by、created_at）与 `dn_carrier_shipments.file_batch_id`。已是 `exported` 的 DN 可以重新导出（记录不变、
+  批次更新）；作废导出记录 = `cancelled`（reason `discarded`，只改本地）。
+- 导入：`POST /warehouse/dn/carrier-files/import`（multipart：`file`、`carrier_id`、`dry_run`）→ 按 `reference_parse`
+  解析出 DN，写运单号；一张 DN 多行（多件）= 多个运单号，第一个为主单号，其余进 `package_tracking_numbers`；
+  `exported` → `active`（没导出过的 DN 也接受，直接建 `file` 运单）；同步到发货任务。逐行结果：`matched` /
+  `not_found` / `already_has_number`（号码不同，需人工决定）/ `same_number`（已导入过，忽略）/ `invalid`。
+  `dry_run = true` 只返回预览，确认后再以 `dry_run = false` 提交。
+- 流程：运单步骤 `waybill_method = file` 时给 `export_file`（单张导出）/ `import_numbers` / `discard_export`；
+  阶段 `awaiting_number` = 已导出待导回。列表工作队列：「待建运单」批量导出、「待导回」批量导入。
 
 ### 6.2 结构化国际地址
 
-- 收件人、仓库、DN 收件地址快照增加：`country`、`postal_code`、`admin_area`（州 / 省 / 都道府县）、`locality`（市区町村）、
-  `dependent_locality`、`address_line1`、`address_line2`、`organization`、`name`、`phone`，以及拉丁转写
-  `latin: {name, organization, address_line1, address_line2, locality, admin_area}`。
-- DN 新增 `ship_to`（json 快照）；创建 DN 接口接受 `ship_to` 对象（可选），旧的 `shipping_address` 字符串照收，
-  有结构化数据时按国家格式生成字符串。收件人接口同样接受结构化字段。批发站改为传结构化地址。
-- 地址显示 / 面单文字按国家格式排版（`warehouse/common/address_format.py`）。
+- 结构化地址（同一组字段名用于收件人、仓库、DN 收件地址快照、交给插件 / 文件模板的 `ship_to` / `shipper`）：
+  `country`（ISO 3166-1 alpha-2）、`postal_code`、`admin_area`（州 / 省 / 都道府县）、`locality`（市区町村）、
+  `dependent_locality`、`address_line1`、`address_line2`、`organization`、`name`、`phone`、`email`，以及拉丁转写
+  `latin: {name, organization, address_line1, address_line2, locality, admin_area}`（跨境面单用；没有时插件退回
+  本地文字或报关快照里的英文收件人）。
+- 收件人表加列：`admin_area`、`locality`、`dependent_locality`、`address_line1`、`address_line2`、`organization`、
+  `latin`（json）；`zip_code` 即 `postal_code`（接口两个名字都收，输出两个都给）。旧的单行 `address` 保留：
+  只给了结构化字段时按国家格式生成。
+- 仓库表加列：`admin_area`、`locality`、`address_line1`、`address_line2`、`latin`（json；旧的 `address_en` 作为
+  拉丁地址的单行写法保留）。
+- DN 新增 `ship_to`（json 快照）：创建 DN 接口接受 `ship_to` 对象（可选）；没给时从收件人的结构化字段拷贝；
+  旧的 `shipping_address` 字符串照收，只给了 `ship_to` 时按国家格式生成。DN 详情输出 `ship_to`。批发站改为传
+  结构化地址（收件人 + `ship_to`）。
+- 地址排版 `warehouse/common/address_format.py`：`format_lines(address, style='local' | 'latin')`，按国家规则包的
+  格式（日本：〒邮编 / 都道府県市区町村 / 番地・建物；欧美：街道 / 城市 州 邮编 / 国家）。
 
 ### 6.3 国家规则包
 
-`warehouse/country_rules/<cc>.py`（注册表按国家取）：报关检查（日本：输出统计代码）、出口方税号标签（日本：
-Corporate No.）、地址格式。核心只调用注册表，不出现国家判断。
+`warehouse/country_rules/`：`base.py`（`CountryRules`：`customs_line_problems(line)`、`exporter_tax_label`、
+`address_format`（local / latin 的行模板）、`phone_normalize`）、`registry.py`（按国家代码取，没有登记的用默认规则）、
+`jp.py`（输出统计代码检查、Corporate No.、日本地址格式）。核心只调用注册表，不出现国家判断；原来散在报关服务里的
+日本专有检查迁进 `jp.py`，行为不变。
 
 ### 6.4 运单服务选项
 
-插件 / 文件预设声明 `service_options`（如配送日、时间带、代收货款、冷藏），DN 新增 `shipping_options`（json，来源系统
-传或界面填），建单 / 导出时带上。
+插件 / 文件预设声明 `service_options`（如配送日 `delivery_date`、时间带 `delivery_time_slot`、送り状种类
+`invoice_type`、代收货款 `cod_amount`、冷藏 `cool_type`）。DN 新增 `shipping_options`（json）：创建 DN 时来源系统
+可传，也可在流程的运单步骤里改（`PUT /warehouse/dn/<id>/shipping-options`，建运单 / 导出后锁定）。建单时交给插件
+（`shipment['options']`），导出时作为 `{options.<key>}`。校验按当前承运商声明的选项（未知键 400、select 值不在
+列表 400）。
+
+### 6.5 其它
+
+- 运单摘要显示服务名称（`service_name`）而不是服务代码。
+- 揽收：交承运商后，还挂着的「已约」揽收显示为已完成（不再提示重约）。
+
+### 6.6 落地时的澄清（第二期实现，迁移 `a7c4e2f9b3d1`）
+
+- 导出请求体是 `{carrier_id, dn_ids（1–500）, warehouse_id?}`，不带 `options`：选项按每张 DN 自己的 `shipping_options`
+  （没设的用选项的 `default`）。任何一行有问题整批不导出：409 `16137`（`details.rows[{dn_id, order_number, problems[{column,
+  code, message}]}]`）；文件方式用不了 / 请求或导入文件不合法：`16138`（409 / 400，带 `field`）；选项不合法：400 `16139`。
+- 模板另有：`service_option`（哪个选项代表服务种类，导出时记成运单的 `service_type`，`service_name` = 它的名称）、
+  `export.charset: 'jis_x0208'`（只收 JIS 第1・第2水准的字，ヤマト用）。导入解码：候选编码里有 UTF-8 时，有 BOM 或是合法
+  UTF-8 就按 UTF-8，否则按 `encoding` → `encoding_fallbacks` 顺序；`header_rows` 只在那一行不像数据行（匹配键解析不出 DN）时跳过。
+- 导入的 `invalid` 包括：运单号为空、DN 已关闭、DN 的承运商不是这家、插件运单结果不明、号码已属于别的 DN、没有未完成的发货任务、
+  没导出过就已发货。已导出、导回前就完成了发货的 DN 仍可导回（补上发货任务的运单号）。
+- `exported` 期间手填了运单号 → 这次导出作废（`reason replaced`）；`file` 运单换号 / 清空同 `manual`。
+- 运单服务选项：有 `api` 运单或 `file` 运单（exported / active）后锁定（409 `16076`，`details.reason SHIPPING_OPTIONS_LOCKED`），
+  手填运单号不锁；创建 DN 时只校验已声明键的取值，没声明的键照收（承运商以后还可能换），导出 / 建单时不用。
+- 流程汇总的运单步骤：文件运单已导出、待导回时 `summary.export = {exported_at（带偏移）, batch_id, file_name, export_count,
+  exported_by: {id, user_name}}`，否则 `null`；导出 / 导回的明细在 `summary.shipment.file`（{preset, exported_at, export_count,
+  import_batch_id, imported_at}）。服务名称多语言在 `shipment.service_label`（`service_name` 为英文）。
+- 承运商接口另给只读的 `service_options`（与 DN 的 `shipping_options` 校验同一口径：文件方式用模板的，否则插件的），
+  新建 DN 页按它显示选项。作废导出时已经没有导出记录 → 409 `16075`（`details.waybill`）。导出逐行问题里模板逐列的另带 `value`
+  （这一列渲染出的文字）。
+- 打包后改收件地址：`GET / PUT /warehouse/dn/<id>/ship-to`（`{ship_to}` → `{ship_to, ship_to_effective, shipping_address, locked,
+  locked_reason, locked_message}`），如导出报地址超长（`TOO_LONG`）时改短再导出；单行 `shipping_address` 随之重新生成，报关快照
+  不动。锁定口径同服务选项：有 `api` / `file`（exported / active）运单 → 409 `16076`（`details.reason SHIP_TO_LOCKED`），已发货
+  409 `16065`，已关闭 400 `16001`；手填运单号不锁。
+- 结构化地址：DN 详情另给 `ship_to_effective`（面单 / 文件实际用的地址：`ship_to` → 收件人的结构化字段 → 单行地址 + 收件人的
+  姓名 / 电话 / 邮编）。`ship_to` 快照没带的姓名 / 电话 / 邮箱 / 邮编按收件人的补。字段不合法：400 `14019` / `14020`（国家）。
+- 国家规则包按出口国（仓库的国家，没有用公司的）取；日本的报关检查只在出口国是日本时参与（以前 JPY 货值和统计番号格式的检查
+  不看出口国）。日本出口方没设 `tax_id_label` 时单证印 `Corporate No.`，以前印 `Tax ID` 签发的单证不算过期。
 
 ## 7. 第三期
 

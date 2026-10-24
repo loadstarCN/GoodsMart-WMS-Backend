@@ -42,9 +42,9 @@ class DNList(Resource):
     def get(self):
         """
         Get all DNs with optional filters & pagination.
-        Each item also has `shipping_stage` (preparing / awaiting_waybill / awaiting_pickup / awaiting_handover /
-        in_transit / exception / delivered / closed; same definition as GET /dn/<id>/shipping-flow) and
-        `shipping` {carrier_name, tracking_number}; `shipping_stage=<stage>` filters by it (evaluated in SQL).
+        Each item also has `shipping_stage` (preparing / awaiting_waybill / awaiting_number / awaiting_pickup /
+        awaiting_handover / in_transit / exception / delivered / closed; same definition as GET /dn/<id>/shipping-flow) and
+        `shipping` {carrier_id, carrier_name, tracking_number}; `shipping_stage=<stage>` filters by it (evaluated in SQL).
         """
         args = dn_pagination_parser.parse_args()
         page = args.get('page')

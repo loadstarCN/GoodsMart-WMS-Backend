@@ -1,7 +1,22 @@
 from extensions.db import db, get_object_or_404
 from extensions.transaction import transactional
+from warehouse.common.address_format import (
+    RECIPIENT_ADDRESS_LIMITS, format_single_line, is_structured, parse_columns, postal_code_of,
+)
 from warehouse.common.references import ensure_not_referenced
 from .models import Recipient, RecipientExternalMapping
+
+
+def _generated_address(recipient) -> str | None:
+    """只有结构化字段时生成的单行地址（按收件国的格式，不含姓名；最长 255）"""
+    address = {
+        'country': recipient.country, 'postal_code': recipient.zip_code, 'admin_area': recipient.admin_area,
+        'locality': recipient.locality, 'dependent_locality': recipient.dependent_locality,
+        'address_line1': recipient.address_line1, 'address_line2': recipient.address_line2,
+    }
+    if not is_structured(address):
+        return None
+    return format_single_line(address, 'local', limit=255) or None
 
 class RecipientService:
 
@@ -96,8 +111,12 @@ class RecipientService:
     @transactional
     def create_recipient(data: dict, created_by_id: int) -> Recipient:
         """
-        创建新 Recipient
+        创建新 Recipient。结构化地址（admin_area / locality / dependent_locality / address_line1 / address_line2 /
+        organization / latin）与 postal_code（= zip_code，两个名字都收）一并保存；没给单行 address 时按国家格式生成。
+        字段不合法 400 14019（field）。
         """
+        structured = parse_columns(data, RECIPIENT_ADDRESS_LIMITS)
+        _has_postal, postal_code = postal_code_of(data)
         external_reference = data.get('external_reference')
         new_recipient = Recipient(
             name=(
@@ -106,15 +125,18 @@ class RecipientService:
                 ) if external_reference else data['name']
             ),
             address=data.get('address'),
-            zip_code=data.get('zip_code'),
+            zip_code=postal_code,
             phone=data.get('phone'),
             email=None if external_reference else data.get('email'),
             contact=data.get('contact'),
             country=data['country'],
             is_active=data.get('is_active', True),
             created_by=created_by_id,
-            company_id=data['company_id']
+            company_id=data['company_id'],
+            **structured,
         )
+        if not (new_recipient.address or '').strip():
+            new_recipient.address = _generated_address(new_recipient)
         db.session.add(new_recipient)
         db.session.flush()
         if external_reference:
@@ -132,9 +154,11 @@ class RecipientService:
     def update_recipient(recipient_id: int, data: dict,
                          company_id: int | None = None) -> Recipient:
         """
-        更新 Recipient 信息
+        更新 Recipient 信息。结构化地址字段只改请求里带了的；改了结构化地址而没给单行 address 时重新生成 address。
         """
         recipient = RecipientService.get_recipient(recipient_id, company_id)
+        structured = parse_columns(data, RECIPIENT_ADDRESS_LIMITS)
+        has_postal, postal_code = postal_code_of(data)
 
         external_reference = data.get('external_reference')
         mapping = recipient.external_mapping
@@ -158,13 +182,19 @@ class RecipientService:
         if mapping is None:
             recipient.name = data.get('name', recipient.name)
         recipient.address = data.get('address', recipient.address)
-        recipient.zip_code = data.get('zip_code', recipient.zip_code)
+        if has_postal:
+            recipient.zip_code = postal_code
+        for field, value in structured.items():
+            setattr(recipient, field, value)
         recipient.phone = data.get('phone', recipient.phone)
         if mapping is None:
             recipient.email = data.get('email', recipient.email)
         recipient.contact = data.get('contact', recipient.contact)
         recipient.country = data.get('country', recipient.country)
         recipient.is_active = data.get('is_active', recipient.is_active)
+        address_changed = any(key in structured for key in RECIPIENT_ADDRESS_LIMITS if key != 'organization')             or has_postal or 'country' in data
+        if 'address' not in data and address_changed:
+            recipient.address = _generated_address(recipient) or recipient.address
         # company_id 不可通过更新修改（归属固定）
 
         # db.session.commit()

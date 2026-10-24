@@ -10,11 +10,11 @@ DN / 发货任务列表每行的阶段、流程汇总接口的 stage 用的都�
   （所带揽收 unknown 或卡住的 pending）。DN 已发货（delivered）时只看运单与跟踪
 - in_transit：已交承运商、还没签收（DN delivered）
 - 以下是 DN packed（打包完、还没交承运商）：
+  - awaiting_number：文件方式已导出给承运商软件、还没导回运单号（file 运单 exported，当前发货任务上也没有运单号）
   - awaiting_waybill：还没有运单号（没有有效运单，当前发货任务上也没有运单号；插件建单进行中也算）
   - awaiting_pickup：有运单，承运商的揽收方式要逐票约（pickup_method api / manual），这张运单还没被有效的揽收占着
     （pending / unknown / scheduled 且揽收日没过）
   - awaiting_handover：有运单、揽收已约好或不用约（scheduled / dropoff / none），等交给承运商
-- awaiting_number（第二期：已导出待导回）现在不会出现。
 「当前发货任务」= 最新的有效任务；承运商 = 当前发货任务的，没有用 DN 的（与建运单同一口径）。
 卡住的判定用 carrier_services.stale_after_seconds()，「揽收日没过」按仓库当地日期（DOCUMENT_TIMEZONE）。
 """
@@ -121,6 +121,7 @@ def stage_expression(now=None, today=None):
             DeliveryTask.tracking_number.isnot(None), DeliveryTask.tracking_number != '',
         ).correlate(DN),
     )
+    exported = exists().where(S.dn_id == DN.id, S.source == 'file', S.status == 'exported').correlate(DN)
     pickup_held = exists().where(
         S.dn_id == DN.id, S.status == 'active', P.id == S.pickup_id,
         P.status.in_(('pending', 'unknown', 'scheduled')), P.pickup_date >= today,
@@ -136,6 +137,7 @@ def stage_expression(now=None, today=None):
         (and_(DN.status == 'delivered', or_(unresolved, tracking_trouble)), literal(STAGE_EXCEPTION)),
         (DN.status == 'delivered', literal(STAGE_IN_TRANSIT)),
         (or_(unresolved, tracking_trouble, pickup_unclear), literal(STAGE_EXCEPTION)),
+        (and_(~has_waybill, exported), literal(STAGE_AWAITING_NUMBER)),
         (~has_waybill, literal(STAGE_AWAITING_WAYBILL)),
         (and_(books_pickups, ~pickup_held), literal(STAGE_AWAITING_PICKUP)),
         else_=literal(STAGE_AWAITING_HANDOVER),
@@ -150,21 +152,25 @@ def stage_of(dn) -> str:
 
 
 def shipping_rows(dn_ids) -> dict:
-    """{dn_id: {'stage', 'carrier_name', 'tracking_number'}}：列表一页的阶段与承运商 / 运单号（一条查询）"""
+    """{dn_id: {'stage', 'carrier_id', 'carrier_name', 'tracking_number'}}：列表一页的阶段与承运商 / 运单号（一条查询）。
+    承运商 = 当前发货任务的，没有用 DN 的（与建运单 / 文件导出同一口径）"""
     from extensions.db import db
     ids = sorted({i for i in dn_ids if i is not None})
     if not ids:
         return {}
     DN, _T, _S, _P, Carrier = _models()
-    carrier_name = select(Carrier.name).where(Carrier.id == carrier_id_expression()).correlate(DN).scalar_subquery()
+    carrier_id = carrier_id_expression()
+    carrier_name = select(Carrier.name).where(Carrier.id == carrier_id).correlate(DN).scalar_subquery()
     rows = db.session.execute(
-        select(DN.id, stage_expression(), carrier_name, tracking_number_expression()).where(DN.id.in_(ids))
+        select(DN.id, stage_expression(), carrier_id, carrier_name, tracking_number_expression())
+        .where(DN.id.in_(ids))
     ).all()
-    return {row[0]: {'stage': row[1], 'carrier_name': row[2], 'tracking_number': row[3]} for row in rows}
+    return {row[0]: {'stage': row[1], 'carrier_id': row[2], 'carrier_name': row[3], 'tracking_number': row[4]}
+            for row in rows}
 
 
 def attach(items, dn_id_of=lambda item: item.id):
-    """给列表的一页对象挂上 _shipping（{stage, carrier_name, tracking_number}），序列化时取（避免逐行查）"""
+    """给列表的一页对象挂上 _shipping（{stage, carrier_id, carrier_name, tracking_number}），序列化时取（避免逐行查）"""
     items = list(items or [])
     rows = shipping_rows(dn_id_of(item) for item in items)
     for item in items:

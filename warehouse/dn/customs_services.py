@@ -23,6 +23,9 @@ from extensions.db import db
 from extensions.error import BadRequestException, ConflictException, NotFoundException
 from extensions.transaction import transactional
 from warehouse.common.countries import COUNTRY_NAMES_EN, is_valid_country, normalize_country
+from warehouse.country_rules import rules_for
+# 日本专有的检查（9 位统计品目番号等）搬到了国家规则包 warehouse/country_rules/jp.py，这里保留旧名
+from warehouse.country_rules.jp import JP_EXPORT_CODE_THRESHOLD_JPY, jp_export_code_problem  # noqa: F401
 from warehouse.shipping.common import (  # noqa: F401  LOCKED_DN_STATUSES：旧的引用位置
     LOCKED_DN_STATUSES, assert_not_locked, current_delivery_task, document_timezone, is_locked, lock_dn,
 )
@@ -95,8 +98,6 @@ _LINE_TEXT_LIMITS = {
     'quantity_unit': 10,
 }
 
-# 日本出口申报（輸出申告）用的 9 位统计品目番号：货值（FOB，不含运费 / 保险费）超过这个金额（JPY）时提示补齐
-JP_EXPORT_CODE_THRESHOLD_JPY = 200000
 
 _HS_STRIP = re.compile(r'[.\s\-]')
 _CURRENCY_RE = re.compile(r'^[A-Z]{3}$')
@@ -172,16 +173,6 @@ def printed_hs_code(hs_code) -> str:
     （如日本 9 位统计番号），只在报关视图里显示，不印到发给进口国的单证上。"""
     digits = _HS_STRIP.sub('', str(hs_code or ''))
     return format_hs_code(digits[:6])
-
-
-def jp_export_code_problem(jp_export_code, hs_code):
-    """9 位日本出口统计品目番号：非 9 位数字或前 6 位与 HS 不一致 → 返回原因，否则 None。"""
-    digits = _HS_STRIP.sub('', str(jp_export_code or ''))
-    if not (digits.isdigit() and len(digits) == 9):
-        return "is not a 9-digit number"
-    if hs_code_valid(hs_code) and digits[:6] != _HS_STRIP.sub('', str(hs_code))[:6]:
-        return "does not match the first 6 digits of the HS code"
-    return None
 
 
 def is_ascii_text(text) -> bool:
@@ -714,10 +705,27 @@ class CustomsService:
 
     @staticmethod
     def _consignee(dn: DN, customs: DNCustoms | None) -> dict:
-        """Consignee / Ship To：报关快照里的 consignee 优先，没有则退回 DN 收货人。"""
+        """Consignee / Ship To：报关快照里的 consignee 优先；没有时用 DN 的结构化收件地址（ship_to，拉丁转写优先），
+        再没有退回 DN 收货人 + 单行的 shipping_address。"""
         consignee = dict((customs.consignee if customs else None) or {})
         if any(consignee.get(key) for key in CONSIGNEE_FIELDS):
             return {key: consignee.get(key) for key in CONSIGNEE_FIELDS}
+        if dn.ship_to:
+            from warehouse.common.address_format import latin_view
+            ship_to = latin_view(dn.ship_to)
+            recipient = dn.recipient
+            return {
+                'name': ship_to.get('name') or getattr(recipient, 'contact', None) or getattr(recipient, 'name', None),
+                'company': ship_to.get('organization'),
+                'address_line1': ' '.join(v for v in (ship_to.get('dependent_locality'), ship_to.get('address_line1'))
+                                          if v) or dn.shipping_address,
+                'address_line2': ship_to.get('address_line2'),
+                'city': ship_to.get('locality'),
+                'state': ship_to.get('admin_area'),
+                'postal_code': ship_to.get('postal_code') or getattr(recipient, 'zip_code', None),
+                'country': (ship_to.get('country') or getattr(recipient, 'country', None) or '').upper() or None,
+                'phone': ship_to.get('phone') or getattr(recipient, 'phone', None),
+            }
         recipient = dn.recipient
         return {
             'name': getattr(recipient, 'contact', None) or getattr(recipient, 'name', None),
@@ -730,6 +738,13 @@ class CustomsService:
             'country': (getattr(recipient, 'country', None) or '').upper() or None,
             'phone': getattr(recipient, 'phone', None),
         }
+
+    @staticmethod
+    def export_country(dn: DN):
+        """出口国：仓库的国家，没有用公司的（与 exporter.export_country_code 同一口径）；都没有为 None"""
+        warehouse = dn.warehouse
+        company = warehouse.company
+        return (warehouse.country_code or '').upper() or (company.country_code or '').upper() or None
 
     @staticmethod
     def _delivery_task(dn: DN):
@@ -747,7 +762,16 @@ class CustomsService:
             awbs.add(record.tracking_number or None)
         carrier = (task.carrier if task is not None and task.carrier is not None else None) or dn.carrier
         carriers = {None, carrier.name if carrier is not None else None}
-        return {_data_hash(data)} | _legacy_hashes(data, awbs, carriers)
+        hashes = {_data_hash(data)} | _legacy_hashes(data, awbs, carriers)
+        # 税号标签的默认值改由国家规则包给（日本 Corporate No.）之前，没设 tax_id_label 的一律印 Tax ID：
+        # 那时签发的单证内容相同就算同一份
+        company = dn.warehouse.company
+        exporter = data.get('exporter') or {}
+        tax_id = company.tax_id if company is not None else None
+        if tax_id and not (company.tax_id_label or '').strip() and exporter.get('tax') != f"Tax ID: {tax_id}":
+            legacy = dict(data, exporter=dict(exporter, tax=f"Tax ID: {tax_id}"))
+            hashes |= {_data_hash(legacy)} | _legacy_hashes(legacy, awbs, carriers)
+        return hashes
 
     @staticmethod
     def build_view(dn: DN) -> dict:
@@ -756,6 +780,8 @@ class CustomsService:
         customs_lines = {line.get('goods_code'): line for line in ((customs.lines if customs else None) or [])}
         locked = CustomsService.is_locked(dn)
         problems = []
+        # 国家专有的检查（如日本的输出统计品目番号）按发货国（仓库的国家，没有用公司的）的规则包
+        rules = rules_for(CustomsService.export_country(dn))
 
         def problem(code, level, message, goods_code=None, field=None):
             item = {'code': code, 'level': level, 'message': message}
@@ -848,12 +874,8 @@ class CustomsService:
             if unit_value is None or unit_value <= 0:
                 problem('UNIT_VALUE_MISSING', 'error', f"Unit value of goods {code} is missing or not positive",
                         goods_code=code, field='unit_value')
-            if line.get('jp_export_code'):
-                reason = jp_export_code_problem(line.get('jp_export_code'), line.get('hs_code'))
-                if reason:
-                    problem('JP_EXPORT_CODE_MISMATCH', 'warning',
-                            f"Japanese export statistics code of goods {code} {reason}",
-                            goods_code=code, field='jp_export_code')
+            for item in rules.customs_line_problems({**line, 'goods_code': code}):
+                problem(item['code'], item['level'], item['message'], goods_code=code, field=item.get('field'))
 
         # ---- 箱子 ----
         packages = CustomsService.packages_payload(dn)
@@ -923,30 +945,14 @@ class CustomsService:
         insurance = (Decimal(customs.insurance_charge)
                      if customs and customs.insurance_charge is not None else Decimal(0))
         invoice_total = goods_value + freight + insurance
-        # 日本正式出口申报（申告价格 = FOB，即货值合计超过 20 万日元）要 9 位统计品目番号：
-        # 按货值判断，运费 / 保险费不算进去；缺的行给警告，不拦出单证
-        if customs is not None and (customs.currency or '').upper() == 'JPY' \
-                and goods_value > JP_EXPORT_CODE_THRESHOLD_JPY:
-            for line in lines:
-                if line['packed_quantity'] > 0 and line['has_customs_line'] and not line['jp_export_code']:
-                    problem('JP_EXPORT_CODE_MISSING', 'warning',
-                            f"Japanese export statistics code of goods {line['goods_code']} is missing "
-                            f"(goods value exceeds {JP_EXPORT_CODE_THRESHOLD_JPY:,} JPY)",
-                            goods_code=line['goods_code'], field='jp_export_code')
-        # 非 JPY 币种：不引入汇率，没法自动判断是否超过 20 万円。从日本出口、且有行没填 9 位统计番号时
-        # 给一条单据级警告，请人工确认（不拦出单证）
-        currency_code = (customs.currency or '').upper() if customs is not None else ''
-        if customs is not None and currency_code != 'JPY' and _CURRENCY_RE.match(currency_code) \
-                and exporter['export_country_code'] == 'JP' and goods_value > 0:
-            missing_codes = [line['goods_code'] for line in lines
-                             if line['packed_quantity'] > 0 and line['has_customs_line'] and not line['jp_export_code']]
-            if missing_codes:
-                problem('JP_EXPORT_VALUE_UNVERIFIED', 'warning',
-                        f"Goods value is in {currency_code}, so whether it exceeds "
-                        f"{JP_EXPORT_CODE_THRESHOLD_JPY:,} JPY cannot be determined automatically; check manually. "
-                        f"If it does, the Japanese 9-digit export statistics code is required for goods "
-                        f"{', '.join(str(c) for c in missing_codes)}",
-                        field='jp_export_code')
+        # 国家专有的单据级检查（日本：货值超过 20 万円要 9 位统计番号 / 非 JPY 币种请人工确认，见 country_rules/jp.py）
+        if customs is not None:
+            for item in rules.customs_problems({
+                'customs': customs, 'currency': (customs.currency or '').upper(), 'goods_value': goods_value,
+                'lines': lines, 'export_country': exporter['export_country_code'],
+            }):
+                problem(item['code'], item['level'], item['message'], goods_code=item.get('goods_code'),
+                        field=item.get('field'))
         totals = {
             'quantity': total_qty,
             'goods_value': _num(goods_value),
@@ -1049,8 +1055,8 @@ class CustomsService:
                 'phone': exporter['phone'],
                 'email': exporter['email'],
                 'contact': exporter['contact_name'],
-                'tax': (f"{exporter['tax_id_label'] or 'Tax ID'}: {exporter['tax_id']}"
-                        if exporter['tax_id'] else None),
+                'tax': (f"{exporter['tax_id_label'] or rules_for(export_country).exporter_tax_label}: "
+                        f"{exporter['tax_id']}" if exporter['tax_id'] else None),
             },
             'ship_from': ({
                 'name': exporter['ship_from']['name'],

@@ -29,8 +29,19 @@ warehouse_simple_model = api_ns.model('WarehouseSimple', {
 warehouse_model = api_ns.model('Warehouse', {
     'id': fields.Integer(readOnly=True, description='Warehouse ID'),
     'name': fields.String(required=True, description='Warehouse Name'),
-    'address': fields.String(description='Warehouse Address'),
-    'zip_code': fields.String(description='Warehouse Zip Code'),
+    'address': fields.String(description='Warehouse address in one line; generated in the country format when only '
+                                         'the structured fields are given'),
+    'zip_code': fields.String(description='Warehouse Zip Code (same as postal_code)'),
+    'postal_code': fields.String(attribute='zip_code',
+                                 description='Postal code (same field as zip_code; either name is accepted)'),
+    # 结构化地址（doc/shipping-flow.md §6.2）
+    'admin_area': fields.String(description='State / province / prefecture'),
+    'locality': fields.String(description='City / municipality'),
+    'address_line1': fields.String(description='Street / block number'),
+    'address_line2': fields.String(description='Building / room'),
+    'latin': fields.Raw(description='Latin transliteration {name, organization, address_line1, address_line2, '
+                                    'locality, admin_area}; address_en stays the one-line Latin address (generated '
+                                    'from latin when it is empty)'),
     'phone': fields.String(description='Warehouse Phone'),
     'default_currency': fields.String(description='Default Currency Code (ISO 4217 standard)', default='JPY'),
     # 出口资料（仓库地址 ≠ 公司地址时印在单证的 Ship From 栏）

@@ -111,8 +111,8 @@ def test_export_flow_through_fedex(client, access_token, fedex):
     assert steps['pickup']['state'] == 'current'
     assert set(_actions(steps['pickup'])) == {'book_pickup', 'record_pickup'}
     assert flow['carrier']['tracking_url'] == 'https://www.fedex.com/fedextrack/?trknbr=794600000001'
-    assert _list_stage(client, access_token, dn_id)[1] == {'carrier_name': 'Test Carrier',
-                                                           'tracking_number': '794600000001'}
+    assert _list_stage(client, access_token, dn_id)[1] == {
+        'carrier_id': carrier_id, 'carrier_name': 'Test Carrier', 'tracking_number': '794600000001'}
 
     # 手工记一笔揽收 → 等交承运商
     shipment_id = summary['shipment']['id']

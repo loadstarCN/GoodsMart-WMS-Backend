@@ -77,7 +77,7 @@ class Carrier(db.Model):
     )
     waybill_method = db.Column(
         db.String(10), nullable=False, default='manual', server_default='manual',
-        info={'description': '运单的对接方式：api（插件建单）/ file（文件导出导入，第二期）/ manual（手填运单号）'}
+        info={'description': '运单的对接方式：api（插件建单）/ file（文件导出导入）/ manual（手填运单号）'}
     )
     pickup_method = db.Column(
         db.String(10), nullable=False, default='none', server_default='none',
@@ -103,6 +103,19 @@ class Carrier(db.Model):
     auto_sign_days = db.Column(
         db.Integer, nullable=True,
         info={'description': '交承运商后这么多天（1–90）还没签收、且没有 API 跟踪时自动视为签收；空 = 关'}
+    )
+    # 文件方式（doc/shipping-flow.md §6.1；校验见 warehouse/carrier/file_settings.py）
+    file_preset = db.Column(
+        db.String(60), nullable=True,
+        info={'description': '文件方式的预设代码（如 jp.yamato_b2cloud，见 warehouse/carrier/presets）'}
+    )
+    file_template = db.Column(
+        db.JSON, nullable=True,
+        info={'description': '在预设基础上改的部分（json，合并到预设上）；没有预设时是完整模板；空 = 完全用预设'}
+    )
+    file_account = db.Column(
+        db.JSON, nullable=True,
+        info={'description': '文件模板 account_fields 声明的账号项 {key: 文字}（如ヤマト的請求先顧客コード）'}
     )
     company_id = db.Column(
         db.Integer, 
@@ -144,6 +157,12 @@ class Carrier(db.Model):
         info={'description': '所属公司对象'}
     )
 
+
+    @property
+    def file_mode(self):
+        """文件方式的概要（承运商接口只读字段，见 file_settings.payload）"""
+        from .file_settings import payload
+        return payload(self)
 
     @property
     def integration_summary(self):

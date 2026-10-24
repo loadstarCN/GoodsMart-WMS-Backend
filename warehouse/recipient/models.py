@@ -53,9 +53,22 @@ class Recipient(db.Model):
         info={'description': '对接联系人姓名'}
     )
     country = db.Column(
-        db.String(2), 
+        db.String(2),
         nullable=False,
         info={'description': '国家代码（ISO 3166标准）'}
+    )
+    # 结构化地址（doc/shipping-flow.md §6.2；字段见 warehouse/common/address_format.py）。zip_code 即 postal_code；
+    # 单行的 address 保留，只给了结构化字段时按国家格式生成
+    admin_area = db.Column(db.String(100), nullable=True, info={'description': '州 / 省 / 都道府县'})
+    locality = db.Column(db.String(100), nullable=True, info={'description': '城市 / 市区町村'})
+    dependent_locality = db.Column(db.String(100), nullable=True, info={'description': '区 / 町域等下级地名'})
+    address_line1 = db.Column(db.String(255), nullable=True, info={'description': '街道 / 番地'})
+    address_line2 = db.Column(db.String(255), nullable=True, info={'description': '建筑 / 房间'})
+    organization = db.Column(db.String(255), nullable=True, info={'description': '公司 / 机构名（面单上印）'})
+    latin = db.Column(
+        db.JSON, nullable=True,
+        info={'description': '拉丁转写 {name, organization, address_line1, address_line2, locality, admin_area}'
+                             '（跨境面单用）'}
     )
     is_active = db.Column(
         db.Boolean, 
@@ -123,6 +136,11 @@ class Recipient(db.Model):
             self.external_mapping.external_reference
             if self.external_mapping else None
         )
+
+    @property
+    def postal_code(self):
+        """结构化地址里的邮编名（与 zip_code 同一列）"""
+        return self.zip_code
 
     @property
     def display_email(self):

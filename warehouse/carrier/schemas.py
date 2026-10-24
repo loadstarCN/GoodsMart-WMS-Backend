@@ -7,6 +7,12 @@ from .methods import available_methods
 # 初始化 Namespace
 api_ns = Namespace('carrier', description='Carrier operations')
 
+def _service_options(carrier):
+    """承运商声明的运单服务选项（与 DN 的 shipping_options 校验同一口径，warehouse/shipping/options.py）"""
+    from warehouse.shipping.options import schema_for
+    return schema_for(carrier)
+
+
 # 定义并重用 User 序列化器
 user_model = api_ns.model('User', original_user_model)
 
@@ -37,8 +43,10 @@ carrier_fields = {
                               description='Online integration (automatic shipments): {adapter, name, enabled} or null'),
     # 对接方式（doc/shipping-flow.md §2；校验见 warehouse/carrier/methods.py，不合法 400 16135）
     'waybill_method': fields.String(enum=['api', 'file', 'manual'], default='manual',
-                                    description='Waybills: api (created by the integration) / manual (tracking number '
-                                                'entered or scanned); file is phase 2'),
+                                    description='Waybills: api (created by the integration) / file (CSV exported in '
+                                                "the carrier software's format, tracking numbers imported back; needs "
+                                                'file_preset or file_template) / manual (tracking number entered or '
+                                                'scanned)'),
     'pickup_method': fields.String(enum=['api', 'manual', 'scheduled', 'dropoff', 'none'], default='none',
                                    description='Pickups: api (booked by the integration) / manual (booked by phone or '
                                                'website, recorded in WMS) / scheduled (regular pickup) / dropoff / none'),
@@ -52,10 +60,28 @@ carrier_fields = {
                                                        "integration's built-in one"),
     'auto_sign_days': fields.Integer(description='Sign automatically this many days (1-90) after handover when the '
                                                  'shipment is not tracked through the API; null = off'),
+    # 文件方式（doc/shipping-flow.md §6.1；校验见 warehouse/carrier/file_settings.py，不合法 400 16135）
+    'file_preset': fields.String(description='File preset code (GET /warehouse/carrier/file-presets), e.g. '
+                                             'jp.yamato_b2cloud; null = none'),
+    'file_template': fields.Raw(description='File template changes merged over the preset (objects merged key by key, '
+                                            'lists replaced, null removes a key); the whole template without a preset; '
+                                            'null = the preset as is'),
+    'file_account': fields.Raw(description='Account values declared by the template account_fields {key: text}, '
+                                           'e.g. the Yamato billing customer code'),
+    'file_mode': fields.Raw(attribute='file_mode', readonly=True,
+                            description='File mode summary: {configured, ready, preset: {code, name, verified, exists} '
+                                        '| null, error, service_options, account_fields, missing_account_fields, '
+                                        'can_import, tracking_url_template, tracking_url_fallback, encoding}'),
+    'service_options': fields.Raw(attribute=lambda c: _service_options(c), readonly=True,
+                                  description='Shipping service options declared for this carrier (what DN '
+                                              'shipping_options are checked against: the file template for '
+                                              'waybill_method file, else the integration plugin): [{key, kind: '
+                                              'select | date | money | text, label, values?, default?, help?, '
+                                              'max_length?}]'),
     'available_methods': fields.Raw(attribute=lambda c: available_methods(c), readonly=True,
                                     description='Methods that can be chosen now: {waybill: [...], pickup: [...], '
                                                 'tracking: [...]}; api only with an enabled integration whose plugin '
-                                                'supports it'),
+                                                'supports it; file only with a file preset / template'),
     'company_id': fields.Integer(required=True, description='ID of the associated company'),
     'company': fields.Nested(company_model, readonly=True, description='Associated company details'),
     'created_at': fields.DateTime(readOnly=True, description='Creation timestamp'),

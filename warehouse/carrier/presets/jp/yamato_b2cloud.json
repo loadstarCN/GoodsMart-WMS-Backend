@@ -1,0 +1,946 @@
+{
+  "code": "jp.yamato_b2cloud",
+  "name": {
+    "en-US": "Yamato Transport – B2 Cloud (basic layout CSV)",
+    "zh-CN": "大和运输 B2クラウド（基本レイアウト CSV）",
+    "ja-JP": "ヤマト運輸 送り状発行システムB2クラウド（基本レイアウト）"
+  },
+  "country": "JP",
+  "version": "B2クラウド 送り状発行データレイアウト 入出力用 (new_exchange1.pdf, PDF作成 2026-02-02) / 基本レイアウトテンプレート newb2web_template1.xls (2025-01-27, 95列) / マニュアル b2cloud_manual_05・09 (2024-12)",
+  "verified": false,
+  "sources": [
+    "https://bmypage.kuronekoyamato.co.jp/bmypage/pdf/new_exchange1.pdf",
+    "https://bmypage.kuronekoyamato.co.jp/bmypage/newb2web_template1.xls",
+    "http://b2-dlserver.kuronekoyamato.co.jp/b2cloud/pdf/b2cloud_manual_05.pdf",
+    "http://b2-dlserver.kuronekoyamato.co.jp/b2cloud/pdf/b2cloud_manual_09.pdf",
+    "https://b-faq.kuronekoyamato.co.jp/app/answers/detail/a_id/812",
+    "https://b-faq.kuronekoyamato.co.jp/app/answers/detail/a_id/557",
+    "https://b-faq.kuronekoyamato.co.jp/app/answers/detail/a_id/576",
+    "https://b-faq.kuronekoyamato.co.jp/app/answers/detail/a_id/1002",
+    "https://b-faq.kuronekoyamato.co.jp/app/answers/detail/a_id/412",
+    "https://b-faq.kuronekoyamato.co.jp/app/answers/detail/a_id/3389",
+    "https://docs.channel.io/logikura_help/ja/articles/a8f5d700-ヤマトB2クラウドから追跡番号をダウンロードする",
+    "https://manual.sokuhan.jp/renkei/delivery/b2/"
+  ],
+  "notes": "【导入步骤】B2クラウド →「外部データから発行」→ 取込みパターン选「基本レイアウト」→ 选文件 → 取込み開始行=2（第1行是表头）→ 取込み開始。基本レイアウト按列位置读取，表头文字不参与匹配；列数按官方模板 95 列（2026-02 规格书另有第96列「連携管理番号」、第97列「通知メールアドレス」，仅「直送り」用，未输出）。一次最多 1,000 件（手册 05；部分资料称 5,000 件）。【字符】仅 JIS 第1・第2水准汉字可用（FAQ 412），CSV 用 CP932/Shift_JIS 编码；字段内不得换行、地址不得含空格。【长度】max_length 以 Shift_JIS 字节计（半角=1，全角=2），对应官方「全角n文字/半角2n文字」。【送り状種類代码】以 2026-02 官方规格为准：7=クロネコゆうパケット、9=宅急便コンパクトコレクト、A=ネコポス（旧资料中 7=ネコポス 已过时）。ネコポス 于 2025-01 决定继续提供。【必填】宅急便系：送り状種類・出荷予定日・お届け先电话/邮编/住所/名称・ご依頼主电话/邮编/住所/名称・品名１・請求先顧客コード・運賃管理番号（FAQ 3389）；コレクト另需代引额与内消费税；ゆうメール不需电话/依頼主。【多件】発行枚数≥2 时每张面单有各自的伝票番号，回填时同一 お客様管理番号 可能对应多行。",
+  "tracking_url_template": "https://member.kms.kuronekoyamato.co.jp/parcel/detail?pno={tracking_number}",
+  "tracking_url_notes": "2026-10-25 用浏览器实测：member.kms…/parcel/detail?pno=… 无需登录即显示「送り状番号：xxxx-xxxx-xxxx」及状态。旧模板 https://toi.kuronekoyamato.co.jp/cgi-bin/tneko?number00=1&number01={tracking_number} 现已不接受 GET 参数（页面只显示空表单，仅 POST 有效），不建议再用。",
+  "service_option": "invoice_type",
+  "export": {
+    "format": "csv",
+    "encoding": "cp932",
+    "encoding_notes": "实现时用 cp932（Windows-31J）编码；JIS 第1/第2水准外的字符（如「髙」「﨑」）B2 会报错，导出前应校验并提示。",
+    "delimiter": ",",
+    "quoting": "minimal",
+    "header": true,
+    "line_ending": "\r\n",
+    "length_unit": "sjis_bytes",
+    "row_unit": "dn",
+    "columns": [
+      {
+        "header": "お客様管理番号",
+        "value": "DN{dn.id}",
+        "required": false,
+        "max_length": 50,
+        "notes": "半角英数字50。WMS 回填匹配键（发行済データ输出第1列）。B2 本身非必填。"
+      },
+      {
+        "header": "送り状種類",
+        "value": "{options.invoice_type|default:0}",
+        "required": true,
+        "max_length": 1,
+        "notes": "0発払い/2コレクト/3クロネコゆうメール/4タイム/5着払い/6発払い（複数口）/7クロネコゆうパケット/8宅急便コンパクト/9宅急便コンパクトコレクト/Aネコポス（官方 2026-02 规格；注意 7/9/A 与旧版不同）。"
+      },
+      {
+        "header": "クール区分",
+        "value": "{options.cool_type}",
+        "required": false,
+        "max_length": 1,
+        "notes": "空或0:通常/1:クール冷凍/2:クール冷蔵；仅 0発払い・2コレクト・5着払い 可指定，其他种类按空白处理。"
+      },
+      {
+        "header": "伝票番号",
+        "value": "",
+        "required": false,
+        "max_length": 12,
+        "notes": "输入时留空（B2 采番）；输出文件中此列为追踪号。"
+      },
+      {
+        "header": "出荷予定日",
+        "value": "{ship_date|date:%Y/%m/%d}",
+        "required": true,
+        "max_length": 10,
+        "notes": "YYYY/MM/DD。"
+      },
+      {
+        "header": "お届け予定日",
+        "value": "{options.delivery_date|date:%Y/%m/%d}",
+        "required": false,
+        "max_length": 10,
+        "notes": "YYYY/MM/DD；空=不印字；也可填文字「最短日」。规格书项目名为「お届け予定（指定）日」，模板表头为「お届け予定日」。"
+      },
+      {
+        "header": "配達時間帯",
+        "value": "{options.delivery_time_slot}",
+        "required": false,
+        "max_length": 4,
+        "notes": "空:指定なし/0812午前中/1416/1618/1820/1921；タイム便: 0010(午前10時まで)/0017(午後5時まで)。ゆうメール・ゆうパケット・ネコポス不可。"
+      },
+      {
+        "header": "お届け先コード",
+        "value": "",
+        "required": false,
+        "max_length": 20
+      },
+      {
+        "header": "お届け先電話番号",
+        "value": "{ship_to.phone|jp_phone}",
+        "required": true,
+        "max_length": 15,
+        "notes": "半角数字+ハイフン，≤15。+81 形式需先转成国内号码（0 开头）。宅急便/ゆうパケット/ネコポス 必填。"
+      },
+      {
+        "header": "お届け先電話番号枝番",
+        "value": "",
+        "required": false,
+        "max_length": 2
+      },
+      {
+        "header": "お届け先郵便番号",
+        "value": "{ship_to.postal_code|digits}",
+        "required": true,
+        "max_length": 8,
+        "notes": "带连字符8位或不带7位均可。"
+      },
+      {
+        "header": "お届け先住所",
+        "value": "{ship_to.admin_area|nospace}{ship_to.locality|nospace}{ship_to.dependent_locality|nospace}{ship_to.address_line1|nospace}",
+        "required": true,
+        "max_length": 64,
+        "notes": "全角32/半角64（都道府県4+市区郡町村12+町・番地16）。住所中含空格会导致解析失败（FAQ 1002）→ 用 |nospace 去空格。超长时把建筑名放到下一列。"
+      },
+      {
+        "header": "お届け先アパートマンション名",
+        "value": "{ship_to.address_line2}",
+        "required": false,
+        "max_length": 32,
+        "notes": "全角16/半角32。"
+      },
+      {
+        "header": "お届け先会社・部門１",
+        "value": "{ship_to.organization}",
+        "required": false,
+        "max_length": 50,
+        "notes": "全角25/半角50。"
+      },
+      {
+        "header": "お届け先会社・部門２",
+        "value": "",
+        "required": false,
+        "max_length": 50
+      },
+      {
+        "header": "お届け先名",
+        "value": "{ship_to.name}",
+        "required": true,
+        "max_length": 32,
+        "notes": "全角16/半角32（FAQ 557）。B2 自动加敬称「様」。只有公司名无联系人时需把公司名放这里。"
+      },
+      {
+        "header": "お届け先名(ｶﾅ)",
+        "value": "",
+        "required": false,
+        "max_length": 50,
+        "notes": "半角カナ。"
+      },
+      {
+        "header": "敬称",
+        "value": "",
+        "required": false,
+        "max_length": 4,
+        "notes": "仅クロネコゆうメール可指定（様・御中・殿・行・係・宛・先生・なし）。"
+      },
+      {
+        "header": "ご依頼主コード",
+        "value": "",
+        "required": false,
+        "max_length": 20
+      },
+      {
+        "header": "ご依頼主電話番号",
+        "value": "{shipper.phone|jp_phone}",
+        "required": true,
+        "max_length": 15
+      },
+      {
+        "header": "ご依頼主電話番号枝番",
+        "value": "",
+        "required": false,
+        "max_length": 2
+      },
+      {
+        "header": "ご依頼主郵便番号",
+        "value": "{shipper.postal_code|digits}",
+        "required": true,
+        "max_length": 8
+      },
+      {
+        "header": "ご依頼主住所",
+        "value": "{shipper.admin_area|nospace}{shipper.locality|nospace}{shipper.dependent_locality|nospace}{shipper.address_line1|nospace}",
+        "required": true,
+        "max_length": 64
+      },
+      {
+        "header": "ご依頼主アパートマンション",
+        "value": "{shipper.address_line2}",
+        "required": false,
+        "max_length": 32
+      },
+      {
+        "header": "ご依頼主名",
+        "value": "{shipper.name}",
+        "required": true,
+        "max_length": 32,
+        "notes": "印在面单上的寄件人名（店铺/公司名），全角16/半角32。"
+      },
+      {
+        "header": "ご依頼主名(ｶﾅ)",
+        "value": "",
+        "required": false,
+        "max_length": 50
+      },
+      {
+        "header": "品名コード１",
+        "value": "",
+        "required": false,
+        "max_length": 30
+      },
+      {
+        "header": "品名１",
+        "value": "{goods.summary|truncate_bytes:50}",
+        "required": true,
+        "max_length": 50,
+        "notes": "全角25/半角50；宅急便/ゆうパケット/ネコポス 必填。"
+      },
+      {
+        "header": "品名コード２",
+        "value": "",
+        "required": false,
+        "max_length": 30
+      },
+      {
+        "header": "品名２",
+        "value": "",
+        "required": false,
+        "max_length": 50
+      },
+      {
+        "header": "荷扱い１",
+        "value": "",
+        "required": false,
+        "max_length": 20,
+        "notes": "如 ワレモノ注意 / 精密機器 等，全角10/半角20。"
+      },
+      {
+        "header": "荷扱い２",
+        "value": "",
+        "required": false,
+        "max_length": 20
+      },
+      {
+        "header": "記事",
+        "value": "{dn.order_number|truncate_bytes:44}",
+        "required": false,
+        "max_length": 44,
+        "notes": "全角22/半角44，印在面单上；这里放客户订单号便于现场核对（纯 ASCII 订单号最多可放44）。"
+      },
+      {
+        "header": "ｺﾚｸﾄ代金引換額（税込)",
+        "value": "{options.cod_amount}",
+        "required": false,
+        "max_length": 7,
+        "notes": "コレクト（2）必填：1～300,000円；宅急便コンパクトコレクト（9）≤30,000円。整数日元，无逗号。"
+      },
+      {
+        "header": "内消費税額等",
+        "value": "{options.cod_tax_amount}",
+        "required": false,
+        "max_length": 7,
+        "notes": "コレクト必填，≤代引额。"
+      },
+      {
+        "header": "止置き",
+        "value": "",
+        "required": false,
+        "max_length": 1,
+        "notes": "0:利用しない/1:利用する（营业所留置）。"
+      },
+      {
+        "header": "営業所コード",
+        "value": "",
+        "required": false,
+        "max_length": 6,
+        "notes": "止置き=1 时必填。"
+      },
+      {
+        "header": "発行枚数",
+        "value": "{package.count|default:1}",
+        "required": false,
+        "max_length": 2,
+        "notes": "通常1；発払い・タイム・着払い・ゆうパケット・ネコポス 可2～99（每张面单各自一个伝票番号）。"
+      },
+      {
+        "header": "個数口表示フラグ",
+        "value": "",
+        "required": false,
+        "max_length": 1,
+        "notes": "1:印字する/2:印字しない/3:枠と口数を印字する。"
+      },
+      {
+        "header": "請求先顧客コード",
+        "value": "{carrier.account.billing_customer_code}",
+        "required": true,
+        "max_length": 12,
+        "notes": "半角数字9～12位（模板写10～12）；ゆうメール・着払い 为非输入项。"
+      },
+      {
+        "header": "請求先分類コード",
+        "value": "{carrier.account.billing_class_code}",
+        "required": false,
+        "max_length": 3,
+        "notes": "空或半角数字3位。"
+      },
+      {
+        "header": "運賃管理番号",
+        "value": "{carrier.account.freight_mgmt_no}",
+        "required": true,
+        "max_length": 2,
+        "notes": "半角数字2位（例 01）。"
+      },
+      {
+        "header": "クロネコwebコレクトデータ登録",
+        "value": "",
+        "required": false,
+        "max_length": 1
+      },
+      {
+        "header": "クロネコwebコレクト加盟店番号",
+        "value": "",
+        "required": false,
+        "max_length": 9
+      },
+      {
+        "header": "クロネコwebコレクト申込受付番号１",
+        "value": "",
+        "required": false,
+        "max_length": 23
+      },
+      {
+        "header": "クロネコwebコレクト申込受付番号２",
+        "value": "",
+        "required": false,
+        "max_length": 23
+      },
+      {
+        "header": "クロネコwebコレクト申込受付番号３",
+        "value": "",
+        "required": false,
+        "max_length": 23
+      },
+      {
+        "header": "お届け予定ｅメール利用区分",
+        "value": "",
+        "required": false,
+        "max_length": 1
+      },
+      {
+        "header": "お届け予定ｅメールe-mailアドレス",
+        "value": "",
+        "required": false,
+        "max_length": 60
+      },
+      {
+        "header": "入力機種",
+        "value": "",
+        "required": false,
+        "max_length": 1
+      },
+      {
+        "header": "お届け予定ｅメールメッセージ",
+        "value": "",
+        "required": false,
+        "max_length": 148
+      },
+      {
+        "header": "お届け完了ｅメール利用区分",
+        "value": "",
+        "required": false,
+        "max_length": 1
+      },
+      {
+        "header": "お届け完了ｅメールe-mailアドレス",
+        "value": "",
+        "required": false,
+        "max_length": 60
+      },
+      {
+        "header": "お届け完了ｅメールメッセージ",
+        "value": "",
+        "required": false,
+        "max_length": 318
+      },
+      {
+        "header": "クロネコ収納代行利用区分",
+        "value": "",
+        "required": false,
+        "max_length": 1
+      },
+      {
+        "header": "予備",
+        "value": "",
+        "required": false,
+        "max_length": 1
+      },
+      {
+        "header": "収納代行請求金額(税込)",
+        "value": "",
+        "required": false,
+        "max_length": 7
+      },
+      {
+        "header": "収納代行内消費税額等",
+        "value": "",
+        "required": false,
+        "max_length": 7
+      },
+      {
+        "header": "収納代行請求先郵便番号",
+        "value": "",
+        "required": false,
+        "max_length": 8
+      },
+      {
+        "header": "収納代行請求先住所",
+        "value": "",
+        "required": false,
+        "max_length": 64
+      },
+      {
+        "header": "収納代行請求先住所（アパートマンション名）",
+        "value": "",
+        "required": false,
+        "max_length": 32
+      },
+      {
+        "header": "収納代行請求先会社・部門名１",
+        "value": "",
+        "required": false,
+        "max_length": 50
+      },
+      {
+        "header": "収納代行請求先会社・部門名２",
+        "value": "",
+        "required": false,
+        "max_length": 50
+      },
+      {
+        "header": "収納代行請求先名(漢字)",
+        "value": "",
+        "required": false,
+        "max_length": 32
+      },
+      {
+        "header": "収納代行請求先名(カナ)",
+        "value": "",
+        "required": false,
+        "max_length": 50
+      },
+      {
+        "header": "収納代行問合せ先名(漢字)",
+        "value": "",
+        "required": false,
+        "max_length": 32
+      },
+      {
+        "header": "収納代行問合せ先郵便番号",
+        "value": "",
+        "required": false,
+        "max_length": 8
+      },
+      {
+        "header": "収納代行問合せ先住所",
+        "value": "",
+        "required": false,
+        "max_length": 64
+      },
+      {
+        "header": "収納代行問合せ先住所（アパートマンション名）",
+        "value": "",
+        "required": false,
+        "max_length": 32
+      },
+      {
+        "header": "収納代行問合せ先電話番号",
+        "value": "",
+        "required": false,
+        "max_length": 15
+      },
+      {
+        "header": "収納代行管理番号",
+        "value": "",
+        "required": false,
+        "max_length": 20
+      },
+      {
+        "header": "収納代行品名",
+        "value": "",
+        "required": false,
+        "max_length": 50
+      },
+      {
+        "header": "収納代行備考",
+        "value": "",
+        "required": false,
+        "max_length": 28
+      },
+      {
+        "header": "複数口くくりキー",
+        "value": "",
+        "required": false,
+        "max_length": 20,
+        "notes": "送り状種類=6（発払い複数口）时必填：同一 DN 的各行填同一键（如 DN{dn.id}），导入后被替换为親伝票番号。"
+      },
+      {
+        "header": "検索キータイトル1",
+        "value": "",
+        "required": false,
+        "max_length": 20
+      },
+      {
+        "header": "検索キー1",
+        "value": "",
+        "required": false,
+        "max_length": 20,
+        "notes": "半角英数字20。可作为备用匹配键（ロジクラ用此列回填）。"
+      },
+      {
+        "header": "検索キータイトル2",
+        "value": "",
+        "required": false,
+        "max_length": 20
+      },
+      {
+        "header": "検索キー2",
+        "value": "",
+        "required": false,
+        "max_length": 20
+      },
+      {
+        "header": "検索キータイトル3",
+        "value": "",
+        "required": false,
+        "max_length": 20
+      },
+      {
+        "header": "検索キー3",
+        "value": "",
+        "required": false,
+        "max_length": 20
+      },
+      {
+        "header": "検索キータイトル4",
+        "value": "",
+        "required": false,
+        "max_length": 20
+      },
+      {
+        "header": "検索キー4",
+        "value": "",
+        "required": false,
+        "max_length": 20
+      },
+      {
+        "header": "検索キータイトル5",
+        "value": "",
+        "required": false,
+        "max_length": 20,
+        "notes": "输入不需要；发行时固定补「ユーザーID」。"
+      },
+      {
+        "header": "検索キー5",
+        "value": "",
+        "required": false,
+        "max_length": 20,
+        "notes": "输入不需要；发行时补发行用户ID。"
+      },
+      {
+        "header": "予備",
+        "value": "",
+        "required": false,
+        "max_length": null
+      },
+      {
+        "header": "予備",
+        "value": "",
+        "required": false,
+        "max_length": null
+      },
+      {
+        "header": "投函予定メール利用区分",
+        "value": "",
+        "required": false,
+        "max_length": 1,
+        "notes": "仅ネコポス。"
+      },
+      {
+        "header": "投函予定メールe-mailアドレス",
+        "value": "",
+        "required": false,
+        "max_length": 60
+      },
+      {
+        "header": "投函予定メールメッセージ",
+        "value": "",
+        "required": false,
+        "max_length": 148
+      },
+      {
+        "header": "投函完了メール（お届け先宛）利用区分",
+        "value": "",
+        "required": false,
+        "max_length": 1
+      },
+      {
+        "header": "投函完了メール（お届け先宛）e-mailアドレス",
+        "value": "",
+        "required": false,
+        "max_length": 60
+      },
+      {
+        "header": "投函完了メール（お届け先宛）メールメッセージ",
+        "value": "",
+        "required": false,
+        "max_length": 318
+      },
+      {
+        "header": "投函完了メール（ご依頼主宛）利用区分",
+        "value": "",
+        "required": false,
+        "max_length": 1
+      },
+      {
+        "header": "投函完了メール（ご依頼主宛）e-mailアドレス",
+        "value": "",
+        "required": false,
+        "max_length": 60
+      },
+      {
+        "header": "投函完了メール（ご依頼主宛）メールメッセージ",
+        "value": "",
+        "required": false,
+        "max_length": 318
+      }
+    ],
+    "charset": "jis_x0208"
+  },
+  "import": {
+    "source": "B2クラウド →「発行済データの検索」→ 勾选 →「外部ファイル出力」→ 勾选「1行目に見出しを出力する」→「ファイル出力」（仅可查询过去 90 天）",
+    "encoding": "cp932",
+    "encoding_notes": "官方手册未写明输出编码；按 Shift_JIS/CP932 读取，失败时回退 UTF-8（建议实现自动探测）。",
+    "header_rows": 1,
+    "header_rows_notes": "若未勾选「1行目に見出しを出力する」则为 0；可按第4列是否为12位数字自动判断。",
+    "reference_column": 1,
+    "reference_header": "お客様管理番号",
+    "reference_value": "DN{dn.id}",
+    "reference_parse": "^DN(\\d+)$",
+    "tracking_column": 4,
+    "tracking_header": "伝票番号",
+    "tracking_normalize": "digits",
+    "notes": "发行済データ输出与输入同为「入出力用」95/97 列布局：第1列 お客様管理番号、第4列（D列）伝票番号（ロジクラ帮助确认 D 列=伝票番号、BX列=検索キー1）。一个 DN 可能有多行（発行枚数≥2 或 複数口）。",
+    "encoding_fallbacks": [
+      "utf-8"
+    ]
+  },
+  "service_options": [
+    {
+      "key": "invoice_type",
+      "kind": "select",
+      "label": {
+        "en-US": "Waybill type",
+        "zh-CN": "面单种类（送り状種類）",
+        "ja-JP": "送り状種類"
+      },
+      "values": [
+        {
+          "value": "0",
+          "label": {
+            "en-US": "Prepaid (Hatsubarai)",
+            "zh-CN": "寄付（発払い）",
+            "ja-JP": "発払い"
+          }
+        },
+        {
+          "value": "2",
+          "label": {
+            "en-US": "Collect on delivery (Collect)",
+            "zh-CN": "代收货款（コレクト）",
+            "ja-JP": "コレクト"
+          }
+        },
+        {
+          "value": "3",
+          "label": {
+            "en-US": "Kuroneko Yu-Mail",
+            "zh-CN": "黑猫邮件（クロネコゆうメール）",
+            "ja-JP": "クロネコゆうメール"
+          }
+        },
+        {
+          "value": "4",
+          "label": {
+            "en-US": "Time service",
+            "zh-CN": "限时（タイム）",
+            "ja-JP": "タイム"
+          }
+        },
+        {
+          "value": "5",
+          "label": {
+            "en-US": "Cash on arrival (freight collect)",
+            "zh-CN": "到付（着払い）",
+            "ja-JP": "着払い"
+          }
+        },
+        {
+          "value": "6",
+          "label": {
+            "en-US": "Prepaid, multi-piece",
+            "zh-CN": "寄付·一票多件（発払い 複数口）",
+            "ja-JP": "発払い（複数口）"
+          }
+        },
+        {
+          "value": "7",
+          "label": {
+            "en-US": "Kuroneko Yu-Packet",
+            "zh-CN": "黑猫邮包（クロネコゆうパケット）",
+            "ja-JP": "クロネコゆうパケット"
+          }
+        },
+        {
+          "value": "8",
+          "label": {
+            "en-US": "TA-Q-BIN Compact",
+            "zh-CN": "宅急便紧凑型",
+            "ja-JP": "宅急便コンパクト"
+          }
+        },
+        {
+          "value": "9",
+          "label": {
+            "en-US": "TA-Q-BIN Compact Collect",
+            "zh-CN": "宅急便紧凑型·代收",
+            "ja-JP": "宅急便コンパクトコレクト"
+          }
+        },
+        {
+          "value": "A",
+          "label": {
+            "en-US": "Nekopos",
+            "zh-CN": "猫邮（ネコポス）",
+            "ja-JP": "ネコポス"
+          }
+        }
+      ],
+      "default": "0"
+    },
+    {
+      "key": "delivery_time_slot",
+      "kind": "select",
+      "label": {
+        "en-US": "Delivery time slot",
+        "zh-CN": "配送时间段",
+        "ja-JP": "配達時間帯"
+      },
+      "values": [
+        {
+          "value": "",
+          "label": {
+            "en-US": "Not specified",
+            "zh-CN": "不指定",
+            "ja-JP": "指定なし"
+          }
+        },
+        {
+          "value": "0812",
+          "label": {
+            "en-US": "Morning (8–12)",
+            "zh-CN": "上午",
+            "ja-JP": "午前中"
+          }
+        },
+        {
+          "value": "1416",
+          "label": {
+            "en-US": "14:00–16:00",
+            "zh-CN": "14～16时",
+            "ja-JP": "14～16時"
+          }
+        },
+        {
+          "value": "1618",
+          "label": {
+            "en-US": "16:00–18:00",
+            "zh-CN": "16～18时",
+            "ja-JP": "16～18時"
+          }
+        },
+        {
+          "value": "1820",
+          "label": {
+            "en-US": "18:00–20:00",
+            "zh-CN": "18～20时",
+            "ja-JP": "18～20時"
+          }
+        },
+        {
+          "value": "1921",
+          "label": {
+            "en-US": "19:00–21:00",
+            "zh-CN": "19～21时",
+            "ja-JP": "19～21時"
+          }
+        },
+        {
+          "value": "0010",
+          "label": {
+            "en-US": "Time service: by 10:00",
+            "zh-CN": "限时：上午10点前",
+            "ja-JP": "タイム：午前10時まで"
+          }
+        },
+        {
+          "value": "0017",
+          "label": {
+            "en-US": "Time service: by 17:00",
+            "zh-CN": "限时：下午5点前",
+            "ja-JP": "タイム：午後5時まで"
+          }
+        }
+      ],
+      "default": ""
+    },
+    {
+      "key": "cool_type",
+      "kind": "select",
+      "label": {
+        "en-US": "Cool service",
+        "zh-CN": "冷链（クール区分）",
+        "ja-JP": "クール区分"
+      },
+      "values": [
+        {
+          "value": "",
+          "label": {
+            "en-US": "Normal",
+            "zh-CN": "常温",
+            "ja-JP": "通常"
+          }
+        },
+        {
+          "value": "1",
+          "label": {
+            "en-US": "Frozen",
+            "zh-CN": "冷冻",
+            "ja-JP": "クール冷凍"
+          }
+        },
+        {
+          "value": "2",
+          "label": {
+            "en-US": "Chilled",
+            "zh-CN": "冷藏",
+            "ja-JP": "クール冷蔵"
+          }
+        }
+      ],
+      "default": ""
+    },
+    {
+      "key": "delivery_date",
+      "kind": "date",
+      "label": {
+        "en-US": "Delivery date",
+        "zh-CN": "指定送达日",
+        "ja-JP": "お届け予定日"
+      }
+    },
+    {
+      "key": "cod_amount",
+      "kind": "money",
+      "label": {
+        "en-US": "COD amount (tax incl.)",
+        "zh-CN": "代收金额（含税）",
+        "ja-JP": "コレクト代金引換額（税込）"
+      }
+    },
+    {
+      "key": "cod_tax_amount",
+      "kind": "money",
+      "label": {
+        "en-US": "Consumption tax within COD",
+        "zh-CN": "代收金额中消费税",
+        "ja-JP": "内消費税額等"
+      },
+      "help": {
+        "en-US": "Usually floor(COD × 10 / 110).",
+        "zh-CN": "通常为 代收额×10/110 向下取整。",
+        "ja-JP": "通常は代引額×10/110（切捨て）。"
+      }
+    }
+  ],
+  "account_fields": [
+    {
+      "key": "billing_customer_code",
+      "label": {
+        "en-US": "Billing customer code",
+        "zh-CN": "请求先顾客代码",
+        "ja-JP": "ご請求先顧客コード"
+      },
+      "required": true,
+      "help": {
+        "en-US": "9–12 digits. In B2 Cloud open 1件ずつ発行 → 基本情報 → 請求先; the part before the hyphen of the login code (FAQ 576).",
+        "zh-CN": "9～12位数字。B2クラウド「1件ずつ発行」→「基本情報」→「請求先」可查；即登录顾客代码中连字符前的部分（FAQ 576）。",
+        "ja-JP": "半角数字9～12桁。「1件ずつ発行」→「基本情報」→「請求先」で確認（FAQ 576）。"
+      }
+    },
+    {
+      "key": "billing_class_code",
+      "label": {
+        "en-US": "Billing class code",
+        "zh-CN": "请求先分类代码",
+        "ja-JP": "ご請求先分類コード"
+      },
+      "required": false,
+      "help": {
+        "en-US": "3 digits; leave blank if your code has only a 2-digit suffix.",
+        "zh-CN": "3位数字；若登录代码连字符后只有2位则留空。",
+        "ja-JP": "半角数字3桁。ハイフン以降が2桁の場合は空白。"
+      }
+    },
+    {
+      "key": "freight_mgmt_no",
+      "label": {
+        "en-US": "Freight management number",
+        "zh-CN": "运费管理编号",
+        "ja-JP": "運賃管理番号"
+      },
+      "required": true,
+      "help": {
+        "en-US": "2 digits, e.g. 01.",
+        "zh-CN": "2位数字，例如 01。",
+        "ja-JP": "半角数字2桁（例：01）。"
+      }
+    }
+  ]
+}

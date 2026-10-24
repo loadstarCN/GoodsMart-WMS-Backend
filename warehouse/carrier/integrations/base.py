@@ -168,6 +168,10 @@ class CarrierAdapter:
         invoice: {invoice_number, currency, incoterm, export_reason, freight, insurance, goods_value,
                   declared_value | None} | None（同上）
         documents: {'commercial_invoice': {content, file_name}} | None（要报关且开了电子单证时才有）
+        options: DN 的运单服务选项 {key: 值}（只含插件 service_options 声明了的键；没有为 {}）
+    第二期起 shipper / recipient 另带 local（结构化地址，本地文字：country postal_code admin_area locality
+    dependent_locality address_line1 address_line2 organization name phone email）与 latin（拉丁转写，
+    没有转写的字段用本地文字），见 warehouse/common/address_format.py；上面的旧键照旧给。
     """
 
     code = None                 # 插件代码（存进建单记录的 carrier 列），小写
@@ -184,6 +188,9 @@ class CarrierAdapter:
     supports_tracking = False   # 能查跟踪（实现了下面的 track）：WMS 据此自动完成发货 / 签收
     tracks_any_number = False   # 能查不是本插件建的运单号（手填 / 文件导回的号码也照常跟踪）
     tracking_url_template = None    # 公开查询页，{tracking_number} 占位（承运商设置里没填时用它）
+    # 运单服务选项（DN 的 shipping_options，建单时 shipment['options']）：
+    # ({key, kind: select | date | money | text, label: {语言: 文本}, values?: [{value, label}], default?, help?}, …)
+    service_options = ()
     track_batch_size = 30       # WMS 每次交给 track() 的单号数（一批失败只影响这一批）
     pickup_max_remarks = 60     # 给快递员的留言最多几个字符
 
@@ -221,6 +228,7 @@ class CarrierAdapter:
             'supports_tracking': bool(cls.supports_tracking),
             'tracks_any_number': bool(cls.tracks_any_number),
             'tracking_url_template': cls.tracking_url_template,
+            'service_options': [dict(option) for option in cls.service_options or ()],
             'fields': [dict(field) for field in cls.fields],
         }
 

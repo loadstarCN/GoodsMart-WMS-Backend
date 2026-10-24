@@ -59,7 +59,19 @@ class DN(db.Model):
     shipping_address = db.Column(
         db.String(255),
         nullable=False,
-        info={'description': '完整发货地址'}
+        info={'description': '完整发货地址（单行；只给了 ship_to 时按国家格式生成）'}
+    )
+    ship_to = db.Column(
+        db.JSON,
+        nullable=True,
+        info={'description': '收件地址快照（结构化，字段见 warehouse/common/address_format.py）：创建 DN 时给的，'
+                             '没给时从收件人的结构化字段拷贝；旧数据为空'}
+    )
+    shipping_options = db.Column(
+        db.JSON,
+        nullable=True,
+        info={'description': '运单服务选项 {key: 值}（配送日、时间带、代收货款……，按承运商声明的 service_options；'
+                             '见 warehouse/shipping/options.py），建运单 / 导出后锁定'}
     )
     expected_shipping_date = db.Column(
         db.Date,
@@ -504,31 +516,35 @@ class DNCarrierShipment(db.Model):
     - cancelling：有效运单正在取消（reason cancel_in_progress），或取消结果不明（reason timeout / server_error /
       bad_response / connection_error / save_failed / interrupted，过期的 cancel_in_progress 按 stale 对外）；
       面单与运单号都还在，但不能发货，重试取消（或确认作废）后落到 cancelled，承运商明确拒绝取消则回到 active
-    一张 DN 同一时刻至多一条 pending / active / unknown / cancelling（部分唯一索引兜底并发，不分来源）。
+    - exported：文件方式（source = file）已导出给承运商软件、还没导回运单号（属于未结束状态）；导回 → active，
+      作废导出 → cancelled（reason discarded）。见 warehouse/dn/carrier_file_services.py
+    一张 DN 同一时刻至多一条 pending / active / unknown / cancelling / exported（部分唯一索引兜底并发，不分来源）。
     主运单号同时存到发货任务的 tracking_number 上（走现有保存运单号的逻辑）。
     source：api = 插件建的（上面的状态机、锁定规则只对它生效）；manual = 手填 / 扫码的运单号（保存运单号时自动写，
     只有 active / cancelled：换号 → 旧记录 cancelled（reason replaced）+ 新记录 active，清空 → cancelled（reason cleared），
-    不调承运商，见 warehouse/shipping/waybills.py）；file = 文件导回的运单号（第二期）。
+    不调承运商，见 warehouse/shipping/waybills.py）；file = 文件方式（导出 exported → 导回运单号 active，
+    换号 / 清空同 manual）。
     tracking_*：插件支持跟踪时，定时任务（warehouse/dn/tracking_services.py）查到的跟踪结果；据此自动完成发货 / 签收，
     做不了的原因记在 tracking_problem。
     """
     __tablename__ = 'dn_carrier_shipments'
 
-    STATUSES = ('pending', 'active', 'cancelled', 'failed', 'unknown', 'dismissed', 'cancelling')
-    OPEN_STATUSES = ('pending', 'active', 'unknown', 'cancelling')        # 同一 DN 至多一条（不分来源）
+    STATUSES = ('pending', 'active', 'cancelled', 'failed', 'unknown', 'dismissed', 'cancelling', 'exported')
+    # 同一 DN 至多一条（不分来源）；exported 只有文件方式的运单有
+    OPEN_STATUSES = ('pending', 'active', 'unknown', 'cancelling', 'exported')
     UNRESOLVED_STATUSES = ('pending', 'unknown', 'cancelling')
     SOURCES = ('api', 'file', 'manual')
 
     __table_args__ = (
         db.Index('idx_dn_carrier_shipment_dn', 'dn_id', 'status'),
-        # 同一 DN 至多一条进行中 / 有效 / 结果不明 / 取消中的运单（并发建单时数据库兜底）
+        # 同一 DN 至多一条进行中 / 有效 / 结果不明 / 取消中 / 已导出的运单（并发建单 / 导出时数据库兜底）
         db.Index(
             'uq_dn_carrier_shipment_open', 'dn_id', unique=True,
-            postgresql_where=db.text("status IN ('pending','active','unknown','cancelling')"),
-            sqlite_where=db.text("status IN ('pending','active','unknown','cancelling')"),
+            postgresql_where=db.text("status IN ('pending','active','unknown','cancelling','exported')"),
+            sqlite_where=db.text("status IN ('pending','active','unknown','cancelling','exported')"),
         ),
         db.CheckConstraint(
-            "status IN ('pending','active','cancelled','failed','unknown','dismissed','cancelling')",
+            "status IN ('pending','active','cancelled','failed','unknown','dismissed','cancelling','exported')",
             name='chk_dn_carrier_shipment_status',
         ),
         db.CheckConstraint("source IN ('api','file','manual')", name='chk_dn_carrier_shipment_source'),
@@ -553,13 +569,23 @@ class DNCarrierShipment(db.Model):
         info={'description': '建单用的承运商（取消时用它的对接设置；旧记录为空，按 DN 当前承运商找）'}
     )
     carrier_data = db.Column(db.JSON, nullable=True,
-                             info={'description': '插件 / 文件模板自己的附加数据（第二期：导出批次等）'})
+                             info={'description': '插件 / 文件模板自己的附加数据（文件方式：{preset, service_name, '
+                                                  'service_label, exported_at, export_count, import_batch_id, '
+                                                  'imported_at}）'})
+    file_batch_id = db.Column(
+        db.Integer,
+        db.ForeignKey('carrier_file_batches.id', ondelete='SET NULL'),
+        nullable=True,
+        index=True,
+        info={'description': '文件方式：最近一次导出批次（没导出过、直接导回的为导入批次）'}
+    )
     tracking_number = db.Column(db.String(100), nullable=True, index=True,
                                 info={'description': '主运单号（pending / failed / 结果不明且没拿到号码时为空）'})
     package_tracking_numbers = db.Column(db.JSON, nullable=True, info={'description': '每箱运单号（按箱号）'})
     service_type = db.Column(db.String(50), nullable=True, info={'description': '服务类型'})
     status = db.Column(db.String(10), nullable=False, default='pending',
-                       info={'description': 'pending / active / cancelled / failed / unknown / dismissed / cancelling'})
+                       info={'description': 'pending / active / cancelled / failed / unknown / dismissed / cancelling / '
+                                            'exported'})
     reason = db.Column(db.String(40), nullable=True,
                        info={'description': '状态原因（如 timeout / server_error / bad_response / compensation_failed / '
                                             'rejected / compensated / cancel_in_progress / save_unconfirmed）'})
@@ -642,7 +668,15 @@ class DNCarrierShipment(db.Model):
     )
     label_document = db.relationship('DNDocument', foreign_keys=[label_document_id], lazy='select')
 
+    def service_name(self):
+        """服务的显示名：文件方式用导出时记下的（模板服务选项的名称），其它按插件把服务代码转成显示名"""
+        data = self.carrier_data if isinstance(self.carrier_data, dict) else {}
+        if self.source == 'file' and data.get('service_name'):
+            return data['service_name']
+        return _service_name(self.carrier, self.service_type)
+
     def to_dict(self) -> dict:
+        data = self.carrier_data if isinstance(self.carrier_data, dict) else {}
         return {
             'id': self.id,
             'source': self.source,
@@ -652,7 +686,12 @@ class DNCarrierShipment(db.Model):
             'package_tracking_numbers': self.package_tracking_numbers or [],
             'status': self.status,
             'service_type': self.service_type,
-            'service_name': _service_name(self.carrier, self.service_type),
+            'service_name': self.service_name(),
+            'service_label': data.get('service_label') if self.source == 'file' else None,
+            'file_batch_id': self.file_batch_id,
+            'file': ({k: data.get(k) for k in ('preset', 'exported_at', 'export_count', 'import_batch_id',
+                                                 'imported_at')}
+                     if self.source == 'file' else None),
             'ship_date': self.ship_date.isoformat() if self.ship_date else None,
             'package_count': self.package_count,
             'net_charge': float(self.net_charge) if self.net_charge is not None else None,
@@ -831,4 +870,64 @@ class CarrierPickup(db.Model):
             'cancelled_by_user': _user_ref(self.cancelled_by),
             'dismissed_at': self.dismissed_at.isoformat() if self.dismissed_at else None,
             'dismissed_by': self.dismissed_by,
+        }
+
+
+class CarrierFileBatch(db.Model):
+    """文件方式（doc/shipping-flow.md §6.1）的一次导出 / 导入：导出给承运商软件的 CSV、导回的运单号文件。
+
+    kind：export（每张 DN 建 / 更新 source = file、status = exported 的运单记录，记录的 file_batch_id 指向本批次）/
+    import（按匹配键写运单号；没导出过的 DN 直接建 file 运单）。summary 记逐项结果的统计与 DN 列表。
+    文件内容不存（导出可随时重新生成；导入的结果在运单记录上）。
+    """
+    __tablename__ = 'carrier_file_batches'
+
+    KINDS = ('export', 'import')
+
+    __table_args__ = (
+        db.Index('idx_carrier_file_batch_carrier', 'carrier_id', 'created_at'),
+        db.Index('idx_carrier_file_batch_warehouse', 'warehouse_id', 'created_at'),
+        db.CheckConstraint("kind IN ('export','import')", name='chk_carrier_file_batch_kind'),
+    )
+
+    id = db.Column(db.Integer, primary_key=True)
+    carrier_id = db.Column(
+        db.Integer,
+        db.ForeignKey('carriers.id', ondelete='CASCADE'),
+        nullable=False,
+        info={'description': '承运商ID'}
+    )
+    warehouse_id = db.Column(
+        db.Integer,
+        db.ForeignKey('warehouses.id', ondelete='CASCADE'),
+        nullable=True,
+        info={'description': '仓库ID（导入时没指定仓库为空）'}
+    )
+    kind = db.Column(db.String(10), nullable=False, info={'description': 'export / import'})
+    file_name = db.Column(db.String(255), nullable=True, info={'description': '文件名（导出生成的 / 上传的）'})
+    row_count = db.Column(db.Integer, nullable=False, default=0, info={'description': '数据行数'})
+    summary = db.Column(db.JSON, nullable=True,
+                        info={'description': '导出 {dn_ids, created, re_exported, preset, encoding}；导入 {matched, '
+                                             'not_found, already_has_number, same_number, invalid, skipped, dn_ids, '
+                                             'encoding}'})
+    created_by = db.Column(
+        db.Integer,
+        db.ForeignKey('users.id', ondelete='SET NULL'),
+        nullable=True,
+        info={'description': '操作人ID'}
+    )
+    created_at = db.Column(db.DateTime, default=db.func.now(), info={'description': '时间'})
+
+    def to_dict(self) -> dict:
+        return {
+            'id': self.id,
+            'carrier_id': self.carrier_id,
+            'warehouse_id': self.warehouse_id,
+            'kind': self.kind,
+            'file_name': self.file_name,
+            'row_count': self.row_count,
+            'summary': self.summary or {},
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'created_by': self.created_by,
+            'created_by_user': _user_ref(self.created_by),
         }

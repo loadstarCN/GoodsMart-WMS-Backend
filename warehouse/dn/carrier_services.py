@@ -67,6 +67,7 @@ from warehouse.carrier.integrations import display_name, portal_name
 from warehouse.carrier.integrations.base import LABEL_FORMATS, STEP_CREATE, CarrierError, CarrierResponseError, clock
 from warehouse.carrier.methods import tracking_url
 from warehouse.carrier.models import Carrier
+from warehouse.common.address_format import dn_ship_to, latin_view, warehouse_address
 from warehouse.common.countries import COUNTRY_NAMES_EN
 from warehouse.shipping.common import LOCKED_DN_STATUSES, document_timezone
 from warehouse.shipping.route import scope_of, shipping_route
@@ -527,7 +528,7 @@ class CarrierShipmentService:
         else:
             parties = CarrierShipmentService._local_parties(dn, route, blockers)
 
-        shipment = CarrierShipmentService._shipment_data(dn, route, ctx['declared_value'], parties)
+        shipment = CarrierShipmentService._shipment_data(dn, route, ctx['declared_value'], parties, carrier)
         ctx['shipment'] = shipment
         # 插件本来就承运不了 / 带不了报关的件不再交给插件检查（地址格式等对不上号）
         if adapter is not None and not route_blockers:
@@ -572,8 +573,10 @@ class CarrierShipmentService:
     def _local_parties(dn: DN, route: dict, blockers: list) -> dict:
         """不报关的件（国内 / 同一关税同盟内）的发件人 / 收件人：
         - 发件人：公司名（本地，没有用英文名）、仓库地址（本地，没有用英文；仓库都没有用公司的）、电话（仓库优先）
-        - 收件人：DN 收件人（名称 / 联系人 / 电话 / 邮箱 / 邮编）+ DN 的收件地址（一个字符串，第二期改结构化）
-        缺地址 / 姓名 / 电话 → blockers。commodities / invoice 为 None。"""
+        - 收件人：DN 有结构化收件地址（ship_to）时按它（address_line1 / 2、city = locality、state = admin_area）；
+          没有时 DN 收件人（名称 / 联系人 / 电话 / 邮箱 / 邮编）+ DN 的收件地址（一个字符串）
+        两边另带 local（结构化地址，本地文字）与 latin（拉丁转写）。缺地址 / 姓名 / 电话 → blockers。
+        commodities / invoice 为 None。"""
         warehouse = dn.warehouse
         company = warehouse.company
         if (warehouse.address or '').strip() or (warehouse.address_en or '').strip():
@@ -592,6 +595,9 @@ class CarrierShipmentService:
             'country_name': COUNTRY_NAMES_EN.get(origin or ''),
             'tax_id': company.tax_id,
         }
+        shipper_local = warehouse_address(warehouse)
+        shipper['local'] = shipper_local
+        shipper['latin'] = latin_view(shipper_local)
         if not shipper['address_text']:
             blockers.append(_blocker('SHIPPER_ADDRESS_MISSING', "Neither the warehouse nor the company has an address",
                                      field='warehouse.address'))
@@ -614,6 +620,23 @@ class CarrierShipmentService:
             'tax_id': None,
             'tax_id_type': None,
         }
+        ship_to = dn_ship_to(dn)
+        if dn.ship_to:
+            # 结构化收件地址快照：姓名 / 电话 / 地址按它（没带的联系方式在 dn_ship_to 里已用收件人的补上）
+            recipient.update({
+                'company_name': ship_to.get('organization') or recipient['company_name'],
+                'person_name': ship_to.get('name') or recipient['person_name'],
+                'phone': ship_to.get('phone') or recipient['phone'],
+                'email': ship_to.get('email') or recipient['email'],
+                'address_line1': ' '.join(v for v in (ship_to.get('dependent_locality'), ship_to.get('address_line1'))
+                                          if v) or address,
+                'address_line2': ship_to.get('address_line2'),
+                'city': ship_to.get('locality'),
+                'state': ship_to.get('admin_area'),
+                'postal_code': ship_to.get('postal_code') or recipient['postal_code'],
+            })
+        recipient['local'] = ship_to
+        recipient['latin'] = latin_view(ship_to)
         if not (recipient['person_name'] or recipient['company_name']):
             blockers.append(_blocker('RECIPIENT_NAME_MISSING', "Recipient name is missing", field='recipient.name'))
         if not re.sub(r'\D', '', str(recipient['phone'] or '')):
@@ -879,9 +902,11 @@ class CarrierShipmentService:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _shipment_data(dn: DN, route: dict, declared_total, parties: dict) -> dict:
+    def _shipment_data(dn: DN, route: dict, declared_total, parties: dict, carrier=None) -> dict:
         """交给插件的一票货（纯数据，不引用 ORM 对象；ship_date / documents 建单时再补），形状见 CarrierAdapter。
-        parties：{shipper, recipient, commodities, invoice}（报关件由报关扩展给，国内件 commodities / invoice 为 None）"""
+        parties：{shipper, recipient, commodities, invoice}（报关件由报关扩展给，国内件 commodities / invoice 为 None）；
+        options：DN 的运单服务选项（只含插件声明了的键，warehouse/shipping/options.py）"""
+        from warehouse.shipping.options import for_plugin, schema_for
         packages = list(dn.packages)
         declared_split = split_evenly(declared_total, len(packages)) if declared_total else [None] * len(packages)
         package_items = [{
@@ -901,6 +926,7 @@ class CarrierShipmentService:
             'commodities': parties.get('commodities'),
             'invoice': parties.get('invoice'),
             'documents': None,
+            'options': for_plugin(dn, schema_for(carrier)) if carrier is not None else {},
         }
 
     @staticmethod

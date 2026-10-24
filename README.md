@@ -153,12 +153,14 @@ GoodsMart-WMS-Backend/
 │   ├── inventory/             # Inventory management
 │   ├── inventory_snapshot/    # Inventory snapshots
 │   ├── supplier/              # Supplier management
-│   ├── carrier/               # Carrier management, integration plugins (integrations/)
+│   ├── carrier/               # Carrier management, integration plugins (integrations/), file presets (presets/)
 │   ├── recipient/             # Recipient management
 │   ├── asn/                   # Inbound: ASN (Advanced Shipping Notice)
 │   ├── sorting/               # Inbound: Sorting
 │   ├── putaway/               # Inbound: Putaway
 │   ├── dn/                    # Outbound: DN (Delivery Note)
+│   ├── shipping/              # Outbound: shipping core, flow, stages, shipping options
+│   ├── country_rules/         # Country rules (customs checks, address formats, phone numbers)
 │   ├── picking/               # Outbound: Picking
 │   ├── packing/               # Outbound: Packing
 │   ├── delivery/              # Outbound: Delivery
@@ -204,7 +206,9 @@ GoodsMart-WMS-Backend/
 - Packing
 - Delivery with tracking number (or create the shipment automatically through a carrier integration; FedEx built in)
 - Shipping flow per DN (`GET /warehouse/dn/<id>/shipping-flow`): domestic / international, carrier methods
-  (API / manual), manual waybills and pickups, automatic signing — see *Shipping Flow*
+  (API / file / manual), manual waybills and pickups, CSV export / import for carriers without an API (Yamato B2 Cloud,
+  Sagawa e-Hiden III, Japan Post Yu-Pack Print R presets), structured international addresses, country rules,
+  shipping service options, automatic signing — see *Shipping Flow*
 - Payment/COD management
 
 ### Inventory Operations
@@ -570,9 +574,10 @@ shipment (`source: api`) is unfinished → 409 `16076`; a manual tracking number
 ## Shipping Flow (domestic and international)
 
 One DN, one flow: ordered → picking → packing → (when customs is required) export documents → waybill → pickup →
-handover to the carrier → in transit → delivered. The design is in `doc/shipping-flow.md`; phase 1 (this release) covers
+handover to the carrier → in transit → delivered. The design is in `doc/shipping-flow.md`; phase 1 covers
 carrier methods, domestic / international routing, manual waybills and pickups, sources and actual times, automatic
-signing by rule and the flow endpoint. Nothing assumes a country, a carrier or an API contract: a carrier without an API
+signing by rule and the flow endpoint; phase 2 adds the file mode (CSV export / import), structured international
+addresses, country rules and shipping service options. Nothing assumes a country, a carrier or an API contract: a carrier without an API
 can run the whole flow by hand.
 
 ### Domestic / international (route)
@@ -581,7 +586,7 @@ can run the whole flow by hand.
 
 - `origin_country` = the warehouse `country_code`, else the company's.
 - `destination_country` = the customs snapshot's recipient country (`recipient_country`, else `consignee.country`) →
-  the recipient's `country`.
+  the DN's `ship_to.country` → the recipient's `country`.
 - `international` = origin ≠ destination (unknown on either side counts as domestic).
 - `requires_customs` = international and not inside one customs union (`warehouse/common/customs_unions.py`, EU
   registered by default); a DN **with a customs snapshot always requires customs** (the source system sent customs data).
@@ -597,18 +602,19 @@ Each carrier chooses, per capability, how it is connected (`carriers` columns, m
 
 | Field | Values (default) | Meaning |
 |-------|------------------|---------|
-| `waybill_method` | `api` / `file` (phase 2) / `manual` (`manual`) | `api`: the integration creates shipments; `manual`: tracking number entered / scanned, label printed on the carrier's website |
+| `waybill_method` | `api` / `file` / `manual` (`manual`) | `api`: the integration creates shipments; `file`: CSV exported in the carrier software's format, tracking numbers imported back (see *File mode*); `manual`: tracking number entered / scanned, label printed on the carrier's website |
 | `pickup_method` | `api` / `manual` / `scheduled` / `dropoff` / `none` (`none`) | `api`: booked through the integration; `manual`: booked by phone / website and recorded in WMS; `scheduled`: regular pickup; `dropoff`: the warehouse drops parcels off; `none`: not managed |
 | `pickup_schedule` | json or `null` | for `scheduled`: `{weekdays: [1..7] (ISO, 1 = Monday), ready_time: "HH:MM", close_time: "HH:MM"}` |
 | `pickup_contact` | text ≤ 255 | phone / URL / note for booking pickups (shown for `manual`) |
 | `tracking_method` | `api` / `link` / `none` (`link`) | `api`: tracked by the integration (shipped on pickup, signed on delivery); `link`: public tracking page only |
 | `tracking_url_template` | URL ≤ 500 with `{tracking_number}` | public tracking page; empty = the plugin's built-in one (FedEx: `https://www.fedex.com/fedextrack/?trknbr={tracking_number}`) |
 | `auto_sign_days` | 1–90 or `null` (off) | sign automatically this many days after handover when the shipment is not tracked through the API |
+| `file_preset` / `file_template` / `file_account` | text / json / json | file mode settings (see *File mode*, migration `a7c4e2f9b3d1`) |
 
 - `GET /warehouse/carrier/` (list) and `GET / PUT /warehouse/carrier/<id>` return these fields plus the read-only
   `available_methods: {waybill: [...], pickup: [...], tracking: [...]}`. `api` is only offered when the carrier's
   online integration is turned on and its plugin declares the capability (`supports_waybill` / `supports_pickup` /
-  `supports_tracking`); `file` is not available yet.
+  `supports_tracking`); `file` once a file preset / template is configured (it may be set in the same request).
 - `POST` / `PUT` validate them: an invalid value, a method that is not available, a bad `pickup_schedule` /
   `tracking_url_template` (must be `http(s)://…{tracking_number}…`) / `auto_sign_days` → 400 `16135` with `field`
   (`waybill_method`, `pickup_schedule.weekdays`, …). A method that is not changed is not checked again (saving other
@@ -626,8 +632,9 @@ Each carrier chooses, per capability, how it is connected (`carriers` columns, m
 ### Waybills: API, manual, file
 
 `dn_carrier_shipments` now holds every waybill of a DN with a `source`: `api` (created by the plugin), `manual`
-(entered / scanned), `file` (exported / imported files, phase 2). A DN still has at most one unfinished waybill record
-(`pending` / `active` / `unknown` / `cancelling`, partial unique index regardless of source). `carrier` (plugin code)
+(entered / scanned), `file` (exported / imported files, see *File mode*). A DN still has at most one unfinished
+waybill record (`pending` / `active` / `unknown` / `cancelling` / `exported`, partial unique index regardless of
+source). `carrier` (plugin code)
 is nullable now; `carrier_data` (json) is reserved for plugins / file templates.
 
 - Saving a tracking number (`PUT /warehouse/delivery/<task_id>/tracking`, `PUT /warehouse/delivery/<task_id>`, or
@@ -743,10 +750,21 @@ render — they do not derive states themselves:
   `carrier-shipment.shipment`, or the latest cancelled API shipment), unresolved, can_create, blockers[]}; `pickup`
   {method, pickup (pickup payload or null), contact, schedule}; `handover` {delivery_task_id, actual_shipping_date};
   `transit` {tracking (shipment tracking payload or null), tracking_url, tracked_by_api}; `delivered`
-  {estimated_delivery, auto_sign_days, auto_sign_at}.
+  {estimated_delivery, auto_sign_days, auto_sign_at}. Phase 2: `waybill` also has `export` (only while a file waybill
+  is exported and waiting for its number: {exported_at (with offset), batch_id, file_name, export_count, exported_by:
+  {id, user_name}}; otherwise null; `shipment.file` keeps {preset, exported_at, export_count, import_batch_id,
+  imported_at} of a file waybill) and
+  `options` ({values, schema, defaults, locked, locked_reason, locked_message}, see *Shipping service options*);
+  `service_name` is the service's display name (file waybills: the label of the template's `service_option`); after
+  handover a still-`scheduled` pickup is `done` with `summary.pickup.done: true` and `summary.handed_over: true` (no
+  "book again" warning).
 - `actions[].key`: `create_waybill`, `enter_tracking`, `cancel_waybill`, `dismiss_waybill`, `print_label`,
-  `book_pickup`, `record_pickup`, `cancel_pickup`, `complete_shipping`, `refresh_tracking`, `open_tracking`, `sign`,
-  `issue_documents`, `edit_packages` (`export_file` / `import_numbers` come with phase 2). `enabled: false` comes with a
+  `export_file`, `import_numbers`, `discard_export`, `book_pickup`, `record_pickup`, `cancel_pickup`,
+  `complete_shipping`, `refresh_tracking`, `open_tracking`, `sign`, `issue_documents`, `edit_packages`. With
+  `waybill_method: file` the waybill step offers `export_file` (single-DN export; `re_export: true` when exported
+  already), `import_numbers` (batch import) and, when exported, `discard_export` (`shipment_id`); all carry
+  `carrier_id`; new reason codes `FILE_NOT_CONFIGURED` (no usable template / account fields missing) and
+  `WAYBILL_EXISTS`. `enabled: false` comes with a
   `reason` (English) and a `reason_code` for translation (`DN_SHIPPED`, `NOT_PICKED`, `NOT_PACKED`, `NO_WAYBILL`,
   `PICKUP_EXISTS`, `NO_OPEN_TASK`, `WAYBILL_UNRESOLVED`, … — `REASON_CODES` in `warehouse/shipping/flow.py` — or a
   carrier-shipment / pickup blocker code or customs problem code); some actions carry the id they act on (`delivery_task_id`, `pickup_id`, `document_id`, `url`). Each key maps
@@ -760,12 +778,199 @@ render — they do not derive states themselves:
 for the flow and the lists: `closed` (DN closed / cancelled), `delivered` (signed), `preparing` (pending / in progress /
 picked), `exception` (unclear API waybill, tracking exception or blocked automatic step, unclear pickup), `in_transit`
 (handed over, not signed), and for packed DNs `awaiting_waybill` (no waybill / tracking number yet), `awaiting_pickup`
-(the carrier books pickups per shipment — `api` / `manual` — and no pickup holds the waybill) or `awaiting_handover`.
-`awaiting_number` (exported, waiting for the import) comes with phase 2.
+(the carrier books pickups per shipment — `api` / `manual` — and no pickup holds the waybill) or `awaiting_handover`;
+`awaiting_number` = a file waybill has been exported and its tracking number not imported yet (no number on the task).
 
-- `GET /warehouse/dn/` items carry `shipping_stage` and `shipping: {carrier_name, tracking_number}` (computed for the
+- `GET /warehouse/dn/` items carry `shipping_stage` and `shipping: {carrier_id, carrier_name, tracking_number}` (computed for the
   whole page in one query); `?shipping_stage=<stage>` filters by it (400 for an unknown stage).
 - `GET /warehouse/delivery/` items carry `shipping_stage` (the stage of their DN).
+
+### File mode (no API contract)
+
+Carriers without an API contract work through their own shipping software: WMS exports a CSV in the software's import
+format, the labels are printed there, and the CSV with the tracking numbers is imported back (migration
+`a7c4e2f9b3d1`).
+
+**Presets.** `GET /warehouse/carrier/file-presets` (`carrier_read`) lists the presets in
+`warehouse/carrier/presets/<country>/<code>.json` (contributions welcome — same structure, with `version` and
+`sources`): `[{code, name: {en-US, zh-CN, ja-JP}, country, version, notes, verified, sources[], tracking_url_template,
+tracking_url_fallback, tracking_url_notes, service_option, service_options[], account_fields[], columns: [{header,
+required, max_length}], export: {encoding, delimiter, quoting, header, line_ending, length_unit, charset}, import:
+{encoding, encoding_fallbacks, header_rows, reference_column, tracking_column, tracking_normalize} | null}]`.
+The first three are **not tested in the carrier software yet** (`verified: false`):
+
+| Code | Software | Columns | Notes |
+|------|----------|---------|-------|
+| `jp.yamato_b2cloud` | Yamato B2 Cloud, basic layout | 95 | Shift_JIS, lengths in Shift_JIS bytes, JIS level 1/2 characters only (`charset: jis_x0208`); import = "発行済データの検索 → 外部ファイル出力" (column 1 reference, column 4 tracking number); account fields `billing_customer_code` / `billing_class_code` / `freight_mgmt_no`; tracking page `https://member.kms.kuronekoyamato.co.jp/parcel/detail?pno={tracking_number}` |
+| `jp.sagawa_ehiden3` | Sagawa e-Hiden III, 標準_飛脚宅配便_CSV_ヘッダ有 | 74 | address / name fields full width (`zenkaku` filter); import = 出荷履歴 (UTF-8, falls back to Shift_JIS; rows with 削除区分 = 2 skipped); the old tracking URL is kept, `tracking_url_fallback` = `https://e-customer.sagawa-exp.co.jp/k2k` (no deep link while Sagawa's lookup service is restricted) |
+| `jp.japanpost_yupri_r` | Japan Post Yu-Pack Print R, 標準フォーマットv3 (明細数 = 1) | 87 | no header, every field quoted; import = 新ＤＥＮＦＤ確定 (column 8 reference, column 7 tracking number); tracking page `https://trackings.post.japanpost.jp/services/srv/search/direct?reqCodeNo1={tracking_number}` |
+
+**Carrier settings** (`GET / PUT /warehouse/carrier/<id>`): `file_preset` (preset code or `null`), `file_template`
+(changes merged over the preset — objects key by key, lists replaced, `null` removes a key; the whole template
+without a preset; `null` = the preset as is), `file_account` (`{key: text}` for the template's `account_fields`), and
+the read-only `file_mode: {configured, ready, preset: {code, name, verified, exists} | null, error, service_options,
+account_fields, missing_account_fields, can_import, tracking_url_template, tracking_url_fallback, encoding}`.
+The read-only `service_options` lists the shipping service options DNs of this carrier are checked against (the file
+template's for `waybill_method: file`, else the integration plugin's; `[]` when none).
+`available_methods.waybill` offers `file` once a preset / template is configured; `file_preset` and
+`waybill_method: file` can be set in the same request. Invalid values → 400 `16135` with `field` (`file_preset`,
+`file_template.export.columns[3].value`, `file_account.<key>`; removing the template while the method is `file` →
+`file_preset`). With no `tracking_url_template` of its own and no plugin one, the carrier's tracking page comes from the
+file template.
+
+**Template** (same structure as a preset; `shift_jis` is always read / written as cp932):
+
+```
+{code, name{locale}, country, version, sources[], notes, verified, tracking_url_template, tracking_url_fallback?,
+ service_option?   (the option that names the service: stored as the waybill's service_type / service_name),
+ export: {format: 'csv', encoding: 'cp932' | 'utf-8' | 'utf-8-sig', delimiter, quoting: 'minimal' | 'all',
+          header: bool, line_ending: '\r\n' | '\n', length_unit: 'chars' | 'sjis_bytes', row_unit: 'dn',
+          charset?: 'jis_x0208', columns: [{header, value, required?, max_length?, notes?}]},
+ import: {encoding, encoding_fallbacks[], delimiter?, header_rows, reference_column (1-based), reference_value: 'DN{dn.id}',
+          reference_parse: '^DN(\\d+)$', tracking_column, tracking_normalize: 'digits' | null,
+          skip_rows_when?: {column, equals}},
+ service_options: [{key, kind: 'select' | 'date' | 'money' | 'text', label{locale}, values?[{value, label}], default?, help?}],
+ account_fields: [{key, label{locale}, required, help?}]}
+```
+
+`value` is text with `{variable|filter:arg|…}` placeholders (`{{` / `}}` for literal braces). Variables: `dn.id`,
+`dn.order_number`, `dn.remark`, `dn.expected_shipping_date`, `dn.special_handling`, `dn.packaging_info`, `ship_date`
+(today in the warehouse time zone), `ship_to.*` / `shipper.*` (structured address fields — see below — plus `contact`,
+`address_text`, `country_name`, `latin.<field>`), `goods.summary` (names joined with " / "), `goods.first_name`,
+`goods.quantity`, `goods.count`, `package.count` (empty without packages), `package.total_weight_kg`,
+`options.<key>` (the DN's shipping options, defaults filled in), `carrier.account.<key>`, `carrier.name`,
+`carrier.code`. Filters: `digits`, `truncate:n`, `truncate_bytes:n` (cp932 bytes, never splits a double-byte
+character), `slice:a:b`, `date:%Y/%m/%d` (empty stays empty), `default:x`, `map:k=v,k=v`, `upper`, `zenkaku`
+(half width → full width), `nospace` (removes half / full width spaces), `jp_phone` (`+81 …` → domestic `0…`,
+full-width digits → half width), `int`. Unknown variables / filters are rejected when the template is saved. The
+reference column is always `DN{dn.id}` (order numbers may be empty, duplicated or too long); the order number goes into
+a remark column printed on the label.
+
+**Export** — `POST /warehouse/dn/carrier-files/export` (`packing_edit` / `delivery_edit`), JSON
+`{carrier_id, dn_ids: [...] (1–500), warehouse_id?}` (`X-WAREHOUSE-ID` / body `warehouse_id` is the warehouse; without
+one the first DN's):
+
+- 200: the file — `Content-Disposition: attachment; filename="<carrier-code>_<YYYYmmdd-HHMMSS>.csv"`, bytes in the
+  template encoding (`text/csv; charset=Shift_JIS` for cp932), headers `X-Batch-Id` / `X-Row-Count`. Every DN gets a
+  `file` waybill record with `status: exported` (a new *open* status: at most one open record per DN still holds) and
+  `file_batch_id`; exporting an exported DN again keeps the record and updates the batch. An export batch is recorded
+  (`carrier_file_batches`).
+- Each row is checked first; **any problem blocks the whole batch** (no file, no records): 409 `16137`
+  `details {rows: [{dn_id, order_number, problems: [{column, column_index?, code, message, …}]}], total}`. DN codes:
+  `DN_NOT_FOUND`, `OTHER_WAREHOUSE`, `NOT_PACKED`, `DN_SHIPPED`, `DN_CLOSED`, `NO_OPEN_TASK`, `CARRIER_NOT_SET`,
+  `OTHER_CARRIER` (the delivery task's carrier — else the DN's — must be this carrier), `WAYBILL_EXISTS` (another open
+  waybill), `TRACKING_NUMBER_EXISTS`, `OPTION_INVALID` (`column: options.<key>`); column codes (`column` = header text):
+  `REQUIRED`, `TOO_LONG` (`length`, `max_length`, `length_unit` — names / addresses are never truncated silently),
+  `UNENCODABLE` (`characters`), `CHARACTER_NOT_ALLOWED` (outside JIS level 1/2 with `charset: jis_x0208`). Line breaks
+  inside a value become spaces.
+- 400 `16138`: invalid `carrier_id` / `dn_ids` / `warehouse_id` (`field`); 409 `16138`: the carrier's
+  `waybill_method` is not `file`, its template is unusable, or a required account field is empty
+  (`field: file_account.<key>`, `details.missing_account_fields`).
+
+**Import** — `POST /warehouse/dn/carrier-files/import` (`packing_edit` / `delivery_edit`), multipart `file`
+(≤ 5 MB, ≤ 5000 rows), `carrier_id`, `dry_run` (`true` default / `false`), `warehouse_id?`:
+
+```json
+{ "dry_run": true, "file_name": "b2.csv", "encoding": "cp932", "batch_id": null,
+  "rows": [{"line": 2, "reference": "DN163", "dn_id": 163, "order_number": "SHP-1", "tracking_numbers": ["401234567890"],
+            "result": "matched", "message": null, "primary": true}, "..."],
+  "summary": {"matched": 2, "not_found": 1, "already_has_number": 0, "same_number": 0, "invalid": 0, "skipped": 0,
+              "dns": {"matched": 1, "not_found": 1, "already_has_number": 0, "same_number": 0, "invalid": 0}} }
+```
+
+- The file is decoded with `import.encoding` and `encoding_fallbacks` (a BOM or valid UTF-8 wins when UTF-8 is a
+  candidate); `header_rows` are skipped unless they already look like data; `skip_rows_when` rows are counted in
+  `summary.skipped`; the reference is parsed with `reference_parse`, the tracking number normalized
+  (`tracking_normalize: digits` drops hyphens).
+- Several rows of one DN (several packages) = several numbers: the first is the main tracking number, the others go to
+  `package_tracking_numbers`.
+- `result`: `matched` (will be / was written), `not_found` (no such DN in this company / warehouse, or not a
+  `DN<id>` reference), `already_has_number` (the DN has a different number — decide by hand), `same_number` (already
+  imported; ignored), `invalid` (no tracking number, DN closed, another carrier, an unresolved API waybill, the number
+  belongs to another DN, no open delivery task, shipped without an exported waybill).
+- `dry_run: false` re-checks each DN under its lock and writes the `matched` ones in one transaction: an `exported`
+  record becomes `active` (a DN that was never exported gets a new `file` waybill), the delivery task gets the main
+  number (and the carrier if it had none) — the same as saving a tracking number, so tracking (`tracks_any_number`),
+  pickups and the flow work as for any waybill. An import batch is recorded (`batch_id`).
+- 400 `16138`: no / empty / too large / unreadable file (`field: file`), invalid `dry_run` / `carrier_id`; 409 `16138`:
+  not in file mode / the template cannot import.
+
+**Discarding an export** — `POST /warehouse/dn/<id>/carrier-shipment/discard-export` → the exported record becomes
+`cancelled` (`reason: discarded`; WMS only — delete it in the carrier software too if it was printed); 200 = the
+`GET …/carrier-shipment` body plus `waybill` (current waybill of any source or `null`); nothing to discard → 409
+`16075`. Entering a tracking number by hand while a DN is exported replaces the export (`reason: replaced`); `file`
+waybills are replaced / cleared like manual ones.
+
+**Batches** — `GET /warehouse/dn/carrier-files/batches?carrier_id=&warehouse_id=&limit=` (`dn_read` / …): newest
+first, `[{id, carrier_id, warehouse_id, kind: export | import, file_name, row_count, summary, created_at, created_by,
+created_by_user}]` (the file contents are not stored).
+
+### Structured addresses
+
+One set of field names for recipients, warehouses, the DN's ship-to snapshot and the `ship_to` / `shipper` handed to
+plugins and file templates: `country` (ISO 3166-1 alpha-2), `postal_code`, `admin_area` (state / province /
+prefecture), `locality` (city), `dependent_locality`, `address_line1`, `address_line2`, `organization`, `name`,
+`phone`, `email`, and the Latin transliteration `latin: {name, organization, address_line1, address_line2, locality,
+admin_area}` (international labels; without it the local text or the customs consignee is used).
+
+- **Recipients** (`/warehouse/recipient/`): new `admin_area`, `locality`, `dependent_locality`, `address_line1`,
+  `address_line2`, `organization`, `latin`; `zip_code` *is* `postal_code` (both accepted, both returned; different
+  values → 400 `14019`). `null` clears a field. When only the structured fields are given (no `address`), the one-line
+  `address` is generated in the country format (and regenerated when they change).
+- **Warehouses** (`/warehouse/warehouse/`): `admin_area`, `locality`, `address_line1`, `address_line2`, `latin`
+  (`postal_code` ≡ `zip_code`); `address` is generated the same way; `address_en` stays the one-line Latin address and
+  is generated from `latin` when it is empty.
+- **DN**: `ship_to` (json snapshot) and `shipping_options` (json). `POST /warehouse/dn/` accepts `ship_to`; without it
+  the recipient's structured fields are copied (legacy recipients without them → `null`). `shipping_address` is still
+  accepted; with only `ship_to` it is generated in the country format (neither → 400 `40000`). `PUT` (pending DNs)
+  replaces `ship_to` / `shipping_options`. After packing, `GET / PUT /warehouse/dn/<id>/ship-to` (`{ship_to}` → `{ship_to,
+  ship_to_effective, shipping_address, locked, locked_reason, locked_message}`) changes the snapshot (e.g. to shorten an
+  address a carrier file rejected as too long); `shipping_address` is regenerated from it, the customs snapshot is not
+  touched. Locked like the shipping options: an `api` waybill or a `file` waybill (exported / active) → 409 `16076`
+  (`details.reason: SHIP_TO_LOCKED`), shipped → 409 `16065`, closed → 400 `16001`; a manual tracking number does not
+  lock it. The DN detail returns `ship_to`, `shipping_options` and
+  `ship_to_effective` (the address used for labels / files: `ship_to`, else the recipient's structured fields, else
+  `address_line1` = `shipping_address` plus the recipient's name / phone / postal code). The destination country of the
+  route is the customs snapshot's → `ship_to.country` → the recipient's.
+- Invalid fields → 400 `14019` (not a string / too long, `field` such as `ship_to.latin.name`) / `14020` (country).
+  Unknown keys are ignored; empty values may be sent as `null`.
+- Formatting: `warehouse/common/address_format.py` — `format_lines(address, style='local' | 'latin')` /
+  `format_single_line(...)`, using the country rules (Japan: 〒postal code / prefecture + city / block + building;
+  US: street / `City, ST ZIP`; others: street / `city state postal code` / country).
+- Plugins: `shipper` / `recipient` keep their previous keys (FedEx is unchanged) and add `local` (structured address)
+  and `latin`; domestic recipients take address lines / city / state from `ship_to`.
+
+### Country rules
+
+`warehouse/country_rules/`: `base.py` (`CountryRules`: `customs_line_problems(line)`, `customs_problems(ctx)`,
+`exporter_tax_label`, `address_format` (local / latin line templates), `phone_normalize`), `registry.py`
+(`rules_for(country)`; unregistered countries get the default rules; third-party packages register through the entry
+point group `goodsmart_wms.country_rules`), `jp.py`, `us.py`. The core only calls the registry. The Japanese customs
+checks (9-digit export statistics code `JP_EXPORT_CODE_MISMATCH` / `JP_EXPORT_CODE_MISSING` /
+`JP_EXPORT_VALUE_UNVERIFIED`) moved into `jp.py` with the same messages; they apply when the export country (warehouse,
+else company) is Japan. For Japanese exporters without a `tax_id_label`, documents now print `Corporate No.` (default
+rules: `Tax ID`); documents issued before with `Tax ID` are not reported as outdated.
+
+### Shipping service options
+
+Plugins (`CarrierAdapter.service_options`, empty for FedEx) and file templates (`service_options`) declare options such
+as `delivery_date`, `delivery_time_slot`, `invoice_type`, `cod_amount`, `cool_type`. The DN's carrier decides which
+apply (the file template with `waybill_method: file`, else the integration plugin).
+
+- `GET /warehouse/dn/<id>/shipping-options` → `{options, values, schema, defaults, locked, locked_reason,
+  locked_message}`; `PUT` with `{options: {...}}` (`packing_edit` / `delivery_edit`) replaces them → 200 same body.
+  Unknown key / select value not listed / invalid date (`YYYY-MM-DD`) / money (≥ 0, 2 decimals) / text → 400 `16139`
+  (`field: options.<key>`; missing `options` → `field: options`).
+- Locked once an `api` waybill or a `file` waybill (exported / active) exists → 409 `16076`
+  (`details.reason: SHIPPING_OPTIONS_LOCKED`, `carrier_shipment`); shipped → 409 `16065`. A manual tracking number
+  does not lock them.
+- `POST /warehouse/dn/` accepts `shipping_options`: declared keys are validated (400 `16139`,
+  `field: shipping_options.<key>`), other keys are kept (the carrier may still change); keys the carrier does not
+  declare are ignored when exporting / creating.
+- Creating a shipment passes `shipment['options']` (declared keys only); exporting uses `{options.<key>}`; an invalid
+  stored value is an `OPTION_INVALID` export problem.
+- File waybills show the service name: `shipment.service_type` = the value of the template's `service_option`,
+  `service_name` = its label (`service_label` has all locales).
 
 ## Carrier Integrations (automatic shipments)
 
@@ -1104,6 +1309,7 @@ Class attributes:
 | `supports_pickup` / `supports_tracking` | Pickup booking / tracking (see *Courier pickups* / *Tracking*) |
 | `tracks_any_number` | Can track numbers it did not create (manual / imported waybills are tracked too; FedEx `True`) |
 | `tracking_url_template` | Public tracking page with `{tracking_number}`, used when the carrier has no `tracking_url_template` of its own |
+| `service_options` | Shipping service options the DN may carry (`({key, kind: select / date / money / text, label, values?, default?, help?}, …)`, empty by default); WMS validates them and passes `shipment['options']` |
 
 Settings — `setting(key, kind, *, label, required=False, default=None, options=None, help=None, group='account',
 placeholder=None)`:
@@ -1120,8 +1326,9 @@ placeholder=None)`:
   the record; `service_name()` gives the display name).
 
 Methods (`shipment` is the data WMS hands over, plain data only: `reference`, `ship_date`, `route`, `shipper`,
-`recipient`, `packages[]`, `commodities[]`, `invoice`, `documents` — the fields are listed in the `CarrierAdapter`
-docstring; `commodities` / `invoice` / `documents` are `None` unless `route.requires_customs`):
+`recipient`, `packages[]`, `commodities[]`, `invoice`, `documents`, `options` — the fields are listed in the
+`CarrierAdapter` docstring; `commodities` / `invoice` / `documents` are `None` unless `route.requires_customs`;
+`shipper` / `recipient` also carry `local` (structured address) and `latin`):
 
 | Method | Contract |
 |--------|----------|
@@ -1402,7 +1609,7 @@ stdout_logfile=/var/log/wms-api.out.log
 | Inventory | 15000-15999 | 400 | Stock-related errors |
 | State | 16000-16999 | 400 | State transition errors |
 
-Business codes of the export-document features: `14019` export profile text too long, `14020` invalid country code, `16063` customs structure invalid, `16064` customs line goods code not in the DN / duplicated, `16065` shipped — customs data / packages / documents locked (409), `16066` invalid packages, `16067` packages cannot be edited in the current DN status (409), `16068` documents cannot be issued yet (409, `details.problems`), `16070` not an export DN (409), `16071` document not found (404), `16117` documents cannot be laid out — a text block (usually the consignee) is too long for one page; shorten it (409, `details {document, reason: LAYOUT_OVERFLOW}`). Carrier shipments (automatic): `16072` preconditions for creating / cancelling not met (409, `details.blockers`), `16073` the carrier returned an error or an unclear result (502, `details.errors` / `transaction_id` / `maybe_processed`), `16074` the carrier timed out or the time budget ran out (504, `details.budget_exhausted`), `16075` no carrier shipment to cancel / dismiss (409, `details.unresolved`), `16076` packages / customs data cannot be changed, or documents with different data cannot be issued, while a carrier shipment is pending, active, unclear or being cancelled (409, `details {reason: CARRIER_SHIPMENT_OPEN | DOCUMENT_DATA_CHANGED, status, carrier, carrier_shipment {id, status, tracking_number}}`), `16077` invalid `label_format`, or not supported by the carrier (400), `16078` tracking number / carrier differs from the active carrier shipment, or a delivery task is added / deleted while a carrier shipment exists (409), `16079` a carrier shipment request is pending or its result is unclear, or the shipment is being cancelled / the cancellation is unclear — no new shipment, tracking number or shipping (409, `details.unresolved`), `16093` the shipment / record named in a cancel / dismiss request is not the current one (409, `details {expected, actual}`), `16094` dismissing a record with a tracking number: the carrier did not confirm it is cancelled / not found (409), `16095` the carrier created the shipment but saving it in WMS failed; compensated (502, `details {error, compensation, unresolved, …}`). Carrier integrations: `16124` invalid integration settings (400, `field`: `adapter` / `enabled` / `settings.<key>` / `secrets.<key>`), `16125` the carrier has unfinished automatic shipments — its integration cannot be removed or switched to another plugin (409, `details.shipments`). Courier pickups: `16130` blockers (409, `details.blockers`), `16131` invalid pickup request (400, `field`), `16132` selected shipments cannot be scheduled (409, `details.shipments[{shipment_id, tracking_number, reason}]`), `16133` the pickup cannot be cancelled / dismissed in its current state (409, `details {pickup_id, status, reason, pickup_date}`); tracking: `16134` no active waybill that can be tracked through the API (409); carrier errors / timeouts as for shipments (`16073` / `16074`, `details.action` `pickup` / `pickup_cancel` / `pickup_availability`). No longer used: `16069` (formerly: documents missing or out of date on completion; completion no longer checks documents); the documents no longer print the tracking number or carrier: `16080` (formerly: tracking number on completion differs from the AWB printed on the CI), `16092` (formerly: carrier on completion differs from the one printed on the CI). Delivery tasks: `16090` the DN already has an unfinished delivery task (409, `details {delivery_task_id, status}`), `16091` DN with customs data or waybill records — not the current delivery task (409, `details {delivery_task_id, current_status}`), `16136` `shipped_at` in the future (400, `field: shipped_at`; an invalid one is `16050`). Shipping flow: `16135` invalid carrier method / pickup schedule / tracking page / `auto_sign_days`, or a method that is not available (400, `field`); `16130` also carries `PICKUP_METHOD_NOT_API`; `16131` manual pickups also use `field` `warehouse_id` / `confirmation_code`; carrier-shipment blockers `SCOPE_NOT_SUPPORTED` / `CUSTOMS_DATA_MISSING` / `CUSTOMS_NOT_SUPPORTED` / `WAYBILL_NOT_SUPPORTED` replace `NOT_EXPORT`. Errors may carry a structured `details` object.
+Business codes of the export-document features: `14019` export profile text too long, `14020` invalid country code, `16063` customs structure invalid, `16064` customs line goods code not in the DN / duplicated, `16065` shipped — customs data / packages / documents locked (409), `16066` invalid packages, `16067` packages cannot be edited in the current DN status (409), `16068` documents cannot be issued yet (409, `details.problems`), `16070` not an export DN (409), `16071` document not found (404), `16117` documents cannot be laid out — a text block (usually the consignee) is too long for one page; shorten it (409, `details {document, reason: LAYOUT_OVERFLOW}`). Carrier shipments (automatic): `16072` preconditions for creating / cancelling not met (409, `details.blockers`), `16073` the carrier returned an error or an unclear result (502, `details.errors` / `transaction_id` / `maybe_processed`), `16074` the carrier timed out or the time budget ran out (504, `details.budget_exhausted`), `16075` no carrier shipment to cancel / dismiss (409, `details.unresolved`), `16076` packages / customs data cannot be changed, or documents with different data cannot be issued, while a carrier shipment is pending, active, unclear or being cancelled (409, `details {reason: CARRIER_SHIPMENT_OPEN | DOCUMENT_DATA_CHANGED, status, carrier, carrier_shipment {id, status, tracking_number}}`), `16077` invalid `label_format`, or not supported by the carrier (400), `16078` tracking number / carrier differs from the active carrier shipment, or a delivery task is added / deleted while a carrier shipment exists (409), `16079` a carrier shipment request is pending or its result is unclear, or the shipment is being cancelled / the cancellation is unclear — no new shipment, tracking number or shipping (409, `details.unresolved`), `16093` the shipment / record named in a cancel / dismiss request is not the current one (409, `details {expected, actual}`), `16094` dismissing a record with a tracking number: the carrier did not confirm it is cancelled / not found (409), `16095` the carrier created the shipment but saving it in WMS failed; compensated (502, `details {error, compensation, unresolved, …}`). Carrier integrations: `16124` invalid integration settings (400, `field`: `adapter` / `enabled` / `settings.<key>` / `secrets.<key>`), `16125` the carrier has unfinished automatic shipments — its integration cannot be removed or switched to another plugin (409, `details.shipments`). Courier pickups: `16130` blockers (409, `details.blockers`), `16131` invalid pickup request (400, `field`), `16132` selected shipments cannot be scheduled (409, `details.shipments[{shipment_id, tracking_number, reason}]`), `16133` the pickup cannot be cancelled / dismissed in its current state (409, `details {pickup_id, status, reason, pickup_date}`); tracking: `16134` no active waybill that can be tracked through the API (409); carrier errors / timeouts as for shipments (`16073` / `16074`, `details.action` `pickup` / `pickup_cancel` / `pickup_availability`). No longer used: `16069` (formerly: documents missing or out of date on completion; completion no longer checks documents); the documents no longer print the tracking number or carrier: `16080` (formerly: tracking number on completion differs from the AWB printed on the CI), `16092` (formerly: carrier on completion differs from the one printed on the CI). Delivery tasks: `16090` the DN already has an unfinished delivery task (409, `details {delivery_task_id, status}`), `16091` DN with customs data or waybill records — not the current delivery task (409, `details {delivery_task_id, current_status}`), `16136` `shipped_at` in the future (400, `field: shipped_at`; an invalid one is `16050`). Shipping flow: `16135` invalid carrier method / pickup schedule / tracking page / `auto_sign_days` / file settings (`file_preset`, `file_template.<path>`, `file_account.<key>`), or a method that is not available (400, `field`); file mode: `16137` rows with problems — nothing exported (409, `details.rows[{dn_id, order_number, problems[{column, code, message}]}]`), `16138` file mode not available: invalid request / import file (400) or the carrier is not in file mode / its template is incomplete (409), with `field`; `16139` invalid shipping options (400, `field: options.<key>`); `16076` also with `details.reason: SHIPPING_OPTIONS_LOCKED` / `SHIP_TO_LOCKED`, `16075` also when there is no exported file waybill to discard (`details.waybill`); structured addresses use `14019` (not a string / too long / `zip_code` ≠ `postal_code`) and `14020` (country); `16130` also carries `PICKUP_METHOD_NOT_API`; `16131` manual pickups also use `field` `warehouse_id` / `confirmation_code`; carrier-shipment blockers `SCOPE_NOT_SUPPORTED` / `CUSTOMS_DATA_MISSING` / `CUSTOMS_NOT_SUPPORTED` / `WAYBILL_NOT_SUPPORTED` replace `NOT_EXPORT`. Errors may carry a structured `details` object.
 
 Process rules (see "Process rules" above): `16110` DN has an unfinished carrier shipment — cancel it first (409), `16111` adjustment cancelled (409), `16112` adjustment cannot be cancelled in its status (409), `16113` adjustment line cannot be applied — the location no longer holds the goods / no location (409), `16114` cycle count has uncounted details (409, `details.detail_ids`), `16115` invalid numeric field (400, `field`), `16116` the ASN of a sorting task cannot be changed (409), `16120` transfer: the goods is not in the source location (404), `16121` the same `client_batch_id` was already submitted with different details (409, `details {client_batch_id, batch_id}`), `16122` the user who changed the adjustment details cannot approve it (409), `16123` invalid `client_batch_id` (400), `44009` location has history records — deactivate it instead (409). Tasks: `16088` the task is deactivated (its DN / ASN was cancelled, 409), `16089` a picking task with nothing picked cannot be completed (409).
 

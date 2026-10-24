@@ -1,0 +1,868 @@
+{
+  "code": "jp.japanpost_yupri_r",
+  "name": {
+    "en-US": "Japan Post – Yu-Pack Print R (standard format v3)",
+    "zh-CN": "日本邮便 ゆうパックプリントR（标准格式 v3）",
+    "ja-JP": "日本郵便 ゆうパックプリントR（標準フォーマットv3）"
+  },
+  "country": "JP",
+  "version": "ゆうプリR 6-1 フィルタ設定別冊（フォーマット一覧）2024-10-01「標準フォーマットv3」/ 8 入出力インターフェース仕様書 2025-08-07 / 6 フィルタ設定説明書 2026-05-27 / ソフト Ver1.3.81 (2026-09-29)",
+  "verified": false,
+  "sources": [
+    "https://www.post.japanpost.jp/yu-packprint-r/member/sql/instructions/index.html",
+    "https://www.post.japanpost.jp/yu-packprint-r/member/download/instructions/６－１．フィルタ設定別冊（フォーマット一覧）.pdf",
+    "https://www.post.japanpost.jp/yu-packprint-r/member/download/instructions/８．入出力インターフェース仕様書.pdf",
+    "https://www.post.japanpost.jp/yu-packprint-r/member/download/instructions/６．フィルタ設定説明書.pdf",
+    "https://www.post.japanpost.jp/yu-packprint-r/member/sql/history/index.html",
+    "https://www.post.japanpost.jp/yu-packprint-r/",
+    "https://www.post.japanpost.jp/web-yu-packprint/index.html"
+  ],
+  "notes": "【对象软件】ゆうパックプリントR（ゆうプリR）是 Windows 安装版软件（SQL版/MDB版），不是 Web 服务；Web 版「Webゆうパックプリント」只支持住所録文本上传，没有批量发货 CSV 导入。【一次性设置】ゆうプリR →「フィルタ設定」→『取込』タブ「新規」→ フィルタの種類=発送データ、詳細編集 → 输入フィルタ名 → フォーマット種別选「標準フォーマットv3」→ 把「明細数」改为 1（本预设输出 87 列；若保持默认 3 则需 99 列）→ 列見出し 保持「なし」（若改为「あり」则把 export.header 设为 true）→ 保存。之后每次用该过滤器取込即可。【送り状種別】两种方式二选一：(a) 只用一种付款方式/纸种时，在账户设置填 label_type_code（例：1100555001 ゆうパックハイブリッドラベル(ユ00555, 元払／代引(まとめ送金)可, 着払不可) / 1100555002 着払ゆうパックハイブリッドラベル / 1100780 ゆうパックシート(A4・2宛分) / 1100783001 ゆうパックシート無地 / 1100783002 着払ゆうパックシート無地 / 1100728002 着払ゆうパックラベル / 1100742002 代引ゆうパックラベル），必须与 元着代引 匹配；(b) 混合时留空，在第69列输出 お客様指定配送種類，并在过滤器「条件設定」中为每个值配置 郵便種別/保冷/元着代引/書留/送り状種別。【字符/格式】Shift_JIS 或 UTF-8 均可（文字数按 Shift_JIS 计）；换行固定 CRLF；字段内不得换行；电话/邮编中的全角连字符会报错；若任何字段含逗号，则所有字段都必须用双引号包围 → 本预设 quoting=all。【长度】max_length 按 Shift_JIS 字节（半角1/全角2）。お客様側管理番号 只有 15 字节，故用 DN{dn.id}。【时间段】2024-10-01 起 20～21时(56) 废止。【备选】标准フォーマットv1（51列，ゆうパック专用，送り状种别只能经 お客様指定配送種類 条件設定，且“列見出しあり但数据不需要表头”的说明有歧义）不推荐。",
+  "tracking_url_template": "https://trackings.post.japanpost.jp/services/srv/search/direct?reqCodeNo1={tracking_number}",
+  "tracking_url_notes": "2026-10-25 浏览器实测可直接显示「個別番号検索結果」（未知号码显示「お問い合わせ番号が見つかりません」）。号码需去掉连字符；也可附加 &searchKind=S002&locale=ja（可选）。",
+  "export": {
+    "format": "csv",
+    "encoding": "cp932",
+    "encoding_notes": "用 cp932。",
+    "delimiter": ",",
+    "quoting": "all",
+    "header": false,
+    "line_ending": "\r\n",
+    "length_unit": "sjis_bytes",
+    "row_unit": "dn",
+    "columns": [
+      {
+        "header": "お客様側管理番号",
+        "value": "DN{dn.id}",
+        "required": false,
+        "max_length": 15,
+        "notes": "半角15字节（接口规格书 No.16）。WMS 回填匹配键。"
+      },
+      {
+        "header": "お問い合わせ番号",
+        "value": "",
+        "required": false,
+        "max_length": 20,
+        "notes": "仅「お問い合わせ番号付きデータ取込」契约使用，通常留空。"
+      },
+      {
+        "header": "代表お問い合わせ番号",
+        "value": "",
+        "required": false,
+        "max_length": 20,
+        "notes": "现状不可用。"
+      },
+      {
+        "header": "発送予定日",
+        "value": "{ship_date|date:%Y%m%d}",
+        "required": false,
+        "max_length": 8,
+        "notes": "YYYYMMDD（100日内）；也接受 YYYY/MM/DD 等。"
+      },
+      {
+        "header": "発送予定時間区分",
+        "value": "",
+        "required": false,
+        "max_length": 2,
+        "notes": "01午前/02午後。"
+      },
+      {
+        "header": "郵便種別",
+        "value": "0",
+        "required": false,
+        "max_length": 1,
+        "notes": "0=ゆうパック（本预设固定）。"
+      },
+      {
+        "header": "保冷種別",
+        "value": "{options.cool_type|default:0}",
+        "required": false,
+        "max_length": 1,
+        "notes": "0保冷なし/1チルド/2冷凍（冷凍需事先申请）。"
+      },
+      {
+        "header": "元／着払／代引",
+        "value": "{options.invoice_type|default:0}",
+        "required": false,
+        "max_length": 1,
+        "notes": "0元払い/1着払い/2代引き。"
+      },
+      {
+        "header": "書留／セキュリティ／特定記録種別",
+        "value": "0",
+        "required": false,
+        "max_length": 1,
+        "notes": "0なし。"
+      },
+      {
+        "header": "送り状種別",
+        "value": "{carrier.account.label_type_code}",
+        "required": false,
+        "max_length": 20,
+        "notes": "面单纸种代码（接口规格书⑨），必须与 元着代引 组合匹配（⑪组合表）。混合 元払/着払/代引 时建议留空并改用第69列 お客様指定配送種類 + ゆうプリR「条件設定」。"
+      },
+      {
+        "header": "お届け先 検索キー",
+        "value": "",
+        "required": false,
+        "max_length": 15
+      },
+      {
+        "header": "お届け先 郵便番号",
+        "value": "{ship_to.postal_code|digits}",
+        "required": true,
+        "max_length": 8,
+        "notes": "必须；半角7位，不可带连字符。"
+      },
+      {
+        "header": "お届け先 住所",
+        "value": "{ship_to.admin_area}{ship_to.locality}{ship_to.dependent_locality}{ship_to.address_line1}",
+        "required": true,
+        "max_length": 50,
+        "notes": "必须；与住所２・３合计≤全角75/半角150，ゆうプリR 自动重新分割为3段。"
+      },
+      {
+        "header": "お届け先 住所２",
+        "value": "{ship_to.address_line2}",
+        "required": false,
+        "max_length": 50
+      },
+      {
+        "header": "お届け先 住所３",
+        "value": "",
+        "required": false,
+        "max_length": 50
+      },
+      {
+        "header": "お届け先 名称",
+        "value": "{ship_to.name}",
+        "required": true,
+        "max_length": 50,
+        "notes": "必须；与名称２合计≤全角50，自动分割为2段。"
+      },
+      {
+        "header": "お届け先 名称２",
+        "value": "{ship_to.organization}",
+        "required": false,
+        "max_length": 50,
+        "notes": "公司名（如需「公司在前」请对调第16/17列）。"
+      },
+      {
+        "header": "お届け先 敬称区分",
+        "value": "0",
+        "required": false,
+        "max_length": 1,
+        "notes": "0様/1殿/2御中/3行/4係/5宛。"
+      },
+      {
+        "header": "お届け先 電話番号",
+        "value": "{ship_to.phone|jp_phone}",
+        "required": false,
+        "max_length": 20,
+        "notes": "半角数字、ハイフン、()；全角连字符会报错。"
+      },
+      {
+        "header": "お届け先 メールアドレス",
+        "value": "",
+        "required": false,
+        "max_length": 100
+      },
+      {
+        "header": "お届け先 局留め区分",
+        "value": "",
+        "required": false,
+        "max_length": 1
+      },
+      {
+        "header": "お届け先 局留め郵便局名",
+        "value": "",
+        "required": false,
+        "max_length": 60
+      },
+      {
+        "header": "お届け先 局留め郵便番号",
+        "value": "",
+        "required": false,
+        "max_length": 8
+      },
+      {
+        "header": "郵便局留めメール利用区分",
+        "value": "",
+        "required": false,
+        "max_length": 1
+      },
+      {
+        "header": "お届け予定メール利用区分",
+        "value": "",
+        "required": false,
+        "max_length": 1
+      },
+      {
+        "header": "ご不在連絡メール利用区分",
+        "value": "",
+        "required": false,
+        "max_length": 1
+      },
+      {
+        "header": "ご依頼主 検索キー",
+        "value": "",
+        "required": false,
+        "max_length": 15
+      },
+      {
+        "header": "ご依頼主 郵便番号",
+        "value": "{shipper.postal_code|digits}",
+        "required": false,
+        "max_length": 8
+      },
+      {
+        "header": "ご依頼主 住所",
+        "value": "{shipper.admin_area}{shipper.locality}{shipper.dependent_locality}{shipper.address_line1}",
+        "required": true,
+        "max_length": 50,
+        "notes": "必须（v3 不能在过滤器里用固定值）。"
+      },
+      {
+        "header": "ご依頼主 住所２",
+        "value": "{shipper.address_line2}",
+        "required": false,
+        "max_length": 50
+      },
+      {
+        "header": "ご依頼主 住所３",
+        "value": "",
+        "required": false,
+        "max_length": 50
+      },
+      {
+        "header": "ご依頼主 名称",
+        "value": "{shipper.name}",
+        "required": true,
+        "max_length": 50,
+        "notes": "必须。"
+      },
+      {
+        "header": "ご依頼主 名称２",
+        "value": "",
+        "required": false,
+        "max_length": 50
+      },
+      {
+        "header": "ご依頼主 敬称区分",
+        "value": "",
+        "required": false,
+        "max_length": 1
+      },
+      {
+        "header": "ご依頼主 電話番号",
+        "value": "{shipper.phone|jp_phone}",
+        "required": false,
+        "max_length": 20
+      },
+      {
+        "header": "ご依頼主 メールアドレス",
+        "value": "",
+        "required": false,
+        "max_length": 100
+      },
+      {
+        "header": "お届け完了メール利用区分",
+        "value": "",
+        "required": false,
+        "max_length": 1
+      },
+      {
+        "header": "ご依頼主 お届け通知はがき使用区分",
+        "value": "",
+        "required": false,
+        "max_length": 1,
+        "notes": "现状不可用。"
+      },
+      {
+        "header": "受注番号",
+        "value": "",
+        "required": false,
+        "max_length": 50,
+        "notes": "对应楽天专用「受注番号」，非楽天留空。"
+      },
+      {
+        "header": "注文日",
+        "value": "",
+        "required": false,
+        "max_length": 8
+      },
+      {
+        "header": "こわれもの区分",
+        "value": "",
+        "required": false,
+        "max_length": 1,
+        "notes": "0なし/1あり。"
+      },
+      {
+        "header": "なまもの区分",
+        "value": "",
+        "required": false,
+        "max_length": 1
+      },
+      {
+        "header": "ビン類区分",
+        "value": "",
+        "required": false,
+        "max_length": 1
+      },
+      {
+        "header": "逆さま厳禁区分",
+        "value": "",
+        "required": false,
+        "max_length": 1
+      },
+      {
+        "header": "下積み厳禁区分",
+        "value": "",
+        "required": false,
+        "max_length": 1
+      },
+      {
+        "header": "商品サイズ／厚さ区分",
+        "value": "{options.package_size}",
+        "required": false,
+        "max_length": 4,
+        "notes": "060/080/100/120/140/160/170。"
+      },
+      {
+        "header": "重量合計（ｇ）",
+        "value": "",
+        "required": false,
+        "max_length": 5,
+        "notes": "郵便用；ゆうパック留空。"
+      },
+      {
+        "header": "書留 損害要償額",
+        "value": "",
+        "required": false,
+        "max_length": 7
+      },
+      {
+        "header": "速達／配達日指定種別",
+        "value": "",
+        "required": false,
+        "max_length": 1,
+        "notes": "郵便用。"
+      },
+      {
+        "header": "配達希望日",
+        "value": "{options.delivery_date|date:%Y%m%d}",
+        "required": false,
+        "max_length": 8
+      },
+      {
+        "header": "配達時間帯区分",
+        "value": "{options.delivery_time_slot}",
+        "required": false,
+        "max_length": 2,
+        "notes": "00希望しない/51午前中/52 12～14/53 14～16/54 16～18/55 18～20/57 19～21；56(20～21) 自 2024-10-01 废止，填入会报错。"
+      },
+      {
+        "header": "ゆうパック複数個割引",
+        "value": "",
+        "required": false,
+        "max_length": 1
+      },
+      {
+        "header": "ゆうパック同一割引",
+        "value": "",
+        "required": false,
+        "max_length": 1
+      },
+      {
+        "header": "複数個口数",
+        "value": "{package.count|default:1}",
+        "required": false,
+        "max_length": 4
+      },
+      {
+        "header": "記事名１",
+        "value": "{dn.order_number|truncate_bytes:50}",
+        "required": false,
+        "max_length": 50,
+        "notes": "印在面单记事栏；放客户订单号。"
+      },
+      {
+        "header": "記事名２",
+        "value": "",
+        "required": false,
+        "max_length": 50
+      },
+      {
+        "header": "フリー項目０１",
+        "value": "",
+        "required": false,
+        "max_length": 50
+      },
+      {
+        "header": "フリー項目０２",
+        "value": "",
+        "required": false,
+        "max_length": 50
+      },
+      {
+        "header": "フリー項目０３",
+        "value": "",
+        "required": false,
+        "max_length": 50
+      },
+      {
+        "header": "フリー項目０４",
+        "value": "",
+        "required": false,
+        "max_length": 50
+      },
+      {
+        "header": "フリー項目０５",
+        "value": "",
+        "required": false,
+        "max_length": 50
+      },
+      {
+        "header": "フリー項目０６",
+        "value": "",
+        "required": false,
+        "max_length": 50
+      },
+      {
+        "header": "フリー項目０７",
+        "value": "",
+        "required": false,
+        "max_length": 50
+      },
+      {
+        "header": "フリー項目０８",
+        "value": "",
+        "required": false,
+        "max_length": 50
+      },
+      {
+        "header": "フリー項目０９",
+        "value": "",
+        "required": false,
+        "max_length": 50
+      },
+      {
+        "header": "フリー項目１０",
+        "value": "",
+        "required": false,
+        "max_length": 50
+      },
+      {
+        "header": "代引金額",
+        "value": "{options.cod_amount}",
+        "required": false,
+        "max_length": 7,
+        "notes": "代引き时必填，≤30万円，整数。"
+      },
+      {
+        "header": "代引消費税金額",
+        "value": "{options.cod_tax_amount}",
+        "required": false,
+        "max_length": 7
+      },
+      {
+        "header": "お客様指定配送種類",
+        "value": "",
+        "required": false,
+        "max_length": 20,
+        "notes": "任意字符串（全角10/半角20），配合 ゆうプリR 过滤器「条件設定」一次性映射 郵便種別/保冷/元着代引/書留/送り状種別。可改为例如 {options.invoice_type|map:0=元払い,1=着払い,2=代引き}。"
+      },
+      {
+        "header": "予備１",
+        "value": "",
+        "required": false,
+        "max_length": null
+      },
+      {
+        "header": "予約・確定識別コード",
+        "value": "",
+        "required": false,
+        "max_length": 10,
+        "notes": "仅拠点受取服务用。"
+      },
+      {
+        "header": "コンビニ等判別コード",
+        "value": "",
+        "required": false,
+        "max_length": 1,
+        "notes": "0或空=通常受取；1～5 コンビニ/局窓口/はこぽす，6 指定場所ダイレクト（置き配）。"
+      },
+      {
+        "header": "コンビニ等受取 通販業者コード",
+        "value": "",
+        "required": false,
+        "max_length": 6
+      },
+      {
+        "header": "コンビニ等受取 コンビニコード",
+        "value": "",
+        "required": false,
+        "max_length": 4
+      },
+      {
+        "header": "コンビニ等受取 コンビニ名",
+        "value": "",
+        "required": false,
+        "max_length": 40
+      },
+      {
+        "header": "コンビニ等受取 店舗コード",
+        "value": "",
+        "required": false,
+        "max_length": 6
+      },
+      {
+        "header": "コンビニ等受取 店舗名",
+        "value": "",
+        "required": false,
+        "max_length": 50
+      },
+      {
+        "header": "コンビニ等受取 認証番号",
+        "value": "",
+        "required": false,
+        "max_length": 20
+      },
+      {
+        "header": "コンビニ等受取 備考１",
+        "value": "",
+        "required": false,
+        "max_length": 200
+      },
+      {
+        "header": "コンビニ等受取 備考２",
+        "value": "",
+        "required": false,
+        "max_length": 200
+      },
+      {
+        "header": "予備２",
+        "value": "",
+        "required": false,
+        "max_length": null
+      },
+      {
+        "header": "商品番号",
+        "value": "",
+        "required": false,
+        "max_length": 20,
+        "notes": "以下6列为第1个明细块（过滤器「明細数」必须设为1，否则默认3块共99列）。"
+      },
+      {
+        "header": "品名",
+        "value": "{goods.summary|truncate_bytes:50}",
+        "required": false,
+        "max_length": 50,
+        "notes": "建议必填（Ver1.3.59 起未填品名会显示注意错误）。"
+      },
+      {
+        "header": "個数",
+        "value": "",
+        "required": false,
+        "max_length": 5
+      },
+      {
+        "header": "単価",
+        "value": "",
+        "required": false,
+        "max_length": 7
+      },
+      {
+        "header": "消費税率区分",
+        "value": "",
+        "required": false,
+        "max_length": 2,
+        "notes": "0/8/10，空=10%。"
+      },
+      {
+        "header": "金額",
+        "value": "",
+        "required": false,
+        "max_length": 7
+      }
+    ]
+  },
+  "import": {
+    "source": "ゆうプリR →「フィルタ設定」→『出力』タブ →「新規」→ フィルタの種類=発送履歴データ、詳細編集 → フォーマット種別「新ＤＥＮＦＤ確定」（或「新ＤＥＮＦＤ予約」）→ 保存；发送确认后从发送履歴用该过滤器输出。",
+    "encoding": "cp932",
+    "header_rows": 0,
+    "reference_column": 8,
+    "reference_header": "お客様側管理番号",
+    "reference_value": "DN{dn.id}",
+    "reference_parse": "^DN(\\d+)$",
+    "tracking_column": 7,
+    "tracking_header": "お問い合わせ番号",
+    "tracking_normalize": "digits",
+    "notes": "新ＤＥＮＦＤ予約/確定 为 ゆうプリR 内置标准输出格式：Shift-JIS、无表头、双引号包围、单纯明细；列1 予約・確定識別コード、2 発送(予定)日、4 商品種別コード、6 伝票個数、7 お問い合わせ番号(12位)、8 お客様側管理番号、9 複数個口代表お問い合わせ番号。仅输出ゆうパック。备选：简易编辑输出过滤器（発送履歴データ，列見出しあり，Shift-JIS 固定）只选两列「お客様側管理番号」「お問い合わせ番号」→ reference_column=1、tracking_column=2、header_rows=1。注意：<発送データ> 过滤器只输出印刷前数据，回填必须用 <発送履歴データ>。複数個口时每个口各有お問い合わせ番号，第9列为代表号。",
+    "encoding_fallbacks": [
+      "utf-8"
+    ]
+  },
+  "service_options": [
+    {
+      "key": "invoice_type",
+      "kind": "select",
+      "label": {
+        "en-US": "Payment type",
+        "zh-CN": "付款方式（元／着払／代引）",
+        "ja-JP": "元／着払／代引"
+      },
+      "values": [
+        {
+          "value": "0",
+          "label": {
+            "en-US": "Prepaid",
+            "zh-CN": "寄付",
+            "ja-JP": "元払い"
+          }
+        },
+        {
+          "value": "1",
+          "label": {
+            "en-US": "Collect (chakubarai)",
+            "zh-CN": "到付",
+            "ja-JP": "着払い"
+          }
+        },
+        {
+          "value": "2",
+          "label": {
+            "en-US": "Cash on delivery",
+            "zh-CN": "代收货款",
+            "ja-JP": "代引き"
+          }
+        }
+      ],
+      "default": "0"
+    },
+    {
+      "key": "cool_type",
+      "kind": "select",
+      "label": {
+        "en-US": "Cool service",
+        "zh-CN": "冷链（保冷種別）",
+        "ja-JP": "保冷種別"
+      },
+      "values": [
+        {
+          "value": "0",
+          "label": {
+            "en-US": "None",
+            "zh-CN": "无",
+            "ja-JP": "保冷なし"
+          }
+        },
+        {
+          "value": "1",
+          "label": {
+            "en-US": "Chilled",
+            "zh-CN": "冷藏（チルド）",
+            "ja-JP": "チルド"
+          }
+        },
+        {
+          "value": "2",
+          "label": {
+            "en-US": "Frozen (contract required)",
+            "zh-CN": "冷冻（需申请）",
+            "ja-JP": "冷凍"
+          }
+        }
+      ],
+      "default": "0"
+    },
+    {
+      "key": "delivery_time_slot",
+      "kind": "select",
+      "label": {
+        "en-US": "Delivery time slot",
+        "zh-CN": "配送时间段",
+        "ja-JP": "配達時間帯区分"
+      },
+      "values": [
+        {
+          "value": "",
+          "label": {
+            "en-US": "Not specified",
+            "zh-CN": "不指定",
+            "ja-JP": "指定なし"
+          }
+        },
+        {
+          "value": "51",
+          "label": {
+            "en-US": "Morning",
+            "zh-CN": "上午",
+            "ja-JP": "午前中"
+          }
+        },
+        {
+          "value": "52",
+          "label": {
+            "en-US": "12:00–14:00",
+            "zh-CN": "12～14时",
+            "ja-JP": "12～14時"
+          }
+        },
+        {
+          "value": "53",
+          "label": {
+            "en-US": "14:00–16:00",
+            "zh-CN": "14～16时",
+            "ja-JP": "14～16時"
+          }
+        },
+        {
+          "value": "54",
+          "label": {
+            "en-US": "16:00–18:00",
+            "zh-CN": "16～18时",
+            "ja-JP": "16～18時"
+          }
+        },
+        {
+          "value": "55",
+          "label": {
+            "en-US": "18:00–20:00",
+            "zh-CN": "18～20时",
+            "ja-JP": "18～20時"
+          }
+        },
+        {
+          "value": "57",
+          "label": {
+            "en-US": "19:00–21:00",
+            "zh-CN": "19～21时",
+            "ja-JP": "19～21時"
+          }
+        }
+      ],
+      "default": ""
+    },
+    {
+      "key": "package_size",
+      "kind": "select",
+      "label": {
+        "en-US": "Yu-Pack size",
+        "zh-CN": "邮包尺寸",
+        "ja-JP": "サイズ"
+      },
+      "values": [
+        {
+          "value": "",
+          "label": {
+            "en-US": "Not specified",
+            "zh-CN": "不指定",
+            "ja-JP": "指定なし"
+          }
+        },
+        {
+          "value": "060",
+          "label": {
+            "en-US": "60",
+            "zh-CN": "60",
+            "ja-JP": "60サイズ"
+          }
+        },
+        {
+          "value": "080",
+          "label": {
+            "en-US": "80",
+            "zh-CN": "80",
+            "ja-JP": "80サイズ"
+          }
+        },
+        {
+          "value": "100",
+          "label": {
+            "en-US": "100",
+            "zh-CN": "100",
+            "ja-JP": "100サイズ"
+          }
+        },
+        {
+          "value": "120",
+          "label": {
+            "en-US": "120",
+            "zh-CN": "120",
+            "ja-JP": "120サイズ"
+          }
+        },
+        {
+          "value": "140",
+          "label": {
+            "en-US": "140",
+            "zh-CN": "140",
+            "ja-JP": "140サイズ"
+          }
+        },
+        {
+          "value": "160",
+          "label": {
+            "en-US": "160",
+            "zh-CN": "160",
+            "ja-JP": "160サイズ"
+          }
+        },
+        {
+          "value": "170",
+          "label": {
+            "en-US": "170",
+            "zh-CN": "170",
+            "ja-JP": "170サイズ"
+          }
+        }
+      ],
+      "default": ""
+    },
+    {
+      "key": "delivery_date",
+      "kind": "date",
+      "label": {
+        "en-US": "Delivery date",
+        "zh-CN": "指定送达日",
+        "ja-JP": "配達希望日"
+      }
+    },
+    {
+      "key": "cod_amount",
+      "kind": "money",
+      "label": {
+        "en-US": "COD amount (tax incl.)",
+        "zh-CN": "代收金额（含税）",
+        "ja-JP": "代金引換金額（税込）"
+      }
+    },
+    {
+      "key": "cod_tax_amount",
+      "kind": "money",
+      "label": {
+        "en-US": "Consumption tax within COD",
+        "zh-CN": "代收金额中消费税",
+        "ja-JP": "代引消費税金額"
+      }
+    }
+  ],
+  "account_fields": [
+    {
+      "key": "label_type_code",
+      "label": {
+        "en-US": "Label type code",
+        "zh-CN": "面单种类代码（送り状種別）",
+        "ja-JP": "送り状種別"
+      },
+      "required": false,
+      "help": {
+        "en-US": "Code from the interface spec §9, e.g. 1100555001 (Yu-Pack hybrid label ユ00555). Must match the payment type; leave blank when mixing prepaid/collect/COD and use 条件設定 instead.",
+        "zh-CN": "接口规格书⑨中的代码，例如 1100555001（ゆうパックハイブリッドラベル ユ00555）。必须与付款方式匹配；混合 元払/着払/代引 时留空并改用「条件設定」。",
+        "ja-JP": "入出力インターフェース仕様書⑨の送り状種別（例：1100555001 ゆうパックハイブリッドラベル）。元着代引と組合せ可能なものを指定。混在時は空白にして条件設定を利用。"
+      }
+    }
+  ]
+}

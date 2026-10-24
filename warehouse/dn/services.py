@@ -75,7 +75,7 @@ def resolve_company_id(data: dict, warehouse) -> int:
 DN_CREATE_FIELDS = (
     'recipient_id', 'shipping_address', 'expected_shipping_date', 'warehouse_id',
     'carrier_id', 'carrier_code', 'dn_type', 'order_number', 'transportation_mode',
-    'packaging_info', 'special_handling', 'remark',
+    'packaging_info', 'special_handling', 'remark', 'ship_to', 'shipping_options',
 )
 DN_UPDATE_FIELDS = tuple(f for f in DN_CREATE_FIELDS if f != 'warehouse_id')
 DN_DETAIL_FIELDS = ('goods_id', 'goods_code', 'quantity', 'remark')
@@ -209,6 +209,96 @@ class DNService:
         mode = payload.get('transportation_mode')
         if mode is not None and mode not in DN.DN_TRANSPORTATION_MODES:
             raise BadRequestException(f"Invalid transportation_mode: {mode}", 16048)
+
+    @staticmethod
+    def _resolve_ship_to(payload: dict, recipient, explicit: bool):
+        """收件地址快照（doc/shipping-flow.md §6.2）：请求里的 ship_to（校验、规范化，国家缺省用收件人的）；
+        没给（explicit=False）时从收件人的结构化字段拷贝（收件人没有结构化地址为 None）。不合法 400 14019 / 14020。"""
+        from warehouse.common.address_format import is_structured, parse_address, recipient_address
+        if explicit:
+            ship_to = parse_address(payload.get('ship_to'), 'ship_to')
+            if ship_to is not None and not ship_to.get('country') and getattr(recipient, 'country', None):
+                ship_to['country'] = (recipient.country or '').strip().upper() or None
+            return ship_to
+        base = recipient_address(recipient)
+        return base if is_structured(base) else None
+
+    @staticmethod
+    def _shipping_options(value, carrier_id):
+        """来源系统传的运单服务选项：结构 + 承运商已声明键的取值（warehouse/shipping/options.py）"""
+        from warehouse.carrier.models import Carrier
+        from warehouse.shipping.options import parse_for_create, schema_for
+        carrier = db.session.get(Carrier, carrier_id) if carrier_id else None
+        return parse_for_create(value, schema_for(carrier))
+
+    # ------------------------------------------------------------------
+    # 收件地址快照（打包后也能改：文件导出报地址超长等时改短，doc/shipping-flow.md §6.6）
+    # ------------------------------------------------------------------
+
+    SHIP_TO_LOCKED = 'SHIP_TO_LOCKED'
+
+    @staticmethod
+    def ship_to_lock(dn: DN):
+        """收件地址现在不能改的原因 → {reason_code, message}；能改为 None。
+        DN 关闭 → DN_CLOSED；已发货 → DN_SHIPPED；有 api 运单（任一未结束状态）或 file 运单（exported / active）
+        → WAYBILL_EXISTS（面单已按旧地址打出，先取消运单 / 作废导出）；手填的运单号不锁（与运单服务选项同一口径）"""
+        from warehouse.shipping.options import lock_of
+        if dn.status == 'closed':
+            return {'reason_code': 'DN_CLOSED', 'message': "The DN is closed; the ship-to address cannot be changed"}
+        lock = lock_of(dn)
+        if lock is None:
+            return None
+        if lock['reason_code'] == 'DN_SHIPPED':
+            return {'reason_code': 'DN_SHIPPED', 'message': "The DN has been shipped; the ship-to address is locked"}
+        record = lock['carrier_shipment']
+        return {
+            'reason_code': lock['reason_code'],
+            'message': (f"The waybill has been {'exported' if record['status'] == 'exported' else 'created'} with the "
+                        "current address; cancel the waybill (or discard the export) before changing the ship-to "
+                        "address"),
+            'carrier_shipment': record,
+        }
+
+    @staticmethod
+    def ship_to_payload(dn: DN) -> dict:
+        """GET / PUT /warehouse/dn/<id>/ship-to 的返回：{ship_to, ship_to_effective, shipping_address, locked,
+        locked_reason, locked_message}"""
+        from warehouse.common.address_format import dn_ship_to
+        lock = DNService.ship_to_lock(dn)
+        return {
+            'ship_to': dn.ship_to,
+            'ship_to_effective': dn_ship_to(dn),
+            'shipping_address': dn.shipping_address,
+            'locked': lock is not None,
+            'locked_reason': lock['reason_code'] if lock else None,
+            'locked_message': lock['message'] if lock else None,
+        }
+
+    @staticmethod
+    @transactional
+    def update_ship_to(dn: DN, value) -> dict:
+        """PUT /warehouse/dn/<id>/ship-to {ship_to}：锁 DN → 锁定检查 → 校验（400 14019 / 14020，国家缺省用收件人的）→ 存，
+        单行 shipping_address 按新地址重新生成（null 清空快照：之后按收件人的结构化字段，单行地址不变）。
+        DN 关闭 400 16001；已发货 409 16065；已有 api / file 运单 409 16076（details.reason SHIP_TO_LOCKED）。
+        报关件的报关快照（收货人）不跟着改。"""
+        from warehouse.common.address_format import format_single_line
+        from warehouse.shipping.common import lock_dn
+        dn = lock_dn(dn)
+        lock = DNService.ship_to_lock(dn)
+        if lock is not None:
+            if lock['reason_code'] == 'DN_CLOSED':
+                raise BadRequestException(lock['message'], 16001)
+            if lock['reason_code'] == 'DN_SHIPPED':
+                raise ConflictException(lock['message'], 16065)
+            record = lock['carrier_shipment']
+            raise ConflictException(lock['message'], 16076, details={
+                'reason': DNService.SHIP_TO_LOCKED, 'status': record['status'], 'carrier_shipment': record})
+        ship_to = DNService._resolve_ship_to({'ship_to': value}, dn.recipient, True)
+        dn.ship_to = ship_to
+        if ship_to:
+            dn.shipping_address = format_single_line(ship_to, 'local', limit=255) or dn.shipping_address
+        db.session.flush()
+        return DNService.ship_to_payload(dn)
 
     @staticmethod
     def _get_instance(dn_or_id: int | DN) -> DN:
@@ -413,6 +503,9 @@ class DNService:
         只接受白名单字段；status 固定 pending、is_active 固定 True，
         picked/packed/delivered_quantity 由流程计算，客户端传入一律忽略。
         收货人 / 承运商 / 商品必须与仓库属于同一公司。
+        收件地址：ship_to（结构化快照，可选，没给时从收件人的结构化字段拷贝）；shipping_address（单行）照收，
+        只给了 ship_to 时按国家格式生成，两者都没有 400 40000。shipping_options（运单服务选项）可选，
+        按承运商已声明的选项校验取值（400 16139）。
 
         :param data: DN 数据（可包含 details）
         :param created_by_id: 当前用户 ID
@@ -421,7 +514,7 @@ class DNService:
         from warehouse.warehouse.models import Warehouse
 
         payload = pick_fields(data, DN_CREATE_FIELDS)
-        require_fields(payload, 'recipient_id', 'shipping_address', 'expected_shipping_date', 'warehouse_id')
+        require_fields(payload, 'recipient_id', 'expected_shipping_date', 'warehouse_id')
         details_data = require_bulk_list(data.get('details'), 'details')
 
         warehouse_id = require_positive_int(payload['warehouse_id'], 'warehouse_id', 16044)
@@ -457,6 +550,18 @@ class DNService:
             goods_ids=requested_by_goods.keys(),
         )
 
+        # 收件地址：ship_to（结构化快照，没给从收件人拷贝）；只给了 ship_to 时按国家格式生成单行的 shipping_address
+        from warehouse.common.address_format import format_single_line
+        from warehouse.recipient.models import Recipient
+        recipient = db.session.get(Recipient, payload['recipient_id'])
+        ship_to = DNService._resolve_ship_to(payload, recipient, 'ship_to' in payload)
+        shipping_address = payload.get('shipping_address')
+        if not (isinstance(shipping_address, str) and shipping_address.strip()):
+            shipping_address = format_single_line(ship_to, 'local', limit=255) if ship_to else None
+        if not shipping_address:
+            raise BadRequestException("Missing required field(s): shipping_address (or ship_to)", 40000)
+        shipping_options = DNService._shipping_options(payload.get('shipping_options'), payload.get('carrier_id'))
+
         # 海外件：顶层 customs 为报关快照（国内件不带）。结构错误在建单前拒绝（16063 / 16064），
         # 内容不全照收，由 GET /dn/<id>/customs 的 problems 列出。
         customs_payload = None
@@ -470,7 +575,9 @@ class DNService:
 
         new_dn = DN(
             recipient_id=payload['recipient_id'],
-            shipping_address=payload['shipping_address'],
+            shipping_address=shipping_address,
+            ship_to=ship_to,
+            shipping_options=shipping_options,
             expected_shipping_date=payload['expected_shipping_date'],
             warehouse_id=warehouse_id,
             carrier_id=payload.get('carrier_id'),
@@ -543,6 +650,18 @@ class DNService:
             recipient_id=payload.get('recipient_id'),
             carrier_id=payload.get('carrier_id'),
         )
+
+        # 收件地址快照：给了 ship_to 就替换（null 清空）；没给单行 shipping_address 时由它生成
+        if 'ship_to' in payload:
+            from warehouse.common.address_format import format_single_line
+            from warehouse.recipient.models import Recipient
+            recipient = db.session.get(Recipient, payload.get('recipient_id') or dn.recipient_id)
+            dn.ship_to = DNService._resolve_ship_to(payload, recipient, True)
+            if payload.get('shipping_address') is None and dn.ship_to:
+                payload['shipping_address'] = format_single_line(dn.ship_to, 'local', limit=255) or None
+        if 'shipping_options' in payload:
+            carrier_id = payload['carrier_id'] if 'carrier_id' in payload else dn.carrier_id
+            dn.shipping_options = DNService._shipping_options(payload['shipping_options'], carrier_id)
 
         # NOT NULL 字段：传 None 视为不改
         for field in ('recipient_id', 'shipping_address', 'expected_shipping_date', 'dn_type'):

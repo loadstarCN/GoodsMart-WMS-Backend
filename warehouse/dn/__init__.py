@@ -5,4 +5,5 @@ from .customs_views import *
 from .carrier_views import *
 from .pickup_views import *
 from .flow_views import *
+from .carrier_file_views import *
 from .services import *

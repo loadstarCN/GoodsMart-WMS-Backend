@@ -2,7 +2,7 @@
 
 - 发货国 origin_country = 仓库的 country_code，没有用公司的。
 - 收件国 destination_country = 报关快照的收件国（recipient_country，没有用快照 consignee.country）
-  → 收件人的 country。（第二期加 DN 收件地址快照的国家，排在报关快照之后。）
+  → DN 收件地址快照（ship_to）的国家 → 收件人的 country。
 - international = 发货国 != 收件国；任一方未知按国内（False）。
 - requires_customs = international 且两国不在同一关税同盟（warehouse/common/customs_unions.py）；
   有报关快照的 DN 一律 True（来源系统明确给了报关数据）。
@@ -32,13 +32,16 @@ def origin_country(dn):
 
 
 def destination_country(dn):
-    """收件国：报关快照的收件国（recipient_country → consignee.country）→ 收件人的 country；都没有为 None"""
+    """收件国：报关快照的收件国（recipient_country → consignee.country）→ DN 的 ship_to.country →
+    收件人的 country；都没有为 None"""
     customs = dn.customs
     if customs is not None:
         code = _country(customs.recipient_country) or _country((customs.consignee or {}).get('country'))
         if code:
             return code
-    return _country(getattr(dn.recipient, 'country', None))
+    ship_to = getattr(dn, 'ship_to', None)
+    code = _country(ship_to.get('country')) if isinstance(ship_to, dict) else None
+    return code or _country(getattr(dn.recipient, 'country', None))
 
 
 def shipping_route(dn) -> dict:
