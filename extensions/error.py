@@ -5,8 +5,7 @@ from werkzeug.exceptions import HTTPException
 # 业务码登记（出口单证 / 发货，完整列表见 README「Business codes」）：
 # 16063  400  报关快照结构不合法：details {field}；行的 unit_value 小数位超过币种小数位（JPY 等 0 位，其它 2 位）
 #             时另带 {currency, max_decimal_places}
-# 16069  409  海外件发货前单证不可用：details {missing_documents: [...], outdated: bool}
-#             （缺 CI / PL → missing_documents 非空、outdated false；已过期 → missing_documents []、outdated true）
+# 16069  409  （已不再使用：完成发货不查单证）原：海外件发货前单证缺失 / 过期，details {missing_documents, outdated}
 # 16076  409  有未结束的自动运单（pending / active / unknown / cancelling）时改箱子 / 改报关快照
 #             （reason CARRIER_SHIPMENT_OPEN），或签发与当前单证（随运单提交的）内容不一致的单证（reason DOCUMENT_DATA_CHANGED）：
 #             details {reason, status, carrier, carrier_shipment: {id, status, tracking_number}}

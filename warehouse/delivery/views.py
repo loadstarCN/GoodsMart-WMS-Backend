@@ -153,9 +153,9 @@ class DeliveryTaskComplete(Resource):
         - tracking_number empty / null / omitted → the saved tracking number is kept (domestic too)
         - Active carrier shipment: a different tracking number or carrier → 409 16078
           (details {tracking_number, carrier[, carrier_id]})
-        - Export DN, checked against the saved data before anything is written:
-          no current CI / PL → 409 16069 {missing_documents: [...], outdated: false};
-          documents out of date → 409 16069 {missing_documents: [], outdated: true}
+        - Customs documents (CI / PL) are not checked: missing or out-of-date documents do not block completion
+          (16069 is no longer returned)
+        - Export DN whose carrier shipment is pending / unclear / being cancelled → 409 16079 (details.unresolved)
         - Export DN whose current CI prints an AWB: the tracking number after completion (the given one, else the
           saved one) differs → 409 16080 {document_tracking_number, tracking_number} (save the tracking number and
           issue the documents again); when the CI has no AWB the given tracking number is saved as before

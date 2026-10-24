@@ -16,9 +16,9 @@ MAX_EVENTS = 30
 DELIVERED_CODES = frozenset({'DL'})
 # 派送中 / 到网点等收件人自取（HL = Hold at Location，HP = Ready for recipient pickup）
 OUT_FOR_DELIVERY_CODES = frozenset({'OD', 'HL', 'HP'})
-# 已揽收、在 FedEx 网络里移动（含通关中 CP・已通关 CC）
+# 已揽收、在 FedEx 网络里移动（含通关中 CP・已通关 CC；OW = On the way，在途时 latestStatusDetail 的 derivedCode）
 IN_TRANSIT_CODES = frozenset({
-    'PU', 'PX', 'IT', 'IX', 'AR', 'AF', 'AA', 'AC', 'AD', 'AO', 'AX', 'DP', 'LO',
+    'PU', 'PX', 'IT', 'IX', 'OW', 'AR', 'AF', 'AA', 'AC', 'AD', 'AO', 'AX', 'DP', 'LO',
     'ED', 'EO', 'FD', 'OF', 'PF', 'PL', 'PM', 'SF', 'SP', 'TR', 'CC', 'CP', 'CH',
 })
 # 不说明货在哪：面单已建・等揽收（IN = Initiated / OC = 运单信息已发给 FedEx / LP・DS・EP・AP・DR 揽收前），

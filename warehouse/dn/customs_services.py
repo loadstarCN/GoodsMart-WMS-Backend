@@ -989,7 +989,7 @@ class CustomsService:
             'current_documents': [current_docs[t].to_meta() for t in DOC_TYPES if t in current_docs],
             'documents_outdated': False,
         }
-        # 当前单证与现在的数据不一致 → 要重新签发（不自动作废；发货前 assert_ready_to_ship 拦）
+        # 当前单证与现在的数据不一致 → 提示重新签发（不自动作废，也不拦发货）
         if customs is not None and current_docs:
             if signature_unavailable:
                 view['documents_outdated'] = True
@@ -1246,16 +1246,12 @@ class CustomsService:
 
     @staticmethod
     def assert_ready_to_ship(dn: DN) -> None:
-        """发货前检查（按当前已存的数据）。国内件不检查。
+        """完成发货前检查。国内件不检查。
 
-        海外件（带报关快照）：
-        - 没有当前有效的 CI 或 PL → 409 16069，details {missing_documents: [...], outdated: false}
-        - 有但已过期（数据指纹变了：箱子 / 快照 / 公司资料等改过没重出）
-          → 409 16069，details {missing_documents: [], outdated: true}
-        - 自动运单进行中 / 结果不明 / 正在取消或取消结果不明（pending / unknown / cancelling）→ 409 16079
-          （details.unresolved）：FedEx 上可能有运单、或面单可能已作废，先处理（取消 / 确认作废）再发货。
-          请求里带不带运单号都拦（带了的在 assert_tracking_matches 已拦）。
-        单证不印运单号 / 承运商，所以完成发货时填的运单号、承运商与单证无关。
+        完成发货只是记下货已经交出去，单证不查（没出 / 过期都放行，以前的 16069 不再出现；过期只在报关卡片上提示）。
+        海外件（带报关快照）只看自动运单：进行中 / 结果不明 / 正在取消或取消结果不明（pending / unknown / cancelling）
+        → 409 16079（details.unresolved）：FedEx 上可能有运单、或面单可能已作废，先处理（取消 / 确认作废）再发货。
+        请求里带不带运单号都拦（带了的在 assert_tracking_matches 已拦）。
         """
         if dn.customs is None:
             return
@@ -1263,19 +1259,6 @@ class CustomsService:
         unresolved = CarrierShipmentService.unresolved_shipment(dn)
         if unresolved is not None:
             raise CarrierShipmentService._unresolved_conflict(unresolved)
-        current = CustomsService.current_documents(dn)
-        missing = [t for t in DOC_TYPES if t not in current]
-        if missing:
-            raise ConflictException(
-                "Export shipment requires a current commercial invoice and packing list before shipping.",
-                16069, details={'missing_documents': missing, 'outdated': False},
-            )
-        if CustomsService.build_view(dn)['documents_outdated']:
-            raise ConflictException(
-                "The commercial invoice / packing list no longer match the current data "
-                "(packages or customs data changed); issue them again before shipping.",
-                16069, details={'missing_documents': [], 'outdated': True},
-            )
 
     @staticmethod
     def delivered_webhook_fields(dn: DN) -> dict:

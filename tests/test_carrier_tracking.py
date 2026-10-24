@@ -92,6 +92,7 @@ def test_status_mapping():
     assert status_of('OC', picked_up=False) == TRACK_LABEL_CREATED
     assert status_of('RP', picked_up=True) == TRACK_IN_TRANSIT       # 揽收后的通知类码按在途
     assert status_of('PU', picked_up=True) == TRACK_IN_TRANSIT
+    assert status_of('OW', picked_up=True) == TRACK_IN_TRANSIT       # 在途时 derivedCode 是 OW（On the way）
     assert status_of('DL', picked_up=True) == TRACK_DELIVERED
     assert status_of('RS', picked_up=True) == TRACK_EXCEPTION
     assert status_of('ZZ', picked_up=True) == TRACK_UNKNOWN
@@ -208,6 +209,24 @@ def test_blocked_shipping_is_recorded_then_retried(client, access_token, fedex):
     assert (stats['shipped'], stats['problems']) == (1, 0)
     state = _state(client, dn_id, task_id)
     assert state['dn'] == 'delivered' and state['tracking']['problem'] is None
+
+
+def test_outdated_documents_do_not_block_automatic_shipping(client, access_token, fedex):
+    """建运单后改了仓库电话（单证过期，有运单时也重出不了）：承运商揽收后照常自动完成发货"""
+    from warehouse.dn.customs_services import CustomsService
+    dn_id, task_id, key_id = _shipped_ready(client, access_token, fedex)
+    with client.application.app_context():
+        db.session.get(DN, dn_id).warehouse.phone = '0750000000'
+        db.session.commit()
+        assert CustomsService.build_view(db.session.get(DN, dn_id))['documents_outdated'] is True
+
+    fedex.set(TRACK, (200, _track_body('OW', [OC, PU, IT])))
+    stats = _sync(client)
+    assert (stats['shipped'], stats['problems']) == (1, 0)
+    state = _state(client, dn_id, task_id)
+    assert (state['dn'], state['task']) == ('delivered', 'completed')
+    assert state['tracking']['status'] == TRACK_IN_TRANSIT and state['tracking']['problem'] is None
+    assert [e[0] for e in _events(client, key_id)] == ['dn.delivered', 'dn.tracking_updated']
 
 
 def test_lookup_errors_keep_last_result(client, access_token, fedex):

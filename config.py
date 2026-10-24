@@ -143,12 +143,14 @@ class TestingConfig(Config):
 
 class ProductionConfig(Config):
     DEBUG = False
-    # db.func.now() is written into timezone-naive columns.  The PostgreSQL
-    # session must use the same wall clock as Python's datetime.now().
-    SQLALCHEMY_ENGINE_OPTIONS = (
-        {'connect_args': {'options': '-c timezone=Asia/Tokyo'}}
-        if WMS_TIMEZONE else {}
-    )
+    SQLALCHEMY_ENGINE_OPTIONS = {
+        # 从连接池取连接时先探一下：数据库那边断掉的空闲连接（SSL connection has been closed unexpectedly）
+        # 换成新连接，不让拿到它的请求 500
+        'pool_pre_ping': True,
+        # db.func.now() is written into timezone-naive columns.  The PostgreSQL
+        # session must use the same wall clock as Python's datetime.now().
+        **({'connect_args': {'options': '-c timezone=Asia/Tokyo'}} if WMS_TIMEZONE else {}),
+    }
     # 生产默认严格校验 webhook 地址（显式设为 false 才关，启动时会打 warning）
     WEBHOOK_URL_STRICT = env_bool('WEBHOOK_URL_STRICT', True)
     SQLALCHEMY_DATABASE_URI = os.getenv('SQLALCHEMY_DATABASE_URI', 'sqlite:///test.db')  # 数据库连接    

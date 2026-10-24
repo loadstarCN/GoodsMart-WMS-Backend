@@ -1,8 +1,7 @@
 """完成发货（PUT /delivery/<id>/complete/）的运单号 / 单证契约
 
 - tracking_number 为空串 / null / 不传 → 不改已存值（国内件也一样）
-- 海外件按写入前的已存状态检查单证：缺 → 409 16069 {missing_documents, outdated: false}；
-  过期 → 409 16069 {missing_documents: [], outdated: true}
+- 单证不查：海外件没出 CI / PL、或单证已过期都照常完成发货（以前的 16069 不再出现）
 - 单证不印运单号 / 承运商：完成发货时填的运单号、承运商与单证无关（以前的 16080 / 16092 不再出现）
 - 有有效自动运单时承运商不一致 → 409 16078（details 带 carrier_id）
 - 检查前先锁 DN 行
@@ -86,18 +85,21 @@ def test_export_empty_tracking_keeps_saved(client, access_token):
 
 
 # ---------------------------------------------------------------------------
-# 16069：单证缺失 / 过期（按写入前的状态）
+# 单证不查：缺失 / 过期都照常发货
 # ---------------------------------------------------------------------------
 
-def test_missing_documents_details(client, access_token):
+def test_ships_without_documents(client, access_token):
     dn_id, task_id = _export_dn_ready(client, access_token)
-    response = _ship(client, access_token, task_id)
-    assert response.status_code == 409 and response.get_json()['code'] == 16069
-    assert response.get_json()['details'] == {
-        'missing_documents': ['commercial_invoice', 'packing_list'], 'outdated': False}
+    response = _ship(client, access_token, task_id, tracking_number='AWB-NO-DOCS')
+    assert response.status_code == 200, response.get_json()
+    assert response.get_json()['tracking_number'] == 'AWB-NO-DOCS'
+    with client.application.app_context():
+        assert db.session.get(DN, dn_id).status == 'delivered'
+        assert DNDocument.query.filter_by(dn_id=dn_id).count() == 0
 
 
-def test_outdated_documents_block_shipping(client, access_token):
+def test_ships_with_outdated_documents(client, access_token):
+    """出口资料改了没重出（单证过期）：报关卡片照样提示，完成发货不拦"""
     dn_id, task_id = _export_dn_ready(client, access_token)
     assert _issue(client, access_token, dn_id).status_code == 201
     _save_tracking(client, access_token, task_id, '7946 0000 0009')
@@ -109,39 +111,13 @@ def test_outdated_documents_block_shipping(client, access_token):
     assert client.get(f'/dn/{dn_id}/customs', headers=_h(access_token)).get_json()['documents_outdated'] is True
 
     response = _ship(client, access_token, task_id)
-    assert response.status_code == 409, response.get_json()
-    assert response.get_json()['code'] == 16069
-    assert response.get_json()['details'] == {'missing_documents': [], 'outdated': True}
-    assert _task(client, task_id)[0] == 'in_progress'
-    with client.application.app_context():
-        assert db.session.get(DN, dn_id).status == 'packed'
-
-    # 重出单证后照常发货
-    assert _issue(client, access_token, dn_id).get_json()['version'] == 2
-    response = _complete(client, access_token, task_id, {})
     assert response.status_code == 200, response.get_json()
     assert response.get_json()['tracking_number'] == '7946 0000 0009'
-
-
-def test_exporter_profile_change_makes_documents_outdated(client, access_token):
-    dn_id, task_id = _export_dn_ready(client, access_token)
-    assert _issue(client, access_token, dn_id).status_code == 201
-    with client.application.app_context():
-        get_company().export_signatory_name = 'Jiro Example'
-        db.session.commit()
-    response = _ship(client, access_token, task_id)
-    assert response.status_code == 409 and response.get_json()['details']['outdated'] is True
-
-
-def test_outdated_check_uses_state_before_writing_request_tracking(client, access_token):
-    """CI 没印 AWB 时带运单号完成发货：写入会让单证过期，但检查按写入前的状态 → 放行"""
-    dn_id, task_id = _export_dn_ready(client, access_token)
-    assert _issue(client, access_token, dn_id).status_code == 201
-    response = _ship(client, access_token, task_id, tracking_number='NEW-AWB-1')
-    assert response.status_code == 200, response.get_json()
-    assert response.get_json()['tracking_number'] == 'NEW-AWB-1'
+    assert _task(client, task_id)[0] == 'completed'
     with client.application.app_context():
         assert db.session.get(DN, dn_id).status == 'delivered'
+        versions = {d.version for d in DNDocument.query.filter_by(dn_id=dn_id)}
+    assert versions == {1}
 
 
 # ---------------------------------------------------------------------------
@@ -187,24 +163,6 @@ def test_complete_locks_dn_before_checking(client, access_token, monkeypatch):
     response = _ship(client, access_token, task_id)
     assert response.status_code == 200, response.get_json()
     assert calls[:2] == [('lock', dn_id), ('check', dn_id)]
-
-
-def test_documents_voided_concurrently_are_seen_after_lock(client, access_token, monkeypatch):
-    """锁 DN 后重新读取：拿锁前单证被并发作废（别的事务改了箱子）→ 仍然 16069"""
-    dn_id, task_id = _export_dn_ready(client, access_token)
-    assert _issue(client, access_token, dn_id).status_code == 201
-    assert client.put(f'/delivery/{task_id}/process/', headers=_h(access_token)).status_code == 200
-    original = CustomsService._lock
-
-    def lock_after_concurrent_void(dn):
-        # 模拟等锁期间另一事务已提交：单证被作废
-        DNDocument.query.filter_by(dn_id=dn.id).update({'status': 'void', 'void_reason': 'packages_changed'})
-        return original(dn)
-
-    monkeypatch.setattr(CustomsService, '_lock', staticmethod(lock_after_concurrent_void))
-    response = _complete(client, access_token, task_id, {})
-    assert response.status_code == 409 and response.get_json()['code'] == 16069
-    assert response.get_json()['details']['missing_documents'] == ['commercial_invoice', 'packing_list']
 
 
 # ---------------------------------------------------------------------------

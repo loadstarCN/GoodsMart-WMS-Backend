@@ -755,24 +755,15 @@ def _webhook_key(client):
         return api_key.id
 
 
-def test_ship_requires_documents_then_locks(client, access_token):
+def test_ship_pushes_documents_then_locks(client, access_token):
     dn_id, task_id = _export_dn_ready(client, access_token)
     key_id = _webhook_key(client)
     with client.application.app_context():
         db.session.get(DN, dn_id).api_key_id = key_id
         db.session.commit()
 
-    blocked = _ship(client, access_token, task_id, tracking_number='AWB-1')
-    assert blocked.status_code == 409
-    assert blocked.get_json()['code'] == 16069
-    assert blocked.get_json()['details'] == {'missing_documents': ['commercial_invoice', 'packing_list'],
-                                             'outdated': False}
-    with client.application.app_context():
-        assert db.session.get(DN, dn_id).status == 'packed'
-        assert db.session.get(DeliveryTask, task_id).status == 'in_progress'
-
     assert _issue(client, access_token, dn_id).status_code == 201
-    shipped = client.put(f'/delivery/{task_id}/complete/', json={'tracking_number': 'AWB-1'}, headers=_h(access_token))
+    shipped = _ship(client, access_token, task_id, tracking_number='AWB-1')
     assert shipped.status_code == 200, shipped.get_json()
 
     with client.application.app_context():

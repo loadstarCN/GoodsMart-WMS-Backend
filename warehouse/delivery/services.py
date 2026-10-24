@@ -438,15 +438,14 @@ class DeliveryTaskService:
         - tracking_number 为空串 / null / 不传 → 不改已存的运单号（国内件也一样）
         - shipping_cost 可为数字或数字字符串；空串 / null → 不改已存值；非法 → 400 16081
         - 有有效的自动运单时运单号 / 承运商与运单不一致 → 409 16078
-        - 海外件（DN 带报关快照）按写入前的已存状态检查单证：缺 CI / PL → 409 16069
-          {missing_documents: [...], outdated: false}；已过期 → 409 16069 {missing_documents: [], outdated: true}
-        - 单证不印运单号 / 承运商：完成发货时填的运单号、承运商与单证无关
+        - 单证（CI / PL）不查：没出 / 过期都放行（以前的 16069 不再出现）；完成发货时填的运单号、承运商与单证无关
+        - 海外件的自动运单进行中 / 结果不明 / 正在取消 → 409 16079（CustomsService.assert_ready_to_ship）
         - 海外件只能完成当前发货任务（CustomsService._delivery_task），别的任务 → 409 16091
         - 本 DN 已取消（含补偿取消）的自动运单号 → 409 16078（details.status = cancelled）
         """
         from warehouse.dn.customs_services import CustomsService
         task = DeliveryTaskService._get_instance(task_or_id)
-        # 先锁 DN 行（与改箱子 / 改报关快照 / 出单证 / 建运单串行），防止检查通过后单证被并发作废仍出货；
+        # 先锁 DN 行（与改箱子 / 改报关快照 / 出单证 / 建运单串行），防止检查通过后自动运单被并发改动仍出货；
         # 再锁任务行并重读（先 DN 后任务），并发的重复完成在下面的状态检查处挡下
         CustomsService._lock(task.dn)
         require_active_task(lock_row(task), 'Delivery Task')
@@ -468,7 +467,7 @@ class DeliveryTaskService:
         DeliveryTaskService._guard_carrier_tracking(task, payload)
         DeliveryTaskService._assert_shipping_dates(task.expected_shipping_date, datetime.now().date())
 
-        # 海外件：单证缺失 / 过期 → 409 16069（按写入前的状态）
+        # 海外件：自动运单进行中 / 结果不明 / 正在取消 → 409 16079（单证不查）
         CustomsService.assert_ready_to_ship(task.dn)
 
         task = DeliveryTaskService._update_task_status(task, 'completed', operator_id)

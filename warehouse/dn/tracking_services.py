@@ -6,10 +6,10 @@ dn.completed）。本模块与具体承运商无关，查询一律经插件（Ca
   delivered，或 DN 已完成（仓库手工签收了）但跟踪还没到送达（只更新显示）。定时任务每 CARRIER_TRACKING_INTERVAL_MINUTES
   分钟（默认 30）查一遍，最久没查的先查；配送页可以手动刷新一张（POST /dn/<id>/carrier-shipment/track，不看天数）。
 - 承运商已经经手（picked_up_at 有值，或状态是在途 / 派送中 / 已送达）而 DN 还是 packed：以建运单的人的名义完成发货
-  （同手动「完成发货」：pending 的发货任务先开始，单证 / 运单 / 计划发货日等校验照旧，推 dn.delivered）。
+  （同手动「完成发货」：pending 的发货任务先开始，不查单证，计划发货日在后照样拦，推 dn.delivered）。
 - 已送达而 DN 是 delivered：签收发货任务（签收时间 = 承运商的送达时刻，换成服务器本地时间——与 WMS 其他时间列一样是
   datetime.now() 的口径；早于完成发货时刻的按完成发货时刻），DN 完成，推 dn.completed。
-- 自动发货 / 签收做不成（单证没出 / 过期、计划发货日在后……）把原因记在运单的 tracking_problem（配送页显示），
+- 自动发货 / 签收做不成（计划发货日在后……）把原因记在运单的 tracking_problem（配送页显示），
   人处理后下一轮再试；做成了、或这一轮没有要做的就清空。手动完成发货 / 签收照常可用，谁先到算谁。
 - 跟踪结果存到运单记录（tracking_*）；状态 / 扫描记录有变化时推 dn.tracking_updated（只推给创建 DN 的 API Key）。
   先自动发货 / 签收、后存跟踪推事件：来源系统收到跟踪更新时，出库单已经是已发货。
