@@ -8,6 +8,7 @@ from warehouse.carrier.schemas import carrier_simple_model,carrier_model
 from warehouse.supplier.schemas import supplier_simple_model,supplier_model
 from warehouse.warehouse.schemas import warehouse_simple_model,warehouse_model
 from .models import ASN
+from .stage import STAGES as INBOUND_STAGES, inbound_stage_of
 
 # -----------------------------
 # 初始化 ASN 命名空间
@@ -171,8 +172,16 @@ asn_pagination_parser.add_argument('created_by', type=int, help='Filter by Creat
 asn_pagination_parser.add_argument('is_active', type=inputs.boolean, help='Is the ASN active?')
 asn_pagination_parser.add_argument('warehouse_id', type=int, help='Filter by Warehouse ID')
 asn_pagination_parser.add_argument('keyword', type=str, help='Keyword search')
+asn_pagination_parser.add_argument('inbound_stage', type=str, choices=INBOUND_STAGES, location='args',
+                                   help='Filter by inbound stage (same definition as GET /asn/<id>/flow stage)')
 
-asn_pagination_model = create_pagination_model(api_ns, asn_base_model)
+# 列表行另带入库阶段（见 warehouse/asn/stage.py）：列表接口整页一条查询算好，挂在 _inbound_stage 上
+asn_list_model = api_ns.inherit('ASNListItem', asn_base_model, {
+    'inbound_stage': fields.String(
+        readOnly=True, enum=list(INBOUND_STAGES), attribute=inbound_stage_of,
+        description='expected / in_transit / receiving / sorting / putaway / completed / closed / exception'),
+})
+asn_pagination_model = create_pagination_model(api_ns, asn_list_model)
 
 
 asn_monthly_stats_parser =  reqparse.RequestParser()

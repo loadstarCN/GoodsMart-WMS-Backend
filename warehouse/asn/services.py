@@ -262,6 +262,10 @@ class ASNService:
             query = query.filter(ASN.expected_arrival_date >= filters['expected_arrival_date'])
         if filters.get('created_by'):
             query = query.filter(ASN.created_by == filters['created_by'])
+        if filters.get('inbound_stage'):
+            # 入库阶段：与入库流程接口的 stage 同一个 SQL 表达式（warehouse/asn/stage.py）
+            from .stage import stage_expression
+            query = query.filter(stage_expression() == filters['inbound_stage'])
 
         # 如果 filters 中没有 is_active 或其值为 None，则只返回 is_active=True
         if 'is_active' not in filters or filters['is_active'] is None:
@@ -390,6 +394,7 @@ class ASNService:
         if data.get('asn_type') and data['asn_type'] not in ASN.ASN_TYPES:
             raise BadRequestException(f"Invalid asn_type: {data['asn_type']}", 14007)
 
+        tracked_before = (asn.tracking_number or None, asn.carrier_id)
         for field in ASNService.ASN_WRITABLE_FIELDS:
             if field not in data:
                 continue
@@ -397,6 +402,9 @@ class ASNService:
             if field == 'expected_arrival_date':
                 value = ASNService._parse_date(value)
             setattr(asn, field, value)
+        # 换了运单号 / 承运商：之前查到的跟踪结果不再适用（入库流程，warehouse/asn/tracking.py）
+        if (asn.tracking_number or None, asn.carrier_id) != tracked_before:
+            asn.clear_tracking()
 
         db.session.add(asn)
         db.session.flush()

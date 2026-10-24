@@ -269,3 +269,78 @@ tracking_url_template = None              # 公开查询页，如 'https://www.f
   - `WMS_TIMEZONE` 不再限定 `Asia/Tokyo`，只作为旧数据的口径和新仓库的默认时区。
   - 生产库转换走一次性维护工作流（备份 → 一个事务内 `ALTER COLUMN … TYPE timestamptz USING … AT TIME ZONE <旧口径>` →
     重启探测），做法同 `doc/timezone-jst.md`。
+
+### 7.1 入库单流程（第三期实现，迁移 `b3e8d1f6a9c2`）
+
+本系统入库单的状态：`pending`（待收货）→ `received`（收货时自动建分拣任务）→ `completed`（分拣任务完成时 WMS 自动完成，
+实收 = 分拣的合格 + 损坏，推 `asn.completed`）；`pending` 可以关闭、`received` 且分拣没开始可以取消（都是 `closed`）。
+上架（`putaway_records`）只有商品 / 库位，不记是哪张入库单的。
+
+`GET /warehouse/asn/<id>/flow`（权限 `asn_read`；仓库归属同其它 ASN 接口，接受 `warehouse_id` / `X-WAREHOUSE-ID`）：
+
+```json
+{
+  "asn_id": 52, "asn_status": "pending", "asn_type": "inbound", "order_number": "PO-1029", "warehouse_id": 1,
+  "expected_arrival_date": "2026-10-28", "closed_at": null,
+  "supplier": {"id": 3, "name": "ACME"},
+  "carrier": {"id": 4, "name": "FedEx", "code": "fedex", "integration": "fedex", "tracking_method": "api",
+              "tracking_url": "https://www.fedex.com/fedextrack/?trknbr=794600000001"},
+  "tracking_number": "794600000001",
+  "stage": "in_transit",
+  "steps": [
+    {"key": "created",    "state": "done", "at": "2026-10-20T12:00:00+09:00", "source": "api",
+       "summary": {"order_number": "PO-1029", "asn_type": "inbound", "expected_arrival_date": "2026-10-28",
+                   "line_count": 2, "quantity": 8, "creator": {"id": 1, "user_name": "admin"}}, "actions": []},
+    {"key": "in_transit", "state": "current", "at": "2026-10-23T09:00:00+09:00", "source": "carrier",
+       "summary": {"tracking_number": "794600000001", "tracking": {"status": "in_transit", "code": "IT", "...": "..."},
+                   "tracking_url": "...", "tracked_by_api": true, "tracking_method": "api"},
+       "actions": [{"key": "refresh_tracking", "enabled": true}, {"key": "open_tracking", "enabled": true, "url": "..."}]},
+    {"key": "received",   "state": "todo", "at": null,
+       "summary": {"line_count": 2, "expected_quantity": 8, "actual_quantity": null, "difference": null,
+                   "expected_arrival_date": "2026-10-28", "overdue": false},
+       "actions": [{"key": "receive", "enabled": true}]},
+    {"key": "sorting",    "state": "todo", "summary": {"task_ids": [], "tasks": [], "sorted_quantity": 0,
+                                                       "damage_quantity": 0, "quantity": 0, "expected_quantity": 8}},
+    {"key": "putaway",    "state": "todo", "summary": {"quantity": null, "pending_quantity": null, "goods": []}},
+    {"key": "completed",  "state": "todo", "summary": {"expected_quantity": 8, "actual_quantity": null, "...": "..."}}
+  ],
+  "problems": [],
+  "tasks": {"sorting": []}
+}
+```
+
+- 步骤（顺序固定）与 `state` / `source` 的取值同 §5；`at` 一律带时区偏移。
+  - `created`：`created_at`；来源 `api`（来源系统建的）或 `warehouse`。
+  - `in_transit`：没有运单号 → `skipped`。有运单号：已收货 → `done`（承运商给了送达时刻就用它，`source = carrier`）；
+    跟踪说已送达 → `done`（**不自动收货**，收货一直是仓库的操作）；跟踪异常 → `warning`（问题 `TRACKING_EXCEPTION`）；
+    最近一次查询失败 → `warning`（`TRACKING_ERROR`，保留上次结果）；否则 `current`（`at` = 最新一条扫描的时刻）。
+    操作：承运商能经 API 查时 `refresh_tracking`（入库单收货后 `enabled = false`，`ASN_NOT_PENDING`），有查询页时
+    `open_tracking`（带 `url`；跟踪方式 `none` 不给）。
+  - `received`：`received_at`；待收货时给 `receive`（`PUT /asn/<id>/receive/`；没有明细 → `enabled = false`、
+    `NO_DETAILS`）。承运商说还在路上 / 跟踪异常时是 `todo`，否则 `current`。预计到货日已过还没收货 → 问题
+    `ARRIVAL_OVERDUE`（warning，`date`）。实收（`actual_quantity` / `difference`）在完成时才有。
+  - `sorting`：有效分拣任务（`summary.task_ids` / `tasks[{id, status, started_at, completed_at}]`）与分拣明细已记的
+    合格 / 损坏数量（分拣中也有）。已收货 → `current`（`at` = 最早开始的任务的 `started_at`）；没有有效任务 → `warning`
+    （`SORTING_TASK_MISSING`）；完成 → `done`（`at` = 任务完成时刻）。
+  - `putaway`：入库单完成后才有内容。**按待上架库存估算**：本单某商品待上架 = clamp(该商品在本仓库的
+    `inventory.sorted_stock` − 比本单晚完成的入库单（同仓库、有效、已完成）该商品的实收合计, 0, 本单该商品的实收)，
+    新完成的入库单先占（旧单不会因为新单的货又回到「待上架」）；下架放回的货也在 `sorted_stock` 里，会算到最近完成的入库单上。
+    有待上架 → `current`，否则 `done`（`at` = 本单商品在本仓库最近一次上架的时刻）。`summary = {quantity, pending_quantity,
+    put_away_quantity, goods[{goods_id, code, name, quantity, pending}], last_putaway_at, estimated: true}`。
+  - `completed`：`completed_at`，来源 `system`（分拣完成时自动完成）；`summary` 是计划 / 实收 / 合格 / 损坏 / 差异。
+    「完成」是单据完成，上架是之后的仓库作业，所以可能出现「上架 current、完成 done」。
+  - 关闭（`closed`）：没做完的步骤一律 `skipped`、不给操作、没有问题；`closed_at` 在顶层。
+- `stage`（列表用，SQL 判定，`warehouse/asn/stage.py`，按顺序先命中先算）：`closed` → `putaway`（已完成、有待上架，
+  口径同上）→ `completed` → `sorting`（`received`）→ 待收货里：`exception`（有运单号且跟踪异常）→ `receiving`（有运单号且
+  承运商说已送达，等仓库收货）→ `in_transit`（有运单号）→ `expected`（没有运单号）。预计到货日过了不改阶段，只记问题。
+- `POST /warehouse/asn/<id>/track`（权限 `asn_edit`）：只在承运商的跟踪方式是 `api`、在线对接的插件 `supports_tracking` 且
+  `tracks_any_number`、设置齐全时可用（否则 / 没有运单号 → 409 `16140`）。经插件 `track()` 查一次（约 40 秒时限，调承运商时
+  不占事务），结果按插件归好的那一套存到入库单的 `tracking_status` / `tracking_detail`（`{code, status_text, picked_up_at,
+  delivered_at, estimated_delivery, events[], error}`）/ `tracking_synced_at`；查询失败不是 HTTP 错误，只记 `error`、保留上次
+  结果；揽收 / 送达时刻比入库单创建早 30 天以上视为回收再用的旧单号，不用（`TRACKING.OLD_SHIPMENT`）。返回流程（同 GET）
+  加 `tracking_sync {tracked, updated, error}`。不定时查、不推 webhook。改运单号 / 承运商时清空跟踪结果。
+- ASN 列表每行带 `inbound_stage`（整页一条查询），支持 `inbound_stage=` 筛选（SQL，与流程同一口径；不认识的值 400）。
+- 迁移 `b3e8d1f6a9c2`（接 `a7c4e2f9b3d1`）：`asn` 加可空列 `tracking_status`（varchar 20）、`tracking_detail`（json）、
+  `tracking_synced_at`（timestamp）。
+- 管理端：入库单详情页用同一套流程组件（`ShippingFlowStepper` / `ShippingFlowStep` / `FlowTransitDetail` 通用化），
+  替换原来的「订单跟踪信息」时间线；入库单列表加阶段页签（状态筛选改为下拉，两个条件可以一起用）与阶段列。

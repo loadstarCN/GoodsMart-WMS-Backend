@@ -121,6 +121,52 @@ class ASN(db.Model):
         nullable=True,
         info={'description': '单据关闭时间'}
     )
+    # 运单号的最近一次承运商跟踪结果（入库流程手动刷新，warehouse/asn/tracking.py；doc/shipping-flow.md §7.1）。
+    # 改运单号 / 承运商时清空
+    tracking_status = db.Column(
+        db.String(20),
+        nullable=True,
+        info={'description': '跟踪状态（TRACK_*：label_created / in_transit / out_for_delivery / delivered / '
+                             'exception / unknown）'}
+    )
+    tracking_detail = db.Column(
+        db.JSON,
+        nullable=True,
+        info={'description': '跟踪详情 {code, status_text, picked_up_at, delivered_at, estimated_delivery, events, '
+                             'error}'}
+    )
+    tracking_synced_at = db.Column(
+        db.DateTime,
+        nullable=True,
+        info={'description': '最近一次查询跟踪的时刻'}
+    )
+
+    def tracking_payload(self):
+        """跟踪结果（没查过为 None）：{status, code, status_text, picked_up_at, delivered_at, estimated_delivery,
+        events, error, synced_at, problem}（与出库运单的 tracking_payload 同一结构；入库不自动做事，problem 恒为 None）"""
+        if self.tracking_synced_at is None:
+            return None
+        detail = self.tracking_detail if isinstance(self.tracking_detail, dict) else {}
+        return {
+            'status': self.tracking_status,
+            'code': detail.get('code'),
+            'status_text': detail.get('status_text'),
+            'picked_up_at': detail.get('picked_up_at'),
+            'delivered_at': detail.get('delivered_at'),
+            'estimated_delivery': detail.get('estimated_delivery'),
+            'events': detail.get('events') or [],
+            'error': detail.get('error'),
+            # 带时区偏移（同 warehouse.dn.services.event_time）
+            'synced_at': (self.tracking_synced_at.astimezone().isoformat(timespec='seconds')
+                          if self.tracking_synced_at else None),
+            'problem': None,
+        }
+
+    def clear_tracking(self):
+        """运单号 / 承运商变了：之前的跟踪结果不再适用"""
+        self.tracking_status = None
+        self.tracking_detail = None
+        self.tracking_synced_at = None
 
     # 关系加载优化
     warehouse = db.relationship(

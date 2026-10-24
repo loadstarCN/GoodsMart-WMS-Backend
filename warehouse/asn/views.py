@@ -21,6 +21,7 @@ from .schemas import (
     asn_monthly_stats_parser
 )
 from .services import ASNService
+from .stage import attach as attach_inbound_stage
 
 
 def _owned_asn(asn_id: int) -> ASN:
@@ -38,7 +39,9 @@ class ASNList(Resource):
     @api_ns.marshal_with(asn_pagination_model)
     def get(self):
         """
-        Get all ASNs with optional filters & pagination
+        Get all ASNs with optional filters & pagination.
+        Each item also has `inbound_stage` (expected / in_transit / receiving / sorting / putaway / completed / closed /
+        exception; same definition as GET /asn/<id>/flow); `inbound_stage=<stage>` filters by it (evaluated in SQL).
         """
         args = asn_pagination_parser.parse_args()
         page = args.get('page')
@@ -55,12 +58,16 @@ class ASNList(Resource):
             'expected_arrival_date': args.get('expected_arrival_date'),
             'created_by': args.get('created_by'),
             'is_active': args.get('is_active'),
-            'keyword': args.get('keyword')
+            'keyword': args.get('keyword'),
+            'inbound_stage': args.get('inbound_stage'),
         }
 
         filters = add_warehouse_filter(filters)
         query = ASNService.list_asns(filters)
-        return paginate(query, page, per_page), 200
+        result = paginate(query, page, per_page)
+        # 每行的 inbound_stage 整页一条查询算好
+        result['items'] = attach_inbound_stage(result['items'])
+        return result, 200
 
     @permission_required(["all_access","company_all_access","asn_edit"])
     @warehouse_required()
