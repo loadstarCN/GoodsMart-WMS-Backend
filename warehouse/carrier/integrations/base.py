@@ -154,16 +154,20 @@ class CarrierAdapter:
 
     shipment（WMS 交给适配器的一票货，纯数据）：
         reference: 订单号；ship_date: date
+        route: {origin_country, destination_country, international, requires_customs}（warehouse/shipping/route.py）
         shipper: {company_name, person_name, phone, email, address_text, postal_code, country_code, country_name,
-                  tax_id} | None（出口资料不全时为 None，那时报关问题清单已经拦着）
+                  tax_id} | None（出口资料不全时为 None，那时报关问题清单已经拦着）。
+                  要报关的件用公司出口资料（英文）；国内件用仓库 / 公司的本地资料（没有用英文的）
         recipient: {company_name, person_name, phone, email, address_line1, address_line2, city, state,
-                    postal_code, country_code, tax_id, tax_id_type} | None
+                    postal_code, country_code, tax_id, tax_id_type} | None。
+                  要报关的件按报关快照的 consignee；国内件按 DN 收件人，地址是一个字符串（address_line1 与
+                  address_text 相同，city / state 为空，怎么拆由插件决定）
         packages: [{gross_weight_kg, length_mm, width_mm, height_mm, declared_value | None}]
         commodities: [{description, origin_country, hs_code, quantity, quantity_unit, unit_value, amount,
-                       weight_kg, part_number}]
+                       weight_kg, part_number}] | None（只在 route.requires_customs 时有值）
         invoice: {invoice_number, currency, incoterm, export_reason, freight, insurance, goods_value,
-                  declared_value | None}
-        documents: {'commercial_invoice': {content, file_name}} | None（开了电子单证时才有）
+                  declared_value | None} | None（同上）
+        documents: {'commercial_invoice': {content, file_name}} | None（要报关且开了电子单证时才有）
     """
 
     code = None                 # 插件代码（存进建单记录的 carrier 列），小写
@@ -173,8 +177,13 @@ class CarrierAdapter:
     fields = ()                 # setting(...) 元组
     label_formats = LABEL_FORMATS
     max_packages = None         # 一票最多几箱（None = 不限）
+    scopes = ('domestic', 'international')     # 能承运的范围（warehouse/shipping/route.py 的 scope_of）
+    supports_waybill = True     # 能建运单（建单 / 取消 / 面单）；False 的插件只用来预约揽收 / 查跟踪
+    supports_customs = False    # 能带报关扩展（commodities / invoice / documents）：要报关的件必须
     supports_pickup = False     # 能在 WMS 里预约上门揽收（实现了下面的 pickup_* / schedule_pickup / cancel_pickup）
     supports_tracking = False   # 能查跟踪（实现了下面的 track）：WMS 据此自动完成发货 / 签收
+    tracks_any_number = False   # 能查不是本插件建的运单号（手填 / 文件导回的号码也照常跟踪）
+    tracking_url_template = None    # 公开查询页，{tracking_number} 占位（承运商设置里没填时用它）
     track_batch_size = 30       # WMS 每次交给 track() 的单号数（一批失败只影响这一批）
     pickup_max_remarks = 60     # 给快递员的留言最多几个字符
 
@@ -205,8 +214,13 @@ class CarrierAdapter:
             'portal_name': cls.portal_name,
             'portal_url': cls.portal_url,
             'label_formats': list(cls.label_formats),
+            'scopes': list(cls.scopes or ()),
+            'supports_waybill': bool(cls.supports_waybill),
+            'supports_customs': bool(cls.supports_customs),
             'supports_pickup': bool(cls.supports_pickup),
             'supports_tracking': bool(cls.supports_tracking),
+            'tracks_any_number': bool(cls.tracks_any_number),
+            'tracking_url_template': cls.tracking_url_template,
             'fields': [dict(field) for field in cls.fields],
         }
 

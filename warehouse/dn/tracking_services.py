@@ -1,8 +1,10 @@
 """按承运商跟踪自动完成发货 / 签收（承运商对接插件 supports_tracking，内置 FedEx Track API）。
 
-运单是 WMS 建的，WMS 最先知道运单号，所以由 WMS 查跟踪，来源系统只收结果（dn.delivered / dn.tracking_updated /
-dn.completed）。本模块与具体承运商无关，查询一律经插件（CarrierAdapter.track）。
-- 要跟的运单：状态 active 的自动运单、有运单号、建单不超过 CARRIER_TRACKING_MAX_DAYS 天（默认 60），DN 是 packed /
+运单是 WMS 建的（或手填进 WMS 的），WMS 最先知道运单号，所以由 WMS 查跟踪，来源系统只收结果（dn.delivered /
+dn.tracking_updated / dn.completed）。本模块与具体承运商无关，查询一律经插件（CarrierAdapter.track）。
+- 要跟的运单：状态 active、有运单号的运单，承运商的跟踪方式是 api（carriers.tracking_method），承运商的插件
+  supports_tracking，且运单是插件建的（source = api）或插件能查任何运单号（tracks_any_number：手填 / 文件导回的号码
+  也照常跟踪）；建单不超过 CARRIER_TRACKING_MAX_DAYS 天（默认 60），DN 是 packed /
   delivered，或 DN 已完成（仓库手工签收了）但跟踪还没到送达（只更新显示）。定时任务每 CARRIER_TRACKING_INTERVAL_MINUTES
   分钟（默认 30）查一遍，最久没查的先查；配送页可以手动刷新一张（POST /dn/<id>/carrier-shipment/track，不看天数）。
 - 承运商已经经手（picked_up_at 有值，或状态是在途 / 派送中 / 已送达）而 DN 还是 packed：以建运单的人的名义完成发货
@@ -16,7 +18,9 @@ dn.completed）。本模块与具体承运商无关，查询一律经插件（Ca
   人处理后下一轮再试；做成了、或这一轮没有要做的就清空。手动完成发货 / 签收照常可用，谁先到算谁。
 - 跟踪结果存到运单记录（tracking_*）；状态 / 扫描记录有变化时推 dn.tracking_updated（只推给创建 DN 的 API Key）。
   先自动发货 / 签收、后存跟踪推事件：来源系统收到跟踪更新时，出库单已经是已发货。
-- 防误判：揽收 / 送达时刻早于建单（承运商回收再用的运单号查到了旧包裹）的结果不用，记成 error。
+- 防误判：揽收 / 送达时刻早于基准时刻（承运商回收再用的运单号查到了旧包裹）的结果不用，记成 error。
+  基准时刻：插件建的运单用建单时刻；手填 / 文件导回的运单用 DN 创建时刻（号码可能比记录早录入承运商系统）。
+- 自动完成发货记 completed_source = carrier，自动签收记 signed_source = carrier（dn.completed 带 signed_source）。
 - 调承运商时不持有行锁、不开事务；按插件的批次大小分批查，一批失败只影响这一批，时限用完的留到下一轮。结果逐张在各自的
   事务里写（先锁 DN），一张失败不影响别的；运单已经不是有效的这张、或别人已经存了更新的结果时不写。
   查询失败（超时、凭证不对……）只在运单上记 error，保留上一次的跟踪结果。
@@ -35,7 +39,7 @@ from warehouse.carrier.integrations.base import (
 from warehouse.carrier.models import Carrier
 from warehouse.common.locks import lock_row
 from .carrier_services import CarrierShipmentService, _config_number
-from .customs_services import CustomsService
+from warehouse.shipping.common import current_delivery_task
 from .models import DN, DNCarrierShipment
 
 logger = logging.getLogger(__name__)
@@ -147,17 +151,24 @@ class CarrierTrackingService:
 
     @staticmethod
     def adapter_of(record: DNCarrierShipment):
-        """→ (对接设置快照, 适配器)：建单用的承运商（carrier_id）的对接；旧记录按 DN 当前的承运商。
-        插件不支持跟踪、不是建这张运单的插件、设置不全 / 解不开时适配器为 None（停用了照样查：已建的运单还要跟到底）"""
+        """→ (对接设置快照, 适配器)：运单的承运商（carrier_id）的对接；旧记录按 DN 当前的承运商。
+        适配器为 None（不跟）：承运商的跟踪方式不是 api、插件不支持跟踪、插件建的运单不是这个插件建的、
+        手填 / 文件导回的运单而插件不能查任意运单号（tracks_any_number）、设置不全 / 解不开
+        （停用了照样查：已建的运单还要跟到底）"""
         carrier = db.session.get(Carrier, record.carrier_id) if record.carrier_id else None
         if carrier is not None:
             snapshot = CarrierIntegrationService.for_carrier(carrier)
             adapter = CarrierIntegrationService.build(snapshot)
         else:
-            _carrier, snapshot, adapter = CarrierShipmentService.integration_of(record.dn)
+            carrier, snapshot, adapter = CarrierShipmentService.integration_of(record.dn)
+        if carrier is None or (carrier.tracking_method or 'link') != 'api':
+            return snapshot, None
         if snapshot is None or adapter is None or not adapter.supports_tracking:
             return snapshot, None
-        if snapshot['adapter'] != record.carrier:
+        if (record.source or 'api') == 'api':
+            if snapshot['adapter'] != record.carrier:
+                return snapshot, None
+        elif not adapter.tracks_any_number:
             return snapshot, None
         if CarrierIntegrationService.problems(snapshot, adapter, for_create=False):
             return snapshot, None
@@ -168,15 +179,22 @@ class CarrierTrackingService:
         return record is not None and CarrierTrackingService.adapter_of(record)[1] is not None
 
     @staticmethod
+    def baseline(record: DNCarrierShipment):
+        """判定「查到的是同号旧包裹」的基准时刻：插件建的运单 = 建单时刻；手填 / 文件导回的 = DN 创建时刻"""
+        if (record.source or 'api') == 'api':
+            return record.created_at
+        return record.dn.created_at if record.dn is not None else record.created_at
+
+    @staticmethod
     def _plan(records) -> list:
-        """→ [{snapshot, records: [(record_id, tracking_number, created_at)]}]，按对接设置（承运商）分组；查不了的跳过"""
+        """→ [{snapshot, records: [(record_id, tracking_number, 基准时刻)]}]，按对接设置（承运商）分组；查不了的跳过"""
         groups = {}
         for record in records:
             snapshot, adapter = CarrierTrackingService.adapter_of(record)
             if adapter is None:
                 continue
             group = groups.setdefault(snapshot['carrier_id'], {'snapshot': snapshot, 'records': []})
-            group['records'].append((record.id, record.tracking_number, record.created_at))
+            group['records'].append((record.id, record.tracking_number, CarrierTrackingService.baseline(record)))
         return list(groups.values())
 
     # ------------------------------------------------------------------
@@ -213,9 +231,9 @@ class CarrierTrackingService:
                         CarrierTrackingService._safely(CarrierTrackingService._save, record_id, number,
                                                        {'error': exc.message}, KEEP, started, stats=stats)
                     continue
-                for record_id, number, created_at in batch:
+                for record_id, number, baseline in batch:
                     result = results.get(number) or {'error': NO_RESULT}
-                    if not result.get('error') and from_older_shipment(result, created_at):
+                    if not result.get('error') and from_older_shipment(result, baseline):
                         logger.warning("carrier tracking: shipment %s returned scans older than the record; ignored",
                                        number)
                         result = {'error': OLD_SHIPMENT}
@@ -296,13 +314,13 @@ class CarrierTrackingService:
         record, dn = CarrierTrackingService._locked(record_id)
         if record is None or record.status != 'active' or dn.status != 'packed':
             return False
-        task = CustomsService._delivery_task(dn)
+        task = current_delivery_task(dn)
         if task is None or task.status not in ('pending', 'in_progress'):
             raise AutoActionError(f"The carrier has the parcel, but DN {dn.id} has no delivery task to complete")
         operator_id = CarrierTrackingService._operator(record, dn)
         if task.status == 'pending':
             DeliveryTaskService.process_task(task, operator_id)
-        DeliveryTaskService.complete_task(task, {}, operator_id, shipped_at=local_naive(picked_up_at))
+        DeliveryTaskService.complete_task(task, {}, operator_id, shipped_at=local_naive(picked_up_at), source='carrier')
         logger.info("DN %s shipped automatically: carrier %s has shipment %s", dn.id, record.carrier,
                     record.tracking_number)
         return True
@@ -329,7 +347,8 @@ class CarrierTrackingService:
         signed_at = local_naive(delivered_at) or datetime.now()
         if task.completed_at is not None and signed_at < task.completed_at:
             signed_at = task.completed_at
-        DeliveryTaskService.sign_task(task, {'signed_at': signed_at}, CarrierTrackingService._operator(record, dn))
+        DeliveryTaskService.sign_task(task, {'signed_at': signed_at}, CarrierTrackingService._operator(record, dn),
+                                      source='carrier')
         logger.info("DN %s signed automatically: carrier %s delivered shipment %s", dn.id, record.carrier,
                     record.tracking_number)
         return True

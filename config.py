@@ -118,6 +118,8 @@ class Config:
     # 只跟建单不超过这么多天的运单；一轮查询的总时限（秒）
     CARRIER_TRACKING_MAX_DAYS = float(os.getenv('CARRIER_TRACKING_MAX_DAYS', 60))
     CARRIER_TRACKING_BUDGET_SECONDS = float(os.getenv('CARRIER_TRACKING_BUDGET_SECONDS', 120))
+    # 自动视为签收（carriers.auto_sign_days）：定时任务的间隔见 scheduler.py（CARRIER_AUTO_SIGN_INTERVAL_MINUTES，
+    # 默认 60，0 = 不跑）
 
 class DevelopmentConfig(Config):
     DEBUG = True # 只在开发环境中启用调试

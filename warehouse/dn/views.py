@@ -23,6 +23,7 @@ from .schemas import (
     dn_monthly_stats_parser
 )
 from .services import DNService
+from warehouse.shipping.stage import attach as attach_shipping
 
 
 def _owned_dn(dn_id: int) -> DN:
@@ -40,7 +41,10 @@ class DNList(Resource):
     @api_ns.marshal_with(dn_pagination_model)
     def get(self):
         """
-        Get all DNs with optional filters & pagination
+        Get all DNs with optional filters & pagination.
+        Each item also has `shipping_stage` (preparing / awaiting_waybill / awaiting_pickup / awaiting_handover /
+        in_transit / exception / delivered / closed; same definition as GET /dn/<id>/shipping-flow) and
+        `shipping` {carrier_name, tracking_number}; `shipping_stage=<stage>` filters by it (evaluated in SQL).
         """
         args = dn_pagination_parser.parse_args()
         page = args.get('page')
@@ -55,12 +59,16 @@ class DNList(Resource):
             'recipient_id': args.get('recipient_id'),
             'created_by': args.get('created_by'),
             'is_active': args.get('is_active'),
-            'keyword': args.get('keyword')
+            'keyword': args.get('keyword'),
+            'shipping_stage': args.get('shipping_stage'),
         }
 
         filters = add_warehouse_filter(filters)
         query = DNService.list_dns(filters)
-        return paginate(query, page, per_page), 200
+        result = paginate(query, page, per_page)
+        # 每行的 shipping_stage / shipping（承运商名、运单号）整页一条查询算好
+        result['items'] = attach_shipping(result['items'])
+        return result, 200
 
     @permission_required(["all_access","company_all_access","dn_edit"])
     @warehouse_required()

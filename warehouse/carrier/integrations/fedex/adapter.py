@@ -131,9 +131,14 @@ class FedexAdapter(CarrierAdapter):
     portal_name = 'FedEx Ship Manager'
     portal_url = 'https://www.fedex.com/shipping/shipEntryAction.do'
     max_packages = MAX_PACKAGES_PER_REQUEST
+    scopes = ('international',)         # 只接跨境件（国内件用别的承运商）
+    supports_waybill = True
+    supports_customs = True             # 报关扩展：commodities / invoice、ETD 电子单证、Global Trade 单证要求
     supports_pickup = True
     pickup_max_remarks = MAX_REMARKS
     supports_tracking = True
+    tracks_any_number = True            # Track API 能查任何 FedEx 运单号（在 FedEx Ship Manager 手工建的也行）
+    tracking_url_template = 'https://www.fedex.com/fedextrack/?trknbr={tracking_number}'
     track_batch_size = MAX_NUMBERS_PER_REQUEST
 
     fields = (

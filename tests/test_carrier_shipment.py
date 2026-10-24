@@ -380,8 +380,18 @@ def test_declared_value_within_goods_value_unchanged(client, access_token, fedex
 def test_blockers_status_packages_task_and_domestic(client, access_token, fedex):
     _prepare(client)
     domestic = _create_dn(client, access_token, customs=None, order_number='ORD-DOM').get_json()['id']
-    response = _create(client, access_token, domestic)
-    assert _codes(response) == ['NOT_EXPORT']
+    with client.application.app_context():
+        db.session.get(DN, domestic).carrier_id = get_carrier().id       # FedEx 对接的承运商
+        db.session.commit()
+    # 没有报关快照、收件人在美国（JP → US 跨境）：CUSTOMS_DATA_MISSING（取代以前的 NOT_EXPORT）
+    codes = _codes(_create(client, access_token, domestic))
+    assert 'CUSTOMS_DATA_MISSING' in codes and 'NOT_EXPORT' not in codes, codes
+    # 收件人在日本 = 国内件：FedEx 插件只接跨境件 → SCOPE_NOT_SUPPORTED
+    with client.application.app_context():
+        db.session.get(DN, domestic).recipient.country = 'JP'
+        db.session.commit()
+    codes = _codes(_create(client, access_token, domestic))
+    assert 'SCOPE_NOT_SUPPORTED' in codes and 'CUSTOMS_DATA_MISSING' not in codes, codes
 
     dn_id = _create_dn(client, access_token, order_number='ORD-EXP-2').get_json()['id']
     codes = _codes(_create(client, access_token, dn_id))

@@ -16,6 +16,9 @@ from sqlalchemy import and_, func, case, extract
 from datetime import datetime, timedelta
 from .models import DeliveryTask, DeliveryTaskStatusLog
 
+# 手工完成发货填的实际交承运商时刻允许比服务器时钟晚这么多（终端时钟误差），再晚 → 400 16136
+SHIPPED_AT_CLOCK_SKEW = timedelta(minutes=5)
+
 # 请求体白名单：status / is_active / created_by / *_at 只经流程端点变更
 DELIVERY_UPDATE_FIELDS = (
     'recipient_id', 'shipping_address', 'expected_shipping_date', 'actual_shipping_date',
@@ -140,6 +143,24 @@ class DeliveryTaskService:
         payload['tracking_number'] = tracking
 
     @staticmethod
+    def _parse_shipped_at(value) -> datetime:
+        """手工完成发货的 shipped_at（实际交承运商的时刻）→ 服务器本地时间（naive，与其它时间列同一口径）。
+        ISO 8601（带不带时区偏移都行，不带按服务器本地时间）；格式不对 400 16050；晚于现在
+        （允许 SHIPPED_AT_CLOCK_SKEW 的终端时钟误差，误差内按现在）→ 400 16136（field shipped_at）。"""
+        try:
+            moment = parse_datetime_value(value, 'shipped_at') if isinstance(value, (str, datetime)) else None
+        except BadRequestException:
+            moment = None
+        if moment is None:
+            raise BadRequestException("shipped_at must be an ISO 8601 datetime", 16050, field='shipped_at')
+        if moment.tzinfo is not None:
+            moment = moment.astimezone().replace(tzinfo=None)
+        now = datetime.now()
+        if moment > now + SHIPPED_AT_CLOCK_SKEW:
+            raise BadRequestException("shipped_at must not be in the future", 16136, field='shipped_at')
+        return min(moment, now)
+
+    @staticmethod
     def _unfinished_task(dn: DN):
         """DN 上未完成（pending / in_progress）的有效发货任务（最新一条），没有返回 None。调用方应先锁 DN 行。"""
         return (
@@ -155,13 +176,14 @@ class DeliveryTaskService:
 
     @staticmethod
     def _assert_current_task(task: DeliveryTask):
-        """海外 DN（带报关快照）：单证过期判定、自动运单都只认「当前发货任务」
+        """带报关快照、或有运单记录（任一来源）的 DN：单证过期判定、运单（插件建的 / 手填的）都只认「当前发货任务」
         （CustomsService._delivery_task：最新的有效任务）。对别的任务完成发货 / 存运单号 / 改任务会绕过
         运单号锁定和单证校验 → 409 16091 {delivery_task_id: 当前任务 id, current_status}。
-        调用方应先锁 DN 行。国内件不检查。"""
+        调用方应先锁 DN 行。既没有报关快照也没有运单记录的 DN 不检查。"""
         from warehouse.dn.customs_services import CustomsService
+        from warehouse.shipping.waybills import has_waybill_records
         dn = task.dn
-        if dn.customs is None:
+        if dn.customs is None and not has_waybill_records(dn):
             return
         current = CustomsService._delivery_task(dn)
         if current is not None and current.id != task.id:
@@ -267,9 +289,10 @@ class DeliveryTaskService:
 
     @staticmethod
     @transactional
-    def update_task(delivery_id: int, data: dict) -> DeliveryTask:
+    def update_task(delivery_id: int, data: dict, user_id=None) -> DeliveryTask:
         """
         更新指定 DeliveryTask（completed / signed 后不可改）。
+        运单号 / 承运商改了时同步手填运单记录（source = manual，见 warehouse/shipping/waybills.py；user_id 记为操作人）。
         只接受白名单字段：dn_id 不可改；status / is_active / created_by / *_at
         只经 process / complete / sign 流转，客户端传入一律忽略。
         运单号：DN 的自动运单结果不明 / 进行中时不能存号码（409 16079）；有有效自动运单时只能是它的号码（16078，
@@ -301,16 +324,27 @@ class DeliveryTaskService:
                       'shipping_cost', 'currency', 'order_number', 'remark'):
             if field in payload:
                 setattr(delivery, field, payload[field])
+        if 'tracking_number' in payload or 'carrier_id' in payload:
+            DeliveryTaskService._sync_manual_waybill(delivery, user_id)
 
         # db.session.commit()
         return delivery
 
     @staticmethod
+    def _sync_manual_waybill(task: DeliveryTask, user_id):
+        """任务上的运单号 / 承运商变了：手填运单记录跟上（没有未结束的插件运单时；DN 已锁）"""
+        from warehouse.shipping.waybills import sync_manual
+        db.session.flush()
+        sync_manual(task, user_id)
+
+    @staticmethod
     @transactional
-    def save_tracking(task_or_id: int | DeliveryTask, data: dict) -> DeliveryTask:
+    def save_tracking(task_or_id: int | DeliveryTask, data: dict, user_id=None) -> DeliveryTask:
         """
         发货前单独保存运单号（与承运商）：在承运商网站建运单拿到运单号 → 保存 → 完成发货。
         单证（CI / PL）不印运单号，打包时就可以出。
+        - 没有未结束的插件运单时，同时写手填运单记录（source = manual，carrier_id = 任务的承运商，created_by = user_id）：
+          换号 → 旧记录 cancelled（replaced）+ 新号 active；清空 → cancelled（cleared）。见 warehouse/shipping/waybills.py
         - 任务 pending / in_progress 可存；DN 已发货或任务已完成 → 409 16065
         - DN 有有效的自动运单（承运商对接）时，只能存它的号码（清空 / 改成别的 → 409 16078，先取消自动运单）；
           号码按规范化比对（忽略空格 / 连字符），入库统一存运单上的标准写法；承运商也不能换（16078）
@@ -346,6 +380,8 @@ class DeliveryTaskService:
             if shipment is not None:
                 DeliveryTaskService._assert_shipment_carrier(shipment, {'carrier_id': carrier_id})
             task.carrier_id = carrier_id
+        if 'tracking_number' in payload or payload.get('carrier_id') is not None:
+            DeliveryTaskService._sync_manual_waybill(task, user_id)
         db.session.flush()
         return task
 
@@ -363,6 +399,10 @@ class DeliveryTaskService:
         if delivery.status != 'pending':
             raise BadRequestException("Cannot delete a non-pending Delivery", 16002)
         CarrierShipmentService.assert_delivery_tasks_editable(delivery.dn, 'deleted')
+        if delivery.tracking_number:
+            # 任务上的运单号随任务删掉：手填运单记录一并作废（cleared）
+            from warehouse.shipping.waybills import close_manual
+            close_manual(delivery.dn, 'cleared')
 
         db.session.delete(delivery)
         # db.session.commit()
@@ -424,7 +464,8 @@ class DeliveryTaskService:
 
     @staticmethod
     @transactional
-    def complete_task(task_or_id: int | DeliveryTask, data:dict, operator_id: int, shipped_at=None) -> DeliveryTask:
+    def complete_task(task_or_id: int | DeliveryTask, data:dict, operator_id: int, shipped_at=None,
+                      source='warehouse') -> DeliveryTask:
         """
         将 DeliveryTask 从 in_progress 切换为 completed
         数据格式：
@@ -443,7 +484,11 @@ class DeliveryTaskService:
         - 海外件只能完成当前发货任务（CustomsService._delivery_task），别的任务 → 409 16091
         - 本 DN 已取消（含补偿取消）的自动运单号 → 409 16078（details.status = cancelled）
         - shipped_at（承运商跟踪自动完成发货时传承运商的揽收时刻，服务器本地时间）：完成时间、实际发货日、DN 的发货时间
-          （dn.delivered 的 shipped_at）都记成它，计划发货日也按它检查；不传 = 现在
+          （dn.delivered 的 shipped_at）都记成它，计划发货日也按它检查；不传 = 现在。
+          手工完成发货可在请求体里带 shipped_at（实际交承运商的时刻，ISO 8601；格式不对 400 16050，
+          晚于现在 400 16136），参数 shipped_at 优先
+        - source：完成发货的来源（completed_source）：warehouse = 手工（默认）/ carrier = 承运商跟踪自动
+        - 运单号 / 承运商改了时同步手填运单记录（source = manual，见 warehouse/shipping/waybills.py）
         """
         from warehouse.dn.customs_services import CustomsService
         task = DeliveryTaskService._get_instance(task_or_id)
@@ -456,6 +501,8 @@ class DeliveryTaskService:
         # 海外件：单证 / 自动运单只认当前发货任务，完成别的任务会绕过运单锁和单证校验 → 409 16091
         DeliveryTaskService._assert_current_task(task)
 
+        if shipped_at is None and isinstance(data, dict) and data.get('shipped_at') not in (None, ''):
+            shipped_at = DeliveryTaskService._parse_shipped_at(data.get('shipped_at'))
         payload = pick_fields(data or {}, (
             'transportation_mode', 'carrier_id', 'tracking_number', 'shipping_cost', 'currency', 'remark',
         ))
@@ -474,6 +521,7 @@ class DeliveryTaskService:
         CustomsService.assert_ready_to_ship(task.dn)
 
         task = DeliveryTaskService._update_task_status(task, 'completed', operator_id)
+        task.completed_source = source
         if shipped_at is not None:
             task.completed_at = shipped_at
             # 开始时刻是 WMS 里点开始（或自动发货当场开始）的时刻，可能晚于承运商实际揽收：不晚于完成
@@ -485,6 +533,8 @@ class DeliveryTaskService:
         for field in ('transportation_mode', 'carrier_id', 'tracking_number', 'shipping_cost', 'currency', 'remark'):
             if field in payload:
                 setattr(task, field, payload[field])
+        if 'tracking_number' in payload or 'carrier_id' in payload:
+            DeliveryTaskService._sync_manual_waybill(task, operator_id)
 
         # 若有需要在此更新库存或者做别的业务处理；dn.delivered 的运单号取这条被完成的任务的
         DNService.delivery_dn(task.dn_id, delivery_task=task, shipped_at=shipped_at)
@@ -493,13 +543,15 @@ class DeliveryTaskService:
 
     @staticmethod
     @transactional
-    def sign_task(task_or_id: int | DeliveryTask,data:dict, operator_id: int) -> DeliveryTask:
+    def sign_task(task_or_id: int | DeliveryTask,data:dict, operator_id: int, source='warehouse') -> DeliveryTask:
         """
         将 DeliveryTask 从 completed 切换为 signed
         数据格式：
         {
             "signed_at": "2021-08-01"
         }
+        - source：签收的来源（signed_source，dn.completed 也带）：warehouse = 手工（默认）/ carrier = 承运商跟踪自动 /
+          rule = 自动视为签收（carriers.auto_sign_days，warehouse/shipping/auto_sign.py）
         """
         # 先锁 DN、再锁任务并重读状态：并发的重复签收在这里挡下，不会重复完成 DN、重复扣 delivered_stock
         task = DeliveryTaskService._lock(task_or_id)
@@ -510,6 +562,7 @@ class DeliveryTaskService:
         signed_at = parse_datetime_value((data or {}).get('signed_at'), 'signed_at')
 
         task = DeliveryTaskService._update_task_status(task, 'signed', operator_id)
+        task.signed_source = source
 
         # 客户端给了签收时间就用它，否则用状态流转时刻
         if signed_at is not None:

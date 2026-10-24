@@ -504,16 +504,20 @@ class DNCarrierShipment(db.Model):
     - cancelling：有效运单正在取消（reason cancel_in_progress），或取消结果不明（reason timeout / server_error /
       bad_response / connection_error / save_failed / interrupted，过期的 cancel_in_progress 按 stale 对外）；
       面单与运单号都还在，但不能发货，重试取消（或确认作废）后落到 cancelled，承运商明确拒绝取消则回到 active
-    一张 DN 同一时刻至多一条 pending / active / unknown / cancelling（部分唯一索引兜底并发）。
+    一张 DN 同一时刻至多一条 pending / active / unknown / cancelling（部分唯一索引兜底并发，不分来源）。
     主运单号同时存到发货任务的 tracking_number 上（走现有保存运单号的逻辑）。
+    source：api = 插件建的（上面的状态机、锁定规则只对它生效）；manual = 手填 / 扫码的运单号（保存运单号时自动写，
+    只有 active / cancelled：换号 → 旧记录 cancelled（reason replaced）+ 新记录 active，清空 → cancelled（reason cleared），
+    不调承运商，见 warehouse/shipping/waybills.py）；file = 文件导回的运单号（第二期）。
     tracking_*：插件支持跟踪时，定时任务（warehouse/dn/tracking_services.py）查到的跟踪结果；据此自动完成发货 / 签收，
     做不了的原因记在 tracking_problem。
     """
     __tablename__ = 'dn_carrier_shipments'
 
     STATUSES = ('pending', 'active', 'cancelled', 'failed', 'unknown', 'dismissed', 'cancelling')
-    OPEN_STATUSES = ('pending', 'active', 'unknown', 'cancelling')        # 同一 DN 至多一条
+    OPEN_STATUSES = ('pending', 'active', 'unknown', 'cancelling')        # 同一 DN 至多一条（不分来源）
     UNRESOLVED_STATUSES = ('pending', 'unknown', 'cancelling')
+    SOURCES = ('api', 'file', 'manual')
 
     __table_args__ = (
         db.Index('idx_dn_carrier_shipment_dn', 'dn_id', 'status'),
@@ -527,6 +531,7 @@ class DNCarrierShipment(db.Model):
             "status IN ('pending','active','cancelled','failed','unknown','dismissed','cancelling')",
             name='chk_dn_carrier_shipment_status',
         ),
+        db.CheckConstraint("source IN ('api','file','manual')", name='chk_dn_carrier_shipment_source'),
     )
 
     id = db.Column(db.Integer, primary_key=True)
@@ -536,13 +541,19 @@ class DNCarrierShipment(db.Model):
         nullable=False,
         info={'description': 'DN ID'}
     )
-    carrier = db.Column(db.String(30), nullable=False, info={'description': '对接插件代码（如 fedex，见 warehouse/carrier/integrations）'})
+    source = db.Column(db.String(10), nullable=False, default='api', server_default='api',
+                       info={'description': '运单来源：api（插件建单）/ file（文件导回，第二期）/ manual（手填运单号）'})
+    carrier = db.Column(db.String(30), nullable=True,
+                        info={'description': '对接插件代码（如 fedex，见 warehouse/carrier/integrations）；'
+                                             'manual / file 运单 = 承运商在线对接的插件，没有对接为空'})
     carrier_id = db.Column(
         db.Integer,
         db.ForeignKey('carriers.id', ondelete='SET NULL'),
         nullable=True,
         info={'description': '建单用的承运商（取消时用它的对接设置；旧记录为空，按 DN 当前承运商找）'}
     )
+    carrier_data = db.Column(db.JSON, nullable=True,
+                             info={'description': '插件 / 文件模板自己的附加数据（第二期：导出批次等）'})
     tracking_number = db.Column(db.String(100), nullable=True, index=True,
                                 info={'description': '主运单号（pending / failed / 结果不明且没拿到号码时为空）'})
     package_tracking_numbers = db.Column(db.JSON, nullable=True, info={'description': '每箱运单号（按箱号）'})
@@ -634,6 +645,7 @@ class DNCarrierShipment(db.Model):
     def to_dict(self) -> dict:
         return {
             'id': self.id,
+            'source': self.source,
             'carrier': self.carrier,
             'carrier_id': self.carrier_id,
             'tracking_number': self.tracking_number,
@@ -705,11 +717,14 @@ class CarrierPickup(db.Model):
     - unknown：结果不明（超时、5xx、响应看不懂……），承运商那边可能已约上
     - dismissed：unknown（或卡住的 pending）经操作员核对后作废
     failed / cancelled / dismissed 时所带运单的 pickup_id 清空，可以重新预约。
+    source = manual：没有 API 时，操作员把电话 / 网站约好的揽收记一笔（直接 scheduled，取消只改本地，不调承运商）。
+    所带运单可以是任一来源（api / manual / file）的有效运单。
     """
     __tablename__ = 'carrier_pickups'
 
     STATUSES = ('pending', 'scheduled', 'cancelled', 'failed', 'unknown', 'dismissed')
     UNRESOLVED_STATUSES = ('pending', 'unknown')
+    SOURCES = ('api', 'manual')
 
     __table_args__ = (
         db.Index('idx_carrier_pickup_warehouse_date', 'warehouse_id', 'pickup_date'),
@@ -717,6 +732,7 @@ class CarrierPickup(db.Model):
             "status IN ('pending','scheduled','cancelled','failed','unknown','dismissed')",
             name='chk_carrier_pickup_status',
         ),
+        db.CheckConstraint("source IN ('api','manual')", name='chk_carrier_pickup_source'),
     )
 
     id = db.Column(db.Integer, primary_key=True)
@@ -726,7 +742,10 @@ class CarrierPickup(db.Model):
         nullable=False,
         info={'description': '揽收仓库ID'}
     )
-    carrier = db.Column(db.String(30), nullable=False, info={'description': '对接插件代码（如 fedex）'})
+    source = db.Column(db.String(10), nullable=False, default='api', server_default='api',
+                       info={'description': '来源：api（插件预约）/ manual（电话 / 网站约好后在 WMS 记一笔）'})
+    carrier = db.Column(db.String(30), nullable=True,
+                        info={'description': '对接插件代码（如 fedex）；manual 记录 = 承运商在线对接的插件，没有对接为空'})
     carrier_id = db.Column(
         db.Integer,
         db.ForeignKey('carriers.id', ondelete='SET NULL'),
@@ -783,6 +802,7 @@ class CarrierPickup(db.Model):
     def to_dict(self) -> dict:
         return {
             'id': self.id,
+            'source': self.source,
             'warehouse_id': self.warehouse_id,
             'carrier': self.carrier,
             'carrier_id': self.carrier_id,

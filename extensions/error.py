@@ -20,7 +20,8 @@ from werkzeug.exceptions import HTTPException
 # 16089  409  拣货任务一件都没拣，不能完成（拣不到货请取消 DN）
 # 16090  409  DN 已有未完成（pending / in_progress）的有效发货任务（手工新建接口已去掉，目前不会出现）：
 #             details {delivery_task_id, status}
-# 16091  409  海外 DN 只能对当前发货任务完成发货 / 存运单号 / 修改：details {delivery_task_id, current_status}
+# 16091  409  有报关快照或有运单记录（任一来源）的 DN 只能对当前发货任务完成发货 / 存运单号 / 修改：
+#             details {delivery_task_id, current_status}
 # 16092  409  （已不再使用：单证不印承运商）完成发货的承运商与当前 CI 上印的不一致
 # 16093  409  取消运单 / 确认作废请求里带的目标与当前记录不符（页面上的记录已变，先重新读取）：
 #             details {expected: 请求里的值, actual: 服务端当前的值}；取消比 tracking_number（规范化后），
@@ -36,14 +37,18 @@ from werkzeug.exceptions import HTTPException
 #             settings.<key> / secrets.<key>
 # 16125  409  承运商还有未结束的自动运单（pending / active / unknown / cancelling）时删除对接或换插件（取消运单要用这套设置）：
 #             details {shipments: [{id, dn_id, status, tracking_number}]}
-# 16130  409  上门揽收前置条件不满足（承运商没有可用的对接 / 不支持预约揽收 / 揽收地址或电话放不进承运商的格式）：
-#             details {blockers}
-# 16131  400  揽收预约参数不合法：field = carrier_id / shipment_ids / pickup_date / ready_time / close_time / remarks /
-#             notification_email / confirm
+# 16130  409  上门揽收前置条件不满足（承运商没有可用的对接 / 不支持预约揽收 / 揽收地址或电话放不进承运商的格式 /
+#             揽收方式不是 api 却要插件预约 PICKUP_METHOD_NOT_API）：details {blockers}
+# 16131  400  揽收预约 / 手工记录参数不合法：field = carrier_id / shipment_ids / pickup_date / ready_time / close_time /
+#             remarks / notification_email / confirm / warehouse_id / confirmation_code
 # 16132  409  所选运单不能预约揽收：details {shipments: [{shipment_id, tracking_number, reason: NOT_FOUND | NOT_ACTIVE |
 #             OTHER_CARRIER | DN_SHIPPED | ALREADY_SCHEDULED, ...}]}
 # 16133  409  揽收预约当前状态不能取消（不是 scheduled / 揽收日已过）或确认作废（不是结果不明）：
 #             details {pickup_id, status, reason, pickup_date}
+# 16135  400  承运商对接方式（waybill_method / pickup_method / tracking_method）、集荷安排 pickup_schedule、公开查询页
+#             tracking_url_template、自动签收天数 auto_sign_days 不合法，或所选方式现在不可选（api 要在线对接已启用且插件
+#             支持；file 第二期）：field = 字段名（pickup_schedule.weekdays 等）
+# 16136  400  手工完成发货的 shipped_at（实际交承运商的时刻）晚于现在：field shipped_at（格式不对为 16050）
 # 16117  409  单证排不下：某块文字比一页还高（实际是收件人各字段都很长，如各约 240 个 CJK 字符），reportlab LayoutError。
 #             不签发、不作废旧单证，请缩短收件人信息：details {document: 'CI' | 'PL', reason: 'LAYOUT_OVERFLOW'}
 #

@@ -20,7 +20,19 @@ class Carrier(db.Model):
         
         # 数据完整性约束（借鉴网页3的模型变换思想）
         db.UniqueConstraint('company_id', 'name', name='uq_company_carrier'),
+        # 对接方式（doc/shipping-flow.md §2）
+        db.CheckConstraint("waybill_method IN ('api','file','manual')", name='chk_carrier_waybill_method'),
+        db.CheckConstraint("pickup_method IN ('api','manual','scheduled','dropoff','none')",
+                           name='chk_carrier_pickup_method'),
+        db.CheckConstraint("tracking_method IN ('api','link','none')", name='chk_carrier_tracking_method'),
+        db.CheckConstraint('auto_sign_days IS NULL OR (auto_sign_days >= 1 AND auto_sign_days <= 90)',
+                           name='chk_carrier_auto_sign_days'),
     )
+
+    # 每项能力的对接方式（取值说明与校验见 warehouse/carrier/methods.py）
+    WAYBILL_METHODS = ('api', 'file', 'manual')
+    PICKUP_METHODS = ('api', 'manual', 'scheduled', 'dropoff', 'none')
+    TRACKING_METHODS = ('api', 'link', 'none')
 
     id = db.Column(db.Integer, primary_key=True)
     name = db.Column(
@@ -62,6 +74,35 @@ class Carrier(db.Model):
         db.Boolean, 
         default=True,
         info={'description': '启用状态（默认激活）'}
+    )
+    waybill_method = db.Column(
+        db.String(10), nullable=False, default='manual', server_default='manual',
+        info={'description': '运单的对接方式：api（插件建单）/ file（文件导出导入，第二期）/ manual（手填运单号）'}
+    )
+    pickup_method = db.Column(
+        db.String(10), nullable=False, default='none', server_default='none',
+        info={'description': '揽收的对接方式：api（插件预约）/ manual（约好后记一笔）/ scheduled（定期集荷）/ '
+                             'dropoff（自送网点）/ none（不管揽收）'}
+    )
+    pickup_schedule = db.Column(
+        db.JSON, nullable=True,
+        info={'description': 'scheduled 时的集荷安排 {weekdays: [1..7]（ISO，1 = 周一）, ready_time, close_time}'}
+    )
+    pickup_contact = db.Column(
+        db.String(255), nullable=True,
+        info={'description': '约揽收的电话 / 网址 / 说明（manual 时显示）'}
+    )
+    tracking_method = db.Column(
+        db.String(10), nullable=False, default='link', server_default='link',
+        info={'description': '跟踪的对接方式：api（插件定时查）/ link（只给公开查询页链接）/ none'}
+    )
+    tracking_url_template = db.Column(
+        db.String(500), nullable=True,
+        info={'description': '公开查询页，{tracking_number} 占位；为空用插件内置的'}
+    )
+    auto_sign_days = db.Column(
+        db.Integer, nullable=True,
+        info={'description': '交承运商后这么多天（1–90）还没签收、且没有 API 跟踪时自动视为签收；空 = 关'}
     )
     company_id = db.Column(
         db.Integer, 

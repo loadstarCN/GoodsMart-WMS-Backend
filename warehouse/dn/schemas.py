@@ -6,6 +6,7 @@ from warehouse.goods.schemas import goods_simple_model as goods_model
 from warehouse.carrier.schemas import carrier_simple_model,carrier_model
 from warehouse.recipient.schemas import recipient_base_model,recipient_model
 from warehouse.warehouse.schemas import warehouse_simple_model,warehouse_model
+from warehouse.shipping.stage import STAGES, shipping_of
 from .models import DN, DNDocument, _user_ref
 
 # 定义 DN 命名空间（类似于 ASN 的 api_ns）
@@ -267,9 +268,31 @@ dn_pagination_parser.add_argument('created_by', type=int, help='Filter by creato
 dn_pagination_parser.add_argument('is_active', type=inputs.boolean, help='Filter by DN active status')
 dn_pagination_parser.add_argument('warehouse_id', type=int, help='Filter by warehouse ID')
 dn_pagination_parser.add_argument('keyword', type=str, help='Keyword search')
+dn_pagination_parser.add_argument('shipping_stage', type=str, choices=STAGES, location='args',
+                                  help='Filter by shipping stage (same definition as GET /dn/<id>/shipping-flow stage)')
 
-# 8) DN 分页模型
-dn_pagination_model = create_pagination_model(api_ns, dn_base_model)
+
+def _list_shipping(dn) -> dict:
+    """列表一行的发货阶段 / 承运商 / 运单号：列表接口预先整页查好挂在 _shipping 上，没挂的单独查"""
+    shipping = getattr(dn, '_shipping', None)
+    if shipping is None:
+        shipping = shipping_of(dn.id) or {}
+    return shipping
+
+
+# 8) DN 分页模型（列表行另带发货阶段，见 warehouse/shipping/stage.py）
+dn_list_model = api_ns.inherit('DNListItem', dn_base_model, {
+    'shipping_stage': fields.String(
+        readOnly=True, enum=list(STAGES), attribute=lambda x: _list_shipping(x).get('stage'),
+        description='preparing / awaiting_waybill / awaiting_pickup / awaiting_handover / in_transit / exception / '
+                    'delivered / closed'),
+    'shipping': fields.Raw(
+        readOnly=True,
+        attribute=lambda x: {k: _list_shipping(x).get(k) for k in ('carrier_name', 'tracking_number')},
+        description='{carrier_name, tracking_number}: carrier of the current delivery task (else of the DN) and the '
+                    'tracking number of the active waybill (else of the delivery task)'),
+})
+dn_pagination_model = create_pagination_model(api_ns, dn_list_model)
 
 dn_monthly_stats_parser =  reqparse.RequestParser()
 dn_monthly_stats_parser.add_argument('months', type=int, help='Number of months to look back', default=6)

@@ -5,7 +5,16 @@ from system.user.schemas import user_simple_model as original_user_model
 from warehouse.recipient.schemas import recipient_model
 from warehouse.carrier.schemas import carrier_simple_model as carrier_model
 from warehouse.dn.schemas import dn_model
+from warehouse.shipping.stage import STAGES, shipping_of
 from .models import DeliveryTask
+
+
+def _list_stage(task):
+    """列表一行的 DN 发货阶段：列表接口预先整页查好挂在 _shipping 上，没挂的单独查"""
+    shipping = getattr(task, '_shipping', None)
+    if shipping is None:
+        shipping = shipping_of(task.dn_id) or {}
+    return shipping.get('stage')
 
 api_ns = Namespace(
     'delivery',
@@ -69,8 +78,16 @@ delivery_task_base_fields = {
     'created_at': fields.DateTime(readonly=True,description='Creation time'),
     'updated_at': fields.DateTime(readonly=True,description='Last update time'),
     'started_at': fields.DateTime(description='Delivery start time'),
-    'completed_at': fields.DateTime(description='Delivery completion time'),
+    'completed_at': fields.DateTime(description='Delivery completion time (when it was handed over to the carrier)'),
     'signed_at': fields.DateTime(description='Delivery sign time (if applicable)'),
+    'completed_source': fields.String(
+        readOnly=True, enum=list(DeliveryTask.EVENT_SOURCES),
+        description='Who completed the delivery: warehouse (by hand) / carrier (carrier tracking); null = old data '
+                    '(warehouse)'),
+    'signed_source': fields.String(
+        readOnly=True, enum=list(DeliveryTask.EVENT_SOURCES),
+        description='Who signed it: warehouse (by hand) / carrier (carrier tracking) / rule (carrier auto_sign_days); '
+                    'null = old data (warehouse)'),
     'creator': fields.Nested(user_model,readonly=True, description='Details of the creator'),
 }
 delivery_task_base_model = api_ns.model('DeliveryTaskBase', delivery_task_base_fields)
@@ -111,6 +128,9 @@ delivery_task_complete_input_model = api_ns.model('DeliveryTaskCompleteInput', {
         enum=DeliveryTask.DELIVERY_TASK_TRANSPORTATION_MODES
     ),
     'remark': fields.String(description='Delivery remarks'),
+    'shipped_at': fields.DateTime(
+        description='When it was actually handed over to the carrier (ISO 8601; default now; not in the future → '
+                    'otherwise 400 16136). Completion time, actual shipping date and dn.delivered shipped_at use it'),
 })
 
 delivery_task_signed_input_model = api_ns.model('DeliveryTaskSignedInput', {
@@ -138,9 +158,14 @@ delivery_pagination_parser.add_argument('warehouse_id', type=int, help='Filter b
 delivery_pagination_parser.add_argument('keyword', type=str, help='Keyword search')
 
 # ------------------------------------------------------------------------------
-# 7. 分页模型: 使用基础模型构建
+# 7. 分页模型: 使用基础模型构建（列表行另带 DN 的发货阶段，见 warehouse/shipping/stage.py）
 # ------------------------------------------------------------------------------
-delivery_pagination_model = create_pagination_model(api_ns, delivery_task_base_model)
+delivery_task_list_model = api_ns.inherit('DeliveryTaskListItem', delivery_task_base_model, {
+    'shipping_stage': fields.String(
+        readOnly=True, enum=list(STAGES), attribute=lambda x: _list_stage(x),
+        description='Shipping stage of the DN (same definition as GET /warehouse/dn/<id>/shipping-flow stage)'),
+})
+delivery_pagination_model = create_pagination_model(api_ns, delivery_task_list_model)
 # ------------------------------------------------------------------------------
 delivery_monthly_stats_parser =  reqparse.RequestParser()
 delivery_monthly_stats_parser.add_argument('months', type=int, help='Number of months to look back', default=6)

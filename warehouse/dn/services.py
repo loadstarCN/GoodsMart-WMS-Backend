@@ -358,6 +358,10 @@ class DNService:
             query = query.filter(DN.expected_shipping_date >= filters['expected_shipping_date'])
         if filters.get('created_by'):
             query = query.filter(DN.created_by == filters['created_by'])
+        if filters.get('shipping_stage'):
+            # 发货阶段：与流程汇总接口的 stage 同一个 SQL 表达式（warehouse/shipping/stage.py）
+            from warehouse.shipping.stage import stage_expression
+            query = query.filter(stage_expression() == filters['shipping_stage'])
 
         # 如果 filters 中没有 is_active 或其值为 None，则只返回 is_active=True
         if 'is_active' not in filters or filters['is_active'] is None:
@@ -1025,6 +1029,8 @@ class DNService:
             'tracking_number': signed_task.tracking_number if signed_task else None,
             'shipped_at': event_time(dn.delivered_at),
             'signed_at': event_time(dn.completed_at),
+            # 签收的来源：warehouse（手工）/ carrier（承运商跟踪自动）/ rule（自动视为签收）
+            'signed_source': (signed_task.signed_source or 'warehouse') if signed_task else 'warehouse',
             'details': [
                 {
                     'goods_code': detail.goods.code,
@@ -1129,11 +1135,13 @@ class DNService:
 
     @staticmethod
     def _open_carrier_shipment(dn: DN):
-        """未结束的承运商自动运单（模型 OPEN_STATUSES：进行中 / 有效 / 结果不明 / 取消中）"""
+        """未结束的承运商自动运单（插件建的 source = api；模型 OPEN_STATUSES：进行中 / 有效 / 结果不明 / 取消中）。
+        手填 / 文件导回的运单不在承运商那边占着什么，不拦取消 DN（取消时一并作废）。"""
         from .models import DNCarrierShipment
         return (
             DNCarrierShipment.query
-            .filter(DNCarrierShipment.dn_id == dn.id, DNCarrierShipment.status.in_(DNCarrierShipment.OPEN_STATUSES))
+            .filter(DNCarrierShipment.dn_id == dn.id, DNCarrierShipment.source == 'api',
+                    DNCarrierShipment.status.in_(DNCarrierShipment.OPEN_STATUSES))
             .order_by(DNCarrierShipment.id.desc())
             .first()
         )
@@ -1147,7 +1155,8 @@ class DNService:
         - 库存：picked → 已拣量从 picked_stock 退回 sorted_stock（打包任务进行中也一样，打包未完成不动库存）；
           packed → 已打包量从 packed_stock 退回 sorted_stock（少打包的差额在打包完成时已退回）。total_stock 不变
         - 拣货 / 打包 / 发货任务一并停用（之后对它们的任何操作 → 409 16088）
-        - 当前有效（issued）的出口单证一并作废（void_reason: dn_cancelled）
+        - 当前有效（issued）的出口单证一并作废（void_reason: dn_cancelled）；手填的运单记录（manual）cancelled
+          （reason dn_cancelled）
         - DN 改为 closed，重算 dn_stock。DN 明细上的已拣 / 已打包量保留为历史
         修复前允许「拣货 0 件完成」留下的 picked DN 也走这里：没有库存要退，只停用任务、关闭单据
         """
@@ -1190,6 +1199,8 @@ class DNService:
             document.status = 'void'
             document.voided_at = now
             document.void_reason = 'dn_cancelled'
+        from warehouse.shipping.waybills import close_manual
+        close_manual(dn, 'dn_cancelled')
 
         dn = DNService._update_dn_status(dn, "closed")
         for detail in dn.details:

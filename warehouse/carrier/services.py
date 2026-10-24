@@ -1,6 +1,7 @@
 from extensions.db import *
 from extensions.transaction import transactional
 from warehouse.common.references import ensure_not_referenced
+from .methods import parse_settings
 from .models import Carrier
 
 
@@ -49,8 +50,11 @@ class CarrierService:
     @transactional
     def create_carrier(data: dict, created_by_id: int) -> Carrier:
         """
-        创建新 Carrier
+        创建新 Carrier。对接方式等（waybill_method / pickup_method / tracking_method / pickup_schedule /
+        pickup_contact / tracking_url_template / auto_sign_days）按 warehouse/carrier/methods.py 校验（400 16135）；
+        新建时还没有在线对接，api 方式不能选。
         """
+        methods = parse_settings(data, None)
         new_carrier = Carrier(
             name=data['name'],
             code=data.get('code'),
@@ -61,7 +65,8 @@ class CarrierService:
             contact=data.get('contact'),
             company_id=data['company_id'],
             is_active=data.get('is_active', True),
-            created_by=created_by_id
+            created_by=created_by_id,
+            **methods,
         )
         db.session.add(new_carrier)
         # db.session.commit()
@@ -71,9 +76,11 @@ class CarrierService:
     @transactional
     def update_carrier(carrier_id: int, data: dict) -> Carrier:
         """
-        更新 Carrier 信息
+        更新 Carrier 信息。对接方式等字段只改请求里带了的；改成不可选的方式（如对接没启用却选 api）→ 400 16135
+        （field 指明哪一项），没改的方式不重新校验。
         """
         carrier = CarrierService.get_carrier(carrier_id)
+        methods = parse_settings(data, carrier)
 
         carrier.name = data.get('name', carrier.name)
         carrier.code = data.get('code', carrier.code)
@@ -83,6 +90,8 @@ class CarrierService:
         carrier.email = data.get('email', carrier.email)
         carrier.contact = data.get('contact', carrier.contact)
         carrier.is_active = data.get('is_active', carrier.is_active)
+        for field, value in methods.items():
+            setattr(carrier, field, value)
         # company_id 不可通过更新修改（归属固定）
 
         # db.session.commit()

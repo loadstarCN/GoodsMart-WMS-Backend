@@ -3,8 +3,8 @@
 - 报关快照（dn_customs）：对接方随 DN 带来的发票号、贸易条件、收件人、运费（及可选的运送保险费、
   运送申告价额）和每个商品的 HS / 英文品名 / 成交单价。
   结构错误拒绝（16063 / 16064），内容不全照收，缺什么由 problems 列出。
-- 装箱（dn_packages）：箱号 / 毛重 / 外箱尺寸，DN 为 picked / packed 时整体替换；
-  已签发单证后改箱子，现有单证自动作废。
+- 装箱（dn_packages）：箱号 / 毛重 / 外箱尺寸，DN 为 picked / packed 时整体替换。箱子归发货（国内件也录），
+  不要求报关快照；有报关快照且已签发单证时改箱子，现有单证自动作废。
 - 单证（dn_documents）：条件齐全时生成 CI + PL 的 PDF 并存库（生成即定稿）。
   单证数据不变 → 返回现有版本；变了 → 作废旧版、版本 +1。
   同表里的承运商面单（shipping_label，见 carrier_services.py）不参与这里的签发 / 作废 / 发货拦截。
@@ -16,7 +16,6 @@ import json
 import re
 from datetime import datetime
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
-from zoneinfo import ZoneInfo
 
 from flask import current_app
 
@@ -24,7 +23,9 @@ from extensions.db import db
 from extensions.error import BadRequestException, ConflictException, NotFoundException
 from extensions.transaction import transactional
 from warehouse.common.countries import COUNTRY_NAMES_EN, is_valid_country, normalize_country
-from warehouse.common.locks import lock_row
+from warehouse.shipping.common import (  # noqa: F401  LOCKED_DN_STATUSES：旧的引用位置
+    LOCKED_DN_STATUSES, assert_not_locked, current_delivery_task, document_timezone, is_locked, lock_dn,
+)
 from .customs_signature import SignatureUnavailable, company_signature_policy, load_company_signature
 from .models import DN, DNCustoms, DNPackage, DNDocument
 
@@ -32,7 +33,6 @@ DOC_CI = 'commercial_invoice'
 DOC_PL = 'packing_list'
 DOC_TYPES = (DOC_CI, DOC_PL)
 
-LOCKED_DN_STATUSES = ('delivered', 'completed')       # 发货后锁定
 PACKAGE_EDITABLE_STATUSES = ('picked', 'packed')      # 可录箱子的 DN 状态
 MAX_PACKAGES = 99
 MAX_CUSTOMS_LINES = 500
@@ -233,13 +233,8 @@ def _country_label(code) -> str:
     return f"{code} - {name}" if name else (code or '')
 
 
-def _document_timezone():
-    tz_name = current_app.config.get('DOCUMENT_TIMEZONE') or 'Asia/Tokyo'
-    try:
-        return ZoneInfo(tz_name)
-    except Exception:  # noqa: BLE001 — 配错时区不能让出单证 500
-        current_app.logger.warning("Invalid DOCUMENT_TIMEZONE %r, falling back to UTC", tz_name)
-        return ZoneInfo('UTC')
+# 业务日期时区搬到了 warehouse/shipping/common.py（document_timezone）；保留旧名给已有的引用方
+_document_timezone = document_timezone
 
 
 # ------------------------------------------------------------------
@@ -488,22 +483,20 @@ class CustomsService:
     # 基础
     # ------------------------------------------------------------------
 
+    # DN 加锁 / 发货后锁定 / 当前发货任务的实现在 warehouse/shipping/common.py，这里是薄包装（各模块与测试照用这些名字）
+
     @staticmethod
     def _lock(dn: DN) -> DN:
-        """对 DN 行加锁（只查主键，避免 joined eager load 撞 PostgreSQL 的 FOR UPDATE 限制）并刷新状态。
-        与 DN / 出库任务状态转换共用 lock_row：同一把 DN 行锁，先 DN 后任务。"""
-        return lock_row(dn)
+        """对 DN 行加锁并刷新状态（warehouse.shipping.common.lock_dn）"""
+        return lock_dn(dn)
 
     @staticmethod
     def is_locked(dn: DN) -> bool:
-        return dn.status in LOCKED_DN_STATUSES
+        return is_locked(dn)
 
     @staticmethod
     def _assert_not_locked(dn: DN):
-        if CustomsService.is_locked(dn):
-            raise ConflictException(
-                f"DN {dn.id} has been shipped; customs data, packages and documents are locked.", 16065
-            )
+        assert_not_locked(dn)
 
     @staticmethod
     def goods_codes_by_id(goods_ids) -> dict:
@@ -624,8 +617,9 @@ class CustomsService:
     @staticmethod
     @transactional
     def replace_packages(dn: DN, raw, user_id) -> dict:
-        """整体替换箱子。DN 须为 picked / packed（已发货 16065，其它 16067）；
-        内容有变且已签发单证 → 单证作废（packages_changed）。"""
+        """整体替换箱子（国内件也可以，不要求报关快照）。DN 须为 picked / packed（已发货 16065，其它 16067）；
+        内容有变、有报关快照且已签发单证 → 单证作废（packages_changed）。
+        有未结束的插件运单（source = api）时不能改（16076）；手填运单号不拦。"""
         dn = CustomsService._lock(dn)
         CustomsService._assert_not_locked(dn)
         if dn.status not in PACKAGE_EDITABLE_STATUSES:
@@ -651,7 +645,8 @@ class CustomsService:
         db.session.flush()
         db.session.expire(dn, ['packages'])
 
-        voided = CustomsService._void_current_documents(dn, 'packages_changed')
+        voided = (CustomsService._void_current_documents(dn, 'packages_changed')
+                  if dn.customs is not None else [])
         return {'packages': CustomsService.packages_payload(dn), 'voided_documents': voided}
 
     # ------------------------------------------------------------------
@@ -738,13 +733,8 @@ class CustomsService:
 
     @staticmethod
     def _delivery_task(dn: DN):
-        from warehouse.delivery.models import DeliveryTask
-        return (
-            dn.delivery_tasks
-            .filter(DeliveryTask.is_active.is_(True))
-            .order_by(DeliveryTask.id.desc())
-            .first()
-        )
+        """当前发货任务（warehouse.shipping.common.current_delivery_task）"""
+        return current_delivery_task(dn)
 
     @staticmethod
     def _content_hashes(dn: DN, data: dict) -> set:
@@ -1246,15 +1236,13 @@ class CustomsService:
 
     @staticmethod
     def assert_ready_to_ship(dn: DN) -> None:
-        """完成发货前检查。国内件不检查。
+        """完成发货前检查（国内 / 跨境一样，按运单记录判断，不看有没有报关快照）。
 
         完成发货只是记下货已经交出去，单证不查（没出 / 过期都放行，以前的 16069 不再出现；过期只在报关卡片上提示）。
-        海外件（带报关快照）只看自动运单：进行中 / 结果不明 / 正在取消或取消结果不明（pending / unknown / cancelling）
-        → 409 16079（details.unresolved）：FedEx 上可能有运单、或面单可能已作废，先处理（取消 / 确认作废）再发货。
-        请求里带不带运单号都拦（带了的在 assert_tracking_matches 已拦）。
+        只看插件建的运单（source = api）：进行中 / 结果不明 / 正在取消或取消结果不明（pending / unknown / cancelling）
+        → 409 16079（details.unresolved）：承运商那边可能有运单、或面单可能已作废，先处理（取消 / 确认作废）再发货。
+        请求里带不带运单号都拦（带了的在 assert_tracking_matches 已拦）。手填的运单号（manual）不拦。
         """
-        if dn.customs is None:
-            return
         from .carrier_services import CarrierShipmentService
         unresolved = CarrierShipmentService.unresolved_shipment(dn)
         if unresolved is not None:

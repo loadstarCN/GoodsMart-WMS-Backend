@@ -199,6 +199,8 @@ GoodsMart-WMS-Backend/
 - 拣货
 - 打包
 - 发货（含运单号；承运商设了在线对接时可自动建运单，内置 FedEx）
+- 每张 DN 的发货流程（`GET /warehouse/dn/<id>/shipping-flow`）：国内 / 跨境、承运商对接方式（API / 手工）、手填运单与手工揽收、
+  自动签收——见「发货流程」
 - 代收付款管理
 
 ### 库存运营
@@ -225,8 +227,8 @@ GoodsMart-WMS-Backend/
   两个请求商品顺序相反时不再死锁；同一新商品第一次被并发建 ASN、同一库位第一次被并发上架 / 移入时不再 500。
 - DN 取消（`PUT /warehouse/dn/<id>/cancel/`）：`pending` 等同关闭；`in_progress` 须拣货尚未开始（否则 409 `16053`）；
   `picked` / `packed`（未发货）可取消，已拣 / 已打包的货退回待上架（`sorted_stock`，`total_stock` 不变），拣货 / 打包 / 发货任务停用，
-  有效的出口单证作废（`void_reason: dn_cancelled`）；有未结束的承运商自动运单（进行中 / 有效 / 结果不明 / 取消中）→ 409 `16110`，
-  先在单证卡片取消运单；`delivered` / `completed` / `closed` → 409 `16052`。`in_progress` / `picked` / `packed` 取消后推 `dn.cancelled`。
+  有效的出口单证作废（`void_reason: dn_cancelled`）；有未结束的承运商自动运单（`source: api`；进行中 / 有效 / 结果不明 / 取消中）
+  → 409 `16110`，先在单证卡片取消运单；手填的运单随 DN 一起作废（`reason: dn_cancelled`）；`delivered` / `completed` / `closed` → 409 `16052`。`in_progress` / `picked` / `packed` 取消后推 `dn.cancelled`。
 - 调整单取消（`PUT /warehouse/adjustment/<id>/cancel/`，需要 `adjustment_approve`）：`pending` / `approved` 可取消，库存不动；
   取消后 `is_active=false`、`status` 保持原值（`operator_id` 为取消人），之后的一切操作 → 409 `16111`；已完成 → 409 `16112`。
   由盘点单生成的调整单取消后，同一盘点单可以重新生成。完成调整时：正向调整的库位还没有该商品的记录 → 新建（库位须启用）；
@@ -255,7 +257,7 @@ WMS 通过 Webhook 向外部系统推送事件通知，使用 HMAC-SHA256 签名
 | `dn.packed` | DN 打包完成（含各商品计划 / 已拣 / 已打包量、打包完成时刻 `packed_at`） |
 | `dn.delivered` | DN 已发货（含运单号、发货时刻 `shipped_at`） |
 | `dn.tracking_updated` | 自动运单的承运商跟踪有变化（状态 / 扫描记录，完整的最新结果，见「跟踪」） |
-| `dn.completed` | DN 完成（含运单号、发货时刻 `shipped_at`、签收时刻 `signed_at`） |
+| `dn.completed` | DN 完成（含运单号、发货时刻 `shipped_at`、签收时刻 `signed_at`、签收来源 `signed_source`：`warehouse` / `carrier` / `rule`） |
 | `dn.cancelled` | 开始处理后（`in_progress` / `picked` / `packed`）的 DN 被取消（含 `previous_status` 与各商品已拣 / 已打包量） |
 | `goods.spec_updated` | 商品重量 / 尺寸 / 原产国变更（按公司广播，需订阅，见下文） |
 
@@ -421,9 +423,10 @@ Authorization: Bearer <token>
 ### 箱子
 
 `GET / PUT /warehouse/dn/<id>/packages`（读：`dn_read` 或 `packing_read`；写：`packing_edit`），
-DN 须为 `picked` 或 `packed`（否则 409 `16067`）。请求体 `{"packages": [{package_no, gross_weight_kg, length_mm, width_mm, height_mm, remark}]}`，
+DN 须为 `picked` 或 `packed`（否则 409 `16067`）；箱子归发货，国内件（没有报关快照）也录。请求体 `{"packages": [{package_no, gross_weight_kg, length_mm, width_mm, height_mm, remark}]}`，
 返回 `{packages, voided_documents}`。1–99 箱，编号从 1 连续（缺省自动编）；毛重 0.01–999.999 kg（三位小数）；
-长宽高 1–3000 mm 整数；不合法 400 `16066`。已出单证后改箱子 → 现有单证作废（`void_reason: packages_changed`）。
+长宽高 1–3000 mm 整数；不合法 400 `16066`。有报关快照且已出单证时改箱子 → 现有单证作废（`void_reason: packages_changed`）。
+有未结束的自动运单（`source: api`）时不能改（409 `16076`）；手填的运单号不拦。
 
 ### 单证
 
@@ -456,14 +459,16 @@ DN 须为 `picked` 或 `packed`（否则 409 `16067`）。请求体 `{"packages"
   （国内件也一样）。完成发货先锁 DN 行，与改箱子 / 改快照 / 出单证串行。
 - 完成发货只是记下货已经交出去，不查单证：没有 CI / PL、或单证已过期（箱子 / 快照 / 出口资料改过没重出）都放行
   （以前的 `16069` 不再出现）；过期只在报关卡片 / 海外发货步骤里提示（`GET /dn/<id>/customs` 的 `documents_outdated`）。
-- DN 的自动运单进行中 / 结果不明，或正在取消 / 取消结果不明（`pending` / `unknown` / `cancelling`）时，带不带运单号都不能
-  完成发货 → 409 `16079`（`details.unresolved`），先处理（取消 / 确认作废）。
+- DN（海外 / 国内一样）的自动运单进行中 / 结果不明，或正在取消 / 取消结果不明（`pending` / `unknown` / `cancelling`）时，
+  带不带运单号都不能完成发货 → 409 `16079`（`details.unresolved`），先处理（取消 / 确认作废）。
+- 完成发货可带 `shipped_at`（实际交承运商的时刻，ISO 8601，默认现在；晚于现在 → 400 `16136`），记 `completed_source: warehouse`
+  （见「发货流程」）。
 - 单证不印运单号 / 承运商，完成发货时填的运单号、承运商不再与 CI 比对（原来的 `16080` / `16092` 已不再使用）；
   有有效自动运单时运单号 / 承运商的锁定见「承运商对接」（`16078`）。
 - 发货任务只在打包完成时自动生成，没有手工新建接口。一张 DN 同时只允许一条未完成（`pending` / `in_progress`）的有效发货任务：
   已有（例如修复前手工建的存量任务）→ 复用那条，不再生成第二条。
-- 海外 DN 的单证 / 自动运单只认当前发货任务（最新的有效任务）：对别的任务完成发货 / 保存运单号 / 修改 → 409 `16091`
-  `details {delivery_task_id, current_status}`。
+- 有报关快照或有运单记录（任一来源）的 DN，单证 / 运单只认当前发货任务（最新的有效任务）：对别的任务完成发货 / 保存运单号 /
+  修改 → 409 `16091` `details {delivery_task_id, current_status}`。
 - `dn.delivered` 的 `tracking_number` 取被完成的那条任务的运单号。
 - DN 发货（`delivered` / `completed`）后，报关快照、箱子、单证全部锁定 → 409 `16065`。
 - 海外 DN 的 `dn.delivered` 追加 `customs_documents`（含 `download_path`）、`packages`、
@@ -477,14 +482,180 @@ DN 须为 `picked` 或 `packed`（否则 409 `16067`）。请求体 `{"packages"
 | `CUSTOMS_SIGNATURE_COMPANY_ID`、`CUSTOMS_SIGNATURE_FROM_DN_ID`、`CUSTOMS_SIGNATURE_SIGNATORY_NAME`、`CUSTOMS_SIGNATURE_SIGNATORY_TITLE`、`CUSTOMS_SIGNATURE_PATH` | （不设） | 可选的出口公司 ID、首个启用签名的 DN ID、签署人姓名和职务，以及授权签名 PNG 的绝对路径；五项须同时配置。图片须保存在源码目录之外、仅后端进程可读。较早的 DN 维持原签署人和未签名 CI；启用后的 DN 更换签名图片会使已签发单证显示为过期。 |
 | `CUSTOMS_PDF_FONT_PATH` | （不设） | 单证用的 TrueType 字体（`.ttf`，或 `.ttc` 的第 1 个字体；不支持 CFF 轮廓的 OTF，如 Noto Sans CJK）。设了就用它印全部文字，字体子集嵌入 PDF；要让收件人的日文等也嵌入，选带这些字形的字体（如 IPAexGothic）。字体里没有的字符、以及不设时 Helvetica 印不出的字符，退回 reportlab 内置的日文 CID 字体（不嵌入，依赖阅读器的字体） |
 
+## 发货流程（国内 / 跨境）
+
+一张出库单一条流程：下单 → 拣货 → 打包 →（要报关时）报关单证 → 运单 → 揽收 → 交承运商 → 运输中 → 签收。设计见
+`doc/shipping-flow.md`；第一期（本版本）做了承运商对接方式、国内 / 跨境判断、手填运单与手工揽收、来源与实际时刻、按规则
+自动签收和流程汇总接口。设计不假设国家、承运商或是否签了 API 合同：没有 API 的承运商也能手工走完整个流程。
+
+### 国内 / 跨境（route）
+
+`warehouse/shipping/route.py` 按 DN 判断：
+
+- 发货国 `origin_country` = 仓库的 `country_code`，没有用公司的。
+- 收件国 `destination_country` = 报关快照的收件国（`recipient_country`，没有用 `consignee.country`）→ 收件人的 `country`。
+- `international` = 发货国 ≠ 收件国（任一方未知按国内）。
+- `requires_customs` = 跨境且不在同一关税同盟（`warehouse/common/customs_unions.py`，默认登记 EU）；**有报关快照的 DN
+  一律要报关**（来源系统明确给了报关数据）。
+- 出口单证（CI / PL）、交给承运商的 commodities / invoice、贸易单证 / ETD、建单后重签是报关**扩展**
+  （`warehouse/dn/customs_extension.py`），只在 `requires_customs` 且有报关快照时参与；国内件不碰报关。
+- 箱子（`PUT /warehouse/dn/<id>/packages`）归发货：不要求报关快照（国内件也录箱子）；只有有报关快照时改箱子才作废 CI / PL。
+
+### 承运商对接方式
+
+承运商每项能力各选一种对接方式（`carriers` 新增列，迁移 `55e9fa27fb9e`）：
+
+| 字段 | 取值（默认） | 说明 |
+|------|--------------|------|
+| `waybill_method` | `api` / `file`（第二期）/ `manual`（`manual`） | `api`：插件建单；`manual`：手填 / 扫码运单号，面单在承运商网站或软件打 |
+| `pickup_method` | `api` / `manual` / `scheduled` / `dropoff` / `none`（`none`） | `api`：插件预约；`manual`：电话 / 网站约好后在 WMS 记一笔；`scheduled`：定期集荷；`dropoff`：自送网点；`none`：不管揽收 |
+| `pickup_schedule` | json 或 `null` | `scheduled` 时：`{weekdays: [1..7]（ISO，1 = 周一）, ready_time: "HH:MM", close_time: "HH:MM"}` |
+| `pickup_contact` | ≤ 255 字 | 约揽收的电话 / 网址 / 说明（`manual` 时显示） |
+| `tracking_method` | `api` / `link` / `none`（`link`） | `api`：插件定时查（揽收后自动交承运商、送达后自动签收）；`link`：只给公开查询页链接 |
+| `tracking_url_template` | 带 `{tracking_number}` 的 URL，≤ 500 | 公开查询页；为空用插件内置的（FedEx：`https://www.fedex.com/fedextrack/?trknbr={tracking_number}`） |
+| `auto_sign_days` | 1–90 或 `null`（关） | 交承运商后这么多天还没签收、且运单没有 API 跟踪时自动视为签收 |
+
+- `GET /warehouse/carrier/`（列表）与 `GET / PUT /warehouse/carrier/<id>` 返回这些字段和只读的
+  `available_methods: {waybill: [...], pickup: [...], tracking: [...]}`：`api` 只在承运商的在线对接已启用、且插件声明了
+  对应能力（`supports_waybill` / `supports_pickup` / `supports_tracking`）时出现；`file` 暂不可选。
+- `POST` / `PUT` 校验：取值不合法、方式现在不可选、`pickup_schedule` / `tracking_url_template`（须为
+  `http(s)://…{tracking_number}…`）/ `auto_sign_days` 不合法 → 400 `16135`（`field` 指明哪一项，如 `waybill_method`、
+  `pickup_schedule.weekdays`）。没改的方式不重新校验（对接停用后照样能保存承运商的其它资料）。
+- 设置在线对接时自动跟上：新建 / 重新启用 / 换插件后，还是默认值的方式改成 `api`（插件支持的）；删掉对接（或换成不支持的插件）
+  时 `api` 退回默认值。
+- 迁移回填：有启用的 FedEx 对接的承运商三项都设 `api`（与升级前一致）；FedEx 对接停用了的只设 `tracking_method: api`
+  （已建的运单照旧跟到底）。第三方插件不回填，升级后在承运商页选。
+- 插件预约揽收要求 `pickup_method: api`（否则 blocker `PICKUP_METHOD_NOT_API`，409 `16130`）。插件建运单只要求对接可用
+  （运单方式决定流程里先给哪个操作）。经 API 跟踪要求 `tracking_method: api`。
+
+### 运单：插件 / 手填 / 文件
+
+`dn_carrier_shipments` 现在记一张 DN 的所有运单，`source` 区分来源：`api`（插件建的）、`manual`（手填 / 扫码）、
+`file`（文件导出导入，第二期）。一张 DN 同一时刻仍至多一条未结束的运单记录（`pending` / `active` / `unknown` /
+`cancelling`，部分唯一索引，不分来源）。`carrier`（插件代码）改为可空；`carrier_data`（json）留给插件 / 文件模板。
+
+- 保存运单号（`PUT /warehouse/delivery/<task_id>/tracking`、`PUT /warehouse/delivery/<task_id>`、完成发货时带
+  `tracking_number`）同时写一条 `manual` 运单记录：`status: active`，`carrier_id` = 任务的承运商，`carrier` = 该承运商在线对接的
+  插件代码（没有对接为 `null`），`created_by` = 操作人。换号或换承运商 → 旧记录 `cancelled`（`reason: replaced`）+ 新记录
+  `active`；清空 → `cancelled`（`reason: cleared`）；同一个号码换了写法（空格 / 连字符）只更新写法。删掉带运单号的发货任务 →
+  `cleared`；取消 DN → `dn_cancelled`。都不调承运商。
+- **锁定规则只对 `api` 运单生效**（在承运商那边真实存在，换号要先取消）：`16078` / `16079`、`16076`（改箱子 / 报关数据）、
+  `16110`（取消 DN）、`16125`（删对接）以及运单接口只看 `source = api`。有未结束的 `api` 运单时不另写 `manual` 记录（运单号由它定）。
+- 发货任务上有手填运单号时插件建单照旧拦（`TRACKING_NUMBER_EXISTS`），先清空。
+- 原来只对海外 DN 的守卫改为按运单记录判断：任何 DN 的 `api` 运单进行中 / 结果不明 / 取消中都不能完成发货（409 `16079`）；
+  有报关快照**或**有运单记录的 DN 只能对当前发货任务完成发货 / 修改 / 存运单号（409 `16091`）。
+
+### 揽收：插件预约 / 手工记录
+
+- 揽收页（`GET /warehouse/dn/carrier-pickups`）列出 `pickup_method` 是 `api`（对接启用的在前）或 `manual` 的承运商，
+  以及所选承运商的有效运单（任一来源：`api` / `manual` / `file`，DN 未发货）。新增：`method`（`api` / `manual`）、
+  `can_record`、`carrier.pickup_method`、`carrier.pickup_contact`、`shipments[].source`、`pickups[].source`。
+- `POST /warehouse/dn/carrier-pickups/manual`（`packing_edit` / `delivery_edit`，请求头 `X-WAREHOUSE-ID`）记一笔电话 /
+  网站约好的揽收：
+
+```json
+{ "warehouse_id": 1, "carrier_id": 4, "shipment_ids": [201, 202], "pickup_date": "2026-10-27",
+  "ready_time": "13:00", "close_time": "17:00", "confirmation_code": "TEL-0425", "remarks": "Booked by phone" }
+→ 201 { "pickup": { "id": 9, "source": "manual", "status": "scheduled", "carrier": null, "carrier_id": 4, "...": "..." },
+        "alerts": [], "message": null }
+```
+
+  `carrier_id` 必填（揽收方式 `manual` 或 `api`：`api` 的承运商系统故障时也可以退回手工记）；`warehouse_id` 可带，须是当前仓库；
+  `confirmation_code` ≤ 40、`remarks` ≤ 100；日期 / 时间同预约（今天起 30 天内，最晚时间晚于准备好时间）。不合法 → 400
+  `16131`（`field`）；运单不能带 → 409 `16132`（原因同预约）。不调承运商；记录像预约一样占着所带运单。手工记录的
+  `POST …/carrier-pickups/<id>/cancel` 只改本地。
+
+### 跟踪任意运单号
+
+跟踪定时任务（见「跟踪」）跟所有 `active` 运单中：承运商 `tracking_method: api`、插件 `supports_tracking`，且运单是插件建的
+（`source = api`）或插件 `tracks_any_number`（FedEx：在 FedEx Ship Manager 建、手填进 WMS 的号码也跟）。「查到同号旧包裹」的
+判定基准：`api` 运单用建单时刻，`manual` / `file` 用 DN 创建时刻。这类手填运单也能用
+`POST /warehouse/dn/<id>/carrier-shipment/track` 手动刷新。
+
+### 实际时刻与来源
+
+- `PUT /warehouse/delivery/<task_id>/complete/` 可带 `shipped_at`（实际交承运商的时刻，ISO 8601，带不带时区偏移都行，默认现在）：
+  完成时间、实际发货日、DN 的 `delivered_at`、`dn.delivered` 的 `shipped_at` 都是它。格式不对 → 400 `16050`，晚于现在
+  （允许 5 分钟时钟误差）→ 400 `16136`（`field: shipped_at`）。
+- 发货任务记来源：`completed_source` / `signed_source` = `warehouse`（手工）/ `carrier`（承运商跟踪自动）/ `rule`（自动视为签收）；
+  `null` = 旧数据（按 `warehouse`）。发货任务接口都返回；`dn.completed` 带 `signed_source`。
+
+### 自动视为签收（规则）
+
+承运商设了 `auto_sign_days` 时，定时任务（每 `CARRIER_AUTO_SIGN_INTERVAL_MINUTES` 分钟，默认 60，`0` = 不跑）把满足条件的
+发货任务签收：DN 是 `delivered`、当前发货任务 `completed`、有效运单**没有**经 API 跟踪（口径同上）、完成时刻 + N 天已过。
+`signed_at` = 完成时刻 + N 天，`signed_source: rule`，操作人 = 运单建单人（没有用 DN 创建人）；走手工签收同一个逻辑（DN
+`completed`、推 `dn.completed`）。一张失败不影响别的。任何时候都可以手工确认签收（填实际时刻）。
+
+### 流程汇总接口
+
+`GET /warehouse/dn/<id>/shipping-flow`（`dn_read` / `packing_read` / `delivery_read`）：管理端和 PDA 都按它渲染，不各自推算状态：
+
+```json
+{
+  "dn_id": 163, "dn_status": "delivered", "order_number": "SHP-261015-37210", "warehouse_id": 2,
+  "route": {"origin_country": "JP", "destination_country": "AU", "international": true, "requires_customs": true},
+  "carrier": {"id": 4, "name": "FedEx", "code": "fedex", "integration": "fedex",
+              "methods": {"waybill": "api", "pickup": "api", "tracking": "api"},
+              "auto_sign_days": null, "tracking_url": "https://www.fedex.com/fedextrack/?trknbr=878978126644"},
+  "stage": "in_transit",
+  "steps": [
+    {"key": "ordered", "state": "done", "at": "2026-10-15T16:56:51+09:00", "source": "api", "summary": {...}, "actions": []},
+    {"key": "waybill", "state": "done", "at": "...", "source": "api",
+     "summary": {"tracking_number": "878978126644", "source": "api", "service": "...", "label_document_id": 9, "shipment": {...}},
+     "actions": [{"key": "print_label", "enabled": true, "document_id": 9}, {"key": "cancel_waybill", "enabled": false, "reason": "...", "reason_code": "CANNOT_CANCEL"}]},
+    "..."
+  ],
+  "problems": [{"code": "...", "level": "error", "message": "...", "step": "waybill"}],
+  "tasks": {"picking": [301], "packing": [302], "delivery": 126}
+}
+```
+
+- `warehouse_id`：DN 所属仓库（揽收按仓库约）。
+- `carrier`：当前发货任务的承运商（没有用 DN 的），都没有为 `null`；`integration` = 插件代码；`tracking_url` = 当前运单号的
+  公开查询页（没有运单号或 `tracking_method: none` 为 `null`）。
+- `steps[].key` 固定按顺序：`ordered`、`picking`、`packing`、`documents`、`waybill`、`pickup`、`handover`、`transit`、`delivered`。
+- `steps[].state`：`done` / `current`（流程走到这一步）/ `todo`（还没到）/ `warning`（要人处理：运单结果不明、单证过期、跟踪异常、
+  自动步骤被挡、揽收结果不明、揽收日已过……）/ `blocked`（走到了但被前面的问题挡着，如没有报关数据）/ `skipped`（不适用：
+  不报关的件的 `documents`、`pickup_method: none` 的 `pickup`、没有跟踪的 `transit`、DN 取消时没做的步骤）。
+- `steps[].at`：这一步实际发生的时刻（ISO 8601，带时区偏移）；`source`：`warehouse` / `carrier` / `rule` / `api`（下单来自来源系统；
+  `waybill` / `pickup` 步骤为经承运商插件建的运单 / 约的揽收）/ `system`。
+- 各步骤的 `summary`：`ordered` {order_number, dn_type, expected_shipping_date}；`picking` {task_ids, picked, planned}；
+  `packing` {task_ids, packed, planned, package_count, gross_weight_kg, packages[]}；`documents` {required, customs, version,
+  outdated, missing[], ready, documents[]（当前单证的元数据）}；`waybill` {method, tracking_number, source, service, service_name,
+  label_document_id, label_download_path, shipment（同 `carrier-shipment.shipment`，没有当前运单时为最近一张已取消的插件运单）,
+  unresolved, can_create, blockers[]}；`pickup` {method, pickup（揽收记录或 null）, contact, schedule}；`handover`
+  {delivery_task_id, actual_shipping_date}；`transit` {tracking（运单的跟踪结果或 null）, tracking_url, tracked_by_api}；
+  `delivered` {estimated_delivery, auto_sign_days, auto_sign_at}。
+- `actions[].key`：`create_waybill`、`enter_tracking`、`cancel_waybill`、`dismiss_waybill`、`print_label`、`book_pickup`、
+  `record_pickup`、`cancel_pickup`、`complete_shipping`、`refresh_tracking`、`open_tracking`、`sign`、`issue_documents`、
+  `edit_packages`（`export_file` / `import_numbers` 第二期）。`enabled: false` 时带 `reason`（英文）和翻译用的 `reason_code`（`DN_SHIPPED`、`NOT_PICKED`、`NOT_PACKED`、`NO_WAYBILL`、
+  `PICKUP_EXISTS`、`NO_OPEN_TASK`、`WAYBILL_UNRESOLVED`……见 `warehouse/shipping/flow.py` 的 `REASON_CODES`；也可能是建运单 /
+  预约揽收的拦截码或报关问题码）；部分操作带要操作的对象 id
+  （`delivery_task_id`、`pickup_id`、`document_id`、`url`）。界面按 key 接到已有接口。
+- `problems[]`：`{code, level: error | warning, message, step, …}`——报关问题、运单方式为 `api` 时建单的拦截原因、运单 / 揽收
+  结果不明、跟踪异常、自动步骤被挡。
+
+### 列表的发货阶段
+
+`stage`（以及 DN 列表的 `shipping_stage`）用 SQL 判定（`warehouse/shipping/stage.py`），流程接口与列表同一口径：`closed`（DN
+关闭 / 取消）、`delivered`（已签收）、`preparing`（待处理 / 拣货中 / 已拣货）、`exception`（插件运单结果不明、跟踪异常或自动步骤
+被挡、揽收结果不明）、`in_transit`（已交承运商、未签收），打包完的 DN 再分 `awaiting_waybill`（还没有运单 / 运单号）、
+`awaiting_pickup`（承运商要逐票约揽收——`api` / `manual`——而运单还没被揽收占着）、`awaiting_handover`。`awaiting_number`
+（已导出待导回）第二期才有。
+
+- `GET /warehouse/dn/` 每行带 `shipping_stage` 与 `shipping: {carrier_name, tracking_number}`（整页一条查询算好）；
+  `?shipping_stage=<stage>` 按它筛选（不认识的阶段 400）。
+- `GET /warehouse/delivery/` 每行带 `shipping_stage`（所属 DN 的阶段）。
+
 ## 承运商对接（自动建运单）
 
-海外 DN 的承运商设置了在线对接时，WMS 可以直接在承运商系统建运单，替代「在承运商网站手工建运单、再把运单号存进 WMS」
+DN 的承运商设置了在线对接时，WMS 可以直接在承运商系统建运单，替代「在承运商网站手工建运单、再把运单号存进 WMS」
 这一步；其余流程不变：运单号走现有的保存运单号逻辑存到发货任务、完成发货、`dn.delivered` 照旧（CI / PL 不印运单号，
 不用重签）。
 对接与具体承运商无关：每家承运商一个插件（`warehouse/carrier/integrations/`），内置 FedEx（见「FedEx 插件」），也可以自己写
-（见「编写承运商插件」）。没设对接的承运商照旧手工保存运单号（`PUT /warehouse/delivery/<task_id>/tracking`），这也是对接
-不可用时的退路。
+（见「编写承运商插件」）。没设对接的承运商照旧手工保存运单号（`PUT /warehouse/delivery/<task_id>/tracking`，记为 `manual` 运单），
+这也是对接不可用时的退路。国内件走同一套，不碰报关（见「发货流程」）；报关扩展（CI / PL、商品明细、ETD、贸易单证）只在要报关时参与。
 
 ### 设置对接
 
@@ -547,7 +718,8 @@ flask carrier import-fedex-env [--carrier-id <id>] [--overwrite] [--dry-run]
 
 `GET` 返回 `{enabled, carrier, integration, can_create, blockers[{code, message, goods_code?, field?}], unresolved,
 can_dismiss, can_cancel, etd_enabled, default_label_format, label_formats{A4|THERMAL: {image_type, stock_type}},
-declared_value_carriage, delivery_task_id, tracking_number, shipment, warnings[]}`：
+route, declared_value_carriage, delivery_task_id, tracking_number, shipment, warnings[]}`（只看自动运单 `source: api`；
+`route` = `{origin_country, destination_country, international, requires_customs}`）：
 
 - `carrier`：建单用的承运商 `{id, name, code}`——当前有效发货任务的承运商，没有则 DN 的（与 CI 上印的同一口径）；都没有为 `null`。
 - `integration`：该承运商的对接 `{code, name, portal_name, portal_url, enabled, ready}`；`null` = 没设对接（或承运商不属于 DN
@@ -565,7 +737,8 @@ declared_value_carriage, delivery_task_id, tracking_number, shipment, warnings[]
 - `shipment`：有效（或取消中）的运单，没有则最近一张已取消的运单，都没有为 `null`；含 `id`、`carrier`（插件代码）、
   `carrier_id`（建单的承运商）、`status`（`active` / `cancelling` / `cancelled`）、`reason`、`service_type` / `service_name`、
   `sender_country`、`label_format`、`image_type`、`label_stock_type`、`label_file_name`、`label_content_type`、
-  `label_parts[]`（面单存档里各文档的来源、箱号、类型、页数、是否存入）、`updated_at` 等。
+  `label_parts[]`（面单存档里各文档的来源、箱号、类型、页数、是否存入）、`updated_at`、`source`（`api`）、`tracking_url`
+  （公开查询页：承运商的 `tracking_url_template`，没填用插件内置的；`tracking_method: none` 时为 `null`）等。
 
 `POST` 可带请求体 `{"label_format": "A4" | "THERMAL"}`（面单打印方式：`A4` = 普通打印机打 A4 / Letter 纸，`THERMAL` = 热敏标签机；
 不带用对接设置里的默认；其它值，或这家承运商的插件不支持 → 400 `16077`）。各打印方式用什么文件格式 / 纸张由插件决定
@@ -579,17 +752,25 @@ declared_value_carriage, delivery_task_id, tracking_number, shipment, warnings[]
     （`CARRIER_NOT_SET`）、承运商没设对接或不属于 DN 所属公司（`CARRIER_NOT_INTEGRATED`，带 `carrier_id`）、插件没装
     （`CARRIER_INTEGRATION_UNAVAILABLE`）、对接已停用（`CARRIER_INTEGRATION_DISABLED`）、必填设置 / 密钥缺
     （`CARRIER_NOT_CONFIGURED`，`fields` 列出缺的键）、设置取值不合法（`CARRIER_CONFIG_INVALID`）；
-  - DN：非海外 DN（`NOT_EXPORT`，只报这一条）、不是 `packed`（`NOT_PACKED`）或已发货（`DN_SHIPPED`）、已有有效运单
+  - 国内 / 跨境（取代原来的 `NOT_EXPORT`）：插件的 `scopes` 不含这票货的范围（国内 / 跨境；`SCOPE_NOT_SUPPORTED`，带 `scope`——
+    FedEx 只接跨境件）、要报关却没有报关快照（`CUSTOMS_DATA_MISSING`，`field: customs`）、要报关而插件不能带报关
+    （`CUSTOMS_NOT_SUPPORTED`）、插件不能建运单（`WAYBILL_NOT_SUPPORTED`）。有这几条时不再跑插件自己的检查；
+  - DN：不是 `packed`（`NOT_PACKED`）或已发货（`DN_SHIPPED`）、已有有效运单
     （`SHIPMENT_EXISTS`）或已手工存过运单号（`TRACKING_NUMBER_EXISTS`）、没有箱子（`PACKAGES_MISSING`）/ 超过插件的箱数上限
-    （`TOO_MANY_PACKAGES`，带 `limit`）/ 箱子缺重量或尺寸（`PACKAGE_INCOMPLETE`）、报关视图有错误级问题（码同报关视图）、
-    收件人姓名和公司都缺（`RECIPIENT_NAME_MISSING`）或电话缺（`RECIPIENT_PHONE_MISSING`）；
+    （`TOO_MANY_PACKAGES`，带 `limit`）/ 箱子缺重量或尺寸（`PACKAGE_INCOMPLETE`）；报关件：报关视图有错误级问题（码同报关视图）、
+    收件人姓名和公司都缺（`RECIPIENT_NAME_MISSING`）或电话缺（`RECIPIENT_PHONE_MISSING`）；国内件：收件人姓名 / 电话缺
+    （`RECIPIENT_NAME_MISSING` / `RECIPIENT_PHONE_MISSING`，`field: recipient.*`）、DN 没有收件地址（`RECIPIENT_ADDRESS_MISSING`）、
+    仓库和公司都没有地址（`SHIPPER_ADDRESS_MISSING`）；
   - 插件自己的检查（地址放不放得下、贸易条件与关税付款方是否矛盾……；FedEx 见「FedEx 插件」）。
 - **运送申告价额**高于已打包货值时自动压到已打包货值（承运商拒收申告价额高于报关货值的运单，FedEx 已实测；部分打包时只保
   实际发出的货）。实际提交的值记在 `shipment.declared_value`；`warnings` 里给 `{code: "DECLARED_VALUE_CAPPED", message,
   requested, applied}`（`GET` 在没有有效运单时作预告，`POST` 响应里是这次实际做的）。
-- 没有当前有效的 CI / PL（或已过期）时先按现有逻辑签发。
+- 报关件：没有当前有效的 CI / PL（或已过期）时先按现有逻辑签发；国内件不出单证。
 - 插件开了电子单证（FedEx 为 `etd_enabled`）时，先把当前 CI PDF 上传给承运商，建单时引用；没开时仓库照旧打印 CI 随货。
-- 交给插件的数据（与承运商无关，形状见 `CarrierAdapter`）：发件人 = 公司出口资料（英文名、电话（仓库优先）、联系人、税号）
+- 交给插件的数据（与承运商无关，形状见 `CarrierAdapter`；每票都带 `route`，不要报关时 `commodities` / `invoice` / `documents`
+  为 `null`）。国内件：发件人 = 公司名（本地，没有用英文名）、仓库地址（本地，没有用英文；仓库没有用公司的）、电话（仓库优先）；
+  收件人 = DN 收件人（名称、联系人、电话、邮箱、邮编）+ DN 收件地址（一个字符串，`address_text` = `address_line1`）。
+  报关件：发件人 = 公司出口资料（英文名、电话（仓库优先）、联系人、税号）
   + 仓库英文地址（仓库没有则用公司的；是一个英文字符串，怎么拆行由插件决定）；收件人与税号 / 税号类型来自报关快照；
   商品来自发票明细（**已打包数量**、HS、原产国（商品主数据）、单价、金额、重量）；每个 WMS 箱子一个包裹（毛重 kg、尺寸 mm）；
   运送申告价额按箱均分；运费 / 保险费按快照；DN 订单号作参考号。
@@ -724,6 +905,12 @@ DN 发货前可取消（发货后 409 `16065`；没有可取消的 409 `16075`�
 | `fields` | 设置项，`setting(...)` 的元组 |
 | `label_formats` | 支持的面单打印方式，`('A4', 'THERMAL')` 的子集；默认两者都支持 |
 | `max_packages` | 一票最多几箱（超出 → `TOO_MANY_PACKAGES`），`None` = 不限 |
+| `scopes` | 能承运的范围，默认 `('domestic', 'international')`；FedEx 为 `('international',)`（否则 `SCOPE_NOT_SUPPORTED`） |
+| `supports_waybill` | 能建运单（建单 / 取消 / 面单），默认 `True`；只用来预约揽收 / 查跟踪的插件设 `False` |
+| `supports_customs` | 能带报关扩展（`commodities` / `invoice` / `documents`），要报关的件必须；默认 `False`，FedEx 为 `True` |
+| `supports_pickup` / `supports_tracking` | 预约揽收 / 查跟踪（见「上门揽收」/「跟踪」） |
+| `tracks_any_number` | 能查不是本插件建的运单号（手填 / 文件导回的运单也照常跟踪）；FedEx 为 `True` |
+| `tracking_url_template` | 公开查询页，`{tracking_number}` 占位；承运商自己没填 `tracking_url_template` 时用它 |
 
 设置项 `setting(key, kind, *, label, required=False, default=None, options=None, help=None, group='account', placeholder=None)`：
 
@@ -734,8 +921,9 @@ DN 发货前可取消（发货后 409 `16065`；没有可取消的 409 `16075`�
   否则 400 `16124`；必填项缺 → `CARRIER_NOT_CONFIGURED`；更多校验覆盖 `setting_problems()`（返回英文说明 → `CARRIER_CONFIG_INVALID`）。
 - 约定的键：`default_label_format`（建单不指定时的打印方式）、`service_type`（记到建单记录上，`service_name()` 给显示名）。
 
-方法（`shipment` 是 WMS 交给插件的一票货，纯数据：`reference`、`ship_date`、`shipper`、`recipient`、`packages[]`、
-`commodities[]`、`invoice`、`documents`，字段见 `CarrierAdapter` 的文档字符串）：
+方法（`shipment` 是 WMS 交给插件的一票货，纯数据：`reference`、`ship_date`、`route`、`shipper`、`recipient`、`packages[]`、
+`commodities[]`、`invoice`、`documents`，字段见 `CarrierAdapter` 的文档字符串；不要报关（`route.requires_customs` 为假）时
+`commodities` / `invoice` / `documents` 为 `None`）：
 
 | 方法 | 约定 |
 |------|------|
@@ -853,16 +1041,18 @@ python scripts/fedex_sandbox_smoke.py [--label-format A4|THERMAL|both] [--packag
 
 | 接口 | 说明 |
 |------|------|
-| `GET /warehouse/dn/carrier-pickups?carrier_id=` | 本公司能预约揽收的承运商（`carriers`，不带 `carrier_id` 用第一个）、该承运商的待揽收运单（`active`、DN 未发货；`can_schedule`）、最近 14 天的预约（结果不明的一律列出）、前置条件 `blockers`、揽收地点 |
+| `GET /warehouse/dn/carrier-pickups?carrier_id=` | 本公司揽收方式是 `api` / `manual` 的承运商（`carriers`，不带 `carrier_id` 用第一个）、`method`、该承运商的待揽收运单（`active`、任一来源、DN 未发货；`can_schedule`）、最近 14 天的预约（结果不明的一律列出）、前置条件 `blockers`、揽收地点、`can_create`（插件预约）/ `can_record`（手工记录） |
 | `GET /warehouse/dn/carrier-pickups/availability?carrier_id=` | 只查询：承运商开放的揽收日与可选时间（`options[{pickup_date, cutoff_time, access_minutes, ready_times, latest_times, default_ready_time, default_latest_time}]`） |
 | `POST /warehouse/dn/carrier-pickups` | `{carrier_id?, shipment_ids, pickup_date, ready_time, close_time, remarks?, notification_email?}` → 201 `{pickup, alerts, message}` |
-| `POST /warehouse/dn/carrier-pickups/<id>/cancel` | 取消已约上、揽收日没过的预约 |
+| `POST /warehouse/dn/carrier-pickups/manual` | 手工记一笔电话 / 网站约好的揽收（不调承运商），见「发货流程」 |
+| `POST /warehouse/dn/carrier-pickups/<id>/cancel` | 取消已约上、揽收日没过的预约（手工记录的只改本地） |
 | `POST /warehouse/dn/carrier-pickups/<id>/dismiss` | `{confirm: true}`：结果不明的预约向承运商核对后作废 |
 
 - 权限与自动运单相同：读 `dn_read` / `packing_read` / `delivery_read`，写 `packing_edit` / `delivery_edit`。
 - **揽收地点**：地址 = 仓库英文地址（没有用公司的），联系人 = 仓库联系人（没有用公司出口联系人），电话 = 仓库电话（没有用公司的），
   公司名 = 公司英文名，由插件转成承运商的格式（FedEx：与建运单的发件地址同一套拆分规则，电话须 8～13 位数字）。
-  前置条件（409 `16130`）：`PICKUP_CARRIER_MISSING` / `CARRIER_NOT_INTEGRATED` / `PICKUP_NOT_SUPPORTED` / 与自动运单相同的
+  前置条件（409 `16130`）：`PICKUP_METHOD_NOT_API`（插件预约要求 `pickup_method: api`）/ `PICKUP_CARRIER_MISSING` /
+  `CARRIER_NOT_INTEGRATED` / `PICKUP_NOT_SUPPORTED` / 与自动运单相同的
   对接问题（`CARRIER_INTEGRATION_DISABLED`、`CARRIER_NOT_CONFIGURED` 等）/ `PICKUP_ADDRESS_MISSING` / `PICKUP_ADDRESS_INVALID` /
   `PICKUP_PHONE_INVALID`。
 - **时间**：日期 / 时间都是仓库当地的（`DOCUMENT_TIMEZONE`，默认 `Asia/Tokyo`）。FedEx：`readyDateTimestamp` 带时区偏移
@@ -885,12 +1075,14 @@ python scripts/fedex_sandbox_smoke.py [--label-format A4|THERMAL|both] [--packag
 运单是 WMS 建的，所以由 WMS 查承运商跟踪（插件能力 `CarrierAdapter.supports_tracking` + `track()`，内置 FedEx 插件用
 Track API，FedEx 开发者项目里要开通 Track API）。实现在 `warehouse/dn/tracking_services.py`，与具体承运商无关：
 
-- **查哪些**：`active` 的自动运单、有运单号、建单不超过 `CARRIER_TRACKING_MAX_DAYS` 天，DN 是 `packed` / `delivered`，
+- **查哪些**：`active`、有运单号、承运商 `tracking_method: api` 的运单——插件建的，或插件 `tracks_any_number`（FedEx）时手填 /
+  文件导回的——建单不超过 `CARRIER_TRACKING_MAX_DAYS` 天，DN 是 `packed` / `delivered`，
   或 DN 已完成（仓库手工签收）但跟踪还没到送达（只更新显示）。定时任务每 `CARRIER_TRACKING_INTERVAL_MINUTES` 分钟查一轮
   （最久没查的先查；按承运商分组、按插件的 `track_batch_size` 分批，一批失败只影响这一批；整轮受
   `CARRIER_TRACKING_BUDGET_SECONDS` 约束，用完的留到下一轮），调承运商时不占行锁。对接停用了照样查（已建的运单要跟到底）；
-  运单记录的插件与承运商现在的对接插件不同时不查。揽收 / 送达时刻早于建单 12 小时以上（承运商回收再用的单号查到旧包裹）
-  的结果不用，记成 `error`（`TRACKING.OLD_SHIPMENT`）。
+  运单记录的插件与承运商现在的对接插件不同时不查。揽收 / 送达时刻早于建单（手填 / 文件导回的运单：早于 DN 创建）12 小时以上
+  （承运商回收再用的单号查到旧包裹）的结果不用，记成 `error`（`TRACKING.OLD_SHIPMENT`）。自动发货 / 签收记
+  `completed_source` / `signed_source: carrier`。
 - **自动发货**：承运商已经经手（插件给出 `picked_up_at`，或状态是 `in_transit` / `out_for_delivery` / `delivered`）而 DN 还是
   `packed` → 以建运单的人的名义完成发货（`pending` 的发货任务先开始；校验与手动「完成发货」相同：不查单证，计划发货日晚于揽收日
   照样拦），推 `dn.delivered`。发货时刻 = 承运商的揽收时刻（换成服务器本地时间）：发货任务的完成时间、实际发货日、DN 的
@@ -923,6 +1115,7 @@ Track API，FedEx 开发者项目里要开通 Track API）。实现在 `warehous
 | `CARRIER_TRACKING_INTERVAL_MINUTES` | `30` | 跟踪定时任务的间隔（分钟），`0` = 不跑 |
 | `CARRIER_TRACKING_MAX_DAYS` | `60` | 只跟建单不超过这么多天的运单 |
 | `CARRIER_TRACKING_BUDGET_SECONDS` | `120` | 一轮跟踪查询的总时限（秒） |
+| `CARRIER_AUTO_SIGN_INTERVAL_MINUTES` | `60` | 自动视为签收定时任务的间隔（分钟，`carriers.auto_sign_days`，见「发货流程」），`0` = 不跑 |
 
 账号、密钥、服务等按承运商存在对接设置里，不用环境变量；密钥用 `SETTINGS_ENCRYPTION_KEY` 加密（生产环境必须设置，见「快速开始」）。
 
@@ -970,7 +1163,7 @@ stdout_logfile=/var/log/wms-api.out.log
 | 库存错误 | 15000-15999 | 400 | 库存相关错误 |
 | 状态错误 | 16000-16999 | 400 | 状态流转错误 |
 
-出口单证相关业务码：`14019` 出口资料文本超长、`14020` 国家代码不合法、`16063` 报关结构不合法、`16064` 报关行商品编码不在 DN 明细或重复、`16065` 已发货不可改（409）、`16066` 箱子数据不合法、`16067` 当前状态不能改箱子（409）、`16068` 单证条件不全（409，`details.problems`）、`16070` 不是海外单（409）、`16071` 单证不存在（404）、`16117` 单证排不下——某块文字（通常是收件人信息）一页放不下，请缩短（409，`details {document, reason: LAYOUT_OVERFLOW}`）。承运商运单（自动建运单）：`16072` 建单 / 取消的前置条件不满足（409，`details.blockers`）、`16073` 承运商返回错误或结果不明（502，`details.errors` / `transaction_id` / `maybe_processed`）、`16074` 承运商超时或时间预算用完（504，`details.budget_exhausted`）、`16075` 没有可取消 / 可确认作废的运单记录（409，`details.unresolved`）、`16076` 有进行中 / 有效 / 结果不明 / 取消中的运单时不能改箱子或报关数据，也不能签发数据有变化的单证（409，`details {reason: CARRIER_SHIPMENT_OPEN | DOCUMENT_DATA_CHANGED, status, carrier, carrier_shipment {id, status, tracking_number}}`）、`16077` `label_format` 不合法或该承运商不支持（400）、`16078` 运单号 / 承运商与有效的自动运单不一致，或有自动运单时新建 / 删除发货任务（409）、`16079` 有结果不明 / 进行中的建单记录，或运单正在取消 / 取消结果不明——不能建单、存运单号、发货（409，`details.unresolved`）、`16093` 取消 / 确认作废请求里的目标与当前记录不符（409，`details {expected, actual}`）、`16094` 确认作废带运单号的记录时承运商没有确认已取消 / 不存在（409）、`16095` 承运商已建好运单但 WMS 写库失败，已补偿处理（502，`details {error, compensation, unresolved, …}`）。承运商在线对接：`16124` 对接设置不合法（400，`field`：`adapter` / `enabled` / `settings.<key>` / `secrets.<key>`）、`16125` 承运商还有未结束的自动运单，不能删除对接或换插件（409，`details.shipments`）。上门揽收：`16130` 前置条件不满足（409，`details.blockers`）、`16131` 预约参数不合法（400，`field`）、`16132` 所选运单不能预约（409，`details.shipments[{shipment_id, tracking_number, reason}]`）、`16133` 当前状态不能取消 / 作废（409，`details {pickup_id, status, reason, pickup_date}`）；跟踪：`16134` 没有可跟踪的自动运单（409）；承运商报错 / 超时同运单（`16073` / `16074`，`details.action` 为 `pickup` / `pickup_cancel` / `pickup_availability`）。已不再使用：`16069`（原：完成发货时单证缺失或已过期；完成发货不再查单证）；单证不再印运单号和承运商：`16080`（原：完成发货时运单号与 CI 上印的 AWB 不一致）、`16092`（原：完成发货时承运商与 CI 上印的不一致）。发货任务：`16090` DN 已有未完成的发货任务（409，`details {delivery_task_id, status}`）、`16091` 海外 DN 不是当前发货任务（409，`details {delivery_task_id, current_status}`）。错误响应可能带结构化的 `details`。
+出口单证相关业务码：`14019` 出口资料文本超长、`14020` 国家代码不合法、`16063` 报关结构不合法、`16064` 报关行商品编码不在 DN 明细或重复、`16065` 已发货不可改（409）、`16066` 箱子数据不合法、`16067` 当前状态不能改箱子（409）、`16068` 单证条件不全（409，`details.problems`）、`16070` 不是海外单（409）、`16071` 单证不存在（404）、`16117` 单证排不下——某块文字（通常是收件人信息）一页放不下，请缩短（409，`details {document, reason: LAYOUT_OVERFLOW}`）。承运商运单（自动建运单）：`16072` 建单 / 取消的前置条件不满足（409，`details.blockers`）、`16073` 承运商返回错误或结果不明（502，`details.errors` / `transaction_id` / `maybe_processed`）、`16074` 承运商超时或时间预算用完（504，`details.budget_exhausted`）、`16075` 没有可取消 / 可确认作废的运单记录（409，`details.unresolved`）、`16076` 有进行中 / 有效 / 结果不明 / 取消中的运单时不能改箱子或报关数据，也不能签发数据有变化的单证（409，`details {reason: CARRIER_SHIPMENT_OPEN | DOCUMENT_DATA_CHANGED, status, carrier, carrier_shipment {id, status, tracking_number}}`）、`16077` `label_format` 不合法或该承运商不支持（400）、`16078` 运单号 / 承运商与有效的自动运单不一致，或有自动运单时新建 / 删除发货任务（409）、`16079` 有结果不明 / 进行中的建单记录，或运单正在取消 / 取消结果不明——不能建单、存运单号、发货（409，`details.unresolved`）、`16093` 取消 / 确认作废请求里的目标与当前记录不符（409，`details {expected, actual}`）、`16094` 确认作废带运单号的记录时承运商没有确认已取消 / 不存在（409）、`16095` 承运商已建好运单但 WMS 写库失败，已补偿处理（502，`details {error, compensation, unresolved, …}`）。承运商在线对接：`16124` 对接设置不合法（400，`field`：`adapter` / `enabled` / `settings.<key>` / `secrets.<key>`）、`16125` 承运商还有未结束的自动运单，不能删除对接或换插件（409，`details.shipments`）。上门揽收：`16130` 前置条件不满足（409，`details.blockers`）、`16131` 预约参数不合法（400，`field`）、`16132` 所选运单不能预约（409，`details.shipments[{shipment_id, tracking_number, reason}]`）、`16133` 当前状态不能取消 / 作废（409，`details {pickup_id, status, reason, pickup_date}`）；跟踪：`16134` 没有能经 API 跟踪的有效运单（409）；承运商报错 / 超时同运单（`16073` / `16074`，`details.action` 为 `pickup` / `pickup_cancel` / `pickup_availability`）。已不再使用：`16069`（原：完成发货时单证缺失或已过期；完成发货不再查单证）；单证不再印运单号和承运商：`16080`（原：完成发货时运单号与 CI 上印的 AWB 不一致）、`16092`（原：完成发货时承运商与 CI 上印的不一致）。发货任务：`16090` DN 已有未完成的发货任务（409，`details {delivery_task_id, status}`）、`16091` 有报关快照或运单记录的 DN 不是当前发货任务（409，`details {delivery_task_id, current_status}`）、`16136` `shipped_at` 晚于现在（400，`field: shipped_at`；格式不对为 `16050`）。发货流程：`16135` 承运商对接方式 / 集荷安排 / 查询页 / `auto_sign_days` 不合法，或所选方式现在不可选（400，`field`）；`16130` 另有 `PICKUP_METHOD_NOT_API`；`16131` 手工揽收另有 `field` `warehouse_id` / `confirmation_code`；建运单的 blocker `SCOPE_NOT_SUPPORTED` / `CUSTOMS_DATA_MISSING` / `CUSTOMS_NOT_SUPPORTED` / `WAYBILL_NOT_SUPPORTED` 取代 `NOT_EXPORT`。错误响应可能带结构化的 `details`。
 
 作业流程（见上文「作业流程规则」）：`16110` DN 有未结束的承运商运单，请先取消运单（409）、`16111` 调整单已取消（409）、`16112` 调整单当前状态不能取消（409）、`16113` 调整明细无法执行：库位上已没有该商品 / 明细没有库位（409）、`16114` 盘点单有未录入的明细（409，`details.detail_ids`）、`16115` 数值字段不合法（400，`field`）、`16116` 分拣任务的 ASN 不能改（409）、`16120` 移库来源库位没有这个商品（404）、`16121` 同一个 `client_batch_id` 已提交过不同的明细（409，`details {client_batch_id, batch_id}`）、`16122` 修改过调整单明细的人不能审批（409）、`16123` `client_batch_id` 不合法（400）、`44009` 库位有历史记录，请改用停用（409）。任务：`16088` 任务已停用（所属 DN / ASN 已取消，409）、`16089` 拣货一件都没拣不能完成（409）。
 

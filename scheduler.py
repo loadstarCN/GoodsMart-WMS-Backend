@@ -25,6 +25,8 @@ def init_scheduler(app):
     snapshot_minute = int(os.getenv('SNAPSHOT_MINUTE', '0'))
     # 承运商跟踪（自动完成发货 / 签收），默认每 30 分钟；0 = 不跑
     tracking_interval = int(os.getenv('CARRIER_TRACKING_INTERVAL_MINUTES', '30'))
+    # 自动视为签收（carriers.auto_sign_days，没有 API 跟踪的运单），默认每 60 分钟；0 = 不跑
+    auto_sign_interval = int(os.getenv('CARRIER_AUTO_SIGN_INTERVAL_MINUTES', '60'))
 
     app.config['JOBS'] = [
         {
@@ -51,6 +53,14 @@ def init_scheduler(app):
             'trigger': 'interval',
             'minutes': tracking_interval,
             'misfire_grace_time': 300,
+        })
+    if auto_sign_interval > 0:
+        app.config['JOBS'].append({
+            'id': 'carrier_auto_sign',
+            'func': 'scheduler:_job_carrier_auto_sign',
+            'trigger': 'interval',
+            'minutes': auto_sign_interval,
+            'misfire_grace_time': 600,
         })
 
     scheduler.init_app(app)
@@ -124,6 +134,22 @@ def _job_carrier_tracking():
                 logger.info(f'[Scheduler] Carrier tracking: {stats}')
         except Exception as e:
             logger.error(f'[Scheduler] Carrier tracking failed: {e}')
+
+
+def _job_carrier_auto_sign():
+    """定时任务：交承运商后 N 天（carriers.auto_sign_days）还没签收、没有 API 跟踪的发货任务按规则签收
+    （warehouse/shipping/auto_sign.py）"""
+    app = scheduler.app
+    if app is None:
+        return
+    with app.app_context():
+        try:
+            from warehouse.shipping.auto_sign import AutoSignService
+            stats = AutoSignService.sync()
+            if stats['signed'] or stats['errors']:
+                logger.info(f'[Scheduler] Carrier auto sign: {stats}')
+        except Exception as e:
+            logger.error(f'[Scheduler] Carrier auto sign failed: {e}')
 
 
 def _job_inventory_snapshot():

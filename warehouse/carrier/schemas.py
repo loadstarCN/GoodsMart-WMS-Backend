@@ -2,6 +2,7 @@ from flask_restx import Namespace, fields, inputs
 from system.common import generate_input_fields,pagination_parser, create_pagination_model
 from system.user.schemas import user_simple_model as original_user_model
 from warehouse.company.schemas import comapny_simple_model as company_model
+from .methods import available_methods
 
 # 初始化 Namespace
 api_ns = Namespace('carrier', description='Carrier operations')
@@ -34,6 +35,27 @@ carrier_fields = {
     'is_active': fields.Boolean(description='Is the carrier active?'),
     'integration': fields.Raw(attribute='integration_summary', readonly=True,
                               description='Online integration (automatic shipments): {adapter, name, enabled} or null'),
+    # 对接方式（doc/shipping-flow.md §2；校验见 warehouse/carrier/methods.py，不合法 400 16135）
+    'waybill_method': fields.String(enum=['api', 'file', 'manual'], default='manual',
+                                    description='Waybills: api (created by the integration) / manual (tracking number '
+                                                'entered or scanned); file is phase 2'),
+    'pickup_method': fields.String(enum=['api', 'manual', 'scheduled', 'dropoff', 'none'], default='none',
+                                   description='Pickups: api (booked by the integration) / manual (booked by phone or '
+                                               'website, recorded in WMS) / scheduled (regular pickup) / dropoff / none'),
+    'pickup_schedule': fields.Raw(description='scheduled: {weekdays: [1..7] (ISO, 1 = Monday), ready_time: HH:MM, '
+                                              'close_time: HH:MM} or null'),
+    'pickup_contact': fields.String(description='Phone / URL / note for booking pickups (shown for manual)'),
+    'tracking_method': fields.String(enum=['api', 'link', 'none'], default='link',
+                                     description='Tracking: api (queried by the integration; auto ship / sign) / '
+                                                 'link (public tracking page only) / none'),
+    'tracking_url_template': fields.String(description='Public tracking page with {tracking_number}; empty = the '
+                                                       "integration's built-in one"),
+    'auto_sign_days': fields.Integer(description='Sign automatically this many days (1-90) after handover when the '
+                                                 'shipment is not tracked through the API; null = off'),
+    'available_methods': fields.Raw(attribute=lambda c: available_methods(c), readonly=True,
+                                    description='Methods that can be chosen now: {waybill: [...], pickup: [...], '
+                                                'tracking: [...]}; api only with an enabled integration whose plugin '
+                                                'supports it'),
     'company_id': fields.Integer(required=True, description='ID of the associated company'),
     'company': fields.Nested(company_model, readonly=True, description='Associated company details'),
     'created_at': fields.DateTime(readOnly=True, description='Creation timestamp'),

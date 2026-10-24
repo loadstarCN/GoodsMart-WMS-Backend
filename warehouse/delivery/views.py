@@ -15,6 +15,7 @@ from .schemas import (
     delivery_monthly_stats_parser
 )
 from .services import DeliveryTaskService
+from warehouse.shipping.stage import attach as attach_shipping
 
 
 def _owned_task(task_id: int) -> DeliveryTask:
@@ -33,7 +34,8 @@ class DeliveryTaskList(Resource):
     @api_ns.marshal_with(delivery_pagination_model)
     def get(self):
         """
-        Get all Deliveries with optional filters & pagination
+        Get all Deliveries with optional filters & pagination (each item has `shipping_stage`, the shipping stage of
+        its DN)
         """
         args = delivery_pagination_parser.parse_args()
         page = args.get('page')
@@ -57,7 +59,10 @@ class DeliveryTaskList(Resource):
         }
         filters = add_warehouse_filter(filters)
         query = DeliveryTaskService.list_tasks(filters)
-        return paginate(query, page, per_page)
+        result = paginate(query, page, per_page)
+        # 每行的 shipping_stage（DN 的发货阶段）整页一条查询算好
+        result['items'] = attach_shipping(result['items'], dn_id_of=lambda task: task.dn_id)
+        return result
 
 
 @api_ns.doc(security="jsonWebToken")
@@ -84,7 +89,7 @@ class DeliveryTaskDetailView(Resource):
         """
         task = _owned_task(task_id)
         data = api_ns.payload
-        updated_delivery = DeliveryTaskService.update_task(task.id, data)
+        updated_delivery = DeliveryTaskService.update_task(task.id, data, require_actor_user_id())
 
         return updated_delivery
 
@@ -133,10 +138,14 @@ class DeliveryTaskTracking(Resource):
         - While the DN has an active carrier shipment only its tracking number (spaces / hyphens ignored; stored as
           the shipment's own spelling) and carrier are accepted (409 16078)
         - A tracking number of a cancelled carrier shipment of this DN → 409 16078 (details.status = cancelled)
-        - Export DN: only the current delivery task → 409 16091 {delivery_task_id, current_status}
+        - DN with customs data or carrier shipment records: only the current delivery task → 409 16091
+          {delivery_task_id, current_status}
+        - Without an unfinished automatic shipment the number is also recorded as a manual waybill
+          (dn_carrier_shipments source manual): a new number replaces the previous one (reason replaced),
+          clearing it cancels it (reason cleared)
         """
         task = _owned_task(task_id)
-        return DeliveryTaskService.save_tracking(task, api_ns.payload)
+        return DeliveryTaskService.save_tracking(task, api_ns.payload, require_actor_user_id())
 
 
 @api_ns.doc(security="jsonWebToken")
@@ -161,8 +170,12 @@ class DeliveryTaskComplete(Resource):
           issue the documents again); when the CI has no AWB the given tracking number is saved as before
         - Export DN whose current CI prints a carrier: a different carrier_id → 409 16092
           {document_carrier, document_carrier_id, carrier_id}
-        - Export DN: only the current delivery task can be completed → 409 16091 {delivery_task_id, current_status}
+        - DN with customs data or carrier shipment records: only the current delivery task can be completed
+          → 409 16091 {delivery_task_id, current_status}
         - A tracking number of a cancelled carrier shipment of this DN → 409 16078 (details.status = cancelled)
+        - shipped_at (optional, ISO 8601): when it was actually handed over to the carrier (default now); invalid
+          → 400 16050, in the future → 400 16136. completed_source = warehouse
+        - A tracking number given here is also recorded as a manual waybill (same rules as PUT .../tracking)
         """
         data = api_ns.payload
         operator_id = require_actor_user_id()
@@ -182,7 +195,8 @@ class DeliveryTaskSign(Resource):
     @api_ns.marshal_with(delivery_task_model)
     def put(self, task_id):
         """
-        Sign a specific Delivery (set status to signed)
+        Sign a specific Delivery (set status to signed); signed_at = when it was actually received (default now).
+        signed_source = warehouse (dn.completed carries signed_source)
         """
         data = api_ns.payload
         operator_id = require_actor_user_id()

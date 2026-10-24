@@ -10,12 +10,18 @@ class DeliveryTask(db.Model):
         Index('idx_delivery_status', 'status'),  # 状态过滤
         Index('idx_transportation_mode', 'transportation_mode'),  # 运输方式分析
         Index('idx_expected_shipping_date', 'expected_shipping_date'),  # 发货日期排序
+        Index('idx_delivery_task_dn', 'dn_id', 'is_active'),  # DN 的当前发货任务（发货阶段的 SQL 判定逐行查它）
         CheckConstraint('actual_shipping_date >= expected_shipping_date', 
                        name='chk_shipping_date'),  # 时间逻辑校验
-        CheckConstraint('shipping_cost >= 0', name='chk_shipping_cost')
+        CheckConstraint('shipping_cost >= 0', name='chk_shipping_cost'),
+        CheckConstraint("completed_source IN ('warehouse','carrier','rule')", name='chk_delivery_completed_source'),
+        CheckConstraint("signed_source IN ('warehouse','carrier','rule')", name='chk_delivery_signed_source'),
     )
 
     DELIVERY_TASK_STATUSES = ('pending', 'in_progress', 'completed', 'signed')
+    # 完成发货 / 签收的来源：warehouse = 仓库手工；carrier = 承运商跟踪自动；rule = 自动视为签收（auto_sign_days）。
+    # 空 = 旧数据，按 warehouse
+    EVENT_SOURCES = ('warehouse', 'carrier', 'rule')
     DELIVERY_TASK_TRANSPORTATION_MODES = ('express', 'pickup', 'courier', 'air', 'sea', 'land', 'rail', 'drone')
 
     id = db.Column(db.Integer, primary_key=True)
@@ -130,6 +136,16 @@ class DeliveryTask(db.Model):
         db.DateTime,
         nullable=True,
         info={'description': '客户签收时间'}
+    )
+    completed_source = db.Column(
+        db.String(10),
+        nullable=True,
+        info={'description': '完成发货的来源：warehouse / carrier（跟踪自动）/ rule；空 = 旧数据（按 warehouse）'}
+    )
+    signed_source = db.Column(
+        db.String(10),
+        nullable=True,
+        info={'description': '签收的来源：warehouse / carrier（跟踪自动）/ rule（自动视为签收）；空 = 旧数据（按 warehouse）'}
     )
 
     # 关系加载策略优化

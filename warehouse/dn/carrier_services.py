@@ -1,20 +1,25 @@
-"""海外 DN 在承运商系统自动建运单（承运商对接插件，见 warehouse/carrier/integrations；内置 FedEx）。
+"""DN 在承运商系统自动建运单（承运商对接插件，见 warehouse/carrier/integrations；内置 FedEx）。
 
-替代「在承运商网站手工建运单 + 保存运单号」这一步，其余流程不变。本模块与具体承运商无关，调承运商一律经插件
+替代「在承运商网站手工建运单 + 保存运单号」这一步，其余流程不变。本模块与具体承运商、国内外无关，调承运商一律经插件
 （CarrierAdapter：check_shipment / upload_documents / create_shipment / label_archive / cancel_shipment）。
+跨境要报关的件另带报关扩展（warehouse/dn/customs_extension.py：CI / PL、commodities / invoice、贸易单证 / ETD），
+国内件（或同一关税同盟内）不碰报关；国内 / 跨境按 warehouse/shipping/route.py 判断。
 - 用哪家：当前有效发货任务的承运商（没有用 DN 的），该承运商在承运商编辑页设置了在线对接（carrier_integrations）且已启用、
-  设置齐全；没设对接的承运商照旧手工建运单、保存运单号。
-- 前置条件（blockers）全部满足才建单：海外 DN、packed、承运商有可用的对接、没有有效运单也没有手工存过运单号、
-  有箱子（不超过插件的箱数上限）、报关没有错误级问题、收件人姓名 / 电话齐全，再加插件自己的检查（地址放不放得下、
-  贸易条件与关税付款方是否矛盾……）。
-- 每次建单请求在 dn_carrier_shipments 留一条记录（carrier = 插件代码，carrier_id = 承运商），分三段，
+  设置齐全；没设对接的承运商照旧手工建运单、保存运单号（同时写 source = manual 的运单记录，见 warehouse/shipping/waybills.py）。
+- 本模块的记录查询（active_shipment / open_shipment / unresolved_shipment ……）与锁定规则只看 source = api 的运单
+  （插件建的、在承运商那边真实存在、换号要先取消）；manual / file 运单不受这些规则约束。
+- 前置条件（blockers）全部满足才建单：packed、承运商有可用的对接、插件能承运这票货的范围（scopes，否则
+  SCOPE_NOT_SUPPORTED）、要报关时有报关快照（CUSTOMS_DATA_MISSING）且插件能带报关（CUSTOMS_NOT_SUPPORTED）、
+  没有有效运单也没有手工存过运单号、有箱子（不超过插件的箱数上限）、收件人姓名 / 电话齐全；报关件另加报关没有错误级问题；
+  再加插件自己的检查（地址放不放得下、贸易条件与关税付款方是否矛盾……）。
+- 每次建单请求在 dn_carrier_shipments 留一条记录（source = api，carrier = 插件代码，carrier_id = 承运商），分三段，
   调承运商时不占 DN 行锁、也不开着数据库事务：
-  1. 锁 DN → 有结果不明的记录（unresolved）→ 409 16079；前置条件不满足 → 409 16072；没有当前有效的 CI / PL
+  1. 锁 DN → 有结果不明的记录（unresolved）→ 409 16079；前置条件不满足 → 409 16072；报关件没有当前有效的 CI / PL
      （或已过期）就先用现有逻辑签发；组好交给插件的数据（含对接设置的快照）；插一条 pending 记录并提交（部分唯一索引兜底并发）。
   2. 插件开了电子单证时先上传 CI，再建单。整个建单流程受 CARRIER_CREATE_BUDGET_SECONDS 总时限约束，
      每次请求的超时按剩余时间收缩，不够就不发（worker 超时被杀前收手；真被杀了 pending 过期后按结果不明处理）。
   3. 成功：先独立提交拿到的运单号，再在一个事务里锁 DN → 记录置 active → 主运单号走现有保存运单号的逻辑存到
-     发货任务 → 面单存 dn_documents（shipping_label）。CI / PL 不印运单号，不用重签。
+     发货任务 → 面单存 dn_documents（shipping_label）。CI / PL 不印运单号，数据没变时重签不出新版本。
   结果：承运商明确拒绝 / 请求没发出去 → failed；读超时、连接中断、5xx、响应看不懂 → unknown（结果不明）；
   第 3 步写库失败 → 先另开事务重读记录：已是 active 且运单号相同（提交其实成功、只是调用方收到了异常）→ 不取消，
   按成功返回；读不到 → 不取消，记 unknown（reason save_unconfirmed，带运单号）；确实没写进去 → 取消刚建的运单（补偿）：
@@ -48,7 +53,6 @@ import hashlib
 import logging
 import re
 from datetime import date, datetime
-from decimal import Decimal, ROUND_FLOOR
 
 from flask import current_app, g
 from sqlalchemy.exc import IntegrityError
@@ -61,17 +65,20 @@ from extensions.transaction import transactional
 from warehouse.carrier.integration_services import CarrierIntegrationService
 from warehouse.carrier.integrations import display_name, portal_name
 from warehouse.carrier.integrations.base import LABEL_FORMATS, STEP_CREATE, CarrierError, CarrierResponseError, clock
+from warehouse.carrier.methods import tracking_url
 from warehouse.carrier.models import Carrier
 from warehouse.common.countries import COUNTRY_NAMES_EN
-from .customs_services import CustomsService, DOC_CI, DOC_PL, DOC_TYPES, _document_timezone, LOCKED_DN_STATUSES
+from warehouse.shipping.common import LOCKED_DN_STATUSES, document_timezone
+from warehouse.shipping.route import scope_of, shipping_route
+from .customs_extension import CustomsExtension, allocate_commodity_weights  # noqa: F401  allocate_* 旧的引用位置
+from .customs_services import CustomsService
 from .models import DN, DNCarrierShipment, DNDocument
 
 logger = logging.getLogger(__name__)
 
 DOC_LABEL = 'shipping_label'
 COMPLETED_TASK_STATUSES = ('completed', 'signed')
-# 报关视图里已由 blockers 自己表达的问题码（不重复列）
-_COVERED_PROBLEMS = ('NOT_PACKED', 'PACKAGES_MISSING')
+SOURCE_API = 'api'
 _FILE_SAFE = re.compile(r'[^A-Za-z0-9._-]+')
 
 OPEN_STATUSES = DNCarrierShipment.OPEN_STATUSES              # pending / active / unknown / cancelling：同一 DN 至多一条
@@ -201,27 +208,6 @@ def split_evenly(total: int, count: int) -> list:
     return [base + (1 if index < remainder else 0) for index in range(count)]
 
 
-def allocate_commodity_weights(lines, gross_total) -> list:
-    """每行商品净重（kg，Decimal）。lines: [{quantity, unit_weight_kg|None}]。
-    商品主数据有单件重量的行 = 单件重量 × 已打包数量；没有的行分摊「箱子总毛重 − 已知净重」
-    （不为正时按数量占比分摊总毛重），按已打包数量比例分。"""
-    gross_total = Decimal(str(gross_total or 0))
-    known = [Decimal(str(l['unit_weight_kg'])) * l['quantity'] if l.get('unit_weight_kg') is not None else None
-             for l in lines]
-    unknown_qty = sum(l['quantity'] for l, w in zip(lines, known) if w is None)
-    if unknown_qty:
-        total_qty = sum(l['quantity'] for l in lines) or 1
-        remaining = gross_total - sum(w for w in known if w is not None)
-        if remaining <= 0:
-            remaining = gross_total * Decimal(unknown_qty) / Decimal(total_qty)
-    result = []
-    for line, weight in zip(lines, known):
-        if weight is None:
-            weight = remaining * Decimal(line['quantity']) / Decimal(unknown_qty)
-        result.append(weight)
-    return result
-
-
 def _carrier_api_exception(err: CarrierError, action: str, code: str, unresolved=None, with_unresolved=False):
     """CarrierError → 502 16073 / 504 16074；details 带承运商的 errors 与 transactionId（不带凭证）、
     maybe_processed（结果不明）；建单时再带 unresolved（结果不明的记录，没有则 null）。"""
@@ -302,9 +288,12 @@ class CarrierShipmentService:
 
     @staticmethod
     def _latest(dn: DN, statuses):
+        """最新一条插件建的运单记录（source = api）：本模块的查询与锁定规则只对 api 运单生效。
+        与来源无关的当前运单见 warehouse/shipping/waybills.py（current_waybill / active_waybill）。"""
         return (
             DNCarrierShipment.query
-            .filter(DNCarrierShipment.dn_id == dn.id, DNCarrierShipment.status.in_(statuses))
+            .filter(DNCarrierShipment.dn_id == dn.id, DNCarrierShipment.source == SOURCE_API,
+                    DNCarrierShipment.status.in_(statuses))
             .order_by(DNCarrierShipment.id.desc())
             .first()
         )
@@ -398,6 +387,11 @@ class CarrierShipmentService:
         from .pickup_services import CarrierPickupService
         payload['pickup'] = (CarrierPickupService.summary_for_shipment(record)
                              if record.status in LIVE_STATUSES else None)
+        # 公开查询页：承运商设置的模板，没有用插件内置的；跟踪方式 none 时不给
+        carrier = db.session.get(Carrier, record.carrier_id) if record.carrier_id else None
+        payload['tracking_url'] = (
+            tracking_url(carrier, record.tracking_number, record.carrier)
+            if record.tracking_number and getattr(carrier, 'tracking_method', None) != 'none' else None)
         return payload
 
     @staticmethod
@@ -454,72 +448,27 @@ class CarrierShipmentService:
     # 前置条件与建单数据
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _sender_country(dn: DN) -> str:
-        """发件国：仓库有英文地址用仓库的国家（没有则公司的），否则公司的国家（与 _shipper 同一口径）"""
-        warehouse = dn.warehouse
-        company = warehouse.company
-        if (warehouse.address_en or '').strip():
-            return (warehouse.country_code or company.country_code or '').upper()
-        return (company.country_code or '').upper()
-
-    @staticmethod
-    def _shipper(dn: DN, exporter: dict) -> dict:
-        """发件人 = 公司出口资料（英文名、电话（仓库优先）、联系人、税号）+ 发货地址 = 仓库英文地址（没有用公司的）。
-        地址是一个英文字符串，怎么拆行由插件决定。"""
-        warehouse = dn.warehouse
-        company = warehouse.company
-        if (warehouse.address_en or '').strip():
-            text, postal = warehouse.address_en, warehouse.zip_code
-        else:
-            text, postal = company.address_en, company.zip_code
-        country = CarrierShipmentService._sender_country(dn)
-        return {
-            'company_name': exporter['legal_name_en'],
-            'person_name': company.export_contact_name or warehouse.contact_name_en,
-            'phone': exporter['phone'],
-            'email': company.email,
-            'address_text': text,
-            'postal_code': postal,
-            'country_code': country,
-            'country_name': COUNTRY_NAMES_EN.get(country),
-            'tax_id': company.tax_id,
-        }
-
-    @staticmethod
-    def _recipient(customs, consignee: dict, country: str) -> dict:
-        return {
-            'company_name': consignee.get('company'),
-            'person_name': consignee.get('name') or consignee.get('company'),
-            'phone': consignee.get('phone'),
-            'email': None,
-            'address_line1': consignee.get('address_line1'),
-            'address_line2': consignee.get('address_line2'),
-            'city': consignee.get('city'),
-            'state': consignee.get('state'),
-            'postal_code': consignee.get('postal_code'),
-            'country_code': (country or '').strip().upper(),
-            'tax_id': customs.recipient_tax_id,
-            'tax_id_type': customs.recipient_tax_id_type,
-        }
+    # 报关件的发件人 / 收件人 / 申告价额搬到了报关扩展（customs_extension.py），这里保留旧名
+    _sender_country = staticmethod(CustomsExtension.sender_country)
+    _shipper = staticmethod(CustomsExtension.shipper)
+    _recipient = staticmethod(CustomsExtension.recipient)
+    _declared_value = staticmethod(CustomsExtension.declared_value)
 
     @staticmethod
     def _collect(dn: DN) -> dict:
         """前置条件检查 + 建单要用的数据：
-        {blockers, warnings, declared_value, view, task, carrier, integration（快照）, adapter, shipment（交给插件的数据，
-        不含 ship_date / documents）}"""
+        {blockers, warnings, declared_value, view（报关视图，报关件才有）, task, carrier, integration（快照）, adapter,
+        route, customs（带报关扩展）, shipment（交给插件的数据，不含 ship_date / documents）}"""
         blockers = []
         ctx = {'blockers': blockers, 'warnings': [], 'declared_value': None, 'view': None, 'task': None,
-               'carrier': None, 'integration': None, 'adapter': None, 'shipment': None}
+               'carrier': None, 'integration': None, 'adapter': None, 'route': None, 'customs': False,
+               'shipment': None}
 
         task = CustomsService._delivery_task(dn)
         carrier, snapshot, adapter = CarrierShipmentService.integration_of(dn, task)
-        ctx.update(task=task, carrier=carrier, integration=snapshot, adapter=adapter)
-
-        customs = dn.customs
-        if customs is None:
-            blockers.append(_blocker('NOT_EXPORT', "DN is not an export shipment (no customs data)"))
-            return ctx
+        route = shipping_route(dn)
+        customs = CustomsExtension.applies(dn, route)
+        ctx.update(task=task, carrier=carrier, integration=snapshot, adapter=adapter, route=route, customs=customs)
 
         if dn.status in LOCKED_DN_STATUSES:
             blockers.append(_blocker('DN_SHIPPED', f"DN has already been shipped (status: {dn.status})"))
@@ -540,6 +489,9 @@ class CarrierShipmentService:
             for item in CarrierIntegrationService.problems(snapshot, adapter):
                 item.setdefault('carrier_id', carrier.id)
                 blockers.append(item)
+        # 国内 / 跨境：插件能不能承运这票货、要报关时有没有报关数据、插件能不能带报关（取代以前的 NOT_EXPORT）
+        route_blockers = CarrierShipmentService._route_blockers(dn, route, adapter)
+        blockers.extend(route_blockers)
         if task is not None and task.status in COMPLETED_TASK_STATUSES:
             blockers.append(_blocker('DELIVERY_TASK_COMPLETED', "Delivery task has already been completed"))
 
@@ -569,57 +521,108 @@ class CarrierShipmentService:
                 blockers.append(_blocker('PACKAGE_INCOMPLETE',
                                          f"Package {package.package_no} has no weight or dimensions"))
 
-        view = CustomsService.build_view(dn)
-        ctx['view'] = view
-        for problem in view['problems']:
-            if problem['level'] != 'error' or problem['code'] in _COVERED_PROBLEMS:
-                continue
-            blockers.append(_blocker(problem['code'], problem['message'],
-                                     goods_code=problem.get('goods_code'), field=problem.get('field')))
+        if customs:
+            # 报关件：报关问题并入 blockers、英文的发件人 / 收件人、commodities / invoice、申告价额
+            parties = CustomsExtension.collect(dn, ctx, has_shipment=active is not None)
+        else:
+            parties = CarrierShipmentService._local_parties(dn, route, blockers)
 
-        ctx['declared_value'], warning = CarrierShipmentService._declared_value(customs, view)
-        if warning and active is None:
-            ctx['warnings'].append(warning)
-
-        exporter = view['exporter']
-        shipper = None
-        if exporter['legal_name_en'] and (exporter['address_en'] or (dn.warehouse.address_en or '').strip()):
-            shipper = CarrierShipmentService._shipper(dn, exporter)
-
-        consignee = view['consignee'] or {}
-        country = view['recipient_country']
-        recipient = CarrierShipmentService._recipient(customs, consignee, country) if country else None
-        if not (consignee.get('name') or consignee.get('company')):
-            blockers.append(_blocker('RECIPIENT_NAME_MISSING', "Consignee name and company are both missing",
-                                     field='consignee.name'))
-        if not re.sub(r'\D', '', str(consignee.get('phone') or '')):
-            blockers.append(_blocker('RECIPIENT_PHONE_MISSING', "Consignee phone number is missing",
-                                     field='consignee.phone'))
-
-        shipment = CarrierShipmentService._shipment_data(dn, view, ctx['declared_value'], shipper, recipient)
+        shipment = CarrierShipmentService._shipment_data(dn, route, ctx['declared_value'], parties)
         ctx['shipment'] = shipment
-        if adapter is not None:
+        # 插件本来就承运不了 / 带不了报关的件不再交给插件检查（地址格式等对不上号）
+        if adapter is not None and not route_blockers:
             blockers.extend(adapter.check_shipment(shipment))
         return ctx
 
     @staticmethod
-    def _declared_value(customs, view):
-        """随运单提交的申告价额（整数，报关币种）与说明：高于已打包货值时压到已打包货值（取整数部分）。
-        承运商拒收申告价额高于报关货值的运单（FedEx：TOTALCARRIAGEVALUE.EXCEEDS.CUSTOMSVALUE，sandbox 实测）。"""
-        requested = customs.declared_value_carriage
-        if not requested:
-            return None, None
-        goods_value = Decimal(str(view['totals']['goods_value'] or 0)).to_integral_value(rounding=ROUND_FLOOR)
-        if requested <= goods_value:
-            return requested, None
-        capped = int(goods_value) or None
-        return capped, {
-            'code': 'DECLARED_VALUE_CAPPED',
-            'message': (f"Declared value for carriage {requested} exceeds the customs value of the packed goods "
-                        f"({goods_value}); {capped or 0} is submitted to the carrier instead"),
-            'requested': requested,
-            'applied': capped,
+    def _route_blockers(dn: DN, route: dict, adapter) -> list:
+        """国内 / 跨境相关的拦截：
+        - CUSTOMS_DATA_MISSING：要报关（跨境且不在同一关税同盟）却没有报关快照
+        - WAYBILL_NOT_SUPPORTED：插件不能建运单（只用来预约揽收 / 查跟踪）
+        - SCOPE_NOT_SUPPORTED：插件的 scopes 不含这票货的范围（如 FedEx 只接跨境件）
+        - CUSTOMS_NOT_SUPPORTED：要报关而插件不能带报关扩展"""
+        blockers = []
+        if route['requires_customs'] and dn.customs is None:
+            blockers.append(_blocker(
+                'CUSTOMS_DATA_MISSING',
+                f"This is an international shipment ({route['origin_country']} → {route['destination_country']}) "
+                "that needs customs data, but the DN has none: the source system must send the customs snapshot "
+                "(PUT /warehouse/dn/<id>/customs)", field='customs'))
+        if adapter is None:
+            return blockers
+        if not adapter.supports_waybill:
+            blockers.append(_blocker('WAYBILL_NOT_SUPPORTED',
+                                     f"The {adapter.name} integration cannot create shipments; enter the tracking "
+                                     "number by hand"))
+        scope = scope_of(route)
+        scopes = tuple(adapter.scopes or ())
+        if scope not in scopes:
+            blockers.append(_blocker(
+                'SCOPE_NOT_SUPPORTED',
+                f"{adapter.name} only carries {' / '.join(scopes) or 'no'} shipments; this DN is {scope} "
+                f"({route['origin_country'] or '?'} → {route['destination_country'] or '?'}). Choose another "
+                "carrier or enter the tracking number by hand", scope=scope))
+        if route['requires_customs'] and not adapter.supports_customs:
+            blockers.append(_blocker('CUSTOMS_NOT_SUPPORTED',
+                                     f"The {adapter.name} integration cannot submit customs data, which this "
+                                     "international shipment needs"))
+        return blockers
+
+    @staticmethod
+    def _local_parties(dn: DN, route: dict, blockers: list) -> dict:
+        """不报关的件（国内 / 同一关税同盟内）的发件人 / 收件人：
+        - 发件人：公司名（本地，没有用英文名）、仓库地址（本地，没有用英文；仓库都没有用公司的）、电话（仓库优先）
+        - 收件人：DN 收件人（名称 / 联系人 / 电话 / 邮箱 / 邮编）+ DN 的收件地址（一个字符串，第二期改结构化）
+        缺地址 / 姓名 / 电话 → blockers。commodities / invoice 为 None。"""
+        warehouse = dn.warehouse
+        company = warehouse.company
+        if (warehouse.address or '').strip() or (warehouse.address_en or '').strip():
+            text, postal = warehouse.address or warehouse.address_en, warehouse.zip_code
+        else:
+            text, postal = company.address or company.address_en, company.zip_code
+        origin = route['origin_country']
+        shipper = {
+            'company_name': company.name or company.legal_name_en,
+            'person_name': warehouse.contact_name_en or company.export_contact_name,
+            'phone': warehouse.phone or company.phone,
+            'email': company.email,
+            'address_text': (text or '').strip() or None,
+            'postal_code': postal,
+            'country_code': origin,
+            'country_name': COUNTRY_NAMES_EN.get(origin or ''),
+            'tax_id': company.tax_id,
         }
+        if not shipper['address_text']:
+            blockers.append(_blocker('SHIPPER_ADDRESS_MISSING', "Neither the warehouse nor the company has an address",
+                                     field='warehouse.address'))
+
+        person = dn.recipient
+        address = (dn.shipping_address or '').strip() or None
+        destination = route['destination_country'] or origin       # 收件国未知按国内（与发货国相同）
+        recipient = {
+            'company_name': getattr(person, 'name', None),
+            'person_name': getattr(person, 'contact', None) or getattr(person, 'name', None),
+            'phone': getattr(person, 'phone', None),
+            'email': getattr(person, 'email', None),
+            'address_text': address,
+            'address_line1': address,
+            'address_line2': None,
+            'city': None,
+            'state': None,
+            'postal_code': getattr(person, 'zip_code', None),
+            'country_code': destination,
+            'tax_id': None,
+            'tax_id_type': None,
+        }
+        if not (recipient['person_name'] or recipient['company_name']):
+            blockers.append(_blocker('RECIPIENT_NAME_MISSING', "Recipient name is missing", field='recipient.name'))
+        if not re.sub(r'\D', '', str(recipient['phone'] or '')):
+            blockers.append(_blocker('RECIPIENT_PHONE_MISSING', "Recipient phone number is missing",
+                                     field='recipient.phone'))
+        if not address:
+            blockers.append(_blocker('RECIPIENT_ADDRESS_MISSING', "DN shipping address is missing",
+                                     field='shipping_address'))
+        return {'shipper': shipper, 'recipient': recipient, 'commodities': None, 'invoice': None}
 
     @staticmethod
     def blockers(dn: DN) -> list:
@@ -686,7 +689,8 @@ class CarrierShipmentService:
         details.status 统一为 'cancelled'（前端按它显示「运单已取消」），record_status 是记录的实际状态。"""
         cancelled = (
             DNCarrierShipment.query
-            .filter(DNCarrierShipment.dn_id == dn.id, DNCarrierShipment.status.in_(('cancelled', 'dismissed')),
+            .filter(DNCarrierShipment.dn_id == dn.id, DNCarrierShipment.source == SOURCE_API,
+                    DNCarrierShipment.status.in_(('cancelled', 'dismissed')),
                     DNCarrierShipment.tracking_number.isnot(None))
             .order_by(DNCarrierShipment.id.desc())
             .all()
@@ -832,6 +836,8 @@ class CarrierShipmentService:
             'regulatory_check_enabled': bool(adapter is not None and adapter.trade_requirements_enabled()),
             'default_label_format': adapter.default_label_format() if adapter is not None else None,
             'label_formats': label_formats,
+            # 国内 / 跨境（{origin_country, destination_country, international, requires_customs}）
+            'route': ctx['route'],
             'declared_value_carriage': customs.declared_value_carriage if customs else None,
             'delivery_task_id': ctx['task'].id if ctx['task'] is not None else None,
             # 发货任务上现在的运单号（自动建的或手工填的）
@@ -844,59 +850,28 @@ class CarrierShipmentService:
             payload['alerts'] = alerts
         return payload
 
-    @staticmethod
-    def _trade_document_plan(regulatory: dict, etd_enabled: bool) -> dict:
-        """Classify FedEx's required documents against the PDFs available for this DN."""
-        missing, paper, upload_packing_list = [], [], False
-        # Global Trade may mark both invoice variants REQUIRED for one commodity.
-        # When a CI is required, the pro forma entry is an invoice alternative.
-        commercial_invoice_required = any(
-            doc['required'] and doc['document_type'] in ('COMMERCIAL_INVOICE', 'COMMERCIAL_OR_PRO_FORMA_INVOICE')
-            for doc in regulatory['documents']
-        )
-        for doc in regulatory['documents']:
-            if not doc['required']:
-                continue
-            kind = doc['document_type']
-            title = (doc['name'] + ' ' + str(doc.get('message') or '')).upper()
-            if kind == 'AIR_WAYBILL' or doc.get('completion_type') == 'COMPLETE':
-                continue
-            available = kind in ('COMMERCIAL_INVOICE', 'COMMERCIAL_OR_PRO_FORMA_INVOICE') or (
-                kind == 'PRO_FORMA_INVOICE' and commercial_invoice_required
-            )
-            packing_list = kind == 'PACKING_LIST' or (kind == 'OTHER' and 'PACKING LIST' in title)
-            if doc['support_type'] == 'PRINT_ONLY':
-                paper.append(doc)
-                continue
-            if not etd_enabled:
-                paper.append(doc)
-                continue
-            if not available and not packing_list:
-                missing.append(doc)
-                continue
-            if packing_list:
-                upload_packing_list = True
-        return {'missing_documents': missing, 'paper_documents': paper,
-                'upload_packing_list': upload_packing_list}
+    # 贸易单证计划搬到了报关扩展（customs_extension.py），这里保留旧名
+    _trade_document_plan = staticmethod(CustomsExtension.trade_document_plan)
 
     @staticmethod
     def trade_requirements_preview(dn: DN) -> dict:
-        """Read-only preflight; create queries again so changed goods or destinations are rechecked."""
+        """Read-only preflight; create queries again so changed goods or destinations are rechecked.
+        只对带报关扩展的件查（国内件 / 同一关税同盟内没有贸易单证要求）。"""
         ctx = CarrierShipmentService._collect(dn)
         if ctx['blockers']:
             raise ConflictException('Carrier shipment conditions are not met', 16072,
                                     details={'blockers': ctx['blockers']})
         adapter = ctx['adapter']
-        if not adapter.trade_requirements_enabled():
+        if not ctx['customs'] or not adapter.trade_requirements_enabled():
             return {'enabled': False, 'documents': [], 'missing_documents': [], 'paper_documents': []}
         shipment = dict(ctx['shipment'])
-        shipment['ship_date'] = datetime.now(_document_timezone()).date()
+        shipment['ship_date'] = datetime.now(document_timezone()).date()
         try:
             regulatory = adapter.trade_requirements(shipment, deadline=clock() + 20)
         except CarrierError as exc:
             raise _carrier_api_exception(exc, 'regulatory', adapter.code,
                                          unresolved=None, with_unresolved=True) from exc
-        return {**regulatory, **CarrierShipmentService._trade_document_plan(regulatory, adapter.documents_enabled()),
+        return {**regulatory, **CustomsExtension.trade_document_plan(regulatory, adapter.documents_enabled()),
                 'enabled': True}
 
     # ------------------------------------------------------------------
@@ -904,9 +879,9 @@ class CarrierShipmentService:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _shipment_data(dn: DN, view: dict, declared_total, shipper, recipient) -> dict:
-        """交给插件的一票货（纯数据，不引用 ORM 对象；ship_date / documents 建单时再补），形状见 CarrierAdapter"""
-        customs = dn.customs
+    def _shipment_data(dn: DN, route: dict, declared_total, parties: dict) -> dict:
+        """交给插件的一票货（纯数据，不引用 ORM 对象；ship_date / documents 建单时再补），形状见 CarrierAdapter。
+        parties：{shipper, recipient, commodities, invoice}（报关件由报关扩展给，国内件 commodities / invoice 为 None）"""
         packages = list(dn.packages)
         declared_split = split_evenly(declared_total, len(packages)) if declared_total else [None] * len(packages)
         package_items = [{
@@ -916,43 +891,15 @@ class CarrierShipmentService:
             'height_mm': p.height_mm,
             'declared_value': value,
         } for p, value in zip(packages, declared_split)]
-
-        lines = [line for line in view['lines'] if line['packed_quantity'] > 0]
-        weights = allocate_commodity_weights(
-            [{'quantity': l['packed_quantity'], 'unit_weight_kg': l['unit_weight_kg']} for l in lines],
-            view['totals']['gross_weight_kg'],
-        )
-        commodities = [{
-            'description': line['description_en'],
-            'origin_country': line['origin_country'],
-            'hs_code': line['hs_code'],
-            'quantity': line['packed_quantity'],
-            'quantity_unit': line['quantity_unit'],
-            'unit_value': line['unit_value'],
-            'amount': line['amount'],
-            'weight_kg': weight,
-            'part_number': line['goods_code'],
-        } for line, weight in zip(lines, weights)]
-
-        totals = view['totals']
-        invoice = {
-            'invoice_number': view['invoice_number'],
-            'currency': customs.currency,
-            'incoterm': customs.incoterm,
-            'export_reason': customs.export_reason,
-            'freight': customs.freight_charge or 0,
-            'insurance': customs.insurance_charge or 0,
-            'goods_value': totals['goods_value'],
-            'declared_value': declared_total if declared_total else None,
-        }
         return {
             'reference': dn.order_number,
             'ship_date': None,
-            'shipper': shipper,
-            'recipient': recipient,
+            'route': dict(route),
+            'shipper': parties['shipper'],
+            'recipient': parties['recipient'],
             'packages': package_items,
-            'commodities': commodities,
-            'invoice': invoice,
+            'commodities': parties.get('commodities'),
+            'invoice': parties.get('invoice'),
             'documents': None,
         }
 
@@ -1023,25 +970,17 @@ class CarrierShipmentService:
                                       f"(supported: {' / '.join(adapter.label_formats)})", 16077, field='label_format')
         label = adapter.label_options(label_format)
 
-        # CI / PL 必须先签发（没有或已过期 → 用现有逻辑签发；随 pending 记录一起提交）
-        current = CustomsService.current_documents(dn)
-        if any(t not in current for t in DOC_TYPES) or ctx['view']['documents_outdated']:
-            CustomsService.issue_documents(dn, user_id)
-            current = CustomsService.current_documents(dn)
-
         shipment = dict(ctx['shipment'])
-        shipment['ship_date'] = datetime.now(_document_timezone()).date()
-        if adapter.documents_enabled():
-            ci = current[DOC_CI]
-            pl = current[DOC_PL]
-            shipment['documents'] = {
-                'commercial_invoice': {'content': ci.content, 'file_name': ci.file_name},
-                'packing_list': {'content': pl.content, 'file_name': pl.file_name},
-            }
+        shipment['ship_date'] = datetime.now(document_timezone()).date()
+        if ctx['customs']:
+            # 报关件：CI / PL 必须先签发（没有或已过期 → 用现有逻辑签发；随 pending 记录一起提交），
+            # 开了电子单证时交给插件
+            CustomsExtension.prepare_documents(dn, user_id, ctx['view'], adapter, shipment)
 
         now = datetime.now()
         record = DNCarrierShipment(
             dn_id=dn.id,
+            source=SOURCE_API,
             carrier=adapter.code,
             carrier_id=ctx['carrier'].id,
             status='pending',
@@ -1067,6 +1006,7 @@ class CarrierShipmentService:
             'shipment': shipment,
             'sender_country': shipment['shipper']['country_code'],
             'warnings': list(ctx['warnings']),
+            'customs': ctx['customs'],              # 带报关扩展（贸易单证要求、建单后重签 CI / PL）
         }
 
     @staticmethod
@@ -1076,43 +1016,17 @@ class CarrierShipmentService:
         adapter = CarrierIntegrationService.build(plan['integration'])
         code, name = adapter.code, adapter.name
 
-        if adapter.trade_requirements_enabled():
+        if plan['customs'] and adapter.trade_requirements_enabled():
+            # 报关件：查目的地和货物要的贸易单证（报关扩展），缺的拦下、补传的随电子单证上传
             try:
                 regulatory = adapter.trade_requirements(plan['shipment'], deadline=deadline)
             except CarrierError as exc:
                 CarrierShipmentService._finish(record_id, 'failed', state, reason='regulatory_lookup_failed',
                                                error_message=exc.message, transaction_id=exc.transaction_id)
                 raise _carrier_api_exception(exc, 'regulatory', code, unresolved=None, with_unresolved=True)
-            plan['regulatory_requirements'] = regulatory
-            document_plan = CarrierShipmentService._trade_document_plan(regulatory, adapter.documents_enabled())
-            required = {(d['document_type'], d['name']) for d in document_plan['missing_documents']}
-            supplied = {(d['document_type'], d['name']) for d in plan['supplemental_documents']}
-            uploadable = {'CERTIFICATE_OF_ORIGIN', 'USMCA_CERTIFICATION_OF_ORIGIN',
-                          'USMCA_COMMERCIAL_INVOICE_CERTIFICATION_OF_ORIGIN', 'PRO_FORMA_INVOICE', 'OTHER'}
-            invalid = supplied - required
-            if invalid or len(supplied) != len(plan['supplemental_documents']):
-                CarrierShipmentService._finish(record_id, 'failed', state, reason='regulatory_documents_invalid')
-                raise ConflictException('Supplemental documents do not match current FedEx requirements', 16072,
-                                        details={'regulatory': regulatory})
-            missing = [d for d in document_plan['missing_documents']
-                       if (d['document_type'], d['name']) not in supplied]
-            if supplied and not adapter.documents_enabled():
-                missing = document_plan['missing_documents']
-            plan['shipment']['upload_packing_list'] = document_plan['upload_packing_list']
-            regulatory['paper_documents'] = document_plan['paper_documents']
-            if supplied:
-                plan['shipment']['documents']['supplemental'] = [
-                    {**item, 'upload_type': item['document_type'] if item['document_type'] in uploadable else 'OTHER'}
-                    for item in plan['supplemental_documents']]
-            if missing:
-                CarrierShipmentService._finish(record_id, 'failed', state, reason='regulatory_documents_missing')
-                raise ConflictException(
-                    "FedEx requires additional trade documents before this shipment can be created.", 16072,
-                    details={'blockers': [
-                        _blocker('REGULATORY_DOCUMENT_REQUIRED', d['name'], document_type=d['document_type'],
-                                 document_url=d['document_url']) for d in missing
-                    ], 'regulatory': regulatory},
-                )
+            CustomsExtension.apply_trade_requirements(
+                plan, adapter, regulatory,
+                lambda reason: CarrierShipmentService._finish(record_id, 'failed', state, reason=reason))
 
         document_ref = None
         if plan['shipment'].get('documents'):
@@ -1302,9 +1216,10 @@ class CarrierShipmentService:
         if task.carrier_id is None:
             tracking_payload['carrier_id'] = plan['carrier_id']
         DeliveryTaskService.save_tracking(task, tracking_payload)
-        # CI / PL 不印运单号，数据没变时这里不出新版本；建单期间单证数据被改了（如公司出口资料）→ 16076，
-        # 按写库失败补偿取消（承运商拿到的申报与现在的数据对不上）
-        CustomsService.issue_documents(dn, user_id)
+        if plan['customs']:
+            # CI / PL 不印运单号，数据没变时这里不出新版本；建单期间单证数据被改了（如公司出口资料）→ 16076，
+            # 按写库失败补偿取消（承运商拿到的申报与现在的数据对不上）
+            CustomsExtension.reissue_after_create(dn, user_id)
 
         ship_date = None
         if result.get('ship_date'):
@@ -1312,7 +1227,7 @@ class CarrierShipmentService:
                 ship_date = date.fromisoformat(str(result['ship_date'])[:10])
             except ValueError:
                 ship_date = None
-        ship_date = ship_date or datetime.now(_document_timezone()).date()
+        ship_date = ship_date or datetime.now(document_timezone()).date()
 
         label_doc = CarrierShipmentService._store_label(dn, tracking, ship_date, archive, user_id)
         record.package_tracking_numbers = result['package_tracking_numbers']

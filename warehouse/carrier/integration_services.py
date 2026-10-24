@@ -17,6 +17,7 @@ from system.settings.services import decrypt_secret, encrypt_secret
 
 from .integrations import adapter_class, display_name, registry
 from .integrations.base import STEP_TEST, CarrierError, clock
+from .methods import adopt_integration, release_integration
 from .models import Carrier, CarrierIntegration
 
 logger = logging.getLogger(__name__)
@@ -141,10 +142,12 @@ class CarrierIntegrationService:
 
     @staticmethod
     def _open_shipments(carrier: Carrier):
+        """承运商未结束的插件运单（source = api；手填 / 文件导回的运单不用这套设置取消）"""
         from warehouse.dn.carrier_services import OPEN_STATUSES
         from warehouse.dn.models import DNCarrierShipment
         return (DNCarrierShipment.query
-                .filter(DNCarrierShipment.carrier_id == carrier.id, DNCarrierShipment.status.in_(OPEN_STATUSES))
+                .filter(DNCarrierShipment.carrier_id == carrier.id, DNCarrierShipment.source == 'api',
+                        DNCarrierShipment.status.in_(OPEN_STATUSES))
                 .order_by(DNCarrierShipment.id)
                 .all())
 
@@ -193,20 +196,27 @@ class CarrierIntegrationService:
     @staticmethod
     @transactional
     def save(carrier: Carrier, data: dict, user_id):
-        """PUT /carrier/<id>/integration：{adapter, enabled, settings, secrets}。adapter 为空 = 删除对接。"""
+        """PUT /carrier/<id>/integration：{adapter, enabled, settings, secrets}。adapter 为空 = 删除对接。
+        对接方式跟上（warehouse/carrier/methods.py）：新建 / 重新启用 / 换插件后，还是默认值的方式改成 api；
+        删掉对接（或换成不支持的插件）时 api 的方式退回默认值。"""
         integration = carrier.integration
         if not (data or {}).get('adapter'):
             if integration is not None:
                 CarrierIntegrationService._assert_no_open_shipments(carrier, "The integration cannot be removed")
                 db.session.delete(integration)
+                release_integration(carrier)
                 db.session.flush()
                 db.session.expire(carrier, ['integration'])
             return None
 
         current = CarrierIntegrationService.snapshot(integration)
         cls, enabled, settings, secrets = CarrierIntegrationService._parse(data, current)
+        was_enabled = integration is not None and integration.adapter == cls.code and bool(integration.enabled)
         if integration is not None and integration.adapter != cls.code:
             CarrierIntegrationService._assert_no_open_shipments(carrier, "The integration cannot be changed")
+            release_integration(carrier, cls)
+        if enabled and not was_enabled:
+            adopt_integration(carrier, cls)
         if integration is None:
             integration = CarrierIntegration(carrier_id=carrier.id)
             db.session.add(integration)

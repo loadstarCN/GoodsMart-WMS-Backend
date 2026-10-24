@@ -1,13 +1,18 @@
-"""上门揽收预约（承运商对接插件 supports_pickup，内置 FedEx Pickup Request API）。
+"""上门揽收：经承运商对接插件预约（supports_pickup，内置 FedEx Pickup Request API），或手工记一笔（source = manual）。
 
 没有和承运商签定期集荷时（如 FedEx 运单的 pickupType 是 CONTACT_FEDEX_TO_SCHEDULE），运单建好后要另约快递员上门。
 揽收按「仓库 + 承运商 + 日期」约，一次带多张同一承运商的运单，件数 / 总重量按所带运单的箱子合计。本模块与具体承运商无关，
 调承运商一律经插件（CarrierAdapter：pickup_location / pickup_availability / schedule_pickup / cancel_pickup）。
-- 承运商：当前仓库所属公司里、对接插件支持上门揽收的承运商（请求可带 carrier_id，不带用第一个）。
-- 待揽收运单：当前仓库、该承运商、状态 active 的自动运单，DN 未发货。被「占着」的不能再约：pending / unknown 的预约，
-  或已约上（scheduled）的预约，且揽收日还没过。揽收日过了、DN 还没发货的运单可以重新预约（快递员没来 / 忘了完成发货）。
-- 前置条件（blockers）：承运商有可用的对接（已启用、设置齐全）且插件支持上门揽收、揽收地址（仓库英文地址，没有则公司的，
-  与建运单的发件地址同一口径）与联系电话放得进承运商的格式（插件检查）。
+- 承运商：当前仓库所属公司里、揽收方式（carriers.pickup_method）是 api 或 manual 的承运商（请求可带 carrier_id，
+  不带用第一个：对接启用的 api 在前，再 manual）。scheduled / dropoff / none 的承运商不用逐票约，不列出。
+- 插件预约（POST /dn/carrier-pickups、可约时间）只对 pickup_method = api 的承运商（否则 blocker PICKUP_METHOD_NOT_API）。
+- 手工记录（POST /dn/carrier-pickups/manual）：电话 / 网站约好后记日期、时间段、受理号、备注，直接 scheduled，不调承运商；
+  api 的承运商也可以记（承运商系统故障时退回手工）。取消只改本地。
+- 待揽收运单：当前仓库、该承运商、状态 active 的运单（任一来源：插件建的 / 手填的 / 文件导回的），DN 未发货。
+  被「占着」的不能再约：pending / unknown 的预约，或已约上（scheduled）的预约，且揽收日还没过。揽收日过了、DN 还没发货的
+  运单可以重新预约（快递员没来 / 忘了完成发货）。
+- 插件预约的前置条件（blockers）：承运商有可用的对接（已启用、设置齐全）且插件支持上门揽收、揽收地址（仓库英文地址，
+  没有则公司的，与建运单的发件地址同一口径）与联系电话放得进承运商的格式（插件检查）。
 - 预约分三段，调承运商时不占行锁、不开事务（与建运单相同）：
   1. 锁所选运单行 → 逐张检查 → 插 pending 记录、运单 pickup_id 指向它，提交；
   2. 调承运商预约（受 CARRIER_CREATE_BUDGET_SECONDS 约束）；
@@ -15,6 +20,7 @@
      结果不明（超时、5xx、响应看不懂）→ unknown，运单仍被占着（免得重复预约），操作员向承运商核对后确认作废才释放。
 - 取消：scheduled 且揽收日没过，用预约时的承运商（carrier_id）的对接设置（停用了也能取消）。取消成功（或回「已取消」）
   → cancelled，运单 pickup_id 清空；明确拒绝 → 保持 scheduled；结果不明 → 保持 scheduled（reason cancel_unclear），可重试取消。
+  手工记录的取消只改本地（不调承运商）。
 - pending 超过 stale_after_seconds() 按 unknown（reason stale）对外。
 - 日期 / 时间都是仓库当地的（DOCUMENT_TIMEZONE，默认 Asia/Tokyo，与运单的发货日同一口径）。
 """
@@ -32,14 +38,14 @@ from extensions.transaction import transactional
 from warehouse.carrier.integration_services import CarrierIntegrationService
 from warehouse.carrier.integrations import adapter_class, display_name
 from warehouse.carrier.integrations.base import STEP_PICKUP, CarrierError, clock
-from warehouse.carrier.models import Carrier, CarrierIntegration
+from warehouse.carrier.models import Carrier
 from warehouse.common.countries import COUNTRY_NAMES_EN
 from warehouse.common.locks import lock_row
 from .carrier_services import (
     ERROR_MESSAGE_MAX, CarrierShipmentService, _blocker, _carrier_api_exception, _unclear_reason,
     create_budget_seconds, stale_after_seconds,
 )
-from .customs_services import CustomsService, LOCKED_DN_STATUSES, _document_timezone
+from warehouse.shipping.common import LOCKED_DN_STATUSES, current_delivery_task, document_timezone
 from .models import DN, CarrierPickup, DNCarrierShipment, _service_name
 
 logger = logging.getLogger(__name__)
@@ -48,6 +54,11 @@ PICKUP_BLOCKED = 16130          # 409 前置条件不满足（details.blockers�
 PICKUP_INVALID = 16131          # 400 请求参数不合法（field）
 PICKUP_SHIPMENTS_INVALID = 16132    # 409 所选运单不能预约（details.shipments）
 PICKUP_STATE_CONFLICT = 16133   # 409 当前状态不能取消 / 作废（details {pickup_id, status, reason}）
+
+SOURCE_API = 'api'
+SOURCE_MANUAL = 'manual'
+BOOKED_METHODS = ('api', 'manual')      # 要逐票约揽收的方式（列在揽收页）
+MAX_CONFIRMATION = 40
 
 UNRESOLVED_STATUSES = CarrierPickup.UNRESOLVED_STATUSES     # pending / unknown
 MAX_DAYS_AHEAD = 30             # 揽收日最多填到 30 天后（承运商实际只开放最近几个营业日，由承运商判断）
@@ -70,7 +81,7 @@ def _maybe_cancelled(name) -> str:
 
 
 def _tz():
-    return _document_timezone()
+    return document_timezone()
 
 
 def local_today() -> date:
@@ -128,7 +139,9 @@ class CarrierPickupService:
 
     @staticmethod
     def can_cancel(record: CarrierPickup, today: date = None) -> bool:
-        return (record is not None and record.status == 'scheduled' and bool(record.confirmation_code)
+        """scheduled 且揽收日没过；插件预约的还要有确认号（取消时交给承运商）"""
+        return (record is not None and record.status == 'scheduled'
+                and (record.source == SOURCE_MANUAL or bool(record.confirmation_code))
                 and record.pickup_date >= (today or local_today()))
 
     @staticmethod
@@ -155,6 +168,7 @@ class CarrierPickupService:
         status, reason = CarrierPickupService.effective_status(record)
         return {
             'id': record.id,
+            'source': record.source,
             'status': status,
             'reason': reason,
             'pickup_date': record.pickup_date.isoformat() if record.pickup_date else None,
@@ -177,17 +191,22 @@ class CarrierPickupService:
 
     @staticmethod
     def pickup_carriers(company_id) -> list:
-        """公司里对接插件支持上门揽收的承运商（对接启用的在前，再按名称）"""
+        """公司里揽收方式是 api / manual 的承运商：能用插件预约的（api、对接启用）在前，再 manual，
+        再对接没启用的 api；同组按名称"""
         rows = (
             Carrier.query
-            .join(CarrierIntegration, CarrierIntegration.carrier_id == Carrier.id)
-            .filter(Carrier.company_id == company_id)
+            .filter(Carrier.company_id == company_id, Carrier.pickup_method.in_(BOOKED_METHODS))
             .all()
         )
-        carriers = [c for c in rows
-                    if adapter_class(c.integration.adapter) is not None
-                    and adapter_class(c.integration.adapter).supports_pickup]
-        return sorted(carriers, key=lambda c: (not c.integration.enabled, not c.is_active, (c.name or '').lower(), c.id))
+
+        def rank(carrier):
+            if carrier.pickup_method == SOURCE_MANUAL:
+                return 1
+            integration = carrier.integration
+            cls = adapter_class(integration.adapter) if integration is not None else None
+            return 0 if cls is not None and cls.supports_pickup and integration.enabled else 2
+
+        return sorted(rows, key=lambda c: (rank(c), not c.is_active, (c.name or '').lower(), c.id))
 
     @staticmethod
     def _carrier(warehouse, carrier_id=None):
@@ -199,7 +218,8 @@ class CarrierPickupService:
         for carrier in carriers:
             if carrier.id == carrier_id:
                 return carrier
-        raise _invalid("carrier_id is not a carrier of this company that can book pickups", 'carrier_id')
+        raise _invalid("carrier_id is not a carrier of this company whose pickups are booked (pickup_method api or "
+                       "manual)", 'carrier_id')
 
     @staticmethod
     def _carrier_payload(carrier):
@@ -208,7 +228,8 @@ class CarrierPickupService:
         integration = carrier.integration
         return {'id': carrier.id, 'name': carrier.name, 'code': carrier.code,
                 'adapter': integration.adapter if integration else None,
-                'enabled': bool(integration and integration.enabled)}
+                'enabled': bool(integration and integration.enabled),
+                'pickup_method': carrier.pickup_method, 'pickup_contact': carrier.pickup_contact}
 
     @staticmethod
     def _place(warehouse) -> dict:
@@ -233,11 +254,16 @@ class CarrierPickupService:
 
     @staticmethod
     def _collect(warehouse, carrier, for_create=True) -> dict:
-        """→ {carrier, snapshot, adapter, blockers, location}；location 是插件转好的揽收地点（有问题为 None）"""
+        """→ {carrier, method, snapshot, adapter, blockers, location}；location 是插件转好的揽收地点（有问题为 None）。
+        揽收方式是 manual 的承运商不看对接（blockers 为空，只能手工记录）。"""
         blockers, snapshot, adapter, location = [], None, None, None
+        method = carrier.pickup_method if carrier is not None else None
         if carrier is None:
             blockers.append(_blocker('PICKUP_CARRIER_MISSING',
-                                     "No carrier of this company has an online integration that can book pickups"))
+                                     "No carrier of this company books pickups (pickup method api or manual)"))
+        elif method != SOURCE_API:
+            return {'carrier': carrier, 'method': method, 'snapshot': None, 'adapter': None, 'blockers': blockers,
+                    'location': None}
         else:
             snapshot = CarrierIntegrationService.for_carrier(carrier)
             adapter = CarrierIntegrationService.build(snapshot)
@@ -259,8 +285,19 @@ class CarrierPickupService:
             blockers.extend(problems)
             if not place['address_text']:
                 location = None
-        return {'carrier': carrier, 'snapshot': snapshot, 'adapter': adapter, 'blockers': blockers,
+        return {'carrier': carrier, 'method': method, 'snapshot': snapshot, 'adapter': adapter, 'blockers': blockers,
                 'location': location}
+
+    @staticmethod
+    def _require_api(ctx):
+        """插件预约 / 查可约时间只对 pickup_method = api 的承运商 → 否则 409 16130（PICKUP_METHOD_NOT_API）"""
+        carrier = ctx['carrier']
+        if carrier is not None and ctx['method'] != SOURCE_API:
+            raise CarrierPickupService._blocked([_blocker(
+                'PICKUP_METHOD_NOT_API',
+                f"Pickups of carrier {carrier.name} are not booked through the online integration (pickup method: "
+                f"{ctx['method']}); record the pickup by hand (POST /warehouse/dn/carrier-pickups/manual)",
+                carrier_id=carrier.id)], carrier.name)
 
     @staticmethod
     def _name(ctx) -> str:
@@ -280,7 +317,7 @@ class CarrierPickupService:
 
     @staticmethod
     def _open_shipments(warehouse_id, carrier, adapter_code):
-        """当前仓库、该承运商、active、DN 未发货的自动运单（新的在前）"""
+        """当前仓库、该承运商、active、DN 未发货的运单（任一来源，新的在前）"""
         return (
             DNCarrierShipment.query
             .join(DN, DN.id == DNCarrierShipment.dn_id)
@@ -299,10 +336,11 @@ class CarrierPickupService:
     @staticmethod
     def _shipment_row(shipment: DNCarrierShipment, pickups: dict, today: date) -> dict:
         dn = shipment.dn
-        task = CustomsService._delivery_task(dn)
+        task = current_delivery_task(dn)
         pickup = pickups.get(shipment.pickup_id) if shipment.pickup_id else None
         return {
             'shipment_id': shipment.id,
+            'source': shipment.source,
             'dn_id': dn.id,
             'order_number': dn.order_number,
             'delivery_task_id': task.id if task is not None else None,
@@ -325,12 +363,16 @@ class CarrierPickupService:
         ctx = CarrierPickupService._collect(warehouse, carrier)
         integration = None
         shipments, recent = [], []
+        code = None
         if ctx['snapshot'] is not None:
             code = ctx['snapshot']['adapter']
             cls = adapter_class(code)
             integration = {'code': code, 'name': display_name(code),
                            'portal_name': cls.portal_name if cls else None,
                            'portal_url': cls.portal_url if cls else None}
+        elif carrier is not None and carrier.integration is not None:
+            code = carrier.integration.adapter
+        if carrier is not None:
             shipments = CarrierPickupService._open_shipments(warehouse.id, carrier, code)
             recent = (
                 CarrierPickup.query
@@ -352,9 +394,13 @@ class CarrierPickupService:
                                 'CARRIER_INTEGRATION_UNAVAILABLE', 'CARRIER_INTEGRATION_DISABLED',
                                 'CARRIER_NOT_CONFIGURED', 'CARRIER_CONFIG_INVALID'}
         adapter = ctx['adapter']
+        api = ctx['method'] == SOURCE_API
+        schedulable = any(r['can_schedule'] for r in rows)
         return {
-            # 承运商的对接可以预约揽收（启用、设置齐全）；能不能约另看 can_create / blockers
-            'enabled': not any(b['code'] in integration_problems for b in ctx['blockers']),
+            # 承运商的对接可以预约揽收（揽收方式 api、对接启用、设置齐全）；能不能约另看 can_create / blockers
+            'enabled': api and not any(b['code'] in integration_problems for b in ctx['blockers']),
+            # 揽收方式：api = 经插件预约（can_create）；manual = 约好后手工记一笔（can_record）
+            'method': ctx['method'],
             'carrier': CarrierPickupService._carrier_payload(carrier),
             'carriers': [CarrierPickupService._carrier_payload(c)
                          for c in CarrierPickupService.pickup_carriers(warehouse.company_id)],
@@ -362,7 +408,9 @@ class CarrierPickupService:
             'warehouse_id': warehouse.id,
             'today': today.isoformat(),
             'timezone': str(_tz()),
-            'can_create': not ctx['blockers'] and any(r['can_schedule'] for r in rows),
+            'can_create': api and not ctx['blockers'] and schedulable,
+            # 手工记录揽收（api 的承运商也可以，承运商系统故障时）
+            'can_record': carrier is not None and schedulable,
             'blockers': ctx['blockers'],
             'pickup_location': ctx['location'],
             'max_remarks': min(adapter.pickup_max_remarks, MAX_REMARKS) if adapter is not None else MAX_REMARKS,
@@ -380,6 +428,7 @@ class CarrierPickupService:
         """GET /dn/carrier-pickups/availability：承运商返回的可约日期与时间（只查询，不预约）"""
         carrier = CarrierPickupService._carrier(warehouse, carrier_id)
         ctx = CarrierPickupService._collect(warehouse, carrier)
+        CarrierPickupService._require_api(ctx)
         if ctx['blockers']:
             raise CarrierPickupService._blocked(ctx['blockers'], CarrierPickupService._name(ctx))
         deadline = clock() + create_budget_seconds()
@@ -483,14 +532,69 @@ class CarrierPickupService:
         warehouse = db.session.get(Warehouse, warehouse_id)
         carrier = CarrierPickupService._carrier(warehouse, request['carrier_id'])
         ctx = CarrierPickupService._collect(warehouse, carrier)
+        CarrierPickupService._require_api(ctx)
         if ctx['blockers']:
             raise CarrierPickupService._blocked(ctx['blockers'], CarrierPickupService._name(ctx))
         adapter = ctx['adapter']
         if request['remarks'] and len(request['remarks']) > adapter.pickup_max_remarks:
             raise _invalid(f"remarks must be at most {adapter.pickup_max_remarks} characters", 'remarks')
 
+        shipments = CarrierPickupService._lock_shipments(warehouse_id, carrier, request['shipment_ids'])
+        package_count = sum(s.package_count or len(dn.packages) for s, dn in shipments)
+        weights = {s.id: CarrierPickupService._weight_kg(dn) for s, dn in shipments}
+        total_weight = sum(weights.values(), Decimal(0))
+        location = ctx['location']
+        now = datetime.now()
+        record = CarrierPickup(
+            warehouse_id=warehouse_id,
+            source=SOURCE_API,
+            carrier=ctx['snapshot']['adapter'],
+            carrier_id=carrier.id,
+            status='pending',
+            pickup_date=request['pickup_date'],
+            ready_time=request['ready'].strftime('%H:%M'),
+            close_time=request['close'].strftime('%H:%M'),
+            package_count=package_count,
+            total_weight_kg=total_weight,
+            shipments=CarrierPickupService._snapshot(shipments, weights),
+            pickup_location=location,
+            remarks=request['remarks'],
+            notification_email=request['notification_email'],
+            created_by=user_id,
+            created_at=now,
+            updated_at=now,
+        )
+        db.session.add(record)
+        db.session.flush()
+        for shipment, _dn in shipments:
+            shipment.pickup_id = record.id
+        db.session.flush()
         today = local_today()
-        ids = request['shipment_ids']
+        return {
+            'record_id': record.id,
+            'snapshot': ctx['snapshot'],
+            'location': location,
+            'pickup': {
+                'pickup_date': request['pickup_date'], 'ready': request['ready'], 'close': request['close'],
+                'same_day': request['pickup_date'] == today, 'tz': _tz(),
+                'package_count': package_count, 'total_weight_kg': total_weight,
+                'remarks': request['remarks'], 'notification_email': request['notification_email'],
+            },
+        }
+
+    @staticmethod
+    def _snapshot(shipments, weights) -> list:
+        """预约记录里所带运单的快照"""
+        return [{
+            'shipment_id': s.id, 'source': s.source, 'dn_id': dn.id, 'order_number': dn.order_number,
+            'tracking_number': s.tracking_number, 'package_count': s.package_count or len(dn.packages),
+            'weight_kg': float(weights[s.id]),
+        } for s, dn in shipments]
+
+    @staticmethod
+    def _lock_shipments(warehouse_id, carrier, ids) -> list:
+        """锁所选运单行、逐张检查 → [(运单, DN)]；有不能带的 → 409 16132（details.shipments）"""
+        today = local_today()
         rows = (
             DNCarrierShipment.query
             .options(lazyload('*'))
@@ -524,30 +628,57 @@ class CarrierPickupService:
             raise ConflictException(
                 "Some of the selected shipments cannot be included in a pickup; reload the list and try again.",
                 PICKUP_SHIPMENTS_INVALID, details={'shipments': problems})
+        return shipments
 
-        package_count = sum(s.package_count or len(dn.packages) for s, dn in shipments)
+    # ------------------------------------------------------------------
+    # 手工记录（没有 API 时：电话 / 网站约好后在 WMS 记一笔）
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def parse_manual(data, warehouse_id) -> dict:
+        """POST /dn/carrier-pickups/manual 请求体 → {carrier_id, shipment_ids, pickup_date, ready, close, remarks,
+        confirmation_code}。carrier_id 必填；warehouse_id 可带，须是当前仓库；不合法 400 16131"""
+        if not isinstance(data, dict):
+            raise _invalid("Request body must be a JSON object", None)
+        if data.get('warehouse_id') is not None and _parse_id(data.get('warehouse_id'), 'warehouse_id') != warehouse_id:
+            raise _invalid("warehouse_id must be the current warehouse (X-WAREHOUSE-ID)", 'warehouse_id')
+        if data.get('carrier_id') is None:
+            raise _invalid("carrier_id is required", 'carrier_id')
+        request = CarrierPickupService.parse_request({**data, 'notification_email': None})
+        code = data.get('confirmation_code')
+        if code is not None and (isinstance(code, bool) or not isinstance(code, (str, int))):
+            raise _invalid("confirmation_code must be a string", 'confirmation_code')
+        code = str(code).strip() if code is not None else ''
+        if len(code) > MAX_CONFIRMATION:
+            raise _invalid(f"confirmation_code must be at most {MAX_CONFIRMATION} characters", 'confirmation_code')
+        request['confirmation_code'] = code or None
+        return request
+
+    @staticmethod
+    @transactional
+    def record_manual(warehouse, user_id, data) -> dict:
+        """POST /dn/carrier-pickups/manual：记一笔约好的揽收（source = manual，直接 scheduled，不调承运商），
+        所选运单的 pickup_id 指向它。承运商的揽收方式须是 api 或 manual。→ {pickup, alerts: [], message: None}"""
+        request = CarrierPickupService.parse_manual(data, warehouse.id)
+        carrier = CarrierPickupService._carrier(warehouse, request['carrier_id'])
+        shipments = CarrierPickupService._lock_shipments(warehouse.id, carrier, request['shipment_ids'])
         weights = {s.id: CarrierPickupService._weight_kg(dn) for s, dn in shipments}
-        total_weight = sum(weights.values(), Decimal(0))
-        location = ctx['location']
         now = datetime.now()
+        integration = carrier.integration
         record = CarrierPickup(
-            warehouse_id=warehouse_id,
-            carrier=ctx['snapshot']['adapter'],
+            warehouse_id=warehouse.id,
+            source=SOURCE_MANUAL,
+            carrier=integration.adapter if integration is not None else None,
             carrier_id=carrier.id,
-            status='pending',
+            status='scheduled',
             pickup_date=request['pickup_date'],
             ready_time=request['ready'].strftime('%H:%M'),
             close_time=request['close'].strftime('%H:%M'),
-            package_count=package_count,
-            total_weight_kg=total_weight,
-            shipments=[{
-                'shipment_id': s.id, 'dn_id': dn.id, 'order_number': dn.order_number,
-                'tracking_number': s.tracking_number, 'package_count': s.package_count or len(dn.packages),
-                'weight_kg': float(weights[s.id]),
-            } for s, dn in shipments],
-            pickup_location=location,
+            package_count=sum(s.package_count or len(dn.packages) for s, dn in shipments),
+            total_weight_kg=sum(weights.values(), Decimal(0)),
+            shipments=CarrierPickupService._snapshot(shipments, weights),
             remarks=request['remarks'],
-            notification_email=request['notification_email'],
+            confirmation_code=request['confirmation_code'],
             created_by=user_id,
             created_at=now,
             updated_at=now,
@@ -557,17 +688,9 @@ class CarrierPickupService:
         for shipment, _dn in shipments:
             shipment.pickup_id = record.id
         db.session.flush()
-        return {
-            'record_id': record.id,
-            'snapshot': ctx['snapshot'],
-            'location': location,
-            'pickup': {
-                'pickup_date': request['pickup_date'], 'ready': request['ready'], 'close': request['close'],
-                'same_day': request['pickup_date'] == today, 'tz': _tz(),
-                'package_count': package_count, 'total_weight_kg': total_weight,
-                'remarks': request['remarks'], 'notification_email': request['notification_email'],
-            },
-        }
+        logger.info("pickup %s recorded by hand for carrier %s (%d shipments) by user %s", record.id, carrier.id,
+                    len(shipments), user_id)
+        return {'pickup': CarrierPickupService.payload(record), 'alerts': [], 'message': None}
 
     @staticmethod
     def _request_and_save(plan: dict, deadline: float, state: dict) -> dict:
@@ -675,6 +798,8 @@ class CarrierPickupService:
         """POST /dn/carrier-pickups/<id>/cancel：检查（锁记录）→ 调承运商（不开事务）→ 锁记录写结果"""
         if getattr(g, 'transaction_depth', 0):
             raise RuntimeError("cancel pickup must not run inside another transaction")
+        if record.source == SOURCE_MANUAL:
+            return CarrierPickupService._cancel_manual(record.id, user_id)
         plan = CarrierPickupService._prepare_cancel(record.id)
         code = plan['snapshot']['adapter']
         name = display_name(code)
@@ -696,6 +821,24 @@ class CarrierPickupService:
         pickup = CarrierPickupService._save_cancel(record.id, user_id, 'cancelled', reason=result.get('reason'),
                                                    cancel_transaction_id=result.get('transaction_id'))
         return {'pickup': pickup, 'alerts': result.get('alerts') or [], 'message': result.get('message')}
+
+    @staticmethod
+    @transactional
+    def _cancel_manual(record_id, user_id) -> dict:
+        """手工记录的揽收取消：只改本地（scheduled 且揽收日没过 → cancelled，放开运单），不调承运商"""
+        record = lock_row(db.session.get(CarrierPickup, record_id))
+        if not CarrierPickupService.can_cancel(record):
+            raise CarrierPickupService._state_conflict(
+                record, "Only a scheduled pickup whose date has not passed can be cancelled.")
+        now = datetime.now()
+        record.status = 'cancelled'
+        record.reason = None
+        record.cancelled_at = now
+        record.cancelled_by = user_id
+        record.updated_at = now
+        CarrierPickupService._release(record)
+        db.session.flush()
+        return {'pickup': CarrierPickupService.payload(record), 'alerts': [], 'message': None}
 
     @staticmethod
     def _cancel_snapshot(record: CarrierPickup):
