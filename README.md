@@ -269,14 +269,19 @@ WMS pushes event notifications to external systems via Webhook with HMAC-SHA256 
 | `asn.received` | ASN marked as received |
 | `asn.completed` | ASN completed with actual quantities |
 | `asn.cancelled` | A received (not yet sorted) ASN was cancelled |
-| `dn.in_progress` | DN processing started |
-| `dn.picked` | DN picking completed (includes the planned / picked quantity per goods) |
-| `dn.packed` | DN packing completed (includes the planned / picked / packed quantity per goods) |
-| `dn.delivered` | DN delivered (includes tracking number) |
+| `dn.in_progress` | DN processing started (includes the start time `started_at`) |
+| `dn.picked` | DN picking completed (includes the planned / picked quantity per goods and `picked_at`) |
+| `dn.packed` | DN packing completed (includes the planned / picked / packed quantity per goods and `packed_at`) |
+| `dn.delivered` | DN delivered (includes tracking number and the shipping time `shipped_at`) |
 | `dn.tracking_updated` | The carrier tracking of an automatic shipment changed (status / scans; the full latest result, see *Tracking*) |
-| `dn.completed` | DN completed |
+| `dn.completed` | DN completed (includes tracking number, `shipped_at` and the signed time `signed_at`) |
 | `dn.cancelled` | A DN was cancelled after processing started (`in_progress` / `picked` / `packed`; includes `previous_status` and the picked / packed quantity per goods) |
 | `goods.spec_updated` | Goods weight / dimensions / country of origin changed (company-wide, subscription required — see below) |
+
+`started_at` / `picked_at` / `packed_at` / `shipped_at` / `signed_at` are when the step actually happened (ISO 8601 with offset, e.g.
+`2026-10-23T13:03:00+09:00`), not when the webhook is sent: the time of the warehouse action for manual steps (the
+entered signed time when one is given), the carrier's pickup time for automatic shipping and the carrier's delivery time
+for automatic signing. Webhooks can arrive late (scheduled pushes, retries), so receivers should record these fields.
 
 Document events (`asn.*`, `dn.*`) are sent only to the API Key that created the document.
 `asn.completed` details also carry the goods master data: `goods_weight_kg`, `goods_length_mm`,
@@ -1077,11 +1082,14 @@ carrier-agnostic, in `warehouse/dn/tracking_services.py`:
   number) are ignored and recorded as `error` (`TRACKING.OLD_SHIPMENT`).
 - **Automatic shipping**: once the carrier has the parcel (`picked_up_at`, or status `in_transit` / `out_for_delivery` /
   `delivered`) and the DN is still `packed`, the delivery is completed in the name of the user who created the shipment
-  (a `pending` task is started first; the same checks as a manual *complete* - no document check, a later expected
-  shipping date still blocks) and `dn.delivered` is pushed.
+  (a `pending` task is started first; the same checks as a manual *complete* - no document check, an expected shipping
+  date after the pickup date still blocks) and `dn.delivered` is pushed. The shipping time is the carrier's pickup time
+  (in the server's local time): the task's completion time, the actual shipping date, the DN's `delivered_at` and
+  `shipped_at` of `dn.delivered` all use it, not the time the result was fetched.
 - **Automatic signing**: tracking `delivered` and DN `delivered` → the delivery task is signed (signed time = the
   carrier's delivery time in the server's local time, like the other WMS timestamps, never before the shipping time), the
-  DN completes and `dn.completed` (with `tracking_number`) is pushed.
+  DN completes (`completed_at` = the signed time) and `dn.completed` (with `tracking_number`, `shipped_at`,
+  `signed_at`) is pushed.
 - When a step cannot be done (e.g. 16061 expected shipping date later) the reason is kept in the
   shipment's `tracking_problem` (shown on the delivery page) and retried next round; it is cleared once done. Manual
   completion / signing still works; whichever comes first wins.

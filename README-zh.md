@@ -250,14 +250,18 @@ WMS 通过 Webhook 向外部系统推送事件通知，使用 HMAC-SHA256 签名
 | `asn.received` | ASN 标记为已收货 |
 | `asn.completed` | ASN 完成（含实际数量） |
 | `asn.cancelled` | 已收货（未分拣）的 ASN 被取消 |
-| `dn.in_progress` | DN 开始处理 |
-| `dn.picked` | DN 拣货完成（含各商品计划 / 已拣量） |
-| `dn.packed` | DN 打包完成（含各商品计划 / 已拣 / 已打包量） |
-| `dn.delivered` | DN 已发货（含运单号） |
+| `dn.in_progress` | DN 开始处理（含开始时刻 `started_at`） |
+| `dn.picked` | DN 拣货完成（含各商品计划 / 已拣量、拣货完成时刻 `picked_at`） |
+| `dn.packed` | DN 打包完成（含各商品计划 / 已拣 / 已打包量、打包完成时刻 `packed_at`） |
+| `dn.delivered` | DN 已发货（含运单号、发货时刻 `shipped_at`） |
 | `dn.tracking_updated` | 自动运单的承运商跟踪有变化（状态 / 扫描记录，完整的最新结果，见「跟踪」） |
-| `dn.completed` | DN 完成 |
+| `dn.completed` | DN 完成（含运单号、发货时刻 `shipped_at`、签收时刻 `signed_at`） |
 | `dn.cancelled` | 开始处理后（`in_progress` / `picked` / `packed`）的 DN 被取消（含 `previous_status` 与各商品已拣 / 已打包量） |
 | `goods.spec_updated` | 商品重量 / 尺寸 / 原产国变更（按公司广播，需订阅，见下文） |
+
+`started_at` / `picked_at` / `packed_at` / `shipped_at` / `signed_at` 是这一步实际发生的时刻（带时区偏移的 ISO 8601，如 `2026-10-23T13:03:00+09:00`），不是推送时刻：
+仓库手动操作的 = 操作时刻（签收时填了签收时间的 = 填的时间），承运商揽收后自动发货的 = 承运商的揽收时刻，送达后自动签收的 =
+承运商的送达时刻。推送可能晚到（定时推、失败重试），来源系统应按这些字段记各步的时间。
 
 单据类事件（`asn.*`、`dn.*`）只推给创建该单据的 API Key。`asn.completed` 明细另带商品主数据：
 `goods_weight_kg`、`goods_length_mm`、`goods_width_mm`、`goods_height_mm` 与
@@ -888,11 +892,12 @@ Track API，FedEx 开发者项目里要开通 Track API）。实现在 `warehous
   运单记录的插件与承运商现在的对接插件不同时不查。揽收 / 送达时刻早于建单 12 小时以上（承运商回收再用的单号查到旧包裹）
   的结果不用，记成 `error`（`TRACKING.OLD_SHIPMENT`）。
 - **自动发货**：承运商已经经手（插件给出 `picked_up_at`，或状态是 `in_transit` / `out_for_delivery` / `delivered`）而 DN 还是
-  `packed` → 以建运单的人的名义完成发货（`pending` 的发货任务先开始；校验与手动「完成发货」相同：不查单证，计划发货日在后照样拦），推
-  `dn.delivered`。
+  `packed` → 以建运单的人的名义完成发货（`pending` 的发货任务先开始；校验与手动「完成发货」相同：不查单证，计划发货日晚于揽收日
+  照样拦），推 `dn.delivered`。发货时刻 = 承运商的揽收时刻（换成服务器本地时间）：发货任务的完成时间、实际发货日、DN 的
+  `delivered_at`、`dn.delivered` 的 `shipped_at` 都是它，不是查到的时刻。
 - **自动签收**：跟踪是 `delivered` 而 DN 是 `delivered` → 签收发货任务（签收时间 = 承运商的送达时刻，换成
-  服务器本地时间，与 WMS 其他时间列同一口径；早于完成发货时刻的按完成发货时刻），DN 完成，推 `dn.completed`
-  （带 `tracking_number`）。
+  服务器本地时间，与 WMS 其他时间列同一口径；早于完成发货时刻的按完成发货时刻），DN 完成（`completed_at` 同签收时间），
+  推 `dn.completed`（带 `tracking_number`、`shipped_at`、`signed_at`）。
 - 做不成（如 16061 计划发货日在后）把原因记在运单的 `tracking_problem`（配送页显示），人处理后下一轮再试；
   做成了清空。手动完成发货 / 签收照常可用，谁先到算谁。
 - **跟踪结果**存在 `dn_carrier_shipments.tracking_*`，运单状态接口的 `shipment.tracking`：

@@ -60,6 +60,8 @@ def _shipped_ready(client, token, fedex):
         db.session.get(DN, dn_id).api_key_id = key_id
         # 建单时刻早于下面造的扫描（晚于建单的扫描才算这张运单的，见 from_older_shipment）
         DNCarrierShipment.query.filter_by(dn_id=dn_id, status='active').one().created_at = CREATED_AT
+        # 实际发货日 = 揽收日（PU 是 10-22），计划发货日不能晚于它
+        db.session.get(DeliveryTask, task_id).expected_shipping_date = CREATED_AT.date()
         db.session.commit()
     return dn_id, task_id, key_id
 
@@ -76,6 +78,11 @@ def _state(client, dn_id, task_id):
         record = DNCarrierShipment.query.filter_by(dn_id=dn_id, status='active').one()
         return {'dn': dn.status, 'task': task.status, 'signed_at': task.signed_at,
                 'tracking': record.tracking_payload(), 'created_by': record.created_by}
+
+
+def _local(iso):
+    """承运商的时刻 → 服务器本地时间（naive，WMS 时间列的口径）"""
+    return datetime.fromisoformat(iso).astimezone().replace(tzinfo=None)
 
 
 def _events(client, key_id):
@@ -152,9 +159,18 @@ def test_picked_up_ships_automatically(client, access_token, fedex):
             ('pending', 'in_progress'), ('in_progress', 'completed')]
         assert {log.operator_id for log in logs[-2:]} == {state['created_by']}
 
+    # 发货时刻 = 承运商的揽收时刻（不是查到的时刻）
+    picked_up = _local(PU['date'])
+    with client.application.app_context():
+        task = db.session.get(DeliveryTask, task_id)
+        assert (task.completed_at, task.actual_shipping_date) == (picked_up, date(2026, 10, 22))
+        assert task.started_at <= task.completed_at
+        assert db.session.get(DN, dn_id).delivered_at == picked_up
+
     events = _events(client, key_id)
     assert [e[0] for e in events] == ['dn.delivered', 'dn.tracking_updated']     # 先发货、后跟踪
     assert events[0][1]['tracking_number'] == AWB
+    assert datetime.fromisoformat(events[0][1]['shipped_at']) == datetime.fromisoformat(PU['date'])
     assert events[1][1]['tracking']['status'] == TRACK_IN_TRANSIT
 
 
@@ -169,7 +185,14 @@ def test_delivered_on_packed_dn_ships_then_signs(client, access_token, fedex):
     # 12:00 UTC → 服务器本地时间（与 datetime.now() 同一口径）
     assert state['signed_at'] == datetime(2026, 10, 25, 12, 0, tzinfo=timezone.utc).astimezone().replace(tzinfo=None)
     assert state['tracking']['delivered_at'] == '2026-10-25T12:00:00+00:00'
-    assert [e[0] for e in _events(client, key_id)] == ['dn.delivered', 'dn.completed', 'dn.tracking_updated']
+    events = _events(client, key_id)
+    assert [e[0] for e in events] == ['dn.delivered', 'dn.completed', 'dn.tracking_updated']
+    # 推送里带承运商的揽收 / 送达时刻；DN 完成时刻同签收时刻
+    completed = events[1][1]
+    assert datetime.fromisoformat(completed['shipped_at']) == datetime.fromisoformat(PU['date'])
+    assert datetime.fromisoformat(completed['signed_at']) == datetime(2026, 10, 25, 12, 0, tzinfo=timezone.utc)
+    with client.application.app_context():
+        assert db.session.get(DN, dn_id).completed_at == state['signed_at']
 
     # DN 完成后定时任务不再跟
     assert _sync(client)['tracked'] == 0
@@ -203,7 +226,7 @@ def test_blocked_shipping_is_recorded_then_retried(client, access_token, fedex):
     assert [e[0] for e in _events(client, key_id)] == ['dn.tracking_updated']
 
     with client.application.app_context():
-        db.session.get(DeliveryTask, task_id).expected_shipping_date = date.today()
+        db.session.get(DeliveryTask, task_id).expected_shipping_date = date(2026, 10, 22)    # 揽收日
         db.session.commit()
     stats = _sync(client)
     assert (stats['shipped'], stats['problems']) == (1, 0)
@@ -331,6 +354,7 @@ def test_failed_batch_does_not_discard_other_batches(client, access_token, fedex
     assert _create(client, access_token, second_dn).status_code == 201
     with client.application.app_context():
         DNCarrierShipment.query.filter_by(dn_id=second_dn, status='active').one().created_at = CREATED_AT
+        db.session.get(DeliveryTask, second_task).expected_shipping_date = CREATED_AT.date()
         db.session.commit()
 
     monkeypatch.setattr(FedexAdapter, 'track_batch_size', 1)

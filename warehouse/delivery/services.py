@@ -424,7 +424,7 @@ class DeliveryTaskService:
 
     @staticmethod
     @transactional
-    def complete_task(task_or_id: int | DeliveryTask, data:dict, operator_id: int) -> DeliveryTask:
+    def complete_task(task_or_id: int | DeliveryTask, data:dict, operator_id: int, shipped_at=None) -> DeliveryTask:
         """
         将 DeliveryTask 从 in_progress 切换为 completed
         数据格式：
@@ -442,6 +442,8 @@ class DeliveryTaskService:
         - 海外件的自动运单进行中 / 结果不明 / 正在取消 → 409 16079（CustomsService.assert_ready_to_ship）
         - 海外件只能完成当前发货任务（CustomsService._delivery_task），别的任务 → 409 16091
         - 本 DN 已取消（含补偿取消）的自动运单号 → 409 16078（details.status = cancelled）
+        - shipped_at（承运商跟踪自动完成发货时传承运商的揽收时刻，服务器本地时间）：完成时间、实际发货日、DN 的发货时间
+          （dn.delivered 的 shipped_at）都记成它，计划发货日也按它检查；不传 = 现在
         """
         from warehouse.dn.customs_services import CustomsService
         task = DeliveryTaskService._get_instance(task_or_id)
@@ -465,21 +467,27 @@ class DeliveryTaskService:
         # 有有效的自动运单时，完成发货传了别的运单号 / 承运商 → 409 16078（相同或不传照常，相同时换成标准写法）；
         # 本 DN 已取消的自动运单号 → 409 16078
         DeliveryTaskService._guard_carrier_tracking(task, payload)
-        DeliveryTaskService._assert_shipping_dates(task.expected_shipping_date, datetime.now().date())
+        shipped_on = (shipped_at or datetime.now()).date()
+        DeliveryTaskService._assert_shipping_dates(task.expected_shipping_date, shipped_on)
 
         # 海外件：自动运单进行中 / 结果不明 / 正在取消 → 409 16079（单证不查）
         CustomsService.assert_ready_to_ship(task.dn)
 
         task = DeliveryTaskService._update_task_status(task, 'completed', operator_id)
+        if shipped_at is not None:
+            task.completed_at = shipped_at
+            # 开始时刻是 WMS 里点开始（或自动发货当场开始）的时刻，可能晚于承运商实际揽收：不晚于完成
+            if task.started_at is not None and task.started_at > shipped_at:
+                task.started_at = shipped_at
 
         # 更新字段
-        task.actual_shipping_date = datetime.now().date()  # 获取当前日期
+        task.actual_shipping_date = shipped_on
         for field in ('transportation_mode', 'carrier_id', 'tracking_number', 'shipping_cost', 'currency', 'remark'):
             if field in payload:
                 setattr(task, field, payload[field])
 
         # 若有需要在此更新库存或者做别的业务处理；dn.delivered 的运单号取这条被完成的任务的
-        DNService.delivery_dn(task.dn_id, delivery_task=task)
+        DNService.delivery_dn(task.dn_id, delivery_task=task, shipped_at=shipped_at)
 
         return task
 

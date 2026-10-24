@@ -6,9 +6,12 @@ dn.completed）。本模块与具体承运商无关，查询一律经插件（Ca
   delivered，或 DN 已完成（仓库手工签收了）但跟踪还没到送达（只更新显示）。定时任务每 CARRIER_TRACKING_INTERVAL_MINUTES
   分钟（默认 30）查一遍，最久没查的先查；配送页可以手动刷新一张（POST /dn/<id>/carrier-shipment/track，不看天数）。
 - 承运商已经经手（picked_up_at 有值，或状态是在途 / 派送中 / 已送达）而 DN 还是 packed：以建运单的人的名义完成发货
-  （同手动「完成发货」：pending 的发货任务先开始，不查单证，计划发货日在后照样拦，推 dn.delivered）。
+  （同手动「完成发货」：pending 的发货任务先开始，不查单证，推 dn.delivered）。发货时刻 = 承运商的揽收时刻（换成服务器
+  本地时间）：完成时间、实际发货日、DN 的 delivered_at、dn.delivered 的 shipped_at 都是它，不是查到的时刻；
+  计划发货日晚于揽收日照样拦（16061）。
 - 已送达而 DN 是 delivered：签收发货任务（签收时间 = 承运商的送达时刻，换成服务器本地时间——与 WMS 其他时间列一样是
-  datetime.now() 的口径；早于完成发货时刻的按完成发货时刻），DN 完成，推 dn.completed。
+  datetime.now() 的口径；早于完成发货时刻的按完成发货时刻），DN 完成（completed_at 同签收时间），推 dn.completed
+  （signed_at 同签收时间）。
 - 自动发货 / 签收做不成（计划发货日在后……）把原因记在运单的 tracking_problem（配送页显示），
   人处理后下一轮再试；做成了、或这一轮没有要做的就清空。手动完成发货 / 签收照常可用，谁先到算谁。
 - 跟踪结果存到运单记录（tracking_*）；状态 / 扫描记录有变化时推 dn.tracking_updated（只推给创建 DN 的 API Key）。
@@ -236,7 +239,8 @@ class CarrierTrackingService:
             return
         problem = None
         if picked_up(result):
-            done, problem = CarrierTrackingService._attempt(CarrierTrackingService._auto_ship, record_id)
+            done, problem = CarrierTrackingService._attempt(
+                CarrierTrackingService._auto_ship, record_id, result.get('picked_up_at'))
             stats['shipped'] += int(bool(done))
         if problem is None and result.get('status') == TRACK_DELIVERED:
             done, problem = CarrierTrackingService._attempt(
@@ -286,8 +290,8 @@ class CarrierTrackingService:
 
     @staticmethod
     @transactional
-    def _auto_ship(record_id) -> bool:
-        """承运商已经经手：完成发货（DN 不是 packed、运单不再有效时什么都不做）"""
+    def _auto_ship(record_id, picked_up_at=None) -> bool:
+        """承运商已经经手：完成发货，发货时刻 = 承运商的揽收时刻（取不到按现在）（DN 不是 packed、运单不再有效时什么都不做）"""
         from warehouse.delivery.services import DeliveryTaskService
         record, dn = CarrierTrackingService._locked(record_id)
         if record is None or record.status != 'active' or dn.status != 'packed':
@@ -298,7 +302,7 @@ class CarrierTrackingService:
         operator_id = CarrierTrackingService._operator(record, dn)
         if task.status == 'pending':
             DeliveryTaskService.process_task(task, operator_id)
-        DeliveryTaskService.complete_task(task, {}, operator_id)
+        DeliveryTaskService.complete_task(task, {}, operator_id, shipped_at=local_naive(picked_up_at))
         logger.info("DN %s shipped automatically: carrier %s has shipment %s", dn.id, record.carrier,
                     record.tracking_number)
         return True

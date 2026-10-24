@@ -2,14 +2,16 @@
 
 - 走真实接口：开始处理 → 拣货完成 → 打包完成，依次推 dn.in_progress、dn.picked、dn.packed
 - dn.picked 带各商品计划量 / 已拣量；dn.packed 另带已打包量（少打包时能看到差额）
+- 各事件带这一步的实际时刻（started_at / picked_at / packed_at，带时区偏移），不是推送时刻
 - 只推给创建 DN 的 API Key；WMS 内部建的 DN（没有 api_key_id）不推
 """
 import uuid
-from datetime import date
 
 from tests.helpers import *  # noqa: F401,F403
 from tests.test_inventory_guards import _h, _inbound, _ok, _task_ids, _world
 from system.webhook.models import WebhookEvent
+
+from datetime import date, datetime     # helpers 的 import * 会把 datetime 换成模块，放在它后面
 
 
 def _hook_key(client):
@@ -62,16 +64,25 @@ def test_picked_and_packed_emit_progress_events(client, access_token):
     with client.application.app_context():
         events = WebhookEvent.query.filter_by(api_key_id=key_id).order_by(WebhookEvent.id).all()
         assert [e.event_type for e in events] == ['dn.in_progress', 'dn.picked', 'dn.packed']
-        picked, packed = events[1].payload, events[2].payload
+        started, picked, packed = (e.payload for e in events)
+        dn = db.session.get(DN, dn_id)
+        # 各步的实际时刻（带时区偏移），与 DN 上记的同一刻
+        times = {'started_at': dn.started_at, 'picked_at': dn.picked_at, 'packed_at': dn.packed_at}
 
+    assert started == {'dn_id': dn_id, 'status': 'in_progress', 'order_number': 'SHP-PROGRESS-1',
+                       'started_at': started['started_at']}
     assert picked == {
-        'dn_id': dn_id, 'status': 'picked', 'order_number': 'SHP-PROGRESS-1',
+        'dn_id': dn_id, 'status': 'picked', 'order_number': 'SHP-PROGRESS-1', 'picked_at': picked['picked_at'],
         'details': [{'goods_code': 'GRD-1', 'planned_quantity': 4, 'picked_quantity': 4}],
     }
     assert packed == {
-        'dn_id': dn_id, 'status': 'packed', 'order_number': 'SHP-PROGRESS-1',
+        'dn_id': dn_id, 'status': 'packed', 'order_number': 'SHP-PROGRESS-1', 'packed_at': packed['packed_at'],
         'details': [{'goods_code': 'GRD-1', 'planned_quantity': 4, 'picked_quantity': 4, 'packed_quantity': 3}],
     }
+    for payload, key in ((started, 'started_at'), (picked, 'picked_at'), (packed, 'packed_at')):
+        moment = datetime.fromisoformat(payload[key])
+        assert moment.tzinfo is not None
+        assert moment.replace(microsecond=0) == times[key].astimezone().replace(microsecond=0)
 
 
 def test_internal_dn_emits_nothing(client, access_token):

@@ -870,7 +870,7 @@ def test_domestic_dn_ships_unchanged(client, access_token):
     assert response.status_code == 200, response.get_json()
     with client.application.app_context():
         payload = WebhookEvent.query.filter_by(api_key_id=key_id, event_type='dn.delivered').first().payload
-    assert set(payload) == {'dn_id', 'status', 'order_number', 'tracking_number', 'details'}
+    assert set(payload) == {'dn_id', 'status', 'order_number', 'tracking_number', 'shipped_at', 'details'}
 
     view = client.get(f'/dn/{dn_id}/customs', headers=_h(access_token)).get_json()
     assert view['is_export'] is False and view['problems'] == [] and view['customs'] is None

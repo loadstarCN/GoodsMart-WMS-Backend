@@ -52,6 +52,12 @@ def parse_datetime_value(value, field: str):
     raise BadRequestException(f"{field} must be an ISO 8601 datetime", 16050)
 
 
+def event_time(value):
+    """webhook 里的事件时刻：WMS 时间列（服务器本地时间，naive）→ 带时区偏移的 ISO 8601（如 2026-10-23T13:03:00+09:00）；
+    空 → None"""
+    return value.astimezone().isoformat(timespec='seconds') if value else None
+
+
 def resolve_company_id(data: dict, warehouse) -> int:
     """按 goods_code / carrier_code 查主数据时使用的公司 = 单据仓库所属公司。
 
@@ -833,6 +839,7 @@ class DNService:
 
         webhook_emit('dn.in_progress', {
             'dn_id': dn.id, 'status': 'in_progress', 'order_number': dn.order_number,
+            'started_at': event_time(dn.started_at),
         }, api_key_id=dn.api_key_id)
 
         return dn
@@ -865,6 +872,7 @@ class DNService:
         # 来源系统（批发站）据此显示仓库作业进度；拣少了能从 picked_quantity 提前看到
         webhook_emit('dn.picked', {
             'dn_id': dn.id, 'status': 'picked', 'order_number': dn.order_number,
+            'picked_at': event_time(dn.picked_at),
             'details': [
                 {
                     'goods_code': detail.goods.code if detail.goods else None,
@@ -906,6 +914,7 @@ class DNService:
 
         webhook_emit('dn.packed', {
             'dn_id': dn.id, 'status': 'packed', 'order_number': dn.order_number,
+            'packed_at': event_time(dn.packed_at),
             'details': [
                 {
                     'goods_code': detail.goods.code if detail.goods else None,
@@ -921,10 +930,12 @@ class DNService:
 
     @staticmethod
     @transactional
-    def delivery_dn(dn_or_id:int | DN, delivery_task=None) -> DN:
+    def delivery_dn(dn_or_id:int | DN, delivery_task=None, shipped_at=None) -> DN:
         """
         Mark a DN as 'delivered' (例如发货操作)，仅当 DN 状态为 packed 时可变更为 delivered
         - delivery_task：被完成的那条发货任务（完成发货时由调用方传入），dn.delivered 的 tracking_number 取它的运单号
+        - shipped_at：实际发货时刻（承运商揽收时刻，服务器本地时间），不传 = 现在；存为 delivered_at，
+          dn.delivered 的 shipped_at（带时区偏移）就是它 —— 来源系统按它记发货时间，不按收到推送的时刻
         """
         # 锁 DN 行并重读状态（完成发货已先锁过 DN，同一事务重复加锁无副作用）
         dn = lock_row(DNService._get_instance(dn_or_id))
@@ -933,6 +944,8 @@ class DNService:
         DNService._lock_inventories(dn)
 
         dn = DNService._update_dn_status(dn, "delivered")
+        if shipped_at is not None:
+            dn.delivered_at = shipped_at
         DNService._update_and_calculate_quantity(dn_or_id)
 
         for detail in dn.details:
@@ -957,6 +970,7 @@ class DNService:
         payload = {
             'dn_id': dn.id, 'status': 'delivered', 'order_number': dn.order_number,
             'tracking_number': tracking_number,
+            'shipped_at': event_time(dn.delivered_at),
             'details': [
                 {
                     'goods_code': detail.goods.code,
@@ -979,7 +993,7 @@ class DNService:
     def complete_dn(dn_or_id:int | DN) -> DN:
         """
         Mark a DN as 'completed'.
-        一般只有在 delivered 状态后才可变成 completed
+        一般只有在 delivered 状态后才可变成 completed。completed_at 与 dn.completed 的 signed_at = 签收任务的签收时刻
         """
         # 锁 DN 行并重读状态：并发的重复签收不会重复扣 delivered_stock
         dn = lock_row(DNService._get_instance(dn_or_id))
@@ -993,7 +1007,8 @@ class DNService:
         for detail in dn.details:
             InventoryService.dn_completed(detail.goods_id,dn.warehouse_id,detail.delivered_quantity)
 
-        # tracking_number：签收的那条发货任务的运单号。dn.delivered 没送到（重试中）时来源系统靠它补上发货信息
+        # tracking_number / shipped_at：签收的那条发货任务的运单号、DN 的发货时刻。dn.delivered 没送到（重试中）时
+        # 来源系统靠它们补上发货信息
         from warehouse.delivery.models import DeliveryTask
         signed_task = (
             DeliveryTask.query
@@ -1002,9 +1017,14 @@ class DNService:
             .order_by(DeliveryTask.id.desc())
             .first()
         )
+        # 完成时刻 = 签收时刻（人填的签收时间、或承运商的送达时刻），不是处理的时刻；没签收的任务按现在
+        if signed_task is not None and signed_task.signed_at is not None:
+            dn.completed_at = signed_task.signed_at
         webhook_emit('dn.completed', {
             'dn_id': dn.id, 'status': 'completed', 'order_number': dn.order_number,
             'tracking_number': signed_task.tracking_number if signed_task else None,
+            'shipped_at': event_time(dn.delivered_at),
+            'signed_at': event_time(dn.completed_at),
             'details': [
                 {
                     'goods_code': detail.goods.code,
