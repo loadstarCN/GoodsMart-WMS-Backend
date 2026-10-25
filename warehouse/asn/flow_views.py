@@ -50,6 +50,9 @@ class ASNFlow(Resource):
         - putaway is estimated from the warehouse's stock waiting for putaway (putaway records carry no ASN):
           summary {quantity, pending_quantity, put_away_quantity, goods[{goods_id, code, name, quantity, pending}],
           last_putaway_at, estimated: true}
+        - sorting summary.spec_capture: {fields, mode, enforcement: warn | block, pending_count, sorted_pending:
+          [{asn_detail_id, goods_id, goods_code, goods_name, spec_pending}]} (sorted lines still to capture: what
+          completing sorting warns about / is blocked by)
         """
         return InboundFlowService.build(_owned_asn(asn_id)), 200
 

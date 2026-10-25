@@ -2,6 +2,7 @@ from flask_restx import Namespace, fields, inputs,reqparse
 from extensions import authorizations
 from system.user.schemas import user_simple_model as original_user_model
 from warehouse.asn.schemas import asn_model
+from warehouse.asn.spec_capture import sorted_pending_lines
 from warehouse.goods.schemas import goods_simple_model as goods_model
 from system.common import pagination_parser, create_pagination_model,generate_input_fields
 from .models import SortingTask
@@ -130,6 +131,12 @@ sorting_task_model = api_ns.inherit('SortingTask', sorting_task_base_model, {
     'task_details': fields.List(fields.Nested(sorting_task_detail_model),readOnly=True,  description='Sorting Task Details'),
     'batches': fields.List(fields.Nested(sorting_batch_model), readOnly=True, description='Sorting Batches of this task'),
     'status_logs': fields.List(fields.Nested(sorting_task_status_log_model), readOnly=True, description='Logs of status changes'),
+    # 规格采集（warehouse/asn/spec_capture.py）：本单分拣到、还没采集规格的行 —— 完成分拣时 warn 照常完成并在这里列出，
+    # block 则 409 17021（details.lines 同一结构）
+    'spec_pending': fields.List(
+        fields.Raw, readOnly=True, attribute=lambda task: sorted_pending_lines(task.asn) if task.asn else [],
+        description='Sorted lines whose specs are still to capture: [{asn_detail_id, goods_id, goods_code, '
+                    'goods_name, spec_pending}] (completing warns with this list; block mode -> 409 17021)'),
 })
 
 # ---------------------------------------------------------------------------------

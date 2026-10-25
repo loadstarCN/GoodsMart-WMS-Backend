@@ -114,6 +114,15 @@ from werkzeug.exceptions import HTTPException
 #             10012 / 10014 / 16100 / 16101，details 带 row / rows / code / columns / value）
 # 11011  409  内置权限（system/user/builtin.py）不能改代码 / 删除：details {permission, reason: RENAME | DELETE}
 # 11012  409  内置角色不能改名 / 停用 / 删除（权限照常分配）：details {role, reason: RENAME | DEACTIVATE | DELETE}
+#
+# 业务码登记（收货规格采集：warehouse/common/spec_capture.py、warehouse/asn/spec_capture.py；17xxx = 入库规则）：
+# 17020  400  规格采集设置不合法（收货通知的 spec_capture；仓库的 default_spec_capture_fields / default_spec_capture_mode /
+#             spec_capture_enforcement）：field = spec_capture / spec_capture.fields / spec_capture.mode / 仓库字段名
+# 17021  409  分拣完成被拦（仓库 spec_capture_enforcement = block）：分拣到的行还有待采集项、也没填跳过原因：
+#             details {asn_id, enforcement, lines: [{asn_detail_id, goods_id, goods_code, goods_name, spec_pending}]}
+# 17022  400  规格采集请求不合法：既没有值也没有跳过原因；长宽高没给齐（field dimensions，details {missing}）；remeasure 模式
+#             没给齐要求的项（field spec_capture，details {missing}）；note 不是文字或超过 255 字（field note）
+# 17023  409  只有已收货（received）的收货通知能采集规格：details {asn_id, status}
 
 class APIException(Exception):
     """API异常基类"""

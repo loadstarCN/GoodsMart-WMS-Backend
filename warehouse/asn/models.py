@@ -19,7 +19,9 @@ class ASN(db.Model):
         db.Index('idx_asn_expected_date', 'expected_arrival_date'),      # 预计到货日期索引
         db.Index('idx_asn_created_status', 'created_at', 'status'), 
         db.CheckConstraint("status IN ('pending','received','completed','closed')", name='chk_valid_status'),
-        db.CheckConstraint("asn_type IN ('inbound','return_from_customer','transfer')", name='chk_valid_type')
+        db.CheckConstraint("asn_type IN ('inbound','return_from_customer','transfer')", name='chk_valid_type'),
+        db.CheckConstraint("spec_capture_mode IS NULL OR spec_capture_mode IN ('missing','remeasure')",
+                           name='chk_asn_spec_capture_mode'),
     )
 
     ASN_TYPES = ('inbound', 'return_from_customer', 'transfer')
@@ -142,6 +144,18 @@ class ASN(db.Model):
         UTCDateTime,
         nullable=True,
         info={'description': '最近一次查询跟踪的时刻'}
+    )
+    # 规格采集请求（warehouse/asn/spec_capture.py）：建单时没传 spec_capture 就复制仓库的默认值（快照）。
+    # 空 / null = 不采集（迁移前的存量单据都是 null）；模式 null 按 missing
+    spec_capture_fields = db.Column(
+        db.JSON,
+        nullable=True,
+        info={'description': '要采集的规格（weight / dimensions / origin_country 的子集）'}
+    )
+    spec_capture_mode = db.Column(
+        db.String(16),
+        nullable=True,
+        info={'description': '采集模式：missing 只补缺 / remeasure 全部重新测量'}
     )
 
     def tracking_payload(self):
@@ -293,6 +307,24 @@ class ASNDetail(db.Model):
         onupdate=db.func.now(),
         info={'description': '最后更新时间'}
     )
+    # 规格采集结果（PUT /asn/<id>/details/<detail_id>/spec）：最近一次采集或跳过的时刻与人；
+    # spec_capture_note 非空 = 跳过（其余没采的项）及原因。待采集项不落库，按商品当前资料与单据的模式算出
+    spec_captured_at = db.Column(
+        UTCDateTime,
+        nullable=True,
+        info={'description': '规格采集 / 跳过的时刻'}
+    )
+    spec_captured_by = db.Column(
+        db.Integer,
+        db.ForeignKey('users.id', ondelete='SET NULL'),
+        nullable=True,
+        info={'description': '规格采集 / 跳过的人'}
+    )
+    spec_capture_note = db.Column(
+        db.String(255),
+        nullable=True,
+        info={'description': '跳过原因（非空 = 跳过）'}
+    )
 
     # 关系优化
     goods = db.relationship(
@@ -303,7 +335,14 @@ class ASNDetail(db.Model):
     )
     creator = db.relationship(
         'User',
+        foreign_keys=[created_by],
         backref=db.backref('created_asn_details', lazy='dynamic'),
         lazy='joined',
         info={'description': '创建人对象'}
+    )
+    spec_capturer = db.relationship(
+        'User',
+        foreign_keys=[spec_captured_by],
+        lazy='select',
+        info={'description': '规格采集 / 跳过的人'}
     )

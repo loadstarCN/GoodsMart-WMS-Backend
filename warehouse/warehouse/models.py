@@ -20,7 +20,10 @@ class Warehouse(db.Model):
         db.Index('idx_warehouse_active', 'is_active'),  # 状态过滤
 
         db.UniqueConstraint('company_id', 'name', name='uq_company_warehouse'),  # 新增复合唯一约束
-        
+        db.CheckConstraint("default_spec_capture_mode IN ('missing','remeasure')",
+                           name='chk_warehouse_spec_capture_mode'),
+        db.CheckConstraint("spec_capture_enforcement IN ('warn','block')",
+                           name='chk_warehouse_spec_capture_enforcement'),
     )
 
     id = db.Column(db.Integer, primary_key=True, autoincrement=True, info={'description': '仓库ID'})
@@ -84,6 +87,29 @@ class Warehouse(db.Model):
         db.String(64),
         nullable=True,
         info={'description': '仓库时区（IANA 名，空 = 默认时区）'}
+    )
+    # 收货规格采集的默认规则：新建收货通知没传 spec_capture 时，把采集项与模式复制到单据上（快照，之后改这里不影响已建的单）。
+    # 默认不采集（空列表），现有流程不变；提示 / 拦截（spec_capture_enforcement）在分拣完成时按仓库当前的设置判断
+    default_spec_capture_fields = db.Column(
+        db.JSON,
+        nullable=True,
+        default=list,
+        server_default=db.text("'[]'"),
+        info={'description': '默认采集项（weight / dimensions / origin_country 的子集；空 = 不采集）'}
+    )
+    default_spec_capture_mode = db.Column(
+        db.String(16),
+        nullable=False,
+        default='missing',
+        server_default='missing',
+        info={'description': '默认采集模式：missing 只补缺 / remeasure 全部重新测量'}
+    )
+    spec_capture_enforcement = db.Column(
+        db.String(8),
+        nullable=False,
+        default='warn',
+        server_default='warn',
+        info={'description': '分拣完成时还有待采集：warn 提示 / block 拦截'}
     )
     company_id = db.Column(
         db.Integer, 
