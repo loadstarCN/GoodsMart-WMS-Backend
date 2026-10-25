@@ -215,6 +215,7 @@ GoodsMart-WMS-Backend/
 - 库位间调拨
 - 库存移除
 - 库存快照（每日定时）
+- 库存流水、按库位查看、历史库存（日终结存）、库存分析（库龄 / 周转 / ABC / 呆滞）、补货阈值批量设置——见「库存流水与库存分析」
 
 ### 作业流程规则
 - 分拣 / 拣货 / 打包 / 发货任务只由单据流转自动生成（ASN 收货 → 分拣；DN 开始处理 → 拣货；拣货完成 → 打包；打包完成 → 发货），
@@ -343,6 +344,29 @@ payload 是当前值的完整快照（`null` = 未录入）：
 它与 `GET /warehouse/goods/<id>` 一样受仓库范围限制（非公司管理员员工须带 `X-WAREHOUSE-ID`，且商品在该仓库有库存，
 否则 404 `13003`），响应只有 `{id, code, origin_country}`。
 CSV 导入支持可选的 `origin_country` 列（已有商品：`append` 只补空白，`override` 只用非空值覆盖）。
+
+## 库存流水与库存分析（库存底座）
+
+所有改实物库存的地方（分拣完成、上架、下架、拣货、打包 / 少打包退回、DN 取消退回、发货、签收、移库、调整单）都经过统一的库存变动服务
+（`warehouse/stock/service.py`），每次变动按桶（仓库 × 商品 × 批次 × 库位 × 库存类别）写一行库存流水；`inventory` 上的实物字段是行表的缓存。
+口径详见 `doc/库存数值系统说明.md` 第九–十三节。查看类接口的权限为 `inventory_read`（阈值修改 `inventory_edit`），范围同库存列表。
+
+| 接口 | 说明 |
+|---|---|
+| `GET /warehouse/stock-ledger/`、`/export` | 库存流水列表 / CSV：按仓库、商品、批号、库位、库存类别、变动类型、单据（doc_type + doc_id / doc_no）、操作人、来源、`trace_id`、时间段筛选 |
+| `GET /warehouse/stock-ledger/summary` | 进销存：期初 / 入 / 出 / 期末（按变动类型拆分；仓内搬动不算入出） |
+| `GET /warehouse/inventory/by-location`、`/by-location/items` | 按库位：库位占用（有库存的库位占比、设了容积另给容积利用率）、按货架（编码前缀）聚合、库位 × 商品明细 |
+| `GET /warehouse/inventory/history`、`/history/export`、`/history/at`、`/history/series`、`/history/flows` | 历史库存（仓库当地日期 24:00，含待上架等全部类别；`coverage` 标出只有库位库存的旧快照日子）、任意时刻、日终走势、每日出入库量 |
+| `GET /warehouse/inventory/metrics`、`/metrics/goods/<id>` | 库存分析（夜间汇总）：近 7 / 30 / 90 天出库（按发货完成）、周转天数、ABC、库龄档、呆滞 |
+| `PUT /warehouse/inventory/thresholds`、`/thresholds/by-filter`，`GET /thresholds/suggest` | 补货阈值批量设置（逐个 / 按分类、品牌、勾选范围设固定值或建议值）与建议值预览 |
+
+- 移库：从破损 / 退货库位移回 standard 库位必须填原因 `reason`（没给时非空的 `remark` 也算）→ 否则 400 `15018`；原因写进流水备注。
+- 库存列表新增筛选 `below_low_threshold=true` / `above_high_threshold=true`；待上架汇总支持 `keyword`（与列表一致）。
+- 写入守卫 `STOCK_GUARD`：`log`（默认，绕过统一服务改库存只记 warning 日志）/ `raise`（测试、开发默认，直接报错）/ `off`。
+- 维护命令：`flask stock init-ledger`（期初，流水为空时才执行）、`reconcile [--apply] [--sync-legacy-counters]`（校正，默认演练）、`audit`（对账，
+  有问题退出码 1）、`daily` / `rebuild-daily --from --to`（日终结存）、`metrics [--date]`（库存分析）、`replay [--apply] [--report 文件]`（历史流水回放，
+  默认演练、只出与旧快照逐批核对的差异报告）。
+- 定时任务：每小时（`STOCK_DAILY_MINUTE`，默认第 7 分钟）按各仓库当地日界补生成前一天的日终结存与库存分析，生成新的一天后对账（差异只记日志）。
 
 ## 库存快照
 
@@ -1361,7 +1385,11 @@ WMS 不假设所有仓库在同一个时区（设计见 `doc/timezone-utc.md`）
 
 1. 服务器工作区不干净（`git status --porcelain` 非空）→ 中止，什么都不动；部署前先探测一次当前服务，完全没有 HTTP 响应也中止（手动触发时可勾选 `skip_precheck` 跳过）
 2. 记下部署前的提交，`fetch` + `reset --keep` → `pip install` → `flask db upgrade`（`lock_timeout=15s`），任一步失败都回到部署前的提交、不重启。迁移整条链在一个事务里，PostgreSQL 上失败会整体回滚
+   → 权限种子 → `flask stock init-ledger`（库存流水期初，已有流水就跳过）
 3. 重启后探测 `GET /health`（不鉴权、不查库，返回 `{status, commit}`），要求 `commit` 等于新的短哈希；失败就回滚代码、重启旧代码（**数据库不回滚**，所以迁移要保持旧代码也能跑：先加后删）
+4. 探测通过后 `flask stock reconcile --apply`：把部署窗口里旧进程改了库存却没写流水的差额写成 `reconcile` 行（部署前的版本还没有库存流水时加 `--sync-legacy-counters`）。期初 / 校正失败不回滚，最后标记失败
+
+PostgreSQL 上的测试：`.github/workflows/test-postgres.yml`（postgres:16 上跑迁移往返和库存 / 并发相关的测试子集）。
 
 探测地址默认 `http://127.0.0.1:5002/health`，用仓库变量 `BACKEND_HEALTH_URL` 覆盖。pm2 进程要能运行 `git`（`/health` 取 commit），否则返回 `unknown`、部署被判失败。
 
@@ -1399,7 +1427,7 @@ stdout_logfile=/var/log/wms-api.out.log
 
 出口单证相关业务码：`14019` 出口资料文本超长、`14020` 国家代码不合法、`16063` 报关结构不合法、`16064` 报关行商品编码不在 DN 明细或重复、`16065` 已发货不可改（409）、`16066` 箱子数据不合法、`16067` 当前状态不能改箱子（409）、`16068` 单证条件不全（409，`details.problems`）、`16070` 不是海外单（409）、`16071` 单证不存在（404）、`16117` 单证排不下——某块文字（通常是收件人信息）一页放不下，请缩短（409，`details {document, reason: LAYOUT_OVERFLOW}`）。承运商运单（自动建运单）：`16072` 建单 / 取消的前置条件不满足（409，`details.blockers`）、`16073` 承运商返回错误或结果不明（502，`details.errors` / `transaction_id` / `maybe_processed`）、`16074` 承运商超时或时间预算用完（504，`details.budget_exhausted`）、`16075` 没有可取消 / 可确认作废的运单记录（409，`details.unresolved`）、`16076` 有进行中 / 有效 / 结果不明 / 取消中的运单时不能改箱子或报关数据，也不能签发数据有变化的单证（409，`details {reason: CARRIER_SHIPMENT_OPEN | DOCUMENT_DATA_CHANGED, status, carrier, carrier_shipment {id, status, tracking_number}}`）、`16077` `label_format` 不合法或该承运商不支持（400）、`16078` 运单号 / 承运商与有效的自动运单不一致，或有自动运单时新建 / 删除发货任务（409）、`16079` 有结果不明 / 进行中的建单记录，或运单正在取消 / 取消结果不明——不能建单、存运单号、发货（409，`details.unresolved`）、`16093` 取消 / 确认作废请求里的目标与当前记录不符（409，`details {expected, actual}`）、`16094` 确认作废带运单号的记录时承运商没有确认已取消 / 不存在（409）、`16095` 承运商已建好运单但 WMS 写库失败，已补偿处理（502，`details {error, compensation, unresolved, …}`）。承运商在线对接：`16124` 对接设置不合法（400，`field`：`adapter` / `enabled` / `settings.<key>` / `secrets.<key>`）、`16125` 承运商还有未结束的自动运单，不能删除对接或换插件（409，`details.shipments`）。上门揽收：`16130` 前置条件不满足（409，`details.blockers`）、`16131` 预约参数不合法（400，`field`）、`16132` 所选运单不能预约（409，`details.shipments[{shipment_id, tracking_number, reason}]`）、`16133` 当前状态不能取消 / 作废（409，`details {pickup_id, status, reason, pickup_date}`）；跟踪：`16134` 没有能经 API 跟踪的有效运单（409）；承运商报错 / 超时同运单（`16073` / `16074`，`details.action` 为 `pickup` / `pickup_cancel` / `pickup_availability`）。已不再使用：`16069`（原：完成发货时单证缺失或已过期；完成发货不再查单证）；单证不再印运单号和承运商：`16080`（原：完成发货时运单号与 CI 上印的 AWB 不一致）、`16092`（原：完成发货时承运商与 CI 上印的不一致）。发货任务：`16090` DN 已有未完成的发货任务（409，`details {delivery_task_id, status}`）、`16091` 有报关快照或运单记录的 DN 不是当前发货任务（409，`details {delivery_task_id, current_status}`）、`16136` `shipped_at` 晚于现在（400，`field: shipped_at`；格式不对为 `16050`）。发货流程：`16135` 承运商对接方式 / 集荷安排 / 查询页 / `auto_sign_days` / 文件方式设置（`file_preset`、`file_template.<位置>`、`file_account.<key>`）不合法，或所选方式现在不可选（400，`field`）；文件方式：`16137` 有行有问题、整批不导出（409，`details.rows[{dn_id, order_number, problems[{column, code, message}]}]`）、`16138` 文件方式用不了：请求 / 导入文件不合法（400）或承运商不是文件方式 / 模板不全（409），带 `field`；`16139` 运单服务选项不合法（400，`field: options.<key>`）；`16076` 另有 `details.reason: SHIPPING_OPTIONS_LOCKED` / `SHIP_TO_LOCKED`，`16075` 另用于没有可作废的已导出文件运单（`details.waybill`）；结构化地址用 `14019`（不是文字 / 超长 / `zip_code` 与 `postal_code` 不同）与 `14020`（国家代码）；`16130` 另有 `PICKUP_METHOD_NOT_API`；`16131` 手工揽收另有 `field` `warehouse_id` / `confirmation_code`；建运单的 blocker `SCOPE_NOT_SUPPORTED` / `CUSTOMS_DATA_MISSING` / `CUSTOMS_NOT_SUPPORTED` / `WAYBILL_NOT_SUPPORTED` 取代 `NOT_EXPORT`。仓库：`14022` 时区不合法（不是 IANA 时区名，400，`field: timezone`）。错误响应可能带结构化的 `details`。
 
-作业流程（见上文「作业流程规则」）：`16110` DN 有未结束的承运商运单，请先取消运单（409）、`16111` 调整单已取消（409）、`16112` 调整单当前状态不能取消（409）、`16113` 调整明细无法执行：库位上已没有该商品 / 明细没有库位（409）、`16114` 盘点单有未录入的明细（409，`details.detail_ids`）、`16115` 数值字段不合法（400，`field`）、`16116` 分拣任务的 ASN 不能改（409）、`16120` 移库来源库位没有这个商品（404）、`16121` 同一个 `client_batch_id` 已提交过不同的明细（409，`details {client_batch_id, batch_id}`）、`16122` 修改过调整单明细的人不能审批（409）、`16123` `client_batch_id` 不合法（400）、`44009` 库位有历史记录，请改用停用（409）。任务：`16088` 任务已停用（所属 DN / ASN 已取消，409）、`16089` 拣货一件都没拣不能完成（409）。库存：`15016` 待上架里的破损品只能上到破损库位，standard / return 库位只能用良品部分（`sorted_stock − sorted_damage_stock`）（400，`details {good_pending, damaged_pending}`）；`16162` 只能从 standard 库位拣货（400，`details {location_id, location_type}`）。待上架：`GET /warehouse/inventory/?pending_putaway=true`（只返回 `sorted_stock > 0` 的行，带 `sorted_damage_stock`、`pending_since`）与 `GET /warehouse/inventory/pending-putaway/summary`（doc/库存数值系统说明.md 第八节）。
+作业流程（见上文「作业流程规则」）：`16110` DN 有未结束的承运商运单，请先取消运单（409）、`16111` 调整单已取消（409）、`16112` 调整单当前状态不能取消（409）、`16113` 调整明细无法执行：库位上已没有该商品 / 明细没有库位（409）、`16114` 盘点单有未录入的明细（409，`details.detail_ids`）、`16115` 数值字段不合法（400，`field`）、`16116` 分拣任务的 ASN 不能改（409）、`16120` 移库来源库位没有这个商品（404）、`16121` 同一个 `client_batch_id` 已提交过不同的明细（409，`details {client_batch_id, batch_id}`）、`16122` 修改过调整单明细的人不能审批（409）、`16123` `client_batch_id` 不合法（400）、`44009` 库位有历史记录，请改用停用（409）。任务：`16088` 任务已停用（所属 DN / ASN 已取消，409）、`16089` 拣货一件都没拣不能完成（409）。库存：`15017` 补货阈值批量设置有错误行、全部不改（400，`details.errors[{index, goods_id, goods_code, field, code, message}]`）、`15018` 从破损 / 退货库位移回标准库位没有填原因（400，`field: reason`）、`15019` 库存流水 / 历史 / 分析接口的查询参数不合法（400，`field`）、`15020` 流水导出超过 50,000 行（400，`details {total, max_rows}`）；`15016` 待上架里的破损品只能上到破损库位，standard / return 库位只能用良品部分（`sorted_stock − sorted_damage_stock`）（400，`details {good_pending, damaged_pending}`）；`16162` 只能从 standard 库位拣货（400，`details {location_id, location_type}`）。待上架：`GET /warehouse/inventory/?pending_putaway=true`（只返回 `sorted_stock > 0` 的行，带 `sorted_damage_stock`、`pending_since`）与 `GET /warehouse/inventory/pending-putaway/summary`（doc/库存数值系统说明.md 第八节）。
 
 主数据与权限：`16100` 商品数值不合法（400）、`16101` CSV 内商品编码重复（400，带行号）、`16102` 数据值不合法（400）、`16103` 不能分配已停用的角色（400）、`16104` 只有公司管理员能新建 / 删除仓库或更换负责人（403）、`16105` 没有公司管理权限时只能管理绑定自己的 API Key（403）、`44004` 被单据或库存引用的主数据不能删除，请改用停用（409，`details {entity, id, references}`）、`44005` 与已有数据冲突（409）。密码：`10015` 新密码须 8–16 位，含大写字母、小写字母、数字和特殊符号（`@$!%*?&`），不能有其它字符（400，`field`，`details {min_length, max_length, special_characters}`；忘记密码重置、修改密码、新建 / 修改用户与员工都查）。内置权限 / 角色（输出 `is_builtin`）：`11011` 内置权限不能改代码、不能删（409，`details {permission, reason}`），`11012` 内置角色（admin / company_admin / warehouse_admin / warehouse_operator）不能改名、停用、删除（409，`details {role, reason}`）。商品导入：模板 `GET /warehouse/goods/bulk_upload/template`；`10004` / `10005` / `10006` / `10012` / `10014` / `16100` / `16101` 带 `details {row, rows, code, columns, value}`，`10016` 文件不是 UTF-8 文本。
 

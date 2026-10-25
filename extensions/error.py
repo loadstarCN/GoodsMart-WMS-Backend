@@ -105,6 +105,19 @@ from werkzeug.exceptions import HTTPException
 #             details {entity: 'location', id, references: {记录类型: 行数}}
 # 15016  400  上到 standard / return 库位的数量超过待上架的良品部分（sorted_stock − sorted_damage_stock；破损品只能上到
 #             damaged 库位）：field = quantity，details {goods_id, location_type, quantity, good_pending, damaged_pending}
+#
+# 业务码登记（库存底座：库存流水 / 历史库存 / 库存分析 / 补货阈值，doc/库存数值系统说明.md 第九–十三节）：
+# 15017  400  补货阈值批量设置有错误行（PUT /inventory/thresholds、/thresholds/by-filter），全部不改：
+#             details {errors: [{index, goods_id, goods_code, field, code, message}]}，code 为 15013（low < -1）/
+#             15014（high < -1）/ 15015（high ≤ low）/ 16030（商品不在本公司）/ 15017（非整数、重复商品、没给值）；
+#             请求体不合法、超过 1,000 个商品、suggest 参数不合法时 field = items / filter / suggest.<key>
+# 15018  400  从破损 / 退货库位移回 standard 库位（移库）没有填原因：field = reason，details {from_location_id,
+#             from_location_type, to_location_id, to_location_type}（reason 优先，没给时非空的 remark 也算原因；原因写进
+#             库存流水的备注）；reason 不是文字 / 超过 255 字也是 15018
+# 15019  400  库存流水 / 按库位 / 历史库存 / 库存分析接口的查询参数不合法（日期格式、未来日期、超过 400 天、未知的库存类别、
+#             group_by / status / sort 取值、没指定仓库）：field = 参数名
+# 15020  400  库存流水导出超过 50,000 行，请缩小筛选范围：details {total, max_rows}
+# 绕过 StockService 直接改库存（STOCK_GUARD = raise）→ StockGuardViolation（未捕获异常，500 50000；生产默认只记日志）
 # 16162  400  拣货只能从 standard 库位拣（批次提交 / 改量 / 完成复核）：field = location_id，details {location_id, location_type}
 #
 # 业务码登记（账号 / 内置权限角色 / 商品导入）：
