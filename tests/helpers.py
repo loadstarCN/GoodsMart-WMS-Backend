@@ -76,6 +76,7 @@ from warehouse.cyclecount.schemas import api_ns as cyclecount_ns
 from warehouse.adjustment.schemas import api_ns as adjustment_ns
 from warehouse.transfer.schemas import api_ns as transfer_ns
 from warehouse.payment.schemas import api_ns as payment_ns
+from warehouse.search.schemas import api_ns as search_ns
 from warehouse.common import extract_warehouse_id
 from system.user.schemas import api_ns as user_ns
 from tasks.views import api_ns as task_ns
@@ -151,6 +152,7 @@ def setup_app():
     api.add_namespace(adjustment_ns, path='/adjustment')
     api.add_namespace(transfer_ns, path='/transfer')
     api.add_namespace(payment_ns, path='/payment')
+    api.add_namespace(search_ns, path='/search')
     api.add_namespace(user_ns, path='/user')
     api.add_namespace(logs_ns, path='/logs')
     api.add_namespace(limiter_ns, path='/ip-lists')

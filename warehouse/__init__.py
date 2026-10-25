@@ -22,6 +22,7 @@ from .cyclecount.schemas import api_ns as cyclecount_ns
 from .adjustment.schemas import api_ns as adjustment_ns
 from .transfer.schemas import api_ns as transfer_ns
 from .payment.schemas import api_ns as payment_ns
+from .search.schemas import api_ns as search_ns
 
 blueprint = Blueprint('warehouse_api', __name__)
 api = Api(
@@ -67,3 +68,4 @@ api.add_namespace(cyclecount_ns, path='/cyclecount')
 api.add_namespace(adjustment_ns, path='/adjustment')
 api.add_namespace(transfer_ns, path='/transfer')
 api.add_namespace(payment_ns, path='/payment')
+api.add_namespace(search_ns, path='/search')

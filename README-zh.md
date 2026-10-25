@@ -166,7 +166,8 @@ GoodsMart-WMS-Backend/
 │   ├── adjustment/            # 库存：库存调整
 │   ├── cyclecount/            # 库存：盘点
 │   ├── transfer/              # 库存：库存调拨
-│   └── removal/               # 库存：库存移除
+│   ├── removal/               # 库存：库存移除
+│   └── search/                # 全局搜索（顶栏搜索框 / 搜索结果页）
 ├── tasks/                     # 定时任务
 │   ├── commands.py            # Flask CLI 命令
 │   ├── snapshot.py            # 库存快照逻辑
@@ -245,6 +246,74 @@ GoodsMart-WMS-Backend/
 - 数值字段：ASN 明细 `weight` / `volume`、库位 `width` / `depth` / `height` / `capacity` 空串按 null 处理；
   非数字、负数（库位尺寸 ≤ 0）→ 400 `16115`。
 - 盘点单 / 调整单列表支持 `keyword`：盘点单按单号、任务名、明细商品 / 库位编码；调整单按单号、调整原因、明细商品编码 / 名称、库位编码。
+
+## 全局搜索
+
+`GET /warehouse/search`（带尾斜杠也可）：顶栏搜索框（Ctrl K）与搜索结果页用。一个关键字同时搜单据、作业任务与主数据，按类型分组返回。代码在 `warehouse/search/`。
+
+| 参数 | 说明 |
+|------|------|
+| `q` | 关键字，去首尾空白后最多 100 个字符（多的截掉）；少于 2 个字符只比单号与商品 / 库位编码（完全相同）；为空时各组 0 条 |
+| `types` | 只搜这几类（逗号分隔或重复给）：`dn` `asn` `sorting` `picking` `packing` `delivery` `cyclecount` `adjustment` `goods` `location` `recipient`；不给 = 全部。不认识的 → 400 `40000`（`field: types`，`details {unknown, allowed}`） |
+| `scope` | `warehouse`（默认）：当前仓库，同各列表（`X-WAREHOUSE-ID` 请求头或 `warehouse_id` 参数；不给时公司管理员 / 绑定公司的 API Key 按可访问的全部仓库，普通员工必须给 → 否则 400 `14003`）。`all`：不看当前仓库，调用方可访问的全部仓库（公司管理员 = 本公司全部仓库，普通员工 = 分配给自己的仓库，绑定公司的 API Key = 该公司全部仓库，平台管理员不受限）。其它值 → 400 `40000`（`field: scope`） |
+| `limit` | 每类条数，默认 5，最多 50 |
+| `page` / `per_page` | 只搜一类时分页（`per_page` 默认 = `limit`，最多 50），每条另带列表列 `columns` |
+| `company_id` | 仅平台管理员：商品 / 收货方只看这家公司（同商品 / 收货方列表） |
+
+各类型（`type` = `url_hint.page`，前端跳 `/<page>/detail/<id>`）与命中字段 `matched_field`：
+
+| type | 搜索字段 |
+|------|----------|
+| `dn` | `number`（DN-163 / 纯数字）、`order_number`、`tracking_number`（当前有效运单号，去空白 / 连字符比较，同 DN 列表：完整号码，或 6 位以上的一段）、`recipient_name`、明细的 `goods_code` / `goods_name` |
+| `asn` | `number`（ASN-12）、`order_number`（外部订单号）、`tracking_number`（去分隔符比较）、`supplier_name`、明细商品 |
+| `sorting` | `number`（SORT-）、`asn_number`（ASN- / 纯数字）、所属 ASN 的明细商品 |
+| `picking` / `packing` / `delivery` | `number`（PICK- / PACK- / DEL-）、`dn_number`（DN- / 纯数字）、所属 DN 的明细商品 |
+| `cyclecount` | `number`（CC-）、`task_name`、明细商品 |
+| `adjustment` | `number`（ADJ- / 纯数字）、`cyclecount_number`（来源盘点单，只认 CC- 前缀，同调整单列表）、明细商品 |
+| `goods` | `goods_code`（相同优先，其次前缀）、`name`（包含） |
+| `location` | `location_code`（相同 / 前缀 / 包含） |
+| `recipient` | `name`、`organization`（公司名）。只返回名称与城市级别信息（城市 / 州省 / 国家），不返回电话、邮箱、详细地址 |
+
+明细商品：编码相同 / 前缀（`goods_code`）、名称包含（`goods_name`），副标题带上第一个命中的商品（编码 名称）。
+
+匹配与排序：大小写不敏感；LIKE 的 `%` `_` 按字面匹配；单号前缀的写法与各列表的关键字搜索一致（`DN-163`、`dn163`、`DN #163`）；纯数字同时试编号和运单号。组内：完整单号（带前缀）/ 完整运单号（`exact: true`）→ 纯数字编号 / 关联单号 / 完全相同 → 前缀 → 包含，同档按 id 倒序。有 exact 条目的组排在前面，全部 exact 条目另在 `exact_matches` 里（总列表置顶用）。
+
+权限与隔离：每类只在调用方有对应查看权限（`dn_read` `asn_read` `sorting_read` `picking_read` `packing_read` `delivery_read` `cycle_count_read` `adjustment_read` `goods_read` `location_read` `recipient_read`，或 `all_access` / `company_all_access`）时才搜，判断同 `permission_required`（API Key 按 key 的权限）；没有权限的类型不出现在 `types` / `counts` / `groups` 里，一类都没有 → 200 空结果（不 403）。数据范围直接用各模块列表的查询函数：公司 / 仓库隔离、默认只看启用的，与列表一致（单据 / 任务 / 库位按仓库范围，商品 / 收货方按公司）。
+
+```json
+{
+  "q": "DN-163", "scope": "warehouse",
+  "types": ["dn", "asn", "picking"],
+  "counts": {"dn": 1, "asn": 0, "picking": 1},
+  "exact_matches": [{"type": "dn", "id": 163, "...": "..."}],
+  "groups": [
+    {"type": "dn", "total": 1, "page": 1, "per_page": 5, "pages": 1, "items": [
+      {"type": "dn", "id": 163, "code": "DN-163", "title": "Yamada Shop",
+       "subtitle": "ORD-1001 · 7946 0000 0001 · Tokyo WH", "status": "delivered", "warehouse_id": 1,
+       "url_hint": {"page": "dn", "id": 163}, "matched_field": "number", "exact": true,
+       "highlights": [{"field": "code", "start": 0, "end": 6}], "columns": null}
+    ]},
+    {"type": "picking", "total": 1, "...": "..."},
+    {"type": "asn", "total": 0, "page": 1, "per_page": 5, "pages": 0, "items": []}
+  ]
+}
+```
+
+- `counts`：本次搜的每类的命中数（0 也给）；结果页切到单类型分页时只含那一类，各类总数取不带 `types` 的那次请求。
+- `title` / `subtitle`：DN 收货方 / 订单号 · 运单号 · 商品 · 仓库；ASN 供应商 / 订单号 · 运单号 · 商品 · 仓库；分拣 / 拣货 / 打包 / 发货 关联单号 / 供应商或收货方 · 订单号（发货另带运单号）· 商品 · 仓库；盘点 任务名 / 商品 · 仓库；调整 调整原因（没有用来源盘点单号）/ 来源盘点单号 · 商品 · 仓库；商品 名称 / 品牌 · 分类；库位 描述 / 仓库；收货方 名称 / 城市 · 州省 · 国家。各部分用 ` · ` 分隔。
+- `status`：原始状态值（前端自己翻译）；主数据为 null。
+- `highlights`：命中位置。`field` 为显示文本的键（`code` / `title` / `subtitle` / `columns.<列>`），`start` / `end` 为 UTF-16 码元下标（与 JavaScript 字符串下标一致），`end` 不含；运单号去分隔符匹配时已换算回显示文本里的位置。只圈真正参与匹配的部分（仓库名、品牌等不圈），纯数字命中单号只圈编号部分。
+- `columns`（只搜一类时）：
+  - `dn`：`recipient_name` `carrier_name` `tracking_number` `status` `shipping_stage` `expected_shipping_date` `order_number` `warehouse_name`
+  - `asn`：`supplier_name` `status` `expected_arrival_date` `order_number` `tracking_number` `warehouse_name`
+  - 作业任务：`task_type` `related_code` `related_url_hint` `status` `warehouse_name`
+  - `goods`：`code` `name` `brand` `thumbnail_url` `available_stock_for_sale` `onhand_stock`（搜索范围内各仓库合计，口径同库存列表）
+  - `location`：`code` `location_type` `warehouse_name` `goods_count`（数量 > 0 的商品种数）`quantity`（件数）
+  - `recipient`：`name` `locality` `admin_area` `country`
+
+「最近搜索」存在浏览器本地，后端不记。
+
+性能：每类只取 `limit` 条（第一页没取满时不再 count），q 太短只做精确比较。包含匹配（`ILIKE '%q%'`）用不上普通 B-tree 索引，数据量大以后建议在 PostgreSQL 上加 `pg_trgm` 的 GIN 索引（`goods.name`、`goods.code`、`dn.order_number`、`asn.order_number`、`recipients.name` / `organization`、`suppliers.name`、`locations.code`、`cycle_count_tasks.task_name`）；编码完全相同可加 `lower(code)` 表达式索引；运单号去分隔符比较可加表达式索引 `upper(replace(replace(replace(tracking_number, ' ', ''), '-', ''), E'\t', ''))`（`dn_carrier_shipments`、`delivery_tasks`、`asn`）。DN 的当前运单号是关联子查询（与 DN 列表同一口径），单据很多时可考虑在 DN 上冗余当前运单号。
 
 ## Webhook 集成
 
