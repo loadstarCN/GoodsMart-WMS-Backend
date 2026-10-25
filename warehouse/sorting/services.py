@@ -3,6 +3,7 @@ from dateutil.relativedelta import relativedelta
 from sqlalchemy import and_, func, case, extract
 from sqlalchemy.orm import joinedload, selectinload
 from extensions.db import *
+from warehouse.common.search import number_conditions
 from extensions.error import BadRequestException, ConflictException, NotFoundException
 from extensions.transaction import transactional
 from warehouse.common import require_non_negative_int, require_fields, delete_batch_with_details
@@ -188,15 +189,9 @@ class SortingTaskService:
         # 搜索ASN.id 或 ASN.tracking_number，或者在detail中的goods.code
         if filters.get('keyword'):
             keyword = filters['keyword']
-            conditions = []
-            try:
-                # 尝试将 keyword 转换为整数
-                task_id = int(keyword)
-                conditions.append(SortingTask.id == task_id)
-                conditions.append(SortingTask.asn_id == task_id)
-            except ValueError:
-                # 如果转换失败，则说明 keyword 不全是数字，不加入 ASN.id 过滤条件
-                pass
+            # 单号：纯数字（任务或入库单编号）、SORT-3（任务）、ASN-12（入库单）
+            conditions = number_conditions(keyword, {'SORT': [SortingTask.id], 'ASN': [SortingTask.asn_id]},
+                                           [SortingTask.id, SortingTask.asn_id])
 
             conditions.append(SortingTask.task_details.any(SortingTaskDetail.goods.has(code=keyword)))
             query = query.filter(db.or_(*conditions))

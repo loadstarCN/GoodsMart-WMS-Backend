@@ -82,6 +82,9 @@ role_model = api_ns.model('Role', {
         ),
     'description': fields.String(description='Role Description'),
     'is_active': fields.Boolean(description='Is the role active?'),
+    'is_builtin': fields.Boolean(readOnly=True, description='Built-in role (referenced by name in the code): cannot '
+                                                            'be renamed, deactivated or deleted (409 11012); its '
+                                                            'permissions can still be changed'),
     'created_at': fields.DateTime(readOnly=True, description='Creation timestamp'),
     'updated_at': fields.DateTime(readOnly=True, description='Last updated timestamp'),
 })
@@ -96,6 +99,9 @@ permission_model = api_ns.model('Permission', {
     'id': fields.Integer(readOnly=True, description='Permission ID'),
     'name': fields.String(required=True, description='Permission Name'),
     'description': fields.String(description='Permission Description'),
+    'is_builtin': fields.Boolean(readOnly=True, description='Built-in permission (checked by name in the code): its '
+                                                            'name cannot be changed and it cannot be deleted '
+                                                            '(409 11011); the description can be changed'),
 })
 
 # -----------------------------

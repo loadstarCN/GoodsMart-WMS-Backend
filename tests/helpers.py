@@ -762,9 +762,10 @@ def init_test_data(app):
         log1 = ActivityLog(
             actor='admin',
             endpoint='/api/test',
-            method='GET',
+            method='POST',   # 只记写操作（ActivityLog.LOGGED_METHODS），GET 不会有日志
             status_code=200,
             ip_address='127.0.0.1',
+            processing_time=12,
             created_at=datetime.datetime.now(datetime.timezone.utc)
         )
         db.session.add(log1)

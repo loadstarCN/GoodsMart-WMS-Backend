@@ -80,8 +80,8 @@ def save_large_data(data):
     return filepath
 
 def before_request_logging():
-    """在每个请求前记录基础信息，仅限 POST、PUT、DELETE"""
-    if request.method not in ['POST', 'PUT', 'DELETE']:
+    """在每个请求前记录基础信息，仅限 POST、PUT、DELETE（ActivityLog.LOGGED_METHODS）"""
+    if request.method not in ActivityLog.LOGGED_METHODS:
         return  # 不记录非目标方法的请求
 
     g.start_time = utc_now()  # 记录请求开始时间
@@ -106,8 +106,8 @@ def before_request_logging():
 
 def after_request_logging(response):
 
-    """在每个请求后记录访问日志，仅限 POST、PUT、DELETE"""
-    if request.method not in ['POST', 'PUT', 'DELETE']:
+    """在每个请求后记录访问日志，仅限 POST、PUT、DELETE（ActivityLog.LOGGED_METHODS）"""
+    if request.method not in ActivityLog.LOGGED_METHODS:
         return response  # 不记录非目标方法的请求
 
     start_time = g.get('start_time') or utc_now()
@@ -138,7 +138,7 @@ def after_request_logging(response):
             status_code=response.status_code,
             request_content_type=request.content_type,
             response_content_type=response.content_type,
-            processing_time=processing_time_ms,
+            processing_time=int(round(processing_time_ms)),  # 列是整数毫秒
         )
 
         db.session.add(log)

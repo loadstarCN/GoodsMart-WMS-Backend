@@ -13,6 +13,8 @@ from extensions.redis import redis_client
 from extensions.transaction import transactional
 from system.common.permissions import assert_grantable_permissions, get_actor_context
 from .models import User, Role, Permission
+from .builtin import PERMISSION_BUILTIN_CODE, ROLE_BUILTIN_CODE
+from .password_policy import validate_new_password
 
 EMAIL_REGEX = r'^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$'
 RESET_CODE_PREFIX = 'pwd_reset:'
@@ -164,6 +166,7 @@ class UserService:
         """
         if not data.get('password'):
             raise BadRequestException("password is required", 10013)
+        validate_new_password(data['password'], 'password')
 
         new_user = User(
             user_name=data['user_name'],
@@ -188,6 +191,8 @@ class UserService:
         更新 User 信息（含 is_active；不允许停用自己）
         """
         user = UserService.get_user(user_id)
+        if data.get('password'):
+            validate_new_password(data['password'], 'password')
 
         user.user_name = data.get('user_name', user.user_name)
         user.email = data.get('email', user.email)
@@ -246,6 +251,7 @@ class UserService:
             raise BadRequestException("Old password is incorrect",10003)
         if not new_password:
             raise BadRequestException("New password is required", 10013)
+        validate_new_password(new_password, 'new_password')
 
         # 这里使用了 User 模型中的 set_password 方法来加密新密码
         user.set_password(new_password)
@@ -288,7 +294,11 @@ class UserService:
     @staticmethod
     @transactional
     def reset_password(email: str, code: str, new_password: str):
-        """验证验证码并重置密码（错误 5 次即作废验证码）"""
+        """验证验证码并重置密码（错误 5 次即作废验证码）。
+        新密码先查复杂度（400 10015）：不合规不消耗验证码的尝试次数，改个合规的密码可以接着用同一个验证码"""
+        if not new_password:
+            raise BadRequestException("New password is required", 10013)
+        validate_new_password(new_password, 'new_password')
         code_key = f'{RESET_CODE_PREFIX}{email}'
         attempts_key = f'{RESET_ATTEMPTS_PREFIX}{email}'
 
@@ -423,6 +433,12 @@ class RoleService:
         更新 Role 信息
         """
         role = RoleService.get_role(role_id)
+        if role.is_builtin:
+            # 内置角色（代码里按名字判断）：不能改名、不能停用；描述、权限照常改（Web 编辑页整表提交原值不算改）
+            if 'name' in data and data['name'] != role.name:
+                RoleService._builtin_conflict(role, 'RENAME', "renamed")
+            if 'is_active' in data and not bool(data['is_active']):
+                RoleService._builtin_conflict(role, 'DEACTIVATE', "deactivated")
 
         role.name = data.get('name', role.name)
         role.description = data.get('description', role.description)
@@ -441,11 +457,21 @@ class RoleService:
         删除 Role（仍有用户使用时拒绝）
         """
         role = RoleService.get_role(role_id)
+        if role.is_builtin:
+            RoleService._builtin_conflict(role, 'DELETE', "deleted")
         in_use = role.users.count()
         if in_use:
             raise ConflictException(f"Role is assigned to {in_use} user(s) and cannot be deleted", 44002)
         db.session.delete(role)
         # db.session.commit()
+
+    @staticmethod
+    def _builtin_conflict(role: Role, reason: str, verb: str):
+        """内置角色不能改名 / 停用 / 删除 → 409 11012，details {role, reason: RENAME | DEACTIVATE | DELETE}"""
+        raise ConflictException(
+            f"Role '{role.name}' is built in and cannot be {verb}; its permissions can still be changed",
+            ROLE_BUILTIN_CODE, details={'role': role.name, 'reason': reason},
+        )
 
 
 class PermissionService:
@@ -503,6 +529,9 @@ class PermissionService:
         更新 Permission 信息
         """
         permission = PermissionService.get_permission(permission_id)
+        # 内置权限（代码里按名字校验）：不能改代码，描述可以改（Web 编辑页整表提交原值不算改）
+        if permission.is_builtin and 'name' in data and data['name'] != permission.name:
+            PermissionService._builtin_conflict(permission, 'RENAME', "renamed")
 
         permission.name = data.get('name', permission.name)
         permission.description = data.get('description', permission.description)
@@ -517,5 +546,15 @@ class PermissionService:
         删除 Permission
         """
         permission = PermissionService.get_permission(permission_id)
+        if permission.is_builtin:
+            PermissionService._builtin_conflict(permission, 'DELETE', "deleted")
         db.session.delete(permission)
         # db.session.commit()
+
+    @staticmethod
+    def _builtin_conflict(permission: Permission, reason: str, verb: str):
+        """内置权限不能改代码 / 删除 → 409 11011，details {permission, reason: RENAME | DELETE}"""
+        raise ConflictException(
+            f"Permission '{permission.name}' is built in (checked by name in the code) and cannot be {verb}",
+            PERMISSION_BUILTIN_CODE, details={'permission': permission.name, 'reason': reason},
+        )

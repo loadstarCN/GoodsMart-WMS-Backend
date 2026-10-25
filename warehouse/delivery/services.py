@@ -1,6 +1,7 @@
 import math
 
 from extensions.db import *
+from warehouse.common.search import number_conditions
 from extensions.error import BadRequestException, ConflictException
 from extensions.transaction import transactional
 from warehouse.dn.models import DN, DNDetail
@@ -256,15 +257,9 @@ class DeliveryTaskService:
         # 搜索id,DN.id ，或者在dn.details中的goods.code
         if filters.get('keyword'):
             keyword = filters['keyword']
-            conditions = []
-            try:
-                # 尝试将 keyword 转换为整数
-                task_id = int(keyword)
-                conditions.append(DeliveryTask.id == task_id)
-                conditions.append(DeliveryTask.dn_id == task_id)
-            except ValueError:
-                # 如果转换失败，则说明 keyword 不全是数字，不加入 DN.id 过滤条件
-                pass
+            # 单号：纯数字（任务或 DN 编号）、DEL-5（任务）、DN-163（DN）
+            conditions = number_conditions(keyword, {'DEL': [DeliveryTask.id], 'DN': [DeliveryTask.dn_id]},
+                                           [DeliveryTask.id, DeliveryTask.dn_id])
 
             conditions.append(DeliveryTask.dn.has(DN.details.any(DNDetail.goods.has(Goods.code.ilike(f"%{keyword}%")))))
             query = query.filter(db.or_(*conditions))

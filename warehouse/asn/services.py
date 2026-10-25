@@ -3,6 +3,7 @@ from dateutil.relativedelta import relativedelta
 from sqlalchemy import and_, func, case, extract
 from sqlalchemy.orm import selectinload
 from extensions.db import *
+from warehouse.common.search import number_conditions
 from extensions.error import BadRequestException, ConflictException, ForbiddenException, NotFoundException
 from extensions.transaction import transactional
 from warehouse.common import require_positive_int, require_fields, require_source_api_key, optional_number
@@ -278,14 +279,8 @@ class ASNService:
         # 搜索ASN.id 或 ASN.tracking_number，或者在detail中的goods.code
         if filters.get('keyword'):
             keyword = filters['keyword']
-            conditions = []
-            try:
-                # 尝试将 keyword 转换为整数
-                asn_id = int(keyword)
-                conditions.append(ASN.id == asn_id)
-            except ValueError:
-                # 如果转换失败，则说明 keyword 不全是数字，不加入 ASN.id 过滤条件
-                pass
+            # 单号：纯数字或 ASN-12（界面显示的格式）
+            conditions = number_conditions(keyword, {'ASN': [ASN.id]}, [ASN.id])
 
             conditions.append(ASN.tracking_number.ilike(f"%{keyword}%"))
             # conditions.append(ASN.remark.ilike(f"%{keyword}%"))
@@ -681,7 +676,9 @@ class ASNService:
 
         # 更新库存信息
         for detail in asn.details:
-            InventoryService.asn_completed(detail.goods_id, asn.warehouse_id, detail.quantity,detail.actual_quantity)
+            # 实收 = 良品 + 破损；破损部分同时记进待上架·破损（sorted_damage_stock），之后只能上到 damaged 库位
+            InventoryService.asn_completed(detail.goods_id, asn.warehouse_id, detail.quantity, detail.actual_quantity,
+                                           detail.damage_quantity or 0)
 
         webhook_emit('asn.completed', {
             'asn_id': asn.id, 'status': 'completed', 'order_number': asn.order_number,

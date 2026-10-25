@@ -3,6 +3,7 @@ from dateutil.relativedelta import relativedelta
 from sqlalchemy import and_, func, case, extract
 from sqlalchemy.orm import selectinload
 from extensions.db import *
+from warehouse.common.search import number_conditions
 from extensions.error import (
     BadRequestException, ConflictException, ForbiddenException, NotFoundException,
 )
@@ -81,6 +82,26 @@ DN_CREATE_FIELDS = (
 )
 DN_UPDATE_FIELDS = tuple(f for f in DN_CREATE_FIELDS if f != 'warehouse_id')
 DN_DETAIL_FIELDS = ('goods_id', 'goods_code', 'quantity', 'remark')
+
+
+def _normalized_tracking_sql(expression):
+    """SQL 里去掉空白和连字符（与 shipping/waybills._normalize 同一口径；replace 在 PostgreSQL / SQLite 都有）"""
+    for char in (' ', '-', '\t'):
+        expression = func.replace(expression, char, '')
+    return func.upper(expression)
+
+
+def tracking_search_condition(keyword):
+    """DN 列表关键字按当前运单号匹配的条件；关键字去掉空白 / 连字符后为空 → None"""
+    from warehouse.shipping.stage import tracking_number_expression
+    normalized = ''.join(str(keyword or '').split()).replace('-', '').upper()
+    if not normalized:
+        return None
+    column = _normalized_tracking_sql(tracking_number_expression())
+    if len(normalized) >= 6:
+        escaped = normalized.replace('!', '!!').replace('%', '!%').replace('_', '!_')
+        return column.like(f'%{escaped}%', escape='!')
+    return column == normalized
 
 
 class DNService:
@@ -469,17 +490,16 @@ class DNService:
         # 搜索DN.id 或 DN.order_number,或者在detail中的goods.code
         if filters.get('keyword'):
             keyword = filters['keyword']
-            conditions = []
-            try:
-                # 尝试将 keyword 转换为整数
-                dn_id = int(keyword)
-                conditions.append(DN.id == dn_id)
-            except ValueError:
-                # 如果转换失败，则说明 keyword 不全是数字，不加入 DN.id 过滤条件
-                pass
+            # 单号：纯数字或 DN-163（界面显示的格式）
+            conditions = number_conditions(keyword, {'DN': [DN.id]}, [DN.id])
 
             conditions.append(DN.order_number.ilike(f"%{keyword}%"))
             # conditions.append(DN.remark.ilike(f"%{keyword}%"))
+            # 运单号：当前有效 / 取消中的运单（任一来源）的号码，没有用当前发货任务上的（与列表显示的 shipping.tracking_number
+            # 同一口径）。去掉空白和连字符比较；完整号码精确匹配，6 位以上可以只输一段
+            tracking = tracking_search_condition(keyword)
+            if tracking is not None:
+                conditions.append(tracking)
             conditions.append(DN.details.any(DNDetail.goods.has(code=keyword)))
             query = query.filter(db.or_(*conditions))
 

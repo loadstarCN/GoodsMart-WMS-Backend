@@ -1,6 +1,7 @@
 from extensions import db  
 from werkzeug.security import generate_password_hash, check_password_hash
 from extensions.db import UTCDateTime
+from .builtin import is_builtin_permission, is_builtin_role
 
 
 # 定义 Role 与 Permission 的多对多关联表（增加级联策略）
@@ -30,6 +31,11 @@ class Permission(db.Model):
         db.String(255),
         info={'description': '权限功能描述'}
     )
+
+    @property
+    def is_builtin(self) -> bool:
+        """内置权限（代码里按名字校验，system/user/builtin.py）：不能改代码 / 删除"""
+        return is_builtin_permission(self.name)
 
 # 用户与角色模型
 user_roles = db.Table(
@@ -83,6 +89,11 @@ class Role(db.Model):
         lazy='joined',  # 立即加载权限列表
         info={'description': '包含的权限集合'}
     )
+
+    @property
+    def is_builtin(self) -> bool:
+        """内置角色（代码里按名字判断，system/user/builtin.py）：不能改名 / 停用 / 删除，权限照常分配"""
+        return is_builtin_role(self.name)
 
 class User(db.Model):
     """系统用户表（支持多态继承）"""

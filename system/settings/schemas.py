@@ -9,7 +9,8 @@ smtp_config_model = api_ns.model('SmtpConfig', {
     'smtp_username': fields.String(description='SMTP username'),
     'smtp_password': fields.String(description='SMTP password (empty = unchanged)'),
     'smtp_sender': fields.String(description='Sender email address'),
-    'smtp_use_tls': fields.String(description='Use TLS (true/false)'),
+    'smtp_use_tls': fields.String(description='Use TLS (true/false; empty / not set = true, only false / 0 / no / '
+                                              'off turn it off)'),
 })
 
 smtp_test_model = api_ns.model('SmtpTest', {

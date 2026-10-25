@@ -1,5 +1,6 @@
 from werkzeug.exceptions import NotFound
 from extensions.db import *
+from warehouse.common.search import number_conditions
 from extensions.error import BadRequestException, ConflictException, NotFoundException
 from extensions.transaction import transactional
 from warehouse.common import require_bulk_list, require_fields, require_non_negative_int, require_company_goods
@@ -79,24 +80,19 @@ class CycleCountTaskService:
             # 否则按用户传入的值进行过滤
             query = query.filter(CycleCountTask.is_active == filters['is_active'])
 
-        # 计划时间的筛选：不带时区的按所筛仓库的时区（没筛仓库按默认时区）
-        if filters.get('scheduled_start_date'):
-            query = query.filter(CycleCountTask.scheduled_date >= clock.parse_input_datetime(
-                filters['scheduled_start_date'], filters.get('warehouse_id')))
-        if filters.get('scheduled_end_date'):
-            query = query.filter(CycleCountTask.scheduled_date <= clock.parse_input_datetime(
-                filters['scheduled_end_date'], filters.get('warehouse_id')))
+        # 计划时间的筛选：只给日期的按所筛仓库当地的那一天（结束日含当天）；不带时区的时刻按所筛仓库的时区
+        # （没筛仓库按默认时区）
+        query = clock.filter_time_range(query, CycleCountTask.scheduled_date, filters.get('scheduled_start_date'),
+                                        filters.get('scheduled_end_date'), filters.get('warehouse_id'))
+        if filters.get('scheduled_date'):
+            query = clock.filter_time_range(query, CycleCountTask.scheduled_date, filters['scheduled_date'],
+                                            filters['scheduled_date'], filters.get('warehouse_id'))
 
         # 搜索id，task_name，在detail中的goods.code，在detail中的location.code
         if filters.get('keyword'):
             keyword = filters['keyword']
-            conditions = []
-            try:
-                # 尝试将 keyword 转换为整数
-                task_id = int(keyword)
-                conditions.append(CycleCountTask.id == task_id)
-            except ValueError:
-                pass
+            # 单号：纯数字或 CC-2（界面显示的格式）
+            conditions = number_conditions(keyword, {'CC': [CycleCountTask.id]}, [CycleCountTask.id])
             conditions.append(CycleCountTask.task_name.ilike(f"%{keyword}%"))
             conditions.append(CycleCountTask.task_details.any(CycleCountTaskDetail.goods.has(code=keyword)))
             conditions.append(CycleCountTask.task_details.any(CycleCountTaskDetail.location.has(code=keyword)))

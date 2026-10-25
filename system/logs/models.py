@@ -18,6 +18,8 @@ class ActivityLog(db.Model):
     )
     
     METHOD_TYPES = ('GET', 'POST', 'PUT', 'DELETE')
+    # 实际记日志的方法（system/logs/utils.py 只记写操作）：列表的 method 筛选 / 输出枚举按它，GET 不会有记录
+    LOGGED_METHODS = ('POST', 'PUT', 'DELETE')
 
     id = db.Column(db.Integer, primary_key=True)
     actor = db.Column(db.String(255), index=True, info={'description': '操作主体'})
@@ -53,8 +55,7 @@ class ActivityLog(db.Model):
             "method": self.method,
             "status_code": self.status_code,
             "processing_time": self.processing_time,
-            "created_at": self.created_at.isoformat(),
-            "trace_id": self.trace_id
+            "created_at": self.created_at.isoformat() if self.created_at else None,
         }
         # IP地址脱敏（网页3）
         if self.ip_address:

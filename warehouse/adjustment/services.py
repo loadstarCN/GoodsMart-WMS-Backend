@@ -1,5 +1,6 @@
 from datetime import datetime
 from extensions.db import *
+from warehouse.common.search import number_conditions
 from extensions.error import BadRequestException, ConflictException, ForbiddenException, NotFoundException
 from extensions.transaction import transactional
 from warehouse.common import require_fields, require_non_negative_int, require_company_goods
@@ -75,8 +76,9 @@ class AdjustmentService:
                     db.or_(Goods.code.ilike(pattern), Goods.name.ilike(pattern)))),
                 Adjustment.details.any(AdjustmentDetail.location.has(Location.code.ilike(pattern))),
             ]
-            if keyword.isdigit():
-                conditions.append(Adjustment.id == int(keyword))
+            # 单号：纯数字或 ADJ-4（调整单）、CC-2（来源盘点单）
+            conditions += number_conditions(keyword, {'ADJ': [Adjustment.id], 'CC': [Adjustment.cyclecount_id]},
+                                            [Adjustment.id])
             query = query.filter(db.or_(*conditions))
         if filters.get('status'):
             query = query.filter(Adjustment.status == filters['status'])

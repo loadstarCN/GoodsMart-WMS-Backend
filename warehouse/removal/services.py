@@ -142,11 +142,14 @@ class RemovalService:
             db.session.add(goods_location_record)
         db.session.flush()
 
-        #更新库存信息：拣货下架的货走 picked_stock（由拣货流程记账），其它原因的下架进入待上架区
+        #更新库存信息：拣货下架的货走 picked_stock（由拣货流程记账），其它原因的下架进入待上架区。
+        # 从 damaged 库位下架、或因破损（damage / damaged）下架的是破损品：记进待上架·破损，之后只能上到 damaged 库位
         if from_picking:
             InventoryService.picking_removed(goods_id, location.warehouse_id, quantity)
         else:
-            InventoryService.removal_completed(goods_id, location.warehouse_id, quantity)
+            damaged = (location.location_type == 'damaged'
+                       or reason in InventoryService.DAMAGED_REMOVAL_REASONS)
+            InventoryService.removal_completed(goods_id, location.warehouse_id, quantity, damaged=damaged)
 
         # db.session.commit()
         return new_record

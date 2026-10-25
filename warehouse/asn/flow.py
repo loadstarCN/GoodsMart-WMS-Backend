@@ -252,7 +252,11 @@ class InboundFlowService:
             'put_away_quantity': quantity - pending,
             'goods': [{'goods_id': r['goods_id'], 'code': getattr(goods.get(r['goods_id']), 'code', None),
                        'name': getattr(goods.get(r['goods_id']), 'name', None), 'quantity': r['quantity'],
-                       'pending': r['pending']} for r in rows],
+                       'pending': r['pending'],
+                       # 仓库里该商品的待上架库存（不只本单）与其中的破损品（只能上到 damaged 库位，其余可上到
+                       # standard / return 库位）：上架时界面据此提示
+                       'sorted_stock': r['sorted_stock'], 'sorted_damage_stock': r['sorted_damage_stock']}
+                      for r in rows],
             'last_putaway_at': _at(last_at),
             # 上架记录不带入库单：按待上架库存估算（见 stage.py）
             'estimated': True,

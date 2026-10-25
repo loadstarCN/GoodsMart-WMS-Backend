@@ -89,7 +89,9 @@ def goods_number_error(field, row=None):
     prefix = f"Row {row}: " if row is not None else ''
     details = {'field': field}
     if row is not None:
+        # CSV 导入：界面按 row / columns 显示行号与列
         details['row'] = row
+        details['columns'] = [field]
     return BadRequestException(f"{prefix}{field} must be {_GOODS_NUMBER_HINTS[field]}",
                                GOODS_NUMBER_INVALID, field, details=details)
 
@@ -459,22 +461,36 @@ class GoodsService:
     @staticmethod
     @transactional
     def bulk_create_goods(data: list, created_by_id: int, override_mode: str = 'skip',
-                          spec_source: str = 'import') -> list:
+                          spec_source: str = 'import', stats: dict | None = None) -> list:
         """
         四策略批量创建逻辑[6,7](@ref)
         :param override_mode: 处理策略（skip|active|append|override）
         :param spec_source: 规格变更来源（goods.spec_updated 的 source），CSV 导入为 import
+        :param stats: 传入 dict 时填上 {created, updated, skipped}（导入结果给界面拼翻译后的提示）
 
-        原产国（origin_country）对已有商品：append 只补空白；override 只在导入值非空时覆盖——
-        导入永远不会清空已录入的原产国（清空只能在商品编辑里手工做）。
+        已有商品：
+        - append（补空白）：原来为空、导入值非空的字段补上（含重量、长宽高、分类、标签、折扣价、过期日）
+        - override（覆盖）：原有的整列覆盖字段照旧（名称、品牌、价格……，导入为空就清空）；
+          重量、长宽高、原产国、分类、标签、折扣价、过期日只在导入值非空时覆盖 —— 导入不会清空已录入的规格
+          （清空只能在商品编辑里手工做；规格变动会推 goods.spec_updated）
+        合并后折扣价高于价格 → 400 10012（details {row, columns}）；价格被覆盖成空时折扣价一并清空（没有价格的折扣没意义，
+        数据库约束 chk_discount_price 也要求 discount_price <= price）。
         """
         new_goods = []
-        # 可更新字段白名单（排除code/company_id）
+        created = updated = skipped = 0
+        # 可更新字段白名单（排除code/company_id）：override 时整列覆盖（导入为空就清空）
         updatable_fields = {
             'name', 'manufacturer', 'brand', 'price',
             'production_date', 'currency', 'unit',
             'description', 'image_url', 'thumbnail_url'
         }
+        # 只补 / 只在非空时覆盖的字段（规格、分类标签、折扣价、过期日）：导入不清空
+        non_clearing_fields = (
+            'weight', 'length', 'width', 'height', 'category', 'tags', 'discount_price', 'expiration_date',
+        )
+
+        def is_blank(value):
+            return value is None or (isinstance(value, str) and not value.strip())
 
         # 批量预查询已存在商品，避免循环内 N+1 查询
         lookup_keys = {(d['code'], d['company_id']) for d in data}
@@ -489,6 +505,7 @@ class GoodsService:
         spec_changes = []
 
         for goods_data in data:
+            row = goods_data.get('_row')
             # 富文本描述按白名单清洗（新建与 append / override 覆盖都用清洗后的值）
             if 'description' in goods_data:
                 goods_data['description'] = sanitize_description(goods_data['description'])
@@ -499,57 +516,79 @@ class GoodsService:
                 goods = GoodsService._build_goods(goods_data, created_by_id)
                 spec_changes.append(_spec_change(goods, {}, spec_source))
                 new_goods.append(goods)
+                created += 1
                 continue
-                
+
             # 策略处理分支
             if override_mode == 'skip':
+                skipped += 1
                 continue  # 完全跳过不处理
-                
+
             elif override_mode == 'active':
                 if not existing.is_active:
                     existing.is_active = True
                     existing.updated_at = clock.now()
                     db.session.add(existing)
                 new_goods.append(existing)
-                
+                updated += 1
+
             elif override_mode == 'append':
                 spec_before = goods_spec_snapshot(existing)
-                for field in updatable_fields:
+                for field in (*updatable_fields, *non_clearing_fields):
                     new_val = goods_data.get(field)
                     current_val = getattr(existing, field)
-                    # 仅当原字段为空且新值不为空时更新
-                    # 复合空值判断（支持None和空字符串）
-                    is_current_empty = current_val in (None, "")  
-                    is_new_valid = new_val not in (None, "")      
-                    
-                    # 仅当原字段为空且新值有效时更新
-                    if is_current_empty and is_new_valid:
+                    # 仅当原字段为空且新值有效时更新（复合空值判断：None 和空字符串）
+                    if is_blank(current_val) and not is_blank(new_val):
                         setattr(existing, field, new_val)
                 origin_country = clean_origin_country(goods_data.get('origin_country'))
                 if origin_country and not existing.origin_country:
                     existing.origin_country = origin_country
+                GoodsService._check_import_prices(existing, row)
                 spec_changes.append(_spec_change(existing, spec_before, spec_source))
                 existing.is_active = True
                 existing.updated_at = clock.now()
                 db.session.add(existing)
                 new_goods.append(existing)
-                
+                updated += 1
+
             elif override_mode == 'override':
-                # 全量字段覆盖
+                # 全量字段覆盖；规格等只在导入值非空时覆盖
                 spec_before = goods_spec_snapshot(existing)
                 for field in updatable_fields:
                     setattr(existing, field, goods_data.get(field))
+                for field in non_clearing_fields:
+                    if not is_blank(goods_data.get(field)):
+                        setattr(existing, field, goods_data.get(field))
                 origin_country = clean_origin_country(goods_data.get('origin_country'))
                 if origin_country:
                     existing.origin_country = origin_country
+                if existing.price is None:
+                    existing.discount_price = None
+                GoodsService._check_import_prices(existing, row)
                 spec_changes.append(_spec_change(existing, spec_before, spec_source))
                 existing.is_active = True
                 existing.updated_at = clock.now()
                 db.session.add(existing)
                 new_goods.append(existing)
+                updated += 1
 
         _emit_spec_changes(spec_changes)
+        if stats is not None:
+            stats.update(created=created, updated=updated, skipped=skipped)
         return new_goods
+
+    @staticmethod
+    def _check_import_prices(goods, row=None):
+        """导入与已有商品合并后：折扣价不能高于价格（数据库约束 chk_discount_price）→ 400 10012，details {row, columns}"""
+        if goods.discount_price is None or goods.price is None:
+            return
+        if Decimal(str(goods.discount_price)) > Decimal(str(goods.price)):
+            prefix = f"Row {row}: " if row is not None else ''
+            details = {'columns': ['discount_price', 'price'], 'code': goods.code}
+            if row is not None:
+                details['row'] = row
+            raise BadRequestException(f"{prefix}discount_price must be <= price (goods {goods.code})", 10012,
+                                      details=details)
 
 
 class GoodsLocationService:
@@ -588,8 +627,11 @@ class GoodsLocationService:
             query = query.filter(GoodsLocation.quantity <= filters['quantity_max'])
 
         # 针对 Location 相关的过滤，先统一 join 一次
-        if filters.get('location_code') or filters.get('warehouse_id') or filters.get('warehouse_ids') or filters.get('keyword'):
+        if (filters.get('location_code') or filters.get('warehouse_id') or filters.get('warehouse_ids')
+                or filters.get('keyword') or filters.get('location_type')):
             query = query.join(Location, GoodsLocation.location_id == Location.id)
+        if filters.get('location_type'):
+            query = query.filter(Location.location_type == filters['location_type'])
         if filters.get('location_code'):
             query = query.filter(Location.code.ilike(f"%{filters['location_code']}%"))
 

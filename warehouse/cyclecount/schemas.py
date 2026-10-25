@@ -175,12 +175,27 @@ cycle_count_task_batch_save_input_model = api_ns.model('CycleCountTaskBatchSaveI
 # ------------------------------------------------------------------------------
 # 5. 分页解析器与分页模型
 # ------------------------------------------------------------------------------
+def _date_or_datetime(value):
+    """计划时间筛选：只给日期（YYYY-MM-DD）→ date（按仓库当地那一天，结束日含当天）；否则 ISO 8601 时刻"""
+    text = str(value).strip()
+    if len(text) == 10 and text[4] == '-' and text[7] == '-':
+        return inputs.date_from_iso8601(text)
+    return inputs.datetime_from_iso8601(text)
+
+
+_date_or_datetime.__schema__ = {'type': 'string', 'format': 'date-time'}
+
 cycle_count_pagination_parser = pagination_parser.copy()
 cycle_count_pagination_parser.add_argument('task_name', type=str, location='args', help='Task name filter')
 cycle_count_pagination_parser.add_argument('status', type=str, location='args',choices=CycleCountTask.CYCLE_COUNT_TASK_STATUSES,help='Cycle Count Task Status')
 cycle_count_pagination_parser.add_argument('is_active', type=inputs.boolean, location='args',help='Is the task active?')
-cycle_count_pagination_parser.add_argument('scheduled_start_date', type=inputs.datetime_from_iso8601, location='args',help='Scheduled date/time start')
-cycle_count_pagination_parser.add_argument('scheduled_end_date', type=inputs.datetime_from_iso8601, location='args',help='Scheduled date/time end')
+cycle_count_pagination_parser.add_argument('scheduled_start_date', type=_date_or_datetime, location='args',
+                                           help='Scheduled from (YYYY-MM-DD = from that local day, or an ISO 8601 time)')
+cycle_count_pagination_parser.add_argument('scheduled_end_date', type=_date_or_datetime, location='args',
+                                           help='Scheduled until (YYYY-MM-DD = through that whole local day, or an '
+                                                'ISO 8601 time)')
+cycle_count_pagination_parser.add_argument('scheduled_date', type=inputs.date_from_iso8601, location='args',
+                                           help='Scheduled on this local day (YYYY-MM-DD)')
 cycle_count_pagination_parser.add_argument('warehouse_id', type=int, location='args',help='Warehouse ID')
 cycle_count_pagination_parser.add_argument('keyword', type=str, location='args', help='Search by task id, task name, or exact goods / location code in its details')
 

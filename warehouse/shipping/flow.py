@@ -252,12 +252,14 @@ class ShippingFlowService:
         if not route['requires_customs']:
             return _step('documents', 'skipped', summary={'required': False})
         if dn.customs is None:
+            if is_locked(dn):
+                # 已发货：报关数据补不了了，不再列问题
+                return _step('documents', 'skipped', summary={'required': True, 'customs': False, 'locked': True})
             f['problems'].append(_problem(
                 'CUSTOMS_DATA_MISSING', 'error',
                 f"International shipment ({route['origin_country']} → {route['destination_country']}) without "
                 "customs data: the source system must send the customs snapshot", 'documents'))
-            return _step('documents', 'warning' if dn.status not in SHIPPED else 'skipped',
-                         summary={'required': True, 'customs': False})
+            return _step('documents', 'warning', summary={'required': True, 'customs': False})
         view = f['ctx']['view'] or CustomsService.build_view(dn)
         current = CustomsService.current_documents(dn)
         missing = [t for t in DOC_TYPES if t not in current]
@@ -287,11 +289,18 @@ class ShippingFlowService:
         else:
             action = _action('issue_documents')
         at = ci.issued_at if ci is not None else None
+        if is_locked(dn):
+            # 已发货（交接）：单证已锁定，这一步就是完成了 —— 不再提示过期 / 缺失，报关问题上面也不再列（没法处理了）。
+            # 发货时一份单证都没出（完成发货不查单证）→ skipped（不适用）
+            summary['outdated'] = False
+            summary['locked'] = True
+            if current:
+                issued = [doc.issued_at for doc in current.values() if doc.issued_at is not None]
+                return _step('documents', 'done', at or (max(issued) if issued else None), 'warehouse', summary,
+                             [action])
+            return _step('documents', 'skipped', None, None, summary, [action])
         if not missing and not summary['outdated']:
             return _step('documents', 'done', at, 'warehouse', summary, [action])
-        if dn.status in SHIPPED:
-            # 发货时没出 / 已过期（完成发货不查单证）：只提示
-            return _step('documents', 'warning', at, 'warehouse' if at else None, summary, [action])
         if dn.status != 'packed':
             return _step('documents', 'todo', at, None, summary, [action])
         state = 'warning' if (summary['outdated'] or errors) else 'current'

@@ -133,7 +133,8 @@ def inbound_stage_of(asn):
 
 def putaway_pending(asn) -> list:
     """本单逐商品的待上架估算（与 putaway_pending_expression 同一口径）→
-    [{goods_id, quantity（本单实收）, sorted_stock（仓库的待上架库存）, newer（晚完成的入库单的实收）, pending}]。
+    [{goods_id, quantity（本单实收）, sorted_stock（仓库的待上架库存）, sorted_damage_stock（其中的破损品，
+    只能上到 damaged 库位）, newer（晚完成的入库单的实收）, pending}]。
     只列实收 > 0 的商品（同一商品多行的旧单据按商品合并）"""
     from extensions.db import db
     ASN, ASNDetail, Inventory = _models()
@@ -143,8 +144,10 @@ def putaway_pending(asn) -> list:
             quantities[detail.goods_id] = quantities.get(detail.goods_id, 0) + detail.actual_quantity
     if not quantities:
         return []
-    stocks = dict(db.session.query(Inventory.goods_id, Inventory.sorted_stock).filter(
-        Inventory.warehouse_id == asn.warehouse_id, Inventory.goods_id.in_(list(quantities))).all())
+    rows = db.session.query(Inventory.goods_id, Inventory.sorted_stock, Inventory.sorted_damage_stock).filter(
+        Inventory.warehouse_id == asn.warehouse_id, Inventory.goods_id.in_(list(quantities))).all()
+    stocks = {goods_id: stock for goods_id, stock, _damaged in rows}
+    damaged_stocks = {goods_id: damaged for goods_id, _stock, damaged in rows}
     outer = aliased(ASN)
     result = []
     for goods_id in sorted(quantities):
@@ -153,6 +156,7 @@ def putaway_pending(asn) -> list:
         ).scalar() or 0
         stock = stocks.get(goods_id) or 0
         quantity = quantities[goods_id]
-        result.append({'goods_id': goods_id, 'quantity': quantity, 'sorted_stock': stock, 'newer': int(newer),
+        result.append({'goods_id': goods_id, 'quantity': quantity, 'sorted_stock': stock,
+                       'sorted_damage_stock': damaged_stocks.get(goods_id) or 0, 'newer': int(newer),
                        'pending': max(0, min(quantity, stock - int(newer)))})
     return result

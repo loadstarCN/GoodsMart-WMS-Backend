@@ -65,7 +65,40 @@ class InventoryService:
             inventory.picked_stock +
             inventory.packed_stock
         )
-    
+
+    @staticmethod
+    def _clamp_sorted_damage(inventory: Inventory):
+        """不变式 0 ≤ sorted_damage_stock ≤ sorted_stock（破损部分是待上架的一部分）"""
+        sorted_stock = inventory.sorted_stock or 0
+        damaged = inventory.sorted_damage_stock or 0
+        inventory.sorted_damage_stock = max(0, min(damaged, sorted_stock))
+
+    @staticmethod
+    def take_sorted_for_putaway(inventory: Inventory, quantity: int, location_type: str):
+        """从待上架里扣 quantity 件上到 location_type 类型的库位（调用方已锁库存行）：
+        - damaged 库位：先扣破损部分（min(上架数, sorted_damage_stock)），其余扣良品部分
+        - standard / return 库位：只能用良品部分（sorted_stock − sorted_damage_stock），超出 → 400 15016，
+          details {good_pending, damaged_pending}
+        sorted_stock 照常减；待上架总量不足仍是 15007。"""
+        sorted_stock = inventory.sorted_stock or 0
+        damaged = min(inventory.sorted_damage_stock or 0, sorted_stock)
+        if sorted_stock < quantity:
+            raise BadRequestException("Not enough sort stock.", 15007)
+        good = sorted_stock - damaged
+        if location_type == 'damaged':
+            damaged -= min(quantity, damaged)
+        elif quantity > good:
+            raise BadRequestException(
+                f"Only {good} good item(s) of goods {inventory.goods_id} are waiting to be put away; "
+                f"{damaged} damaged item(s) can only be put away to a damaged location.",
+                15016, field='quantity',
+                details={'goods_id': inventory.goods_id, 'location_type': location_type, 'quantity': quantity,
+                         'good_pending': good, 'damaged_pending': damaged},
+            )
+        inventory.sorted_stock = sorted_stock - quantity
+        inventory.sorted_damage_stock = damaged
+        InventoryService._clamp_sorted_damage(inventory)
+
 
     @staticmethod
     def get_inventory(goods_id: int, warehouse_id: int) -> Inventory:
@@ -86,15 +119,14 @@ class InventoryService:
         :return: 一个已排序并过滤后的 SQLAlchemy Query 对象
         """
         query = Inventory.query.order_by(Inventory.goods_id.desc())
-        query = query.join(Warehouse).filter(Warehouse.is_active == True)
-        
+        query = InventoryService._scoped(query.join(Warehouse), filters)
+
         if filters.get('goods_id'):
             query = query.filter(Inventory.goods_id == filters['goods_id'])
-        if filters.get('warehouse_id'):
-            query = query.filter(Inventory.warehouse_id == filters['warehouse_id'])
-        if filters.get('warehouse_ids'):
-            query = query.filter(Inventory.warehouse_id.in_(filters['warehouse_ids']))
-        
+        # 只看还有待上架的（sorted_stock > 0；其中 sorted_damage_stock 只能上到 damaged 库位）
+        if filters.get('pending_putaway'):
+            query = query.filter(Inventory.sorted_stock > 0)
+
         if filters.get('low_stock_threshold'):
             query = query.filter(Inventory.low_stock_threshold <= filters['low_stock_threshold'])
         if filters.get('high_stock_threshold'):
@@ -119,6 +151,48 @@ class InventoryService:
         return query
 
     @staticmethod
+    def _scoped(query, filters: dict):
+        """库存行的范围（列表与待上架汇总共用；query 已 join Warehouse）：启用中的仓库；
+        warehouse_id / warehouse_ids（add_warehouse_filter 给的当前仓库 / 可访问仓库）；company_id"""
+        query = query.filter(Warehouse.is_active == True)
+        if filters.get('warehouse_id'):
+            query = query.filter(Inventory.warehouse_id == filters['warehouse_id'])
+        if filters.get('warehouse_ids'):
+            query = query.filter(Inventory.warehouse_id.in_(filters['warehouse_ids']))
+        if filters.get('company_id'):
+            query = query.filter(Warehouse.company_id == filters['company_id'])
+        return query
+
+    @staticmethod
+    def pending_putaway_summary(filters: dict, overdue_days: int | None = None) -> dict:
+        """待上架汇总（GET /inventory/pending-putaway/summary，首页 / 侧栏的数字）：范围同库存列表，
+        只算 sorted_stock > 0 的行 → {inventory_count, goods_count, total_quantity, damaged_quantity, good_quantity,
+        overdue_days, overdue_quantity, overdue_inventory_count, oldest_pending_since}（超期按先进先上，见 pending.py）"""
+        from warehouse.common import clock
+        from .pending import PENDING_PUTAWAY_OVERDUE_DAYS, overdue_summary
+        if overdue_days is None:
+            overdue_days = PENDING_PUTAWAY_OVERDUE_DAYS
+        query = db.session.query(Inventory.goods_id, Inventory.warehouse_id, Inventory.sorted_stock,
+                                 Inventory.sorted_damage_stock).select_from(Inventory).join(
+            Warehouse, Warehouse.id == Inventory.warehouse_id)
+        rows = InventoryService._scoped(query, filters).filter(Inventory.sorted_stock > 0).all()
+        total = sum(int(row.sorted_stock or 0) for row in rows)
+        damaged = sum(min(int(row.sorted_damage_stock or 0), int(row.sorted_stock or 0)) for row in rows)
+        overdue = overdue_summary([(row.goods_id, row.warehouse_id, int(row.sorted_stock)) for row in rows],
+                                  overdue_days, clock.now())
+        return {
+            'warehouse_id': filters.get('warehouse_id'),
+            'company_id': filters.get('company_id'),
+            'inventory_count': len(rows),
+            'goods_count': len({row.goods_id for row in rows}),
+            'total_quantity': total,
+            'damaged_quantity': damaged,
+            'good_quantity': total - damaged,
+            'overdue_days': overdue_days,
+            **overdue,
+        }
+
+    @staticmethod
     @transactional
     def create_inventory(data) -> Inventory:
         """
@@ -140,6 +214,7 @@ class InventoryService:
             asn_stock=data.get('asn_stock', 0),
             received_stock=data.get('received_stock', 0),
             sorted_stock=data.get('sorted_stock', 0),
+            sorted_damage_stock=data.get('sorted_damage_stock', 0),
             dn_stock=data.get('dn_stock', 0),
             picked_stock=data.get('picked_stock', 0),
             packed_stock=data.get('packed_stock', 0),        # 注意字段命名改为 packed_stock
@@ -147,6 +222,7 @@ class InventoryService:
             remark=data.get('remark', ""),
         )
 
+        InventoryService._clamp_sorted_damage(new_inventory)
         db.session.add(new_inventory)
         # db.session.commit()
         return new_inventory
@@ -194,6 +270,8 @@ class InventoryService:
         inventory.asn_stock = data.get('asn_stock', inventory.asn_stock)
         inventory.received_stock = data.get('received_stock', inventory.received_stock)
         inventory.sorted_stock = data.get('sorted_stock', inventory.sorted_stock)
+        inventory.sorted_damage_stock = data.get('sorted_damage_stock', inventory.sorted_damage_stock)
+        InventoryService._clamp_sorted_damage(inventory)
         inventory.dn_stock = data.get('dn_stock', inventory.dn_stock)
         inventory.picked_stock = data.get('picked_stock', inventory.picked_stock)        
         inventory.packed_stock = data.get('packed_stock', inventory.packed_stock)        
@@ -265,13 +343,15 @@ class InventoryService:
 
     @staticmethod
     @transactional
-    def asn_completed(goods_id: int, warehouse_id: int, quantity: int, actual_quantity: int):
+    def asn_completed(goods_id: int, warehouse_id: int, quantity: int, actual_quantity: int,
+                      damage_quantity: int = 0):
         """
         分拣完成：签收库存减少，分拣库存增加
         :param goods_id: 关联的商品 ID
         :param warehouse_id: 仓库 ID
         :param quantity: 签收数量
-        :param actual_quantity: 实际分拣数量
+        :param actual_quantity: 实际分拣数量（良品 + 破损）
+        :param damage_quantity: 其中的破损数量：同时记进 sorted_stock 与 sorted_damage_stock（只能上到 damaged 库位）
         这里的实际分拣数量可能小于签收数量，表示部分商品缺货，也有可能大于签收数量，表示多拣货
         """
         inventory = InventoryService._get_for_update(goods_id, warehouse_id)
@@ -280,8 +360,12 @@ class InventoryService:
         if inventory.received_stock < quantity:
             raise BadRequestException("Not enough received stock.", 15006)
         inventory.received_stock -= quantity
-        # 分拣库存增加
+        # 分拣库存增加（破损是实收的一部分）
+        actual_quantity = actual_quantity or 0
         inventory.sorted_stock += actual_quantity
+        inventory.sorted_damage_stock = (inventory.sorted_damage_stock or 0) + max(
+            0, min(damage_quantity or 0, actual_quantity))
+        InventoryService._clamp_sorted_damage(inventory)
         inventory.total_stock = InventoryService._calculate_total_stock(inventory)
         # db.session.commit()
 
@@ -303,32 +387,40 @@ class InventoryService:
 
     @staticmethod
     @transactional
-    def putaway_completed(goods_id: int, warehouse_id: int, quantity: int):
+    def putaway_completed(goods_id: int, warehouse_id: int, quantity: int, location_type: str = 'standard'):
         """
         上架完成：分拣库存减少，现有库存增加
         :param goods_id: 关联的商品 ID
         :param warehouse_id: 仓库 ID
         :param quantity: 上架数量
+        :param location_type: 目标库位类型（standard / damaged / return）：damaged 先扣待上架·破损；
+            standard / return 只能用良品部分，超出 → 400 15016（见 take_sorted_for_putaway）
         """
         inventory = InventoryService._get_for_update(goods_id, warehouse_id)
-        if inventory.sorted_stock < quantity:
-            raise BadRequestException("Not enough sort stock.",15007)
-        inventory.sorted_stock -= quantity
+        InventoryService.take_sorted_for_putaway(inventory, quantity, location_type)
         db.session.flush()
         InventoryService.update_and_calculate_stock(goods_id, warehouse_id)
         # db.session.commit()
 
+    # 这些原因的下架按破损品回到待上架（只能再上到 damaged 库位）；从 damaged 库位下架的也一样
+    DAMAGED_REMOVAL_REASONS = frozenset({'damage', 'damaged'})
+
     @staticmethod
     @transactional
-    def removal_completed(goods_id: int, warehouse_id: int, quantity: int):
+    def removal_completed(goods_id: int, warehouse_id: int, quantity: int, damaged: bool = False):
         """
-        下架完成：现有库存减少
+        下架完成：现有库存减少，货进入待上架
         :param goods_id: 关联的商品 ID
         :param warehouse_id: 仓库 ID
         :param quantity: 下架数量
+        :param damaged: 下架的是破损品（从 damaged 库位下架，或下架原因是 damage / damaged）：
+            同时记进 sorted_damage_stock，之后只能上到 damaged 库位
         """
         inventory = InventoryService._get_for_update(goods_id, warehouse_id)
         inventory.sorted_stock += quantity
+        if damaged:
+            inventory.sorted_damage_stock = (inventory.sorted_damage_stock or 0) + quantity
+        InventoryService._clamp_sorted_damage(inventory)
         db.session.flush()
         InventoryService.update_and_calculate_stock(goods_id, warehouse_id)
         # db.session.commit()
@@ -395,7 +487,7 @@ class InventoryService:
             raise BadRequestException("Not enough pick stock.", 15009)
         inventory.picked_stock -= picked_quantity
         inventory.packed_stock += quantity
-        # 少打包的差额回到待上架区
+        # 少打包的差额回到待上架区（按良品：sorted_damage_stock 不变，0 ≤ 破损 ≤ 待上架仍成立）
         inventory.sorted_stock += picked_quantity - quantity
         inventory.total_stock = InventoryService._calculate_total_stock(inventory)
         # db.session.commit()
@@ -421,6 +513,7 @@ class InventoryService:
             raise BadRequestException("Not enough packed stock.", 15010)
         inventory.picked_stock -= picked_quantity
         inventory.packed_stock -= packed_quantity
+        # 退回待上架的按良品（sorted_damage_stock 不变）
         inventory.sorted_stock += picked_quantity + packed_quantity
         inventory.total_stock = InventoryService._calculate_total_stock(inventory)
 

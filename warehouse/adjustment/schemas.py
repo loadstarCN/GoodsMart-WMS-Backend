@@ -4,6 +4,7 @@ from system.common import pagination_parser, create_pagination_model,generate_in
 from system.user.schemas import user_simple_model as original_user_model
 from warehouse.goods.schemas import goods_simple_model as goods_model
 from warehouse.location.schemas import location_simple_model as location_model
+from warehouse.warehouse.schemas import warehouse_simple_model as warehouse_model
 from .models import Adjustment
 
 # -----------------------------
@@ -15,6 +16,19 @@ api_ns = Namespace(
     authorizations=authorizations
 )
 user_model = api_ns.model('User', original_user_model)
+
+# 明细所属调整单的概要（商品 / 库位详情页的「调整」历史按明细列表显示审批 / 完成时刻、原因）
+adjustment_summary_model = api_ns.model('AdjustmentSummary', {
+    'id': fields.Integer(readOnly=True, description='Inventory Adjustment ID'),
+    'warehouse_id': fields.Integer(readOnly=True, description='ID of the associated warehouse'),
+    'adjustment_reason': fields.String(readOnly=True, description='Reason for adjustment'),
+    'cyclecount_id': fields.Integer(readOnly=True, description='Source CycleCountTask ID'),
+    'status': fields.String(readOnly=True, enum=Adjustment.AdjustmentStatuses, description='Adjustment status'),
+    'is_active': fields.Boolean(readOnly=True, description='Whether the adjustment is active'),
+    'created_at': fields.DateTime(readOnly=True, description='Creation time'),
+    'approved_at': fields.DateTime(readOnly=True, description='Approval time'),
+    'completed_at': fields.DateTime(readOnly=True, description='Completion time'),
+})
 
 # -----------------------------
 # Adjustment Detail 模型定义
@@ -30,7 +44,14 @@ adjustment_detail_fields = {
     'adjustment_quantity': fields.Integer(description='Difference between system and actual quantity'),
     'remark': fields.String(description='Additional remarks about the adjustment detail'),
     'goods': fields.Nested(goods_model, readonly=True, description='Details of the goods'),
-    'location': fields.Nested(location_model, readonly=True, description='Details of the location (if applicable)')
+    'location': fields.Nested(location_model, readonly=True, description='Details of the location (if applicable)'),
+    # 所属调整单的概要与审批人 / 操作人（商品 / 库位详情页的调整历史要显示；以前这几列永远为空）
+    'adjustment': fields.Nested(adjustment_summary_model, readonly=True, allow_null=True,
+                                description='Summary of the adjustment the detail belongs to'),
+    'approver': fields.Nested(user_model, readonly=True, allow_null=True, attribute='adjustment.approver',
+                              description='Approver of the adjustment'),
+    'operator': fields.Nested(user_model, readonly=True, allow_null=True, attribute='adjustment.operator',
+                              description='Operator who completed / cancelled the adjustment'),
 }
 
 # 输出模型：完整的 Adjustment Detail 模型
@@ -70,7 +91,7 @@ adjustment_fields = {
     'creator': fields.Nested(user_model, readonly=True, description='Details of the creator'),
     'approver': fields.Nested(user_model, readonly=True, description='Details of the approver'),
     'operator': fields.Nested(user_model, readonly=True, description='Details of the operator'),
-    'warehouse': fields.Nested(location_model, readonly=True, description='Details of the warehouse'),
+    'warehouse': fields.Nested(warehouse_model, readonly=True, description='Details of the warehouse'),
     'detail_count': fields.Integer(
         readOnly=True,
         attribute=lambda x: len(x.details),  # 直接计算关联的 details 数量

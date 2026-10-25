@@ -1,10 +1,11 @@
 from extensions.db import *
+from warehouse.common.search import number_conditions
 from extensions.error import BadRequestException, ConflictException, NotFoundException
 from warehouse.common import require_positive_int, require_bulk_list, lock_goods_location, delete_batch_with_details
 from warehouse.common.locks import lock_row, lock_inventory_rows, lock_order_key
 from warehouse.common.batch_idempotency import parse_client_batch_id, find_batch, replay_or_conflict, insert_batch
 from warehouse.common.validation import require_active_task
-from warehouse.dn.models import DN
+from warehouse.dn.models import DN, DNDetail
 from warehouse.dn.services import DNService, pick_fields, parse_datetime_value
 from warehouse.location.models import Location
 from warehouse.removal.services import RemovalService
@@ -15,6 +16,10 @@ from dateutil.relativedelta import relativedelta
 from sqlalchemy import and_, func, case, extract
 from sqlalchemy.orm import selectinload, joinedload
 from datetime import datetime, timedelta
+
+# 只能从 standard 库位拣货（破损 / 退货库位上的货不发货；可售库存 available_stock_for_sale 也只算 standard）
+PICKABLE_LOCATION_TYPE = 'standard'
+
 
 class PickingTaskService:
 
@@ -70,17 +75,12 @@ class PickingTaskService:
         # 搜索id,DN.id ，或者在detail中的goods.code
         if filters.get('keyword'):
             keyword = filters['keyword']
-            conditions = []
-            try:
-                # 尝试将 keyword 转换为整数
-                task_id = int(keyword)
-                conditions.append(PickingTask.id == task_id)
-                conditions.append(PickingTask.dn_id == task_id)
-            except ValueError:
-                # 如果转换失败，则说明 keyword 不全是数字，不加入 DN.id 过滤条件
-                pass
+            # 单号：纯数字（任务或 DN 编号）、PICK-5（任务）、DN-163（DN）
+            conditions = number_conditions(keyword, {'PICK': [PickingTask.id], 'DN': [PickingTask.dn_id]},
+                                           [PickingTask.id, PickingTask.dn_id])
 
-            conditions.append(PickingTask.task_details.any(PickingTaskDetail.goods.has(code=keyword)))
+            # 商品编码按所属 DN 的商品明细匹配（以前按已拣 / 已打包的明细，待处理的任务搜不到）
+            conditions.append(PickingTask.dn.has(DN.details.any(DNDetail.goods.has(code=keyword))))
             query = query.filter(db.or_(*conditions))
 
         if filters.get('warehouse_id') or filters.get('warehouse_ids'):
@@ -271,19 +271,30 @@ class PickingTaskService:
 
     @staticmethod
     def _assert_locations_in_warehouse(task: PickingTask, location_ids):
-        """明细库位必须属于 DN 所在仓库，否则 complete 时会跨仓扣库存。"""
+        """明细库位必须属于 DN 所在仓库，否则 complete 时会跨仓扣库存；
+        且只能是 standard 库位：破损 / 退货库位上的货不能拣去发货（400 16162，details {location_id, location_type}）。"""
         location_ids = {lid for lid in location_ids if lid is not None}
         if not location_ids:
             return
-        warehouse_by_location = dict(
-            db.session.query(Location.id, Location.warehouse_id)
-            .filter(Location.id.in_(location_ids))
-            .all()
-        )
-        for location_id in location_ids:
-            if warehouse_by_location.get(location_id) != task.dn.warehouse_id:
+        rows = {
+            location_id: (warehouse_id, location_type)
+            for location_id, warehouse_id, location_type in (
+                db.session.query(Location.id, Location.warehouse_id, Location.location_type)
+                .filter(Location.id.in_(location_ids))
+                .all()
+            )
+        }
+        for location_id in sorted(location_ids, key=str):
+            warehouse_id, location_type = rows.get(location_id, (None, None))
+            if warehouse_id != task.dn.warehouse_id:
                 raise BadRequestException(
                     f"Location {location_id} does not belong to the DN warehouse.", 16054
+                )
+            if location_type != PICKABLE_LOCATION_TYPE:
+                raise BadRequestException(
+                    f"Location {location_id} is a {location_type} location; goods can only be picked from "
+                    f"standard locations.", 16162, field='location_id',
+                    details={'location_id': location_id, 'location_type': location_type},
                 )
 
     @staticmethod

@@ -103,6 +103,17 @@ from werkzeug.exceptions import HTTPException
 # 16123  400  client_batch_id 不合法：须为 1~64 个字符的字符串（field = client_batch_id）
 # 44009  409  库位有历史记录（上架 / 下架 / 移库 / 拣货 / 盘点 / 调整 / 库存快照）引用，不能删除（请改用停用）：
 #             details {entity: 'location', id, references: {记录类型: 行数}}
+# 15016  400  上到 standard / return 库位的数量超过待上架的良品部分（sorted_stock − sorted_damage_stock；破损品只能上到
+#             damaged 库位）：field = quantity，details {goods_id, location_type, quantity, good_pending, damaged_pending}
+# 16162  400  拣货只能从 standard 库位拣（批次提交 / 改量 / 完成复核）：field = location_id，details {location_id, location_type}
+#
+# 业务码登记（账号 / 内置权限角色 / 商品导入）：
+# 10015  400  新密码不合规（8–16 位，含大小写字母、数字、特殊符号 @$!%*?&，不能有其它字符；system/user/password_policy.py）：
+#             field = password / new_password，details {min_length, max_length, special_characters}
+# 10016  400  商品导入文件不是 UTF-8 文本：field 无，details {reason: NOT_UTF8}（其余导入错误沿用 10004 / 10005 / 10006 /
+#             10012 / 10014 / 16100 / 16101，details 带 row / rows / code / columns / value）
+# 11011  409  内置权限（system/user/builtin.py）不能改代码 / 删除：details {permission, reason: RENAME | DELETE}
+# 11012  409  内置角色不能改名 / 停用 / 删除（权限照常分配）：details {role, reason: RENAME | DEACTIVATE | DELETE}
 
 class APIException(Exception):
     """API异常基类"""

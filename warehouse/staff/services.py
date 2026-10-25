@@ -5,6 +5,7 @@ from extensions.transaction import transactional
 from .models import Staff
 from warehouse.warehouse.models import Warehouse
 from system.user.models import Role
+from system.user.password_policy import validate_new_password
 from system.user.services import RoleService
 from sqlalchemy import or_,func
 
@@ -116,6 +117,8 @@ class StaffService:
         创建新 Staff
         """
         company_id = data['company_id']
+        if data.get('password'):
+            validate_new_password(data['password'], 'password')
         new_staff = Staff(
             user_name=data['user_name'],
             avatar=data.get('avatar'),
@@ -152,6 +155,8 @@ class StaffService:
         更新 Staff 信息（company_id 不在此修改）
         """
         staff = StaffService.get_staff(staff_id)
+        if data.get('password'):
+            validate_new_password(data['password'], 'password')
 
         staff.user_name = data.get('user_name', staff.user_name)
         staff.avatar = data.get('avatar', staff.avatar)

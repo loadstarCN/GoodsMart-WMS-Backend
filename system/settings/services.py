@@ -64,6 +64,14 @@ def decrypt_secret(ciphertext: str) -> str:
     return _get_fernet().decrypt(ciphertext.encode()).decode()
 
 
+def smtp_use_tls(value) -> bool:
+    """SMTP「启用 TLS」：没设 / 空 = 开（与设置页的显示一致）；只有明确的 false / 0 / no / off 才关"""
+    text = str(value if value is not None else '').strip().lower()
+    if not text:
+        return True
+    return text not in ('false', '0', 'no', 'off')
+
+
 class SettingsService:
 
     @staticmethod
@@ -123,7 +131,7 @@ class SettingsService:
         msg.attach(MIMEText(html_body, 'html', 'utf-8'))
 
         port = int(config.get('smtp_port') or 587)
-        use_tls = str(config.get('smtp_use_tls', 'true')).lower() in ('true', '1', 'yes')
+        use_tls = smtp_use_tls(config.get('smtp_use_tls'))
 
         with smtplib.SMTP(config['smtp_host'], port, timeout=10) as server:
             if use_tls:

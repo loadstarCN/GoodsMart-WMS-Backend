@@ -34,10 +34,10 @@ location_simple_fields = {
 location_fields = dict(location_simple_fields)
 location_fields.update({
     'description': fields.String(description='Location Description'),
-    'width': fields.Float(description='Width in meters'),
-    'depth': fields.Float(description='Depth in meters'),
-    'height': fields.Float(description='Height in meters'),
-    'capacity': fields.Float(description='Maximum weight capacity in kilograms'),    
+    'width': fields.Float(description='Width in centimeters (cm)'),
+    'depth': fields.Float(description='Depth in centimeters (cm)'),
+    'height': fields.Float(description='Height in centimeters (cm)'),
+    'capacity': fields.Float(description='Maximum storage capacity (volume) in cubic meters (m³)'),
     'created_by': fields.Integer(description='User ID of the creator'),
     'created_at': fields.DateTime(readOnly=True, description='Creation timestamp'),
     'updated_at': fields.DateTime(readOnly=True, description='Last updated timestamp'),

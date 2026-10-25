@@ -2,6 +2,7 @@ from flask_restx import Namespace, fields, inputs, reqparse
 from werkzeug.datastructures import FileStorage
 from system.common import generate_input_fields,pagination_parser, create_pagination_model
 from system.user.schemas import user_simple_model as original_user_model  # 用户序列化器
+from warehouse.location.models import Location
 from warehouse.location.schemas import location_simple_model  # 位置序列化器
 from warehouse.company.schemas import comapny_simple_model as company_model  # 公司序列化器
 
@@ -175,6 +176,10 @@ goods_location_pagination_parser.add_argument('quantity_min', type=int, help='Fi
 goods_location_pagination_parser.add_argument('quantity_max', type=int, help='Filter by maximum quantity')
 goods_location_pagination_parser.add_argument('keyword', type=str, help='Search by keyword in goods name, code, manufacturer, category, tags, brand, and location code')
 goods_location_pagination_parser.add_argument('warehouse_id', type=int, help='Filter by Warehouse ID')
+# 拣货页只列可拣库位：location_type=standard（拣货只能从 standard 库位拣，别的类型提交批次 → 400 16162）
+goods_location_pagination_parser.add_argument('location_type', type=str, choices=Location.LOCATION_TYPES,
+                                              help='Filter by location type (standard / damaged / return); '
+                                                   'picking pages pass standard')
 
 
 # 创建上传文件的请求解析器

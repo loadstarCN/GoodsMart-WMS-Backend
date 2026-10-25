@@ -61,7 +61,10 @@ class CycleCountTaskList(Resource):
             'task_name': args.get('task_name'),
             'status': args.get('status'),
             'is_active': args.get('is_active'),
+            # 计划时间：以前只传了解析器里没有的 scheduled_date，scheduled_start_date / scheduled_end_date 没传进去，筛选不生效
             'scheduled_date': args.get('scheduled_date'),
+            'scheduled_start_date': args.get('scheduled_start_date'),
+            'scheduled_end_date': args.get('scheduled_end_date'),
             'warehouse_id': args.get('warehouse_id'),
             'keyword': args.get('keyword')
         }

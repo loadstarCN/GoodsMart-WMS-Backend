@@ -114,8 +114,8 @@ class PutawayService:
         db.session.add(goods_location_record)
         db.session.flush()
 
-        #更新库存信息
-        InventoryService.putaway_completed(goods_id, location.warehouse_id, quantity)
+        # 更新库存信息：破损品只能上到 damaged 库位（standard / return 库位只能用待上架的良品部分，超出 400 15016）
+        InventoryService.putaway_completed(goods_id, location.warehouse_id, quantity, location.location_type)
 
         # db.session.commit()
         return new_record

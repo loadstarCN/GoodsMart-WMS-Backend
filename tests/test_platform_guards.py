@@ -299,7 +299,7 @@ def test_csv_goods_numbers_rejected_with_row(client, access_company_admin_token,
     assert response.status_code == 400, response.get_json()
     body = response.get_json()
     assert body['code'] == 16100
-    assert body['details'] == {'field': field, 'row': 3}
+    assert body['details'] == {'field': field, 'row': 3, 'columns': [field]}
     assert body['message'].startswith('Row 3:')
     with client.application.app_context():
         assert Goods.query.filter(Goods.code.in_(['OK1', 'WEIRD1'])).count() == 0
@@ -311,7 +311,7 @@ def test_csv_duplicate_code_reports_rows(client, access_company_admin_token):
     assert response.status_code == 400, response.get_json()
     body = response.get_json()
     assert body['code'] == 16101
-    assert body['details'] == {'code': 'DUP1', 'rows': [3, 4]}
+    assert body['details'] == {'code': 'DUP1', 'rows': [3, 4], 'columns': ['code']}
     with client.application.app_context():
         assert Goods.query.filter(Goods.code.in_(['DUP0', 'DUP1'])).count() == 0
 
@@ -671,13 +671,21 @@ def test_payment_endpoints_enforce_warehouse_scope(client, access_token):
 # B-77  停用角色
 # ===========================================================================
 
+def _set_role_active(client, role_id, active):
+    """company_admin 是内置角色，接口不能停用（409 11012）；这里直接改库，测停用角色的效果（存量数据可能有）"""
+    with client.application.app_context():
+        db.session.get(Role, role_id).is_active = active
+        db.session.commit()
+
+
 def test_inactive_role_grants_nothing(client, access_token, access_company_admin_token):
     with client.application.app_context():
         role_id = Role.query.filter_by(name='company_admin').first().id
     assert client.get('/supplier/', headers=_h(access_company_admin_token)).status_code == 200
 
     response = client.put(f'/user/roles/{role_id}', headers=_h(access_token), json={'is_active': False})
-    assert response.status_code == 200 and response.get_json()['is_active'] is False
+    assert response.status_code == 409 and response.get_json()['code'] == 11012
+    _set_role_active(client, role_id, False)
 
     # 权限不再生效（permission_required）
     assert client.get('/supplier/', headers=_h(access_company_admin_token)).status_code == 403
@@ -690,8 +698,9 @@ def test_inactive_role_grants_nothing(client, access_token, access_company_admin
     # 登录返回的角色只含生效中的
     response = client.post('/user/login', json={'account': 'company_admin', 'password': 'password'})
     assert response.status_code == 200 and 'company_admin' not in response.get_json()['roles']
-    # 重新启用即恢复
-    client.put(f'/user/roles/{role_id}', headers=_h(access_token), json={'is_active': True})
+    # 重新启用即恢复（启用内置角色接口允许）
+    response = client.put(f'/user/roles/{role_id}', headers=_h(access_token), json={'is_active': True})
+    assert response.status_code == 200 and response.get_json()['is_active'] is True
     assert client.get('/supplier/', headers=_h(access_company_admin_token)).status_code == 200
 
 
@@ -710,7 +719,7 @@ def test_inactive_company_admin_role_loses_company_wide_warehouse_scope(client, 
     assert client.get('/inventory/', headers=_h(token)).status_code == 200
     assert client.get('/inventory/', headers=_h(token, wh_b_id)).status_code == 200
 
-    client.put(f'/user/roles/{role_id}', headers=_h(access_token), json={'is_active': False})
+    _set_role_active(client, role_id, False)
     # 停用后按普通员工处理：必须带仓库，且只能是分配给自己的仓库（A）
     assert client.get('/inventory/', headers=_h(token)).status_code == 400
     assert client.get('/inventory/', headers=_h(token, wh_b_id)).status_code == 403
@@ -731,11 +740,11 @@ def test_inactive_role_cannot_be_assigned_but_can_be_kept(client, access_token):
     body = response.get_json()
     assert body['code'] == 16103 and body['field'] == 'roles' and body['details'] == {'roles': ['retired_role']}
     response = client.post('/staff/', headers=h, json={
-        'user_name': 'new_s', 'email': 'new_s@t.com', 'password': 'password123', 'company_id': 1,
+        'user_name': 'new_s', 'email': 'new_s@t.com', 'password': 'Passw0rd!', 'company_id': 1,
         'roles': ['retired_role']})
     assert response.status_code == 400 and response.get_json()['code'] == 16103
     response = client.post('/user/users', headers=h, json={
-        'user_name': 'new_u', 'email': 'new_u@t.com', 'password': 'password123', 'roles': ['retired_role']})
+        'user_name': 'new_u', 'email': 'new_u@t.com', 'password': 'Passw0rd!', 'roles': ['retired_role']})
     assert response.status_code == 400 and response.get_json()['code'] == 16103
 
     # 已持有的角色被停用后，编辑页原样提交回来 → 照常保存（保留该分配）

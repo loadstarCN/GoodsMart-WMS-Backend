@@ -1,7 +1,11 @@
 from flask_restx import Resource
 from system.common import paginate,permission_required
 from warehouse.common import warehouse_required, add_warehouse_filter, require_warehouse_scope
-from .schemas import api_ns, inventory_model, inventory_pagination_parser,pagination_model
+from .schemas import (
+    api_ns, inventory_model, inventory_pagination_parser, pagination_model,
+    pending_putaway_summary_model, pending_putaway_summary_parser,
+)
+from .pending import attach_pending_since
 from .services import InventoryService
 
 
@@ -27,13 +31,18 @@ class InventoryList(Resource):
             'low_stock_threshold': args.get('low_stock_threshold'),
             'high_stock_threshold': args.get('high_stock_threshold'),
             'keyword': args.get('keyword'),
+            # true：只返回还有待上架的行（sorted_stock > 0）
+            'pending_putaway': args.get('pending_putaway'),
         }
 
         filters = add_warehouse_filter(filters)
 
         query = InventoryService.list_inventories(filters)
-        
-        return paginate(query, page, per_page, get_all), 200
+
+        result = paginate(query, page, per_page, get_all)
+        # 每行的 pending_since（最早一件待上架的进入时刻，先进先上估算）：一页几条查询
+        attach_pending_since(result['items'])
+        return result, 200
 
     # @permission_required(["all_access","company_all_access","inventory_edit"])
     # @api_ns.expect(inventory_input_model)
@@ -44,6 +53,35 @@ class InventoryList(Resource):
     #     data = api_ns.payload
     #     new_inventory = InventoryService.create_inventory(data)
     #     return new_inventory, 201
+
+
+@api_ns.doc(security="jsonWebToken")
+@api_ns.route('/pending-putaway/summary')
+class InventoryPendingPutawaySummary(Resource):
+
+    # 首页 / 侧栏的数字：做上架的角色（putaway_read / putaway_edit）也能看
+    @permission_required(["all_access", "company_all_access", "inventory_read", "putaway_read", "putaway_edit"])
+    @warehouse_required()
+    @api_ns.expect(pending_putaway_summary_parser)
+    @api_ns.marshal_with(pending_putaway_summary_model)
+    def get(self):
+        """Summary of the stock waiting to be put away (for the home page / sidebar badges)
+
+        Scope is the same as GET /inventory/: the warehouse in `warehouse_id` / `X-WAREHOUSE-ID`, else every
+        warehouse the caller can access (staff / API keys: their own company); `company_id` narrows it further.
+        Counts only rows with `sorted_stock > 0`:
+        - `inventory_count`: rows (= `total` of `GET /inventory/?pending_putaway=true` with the same scope)
+        - `goods_count`: distinct goods
+        - `total_quantity`: items waiting (sum of `sorted_stock`)
+        - `damaged_quantity`: of which damaged (sum of `sorted_damage_stock`; can only go to damaged locations)
+        - `good_quantity`: `total_quantity - damaged_quantity`
+        - `overdue_quantity` / `overdue_inventory_count`: items / rows waiting longer than `overdue_days`
+          (query parameter, default 3, 0-365), first-in-first-out like `pending_since`
+        - `oldest_pending_since`: earliest `pending_since` (UTC, +00:00)
+        """
+        args = pending_putaway_summary_parser.parse_args()
+        filters = add_warehouse_filter({'company_id': args.get('company_id')})
+        return InventoryService.pending_putaway_summary(filters, args.get('overdue_days')), 200
 
 @api_ns.doc(security="jsonWebToken")
 @api_ns.route('/goods/<int:goods_id>/warehouse/<int:warehouse_id>')
@@ -60,7 +98,9 @@ class InventoryDetail(Resource):
         """
         # 路径里的 warehouse_id 必须在调用方可访问范围内（B-24）
         require_warehouse_scope(warehouse_id, 'Inventory')
-        return InventoryService.get_inventory(goods_id,warehouse_id), 200
+        inventory = InventoryService.get_inventory(goods_id, warehouse_id)
+        attach_pending_since([inventory])
+        return inventory, 200
 
     # @permission_required(["all_access","company_all_access","inventory_edit"])
     # @api_ns.expect(inventory_input_model)

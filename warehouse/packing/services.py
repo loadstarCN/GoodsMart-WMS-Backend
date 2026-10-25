@@ -1,7 +1,8 @@
 from extensions.db import *
+from warehouse.common.search import number_conditions
 from extensions.error import BadRequestException, NotFoundException
 from extensions.transaction import transactional
-from warehouse.dn.models import DN
+from warehouse.dn.models import DN, DNDetail
 from .models import (
     PackingTask, 
     PackingTaskDetail, 
@@ -70,17 +71,12 @@ class PackingTaskService:
         # 搜索id,DN.id ，或者在detail中的goods.code
         if filters.get('keyword'):
             keyword = filters['keyword']
-            conditions = []
-            try:
-                # 尝试将 keyword 转换为整数
-                task_id = int(keyword)
-                conditions.append(PackingTask.id == task_id)
-                conditions.append(PackingTask.dn_id == task_id)
-            except ValueError:
-                # 如果转换失败，则说明 keyword 不全是数字，不加入 DN.id 过滤条件
-                pass
+            # 单号：纯数字（任务或 DN 编号）、PACK-5（任务）、DN-163（DN）
+            conditions = number_conditions(keyword, {'PACK': [PackingTask.id], 'DN': [PackingTask.dn_id]},
+                                           [PackingTask.id, PackingTask.dn_id])
 
-            conditions.append(PackingTask.task_details.any(PackingTaskDetail.goods.has(code=keyword)))
+            # 商品编码按所属 DN 的商品明细匹配（以前按已拣 / 已打包的明细，待处理的任务搜不到）
+            conditions.append(PackingTask.dn.has(DN.details.any(DNDetail.goods.has(code=keyword))))
             query = query.filter(db.or_(*conditions))
 
         if filters.get('warehouse_id') or filters.get('warehouse_ids'):

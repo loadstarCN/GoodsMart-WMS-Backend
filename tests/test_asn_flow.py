@@ -153,11 +153,23 @@ def test_flow_without_tracking(client, access_token):
     assert {g['goods_id']: g['pending'] for g in putaway['goods']} == {1: 5, 2: 3}
     assert putaway['estimated'] is True and putaway['goods'][0]['code']
 
-    # 上架一部分：还是 putaway
+    # 上架一部分：还是 putaway。商品 1 的 1 件破损只能上到破损库位（普通库位只收 4 件良品，5 件 → 400 15016）
     with client.application.app_context():
         location_id = get_location().id
+        damaged = Location(warehouse_id=get_location().warehouse_id, code='FLOW-DMG', location_type='damaged',
+                           created_by=get_admin_user().id)
+        db.session.add(damaged)
+        db.session.commit()
+        damaged_id = damaged.id
+    assert {g['goods_id']: g['sorted_damage_stock'] for g in putaway['goods']}[1] == 1
     response = client.post('/putaway/', headers=_h(access_token), json={'goods_id': 1, 'location_id': location_id,
                                                                          'quantity': 5})
+    assert response.status_code == 400 and response.get_json()['code'] == 15016, response.get_json()
+    response = client.post('/putaway/', headers=_h(access_token), json={'goods_id': 1, 'location_id': location_id,
+                                                                         'quantity': 4})
+    assert response.status_code == 201, response.get_json()
+    response = client.post('/putaway/', headers=_h(access_token), json={'goods_id': 1, 'location_id': damaged_id,
+                                                                         'quantity': 1})
     assert response.status_code == 201, response.get_json()
     putaway = _steps(_assert_stage(client, access_token, asn_id, 'putaway'))['putaway']['summary']
     assert (putaway['pending_quantity'], putaway['put_away_quantity']) == (3, 5)
@@ -352,7 +364,7 @@ def test_putaway_stock_goes_to_newer_asn_first(client, access_token):
     flow = _assert_stage(client, access_token, older, 'putaway')
     assert _steps(flow)['putaway']['summary']['goods'] == [
         {'goods_id': 1, 'code': 'G001', 'name': _steps(flow)['putaway']['summary']['goods'][0]['name'],
-         'quantity': 4, 'pending': 2}]
+         'quantity': 4, 'pending': 2, 'sorted_stock': 8, 'sorted_damage_stock': 0}]
     _assert_stage(client, access_token, newer, 'putaway')
 
     _sorted_stock(client, 1, 0)

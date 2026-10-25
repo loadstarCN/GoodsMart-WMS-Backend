@@ -29,6 +29,10 @@ class LogService:
             # 不带时区的按默认时区（WMS_DEFAULT_TIMEZONE → WMS_TIMEZONE → UTC）
             from warehouse.common.clock import parse_input_datetime
             query = query.filter(ActivityLog.created_at >= parse_input_datetime(filters['created_at']))
+        if filters.get('created_at_end'):
+            # 结束时间（含）：只给日期的含那一整天（默认时区）
+            from warehouse.common.clock import filter_time_range
+            query = filter_time_range(query, ActivityLog.created_at, None, filters['created_at_end'])
         # keyword 只搜 actor / endpoint，不搜请求响应正文（避免逐字盲猜正文中的凭证）
         if filters.get('keyword'):
             keyword = f"%{filters['keyword']}%"

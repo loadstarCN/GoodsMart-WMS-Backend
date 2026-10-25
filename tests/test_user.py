@@ -108,7 +108,7 @@ def test_create_user(client, access_token):
     }, json={
         'user_name': 'test_user',
         'email': 'test_user@example.com',
-        'password': 'test_password',
+        'password': 'TestPassw0rd!',
         'roles': ['warehouse_operator'],
         'is_active': True
     })
@@ -123,7 +123,7 @@ def test_create_user_with_unknown_role_is_rejected(client, access_token):
     }, json={
         'user_name': 'test_user2',
         'email': 'test_user2@example.com',
-        'password': 'test_password',
+        'password': 'TestPassw0rd!',
         'roles': ['no_such_role'],
     })
     assert response.status_code == 400
@@ -174,17 +174,22 @@ def test_delete_user(client, access_token):
         
 
 def test_update_role(client, access_token):
+    headers = {'Authorization': f'Bearer {access_token}'}
+    created = client.post('/user/roles', headers=headers, json={'name': 'custom_role', 'description': 'tmp'})
+    assert created.status_code == 201 and created.get_json()['is_builtin'] is False
+    response = client.put(f"/user/roles/{created.get_json()['id']}", headers=headers, json={
+        'name': 'updated_custom_role',
+        'description': 'Updated custom role',
+        'is_active': True
+    })
+    assert response.status_code == 200
+    assert response.get_json()['name'] == 'updated_custom_role'
+
+    # 内置角色（admin）不能改名（tests/test_builtin_roles_permissions.py 另有完整用例）
     with client.application.app_context():
-        role = get_admin_role()
-        response = client.put(f'/user/roles/{role.id}', headers={
-            'Authorization': f'Bearer {access_token}'
-        }, json={
-            'name': 'updated_admin_role',
-            'description': 'Updated admin role',
-            'is_active': True
-        })
-        assert response.status_code == 200
-        assert response.get_json()['name'] == 'updated_admin_role'
+        role_id = get_admin_role().id
+    response = client.put(f'/user/roles/{role_id}', headers=headers, json={'name': 'updated_admin_role'})
+    assert response.status_code == 409 and response.get_json()['code'] == 11012
 
 def test_delete_role(client, access_token):
     headers = {'Authorization': f'Bearer {access_token}'}

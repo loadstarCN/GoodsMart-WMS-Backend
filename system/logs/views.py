@@ -27,6 +27,7 @@ class UserLogs(Resource):
             'status_code': args.get('status_code'),
             'ip_address': args.get('ip_address'),
             'created_at': args.get('created_at'),
+            'created_at_end': args.get('created_at_end'),
             'keyword': args.get('keyword')
         }
 

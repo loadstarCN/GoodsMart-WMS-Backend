@@ -169,6 +169,54 @@ def test_documents_problems_dropped_after_shipping(client, access_token):
     assert issue['enabled'] is False and issue['reason_code'] == 'DN_SHIPPED'
 
 
+def test_documents_step_done_after_shipping_even_if_data_changed(client, access_token):
+    """生产 DN-163：已在运输中，单证一步却是 outdated（橙色）+ 缺收件人税号警告。发货（交接）后单证已锁定：
+    这一步显示完成，不再提示「内容有变，需要重新签发」，报关视图也不再列问题"""
+    from .test_customs import _customs, _export_dn_ready, _issue
+    dn_id, task_id = _export_dn_ready(client, access_token, customs=_customs(recipient_tax_id=None,
+                                                                             recipient_tax_id_type=None))
+    issued = _issue(client, access_token, dn_id)
+    assert issued.status_code == 201, issued.get_json()
+    # 签发后改了出口资料：发货前照常提示过期、列出报关问题
+    with client.application.app_context():
+        get_company().export_signatory_name = 'Someone Else'
+        db.session.commit()
+    flow = _flow(client, access_token, dn_id)
+    documents = _steps(flow)['documents']
+    assert documents['state'] == 'warning' and documents['summary']['outdated'] is True
+    view = client.get(f'/dn/{dn_id}/customs', headers=_h(access_token)).get_json()
+    assert view['documents_outdated'] is True
+    assert 'RECIPIENT_TAX_ID_MISSING' in [p['code'] for p in view['problems']]
+
+    assert _ship(client, access_token, task_id).status_code == 200
+    # 发货后再改数据（商品原产国）也一样
+    with client.application.app_context():
+        Goods.query.filter_by(code='G001').first().origin_country = 'CN'
+        db.session.commit()
+    flow = _flow(client, access_token, dn_id)
+    documents = _steps(flow)['documents']
+    assert documents['state'] == 'done' and documents['source'] == 'warehouse' and documents['at']
+    assert documents['summary']['outdated'] is False and documents['summary']['locked'] is True
+    assert documents['summary']['version'] == 1 and documents['summary']['missing'] == []
+    assert not [p for p in flow['problems'] if p['step'] == 'documents']
+    assert _actions(documents)['issue_documents']['reason_code'] == 'DN_SHIPPED'
+    view = client.get(f'/dn/{dn_id}/customs', headers=_h(access_token)).get_json()
+    assert view['locked'] is True and view['documents_outdated'] is False and view['problems'] == []
+    assert [d['version'] for d in view['current_documents']] == [1, 1]
+
+
+def test_documents_step_skipped_when_shipped_without_documents(client, access_token):
+    """完成发货不查单证：一份都没出就发了货 → 单证一步 skipped（不再是 warning），也不列报关问题"""
+    from .test_customs import _export_dn_ready
+    dn_id, task_id = _export_dn_ready(client, access_token)
+    assert _steps(_flow(client, access_token, dn_id))['documents']['state'] == 'current'
+    assert _ship(client, access_token, task_id).status_code == 200
+    flow = _flow(client, access_token, dn_id)
+    documents = _steps(flow)['documents']
+    assert documents['state'] == 'skipped' and documents['summary']['outdated'] is False
+    assert not [p for p in flow['problems'] if p['step'] == 'documents']
+
+
 def _domestic(client, token, order_number, pickup_method='none'):
     _prepare(client)
     with client.application.app_context():

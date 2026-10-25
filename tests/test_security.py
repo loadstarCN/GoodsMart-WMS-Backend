@@ -54,7 +54,7 @@ def test_password_change_revokes_existing_tokens(client):
     # 用户级吊销以秒为粒度，改密要晚于签发至少 1 秒
     time.sleep(1.1)
     response = client.put('/user/change-password', headers=headers,
-                          json={'old_password': 'password', 'new_password': 'new-password-1'})
+                          json={'old_password': 'password', 'new_password': 'NewPassw0rd!'})
     assert response.status_code == 200
 
     with client.application.app_context():
@@ -63,7 +63,7 @@ def test_password_change_revokes_existing_tokens(client):
     assert response.status_code == 401
 
     # 新密码可以登录
-    assert client.post('/user/login', json={'account': 'operator', 'password': 'new-password-1'}).status_code == 200
+    assert client.post('/user/login', json={'account': 'operator', 'password': 'NewPassw0rd!'}).status_code == 200
 
 
 # ---------------------------------------------------------------------------
@@ -103,7 +103,7 @@ def test_company_admin_cannot_touch_other_company_staff(client, access_company_a
 
     # 尝试在别的公司创建员工：company_id 被强制为自己公司
     response = client.post('/staff/', headers=headers, json={
-        'user_name': 'planted', 'email': 'planted@b.com', 'password': 'password', 'company_id': company_b_id,
+        'user_name': 'planted', 'email': 'planted@b.com', 'password': 'Passw0rd!', 'company_id': company_b_id,
     })
     assert response.status_code == 201
     assert response.get_json()['company_id'] == own_company_id

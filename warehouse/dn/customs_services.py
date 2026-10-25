@@ -985,6 +985,11 @@ class CustomsService:
             'current_documents': [current_docs[t].to_meta() for t in DOC_TYPES if t in current_docs],
             'documents_outdated': False,
         }
+        if locked:
+            # 已发货（交接）：单证随货交出、已锁定，重新签发 / 改报关数据都做不了 —— 不再提示过期，也不再列报关问题
+            # （发货后商品主数据、出口资料的改动不影响已交出的单证；以前已发货的 DN 仍显示「内容有变，需要重新签发」）
+            view['problems'] = []
+            return view
         # 当前单证与现在的数据不一致 → 提示重新签发（不自动作废，也不拦发货）
         if customs is not None and current_docs:
             if signature_unavailable:

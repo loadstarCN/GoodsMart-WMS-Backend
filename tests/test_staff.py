@@ -25,7 +25,7 @@ def test_create_staff(client, access_token):
         }, json={
             'user_name': 'New Staff',
             'email': 'newstaff@company.com',
-            'password': 'password123',
+            'password': 'Passw0rd!',
             'phone': '555555555',
             'company_id': company.id,
             'department_id': department.id,

@@ -10,6 +10,7 @@ class Inventory(db.Model):
         db.Index('idx_low_stock', 'low_stock_threshold'),  # 低库存预警查询加速
         db.Index('idx_high_stock', 'high_stock_threshold'),  # 高库存积压分析
         db.CheckConstraint('total_stock >= 0', name='chk_non_negative_total_stock'),
+        db.CheckConstraint('sorted_damage_stock >= 0', name='chk_inventory_sorted_damage_stock'),
     )
 
     goods_id = db.Column(
@@ -92,9 +93,17 @@ class Inventory(db.Model):
         db.Integer,
         default=0,
         nullable=False,
-        info={'description': '分拣完成待上架库存（计入总库存）'}
+        info={'description': '分拣完成待上架库存（计入总库存；含 sorted_damage_stock）'}
     )
-    
+    sorted_damage_stock = db.Column(
+        db.Integer,
+        default=0,
+        server_default='0',
+        nullable=False,
+        info={'description': '待上架库存中的破损品（sorted_stock 的一部分，只能上到 damaged 库位；'
+                             '不变式 0 ≤ sorted_damage_stock ≤ sorted_stock）'}
+    )
+
     # 出库流程字段（增加状态校验）
     dn_stock = db.Column(
         db.Integer,
@@ -156,6 +165,17 @@ class Inventory(db.Model):
         lazy='joined'
     )
 
+    @property
+    def pending_since(self):
+        """最早一件待上架的进入时刻（先进先上估算，warehouse/inventory/pending.py）：列表 / 详情接口序列化前
+        用 attach_pending_since 挂上；没挂或没有待上架为 None"""
+        return getattr(self, '_pending_since', None)
+
+    @property
+    def sorted_good_stock(self):
+        """待上架里的良品（= sorted_stock − sorted_damage_stock）：只有这部分能上到 standard / return 库位"""
+        return (self.sorted_stock or 0) - (self.sorted_damage_stock or 0)
+
     # 计算可售卖库存
     @property
     def available_stock_for_sale(self):
@@ -179,7 +199,7 @@ class Inventory(db.Model):
             f"  ASN Process Flow:\n"
             f"  - ASN          : {self.asn_stock}\n"
             f"  - Received     : {self.received_stock}\n"
-            f"  - Sorted       : {self.sorted_stock}\n\n"
+            f"  - Sorted       : {self.sorted_stock} (damaged {self.sorted_damage_stock})\n\n"
             f"  DN Process Flow:\n"
             f"  - DN           : {self.dn_stock}\n"
             f"  - Picked       : {self.picked_stock}\n"
