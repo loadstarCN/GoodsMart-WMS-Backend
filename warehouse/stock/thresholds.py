@@ -71,7 +71,9 @@ def apply_thresholds(warehouse, items, dry_run=False) -> dict:
             continue
         goods = None
         if item.get('goods_id') is not None:
-            goods = db.session.get(Goods, item['goods_id']) if isinstance(item['goods_id'], int) else None
+            goods_id = item['goods_id']
+            valid = isinstance(goods_id, int) and not isinstance(goods_id, bool)
+            goods = db.session.get(Goods, goods_id) if valid else None
             if goods is not None and goods.company_id != warehouse.company_id:
                 goods = None
         elif item.get('goods_code'):
