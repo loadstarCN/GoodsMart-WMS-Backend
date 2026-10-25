@@ -343,7 +343,7 @@ WMS pushes event notifications to external systems via Webhook with HMAC-SHA256 
 | Event | Trigger |
 |-------|---------|
 | `asn.received` | ASN marked as received |
-| `asn.completed` | ASN completed with actual quantities |
+| `asn.completed` | ASN completed with actual quantities (includes the completion time `completed_at` / `completed_at_ms`) |
 | `asn.cancelled` | A received (not yet sorted) ASN was cancelled |
 | `dn.in_progress` | DN processing started (includes the start time `started_at`) |
 | `dn.picked` | DN picking completed (includes the planned / picked quantity per goods and `picked_at`) |
@@ -354,7 +354,7 @@ WMS pushes event notifications to external systems via Webhook with HMAC-SHA256 
 | `dn.cancelled` | A DN was cancelled after processing started (`in_progress` / `picked` / `packed`; includes `previous_status` and the picked / packed quantity per goods) |
 | `goods.spec_updated` | Goods weight / dimensions / country of origin changed (company-wide, subscription required — see below) |
 
-`started_at` / `picked_at` / `packed_at` / `shipped_at` / `signed_at` are when the step actually happened (ISO 8601 with offset, e.g.
+`completed_at` (ASN) / `started_at` / `picked_at` / `packed_at` / `shipped_at` / `signed_at` are when the step actually happened (ISO 8601 with offset, e.g.
 `2026-10-23T13:03:00+09:00`), not when the webhook is sent: the time of the warehouse action for manual steps (the
 entered signed time when one is given), the carrier's pickup time for automatic shipping and the carrier's delivery time
 for automatic signing. Webhooks can arrive late (scheduled pushes, retries), so receivers should record these fields.
@@ -364,7 +364,10 @@ Document events (`asn.*`, `dn.*`) are sent only to the API Key that created the 
 `goods_width_mm`, `goods_height_mm` and `goods_origin_country` (ISO 3166-1 alpha-2, `null` = not recorded), and
 `spec_pending`: the specs requested on the ASN (*Spec capture on receiving*) that were still not captured when it
 completed (`weight` / `dimensions` / `origin_country`; `[]` = none — also when nothing was requested, the line was
-skipped with a reason or nothing arrived).
+skipped with a reason or nothing arrived). The snapshot is read when the ASN completes: `completed_at` (ISO 8601 with
+the warehouse's offset, like the other event times) and `completed_at_ms` (epoch milliseconds) tell how new it is —
+compare `completed_at_ms` with the `changed_at_ms` of `goods.spec_updated` for the same goods and keep the newer one.
+The goods table keeps no separate time of its last spec change, so the lines carry no per-goods change time.
 
 ### Setup
 

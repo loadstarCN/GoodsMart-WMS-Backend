@@ -456,6 +456,40 @@ def test_complete_warn_lists_pending_and_webhook(client, access_token):
     assert pending == {'G001': ['origin_country'], 'G002': []}
 
 
+def test_asn_completed_carries_completion_time(client, access_token):
+    """asn.completed 带完成时刻：completed_at（仓库时区偏移的 ISO 8601）与 completed_at_ms（epoch 毫秒），同一时刻"""
+    import time
+    from datetime import datetime as dt
+    _set_warehouse(client, timezone='Asia/Tokyo')
+    body = _create_asn(client, access_token, details=[{'goods_id': 1, 'quantity': 1}])
+    asn_id = body['id']
+    with client.application.app_context():
+        api_key = APIKey(key=hash_api_key('spec-asn-time'), system_name='spec_asn_time', permissions=['all_access'])
+        api_key.webhook_url = 'http://127.0.0.1:9/webhook'
+        db.session.add(api_key)
+        db.session.commit()
+        db.session.get(ASN, asn_id).api_key_id = api_key.id
+        db.session.commit()
+        key_id = api_key.id
+    task_id = _receive(client, access_token, asn_id)
+    _sort(client, access_token, task_id, [{'goods_id': 1, 'sorted_quantity': 1, 'damage_quantity': 0}])
+    before_ms = time.time_ns() // 1_000_000
+    assert client.put(f'/sorting/{task_id}/complete/', headers=_h(access_token)).status_code == 200
+    after_ms = time.time_ns() // 1_000_000
+
+    with client.application.app_context():
+        payload = WebhookEvent.query.filter_by(api_key_id=key_id, event_type='asn.completed').one().payload
+        completed_at = db.session.get(ASN, asn_id).completed_at
+    assert payload['completed_at'].endswith('+09:00')
+    assert dt.fromisoformat(payload['completed_at']) == completed_at.replace(microsecond=0)
+    assert isinstance(payload['completed_at_ms'], int)
+    assert payload['completed_at_ms'] == int(completed_at.timestamp() * 1000)
+    assert before_ms - 1000 <= payload['completed_at_ms'] <= after_ms + 1000
+    # 商品上没有单独的规格变更时刻：明细不带 spec_changed_at_ms
+    assert all('spec_changed_at_ms' not in line for line in payload['details'])
+    assert payload['details'][0]['goods_weight_kg'] == pytest.approx(1.2)
+
+
 def test_capture_after_completion(client, access_token):
     """完成后补采：同样写回商品、推 goods.spec_updated、记采集时刻与人；不重推 asn.completed。
     pending / closed 仍 409 17023"""

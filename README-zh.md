@@ -308,7 +308,7 @@ WMS 通过 Webhook 向外部系统推送事件通知，使用 HMAC-SHA256 签名
 | 事件 | 触发时机 |
 |------|----------|
 | `asn.received` | ASN 标记为已收货 |
-| `asn.completed` | ASN 完成（含实际数量） |
+| `asn.completed` | ASN 完成（含实际数量、完成时刻 `completed_at` / `completed_at_ms`） |
 | `asn.cancelled` | 已收货（未分拣）的 ASN 被取消 |
 | `dn.in_progress` | DN 开始处理（含开始时刻 `started_at`） |
 | `dn.picked` | DN 拣货完成（含各商品计划 / 已拣量、拣货完成时刻 `picked_at`） |
@@ -319,7 +319,7 @@ WMS 通过 Webhook 向外部系统推送事件通知，使用 HMAC-SHA256 签名
 | `dn.cancelled` | 开始处理后（`in_progress` / `picked` / `packed`）的 DN 被取消（含 `previous_status` 与各商品已拣 / 已打包量） |
 | `goods.spec_updated` | 商品重量 / 尺寸 / 原产国变更（按公司广播，需订阅，见下文） |
 
-`started_at` / `picked_at` / `packed_at` / `shipped_at` / `signed_at` 是这一步实际发生的时刻（带时区偏移的 ISO 8601，如 `2026-10-23T13:03:00+09:00`），不是推送时刻：
+`completed_at`（ASN）/ `started_at` / `picked_at` / `packed_at` / `shipped_at` / `signed_at` 是这一步实际发生的时刻（带时区偏移的 ISO 8601，如 `2026-10-23T13:03:00+09:00`），不是推送时刻：
 仓库手动操作的 = 操作时刻（签收时填了签收时间的 = 填的时间），承运商揽收后自动发货的 = 承运商的揽收时刻，送达后自动签收的 =
 承运商的送达时刻。推送可能晚到（定时推、失败重试），来源系统应按这些字段记各步的时间。
 
@@ -327,7 +327,9 @@ WMS 通过 Webhook 向外部系统推送事件通知，使用 HMAC-SHA256 签名
 `goods_weight_kg`、`goods_length_mm`、`goods_width_mm`、`goods_height_mm` 与
 `goods_origin_country`（ISO 3166-1 alpha-2，`null` = 未录入），以及 `spec_pending`：收货通知要求采集（「收货规格采集」）、
 到完成时仍没采集到的项（`weight` / `dimensions` / `origin_country`；`[]` = 没有——没要求采集、这一行填了跳过原因、或没到货时
-也是 `[]`）。
+也是 `[]`）。规格快照是完成时读的：`completed_at`（带仓库时区偏移的 ISO 8601，与其他事件时刻同格式）与 `completed_at_ms`
+（epoch 毫秒）表示它有多新——同一商品拿 `completed_at_ms` 与 `goods.spec_updated` 的 `changed_at_ms` 比，取较新的一份。
+商品表没有单独记规格的最近变更时刻，所以明细里不带每个商品的变更时刻。
 
 ### 配置
 

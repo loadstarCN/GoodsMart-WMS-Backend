@@ -693,6 +693,10 @@ class ASNService:
 
         webhook_emit('asn.completed', {
             'asn_id': asn.id, 'status': 'completed', 'order_number': asn.order_number,
+            # 完成时刻（仓库时区偏移的 ISO 8601，同其他 webhook 的时刻）与 epoch 毫秒：明细里的商品规格快照是完成的同一事务里
+            # 读的，订阅方可拿 completed_at_ms 与 goods.spec_updated 的 changed_at_ms 比新旧（商品上没有单独记规格的变更时刻）
+            'completed_at': clock.local_iso(asn.completed_at, asn),
+            'completed_at_ms': int(asn.completed_at.timestamp() * 1000) if asn.completed_at else None,
             'details': [{'goods_code': d.goods.code if d.goods else None,
                          'actual_quantity': d.actual_quantity,
                          'quantity': d.quantity,
