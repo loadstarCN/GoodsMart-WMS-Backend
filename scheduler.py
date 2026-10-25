@@ -29,6 +29,8 @@ def init_scheduler(app):
     tracking_interval = int(os.getenv('CARRIER_TRACKING_INTERVAL_MINUTES', '30'))
     # 自动视为签收（carriers.auto_sign_days，没有 API 跟踪的运单），默认每 60 分钟；0 = 不跑
     auto_sign_interval = int(os.getenv('CARRIER_AUTO_SIGN_INTERVAL_MINUTES', '60'))
+    # 商品导入导出的文件（warehouse/goods/exporter.py）：接着生成后台导出、恢复中断的、删到期的导出 / 导入文件，默认每分钟
+    goods_files_interval = int(os.getenv('GOODS_FILE_JOB_INTERVAL_MINUTES', '1'))
 
     app.config['JOBS'] = [
         {
@@ -71,6 +73,15 @@ def init_scheduler(app):
             'trigger': 'interval',
             'minutes': auto_sign_interval,
             'misfire_grace_time': 600,
+        })
+    if goods_files_interval > 0:
+        app.config['JOBS'].append({
+            'id': 'goods_files',
+            'func': 'scheduler:_job_goods_files',
+            'trigger': 'interval',
+            'minutes': goods_files_interval,
+            'misfire_grace_time': 60,
+            'kwargs': {'time_budget': max(30, goods_files_interval * 60 - 15)},
         })
 
     scheduler.init_app(app)
@@ -160,6 +171,21 @@ def _job_carrier_auto_sign():
                 logger.info(f'[Scheduler] Carrier auto sign: {stats}')
         except Exception as e:
             logger.error(f'[Scheduler] Carrier auto sign failed: {e}')
+
+
+def _job_goods_files(time_budget=45):
+    """定时任务：生成排队中的商品导出（时间预算内）、把中断的重新排队，删掉到期的导出文件（7 天）与导入文件（30 天）"""
+    app = scheduler.app
+    if app is None:
+        return
+    with app.app_context():
+        try:
+            from warehouse.goods.exporter import run_goods_file_jobs
+            result = run_goods_file_jobs(time_budget=time_budget)
+            if any(result.values()):
+                logger.info(f'[Scheduler] Goods files: {result}')
+        except Exception as e:
+            logger.error(f'[Scheduler] Goods files failed: {e}')
 
 
 def _job_stock_daily():

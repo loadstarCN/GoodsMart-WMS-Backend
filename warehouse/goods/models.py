@@ -251,3 +251,207 @@ class GoodsLocation(db.Model):
         lazy='joined',
         info={'description': '关联库位对象'}
     )
+
+
+def _user_ref(user_id):
+    """操作人：{id, user_name}（用户已删除时为 None）"""
+    if user_id is None:
+        return None
+    from system.user.models import User
+    user = db.session.get(User, user_id)
+    return {'id': user.id, 'user_name': user.user_name} if user else None
+
+
+def _iso(moment):
+    from extensions.db import as_utc
+    return as_utc(moment).isoformat() if moment is not None else None
+
+
+class GoodsImport(db.Model):
+    """商品导入记录（POST /goods/bulk_upload 真正执行的每一次；dry_run 校验不记）。
+
+    原文件与错误行文件（原格式 + 末列「错误」）存库，保留 30 天（files_expire_at），到期由定时任务清掉文件内容，记录本身保留。
+    这次新增 / 更新的商品记在 goods_import_items（商品列表按 import_id 筛选）。
+    """
+    __tablename__ = 'goods_imports'
+
+    MODES = ('skip', 'append', 'override', 'active')
+    STATUSES = ('completed', 'partial', 'failed')
+
+    __table_args__ = (
+        db.Index('idx_goods_imports_company_created', 'company_id', 'created_at'),
+        db.Index('idx_goods_imports_files_expire', 'files_expire_at'),
+        db.CheckConstraint("status IN ('completed','partial','failed')", name='chk_goods_imports_status'),
+    )
+
+    id = db.Column(db.Integer, primary_key=True)
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id', ondelete='CASCADE'), nullable=False,
+                           info={'description': '公司ID'})
+    file_name = db.Column(db.String(255), nullable=True, info={'description': '上传的文件名'})
+    file_format = db.Column(db.String(10), nullable=True, info={'description': 'csv / xlsx'})
+    encoding = db.Column(db.String(20), nullable=True,
+                         info={'description': 'CSV 的实际编码 utf-8 / utf-8-sig / cp932（Excel 为空）'})
+    encoding_detected = db.Column(db.Boolean, nullable=True, info={'description': '编码是否自动识别'})
+    sheet_name = db.Column(db.String(100), nullable=True, info={'description': 'Excel 读的工作表'})
+    mode = db.Column(db.String(10), nullable=False,
+                     info={'description': '编码已存在时：skip / append / override / active'})
+    status = db.Column(db.String(10), nullable=False,
+                       info={'description': 'completed（无错误）/ partial（有错误行未导入）/ failed（什么都没导入）'})
+    row_count = db.Column(db.Integer, nullable=False, default=0, info={'description': '数据行数'})
+    created_count = db.Column(db.Integer, nullable=False, default=0)
+    updated_count = db.Column(db.Integer, nullable=False, default=0)
+    unchanged_count = db.Column(db.Integer, nullable=False, default=0)
+    skipped_count = db.Column(db.Integer, nullable=False, default=0)
+    error_count = db.Column(db.Integer, nullable=False, default=0)
+    columns = db.Column(db.JSON, nullable=True, info={'description': '认出的列（列键，文件里的顺序）'})
+    ignored_columns = db.Column(db.JSON, nullable=True, info={'description': '没认出、导入时忽略的表头'})
+    failure = db.Column(db.JSON, nullable=True,
+                        info={'description': '整份文件不能用 / 有错误时的第一个错误 {code, message, details}'})
+    errors = db.deferred(db.Column(db.JSON, nullable=True,
+                                   info={'description': '错误行（前 200 行）[{row, code, errors: [...]}]'}))
+    original_file = db.deferred(db.Column(db.LargeBinary, nullable=True, info={'description': '原文件'}))
+    original_size = db.Column(db.Integer, nullable=True)
+    error_file = db.deferred(db.Column(db.LargeBinary, nullable=True,
+                                       info={'description': '错误行文件（原格式 + 末列「错误」）'}))
+    error_file_name = db.Column(db.String(255), nullable=True)
+    files_expire_at = db.Column(UTCDateTime, nullable=True, info={'description': '原文件 / 错误行文件的删除时刻'})
+    files_purged_at = db.Column(UTCDateTime, nullable=True, info={'description': '文件已删除的时刻'})
+    created_by = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    created_at = db.Column(UTCDateTime, default=db.func.now())
+
+    def to_dict(self) -> dict:
+        files_available = self.files_purged_at is None
+        return {
+            'id': self.id,
+            'company_id': self.company_id,
+            'file_name': self.file_name,
+            'file_format': self.file_format,
+            'encoding': self.encoding,
+            'encoding_detected': self.encoding_detected,
+            'sheet_name': self.sheet_name,
+            'mode': self.mode,
+            'status': self.status,
+            'row_count': self.row_count,
+            'created': self.created_count,
+            'updated': self.updated_count,
+            'unchanged': self.unchanged_count,
+            'skipped': self.skipped_count,
+            'errors': self.error_count,
+            'columns': self.columns or [],
+            'ignored_columns': self.ignored_columns or [],
+            'failure': self.failure,
+            'has_original_file': files_available and self.original_size is not None,
+            'has_error_file': files_available and self.error_file_name is not None,
+            'error_file_name': self.error_file_name,
+            'files_expire_at': _iso(self.files_expire_at),
+            'files_purged_at': _iso(self.files_purged_at),
+            'created_by': self.created_by,
+            'created_by_user': _user_ref(self.created_by),
+            'created_at': _iso(self.created_at),
+        }
+
+
+class GoodsImportItem(db.Model):
+    """一次导入新增 / 更新了哪些商品（商品列表 ?import_id= 筛选）。商品删除时一并删除"""
+    __tablename__ = 'goods_import_items'
+
+    __table_args__ = (
+        db.Index('idx_goods_import_items_goods', 'goods_id'),
+        db.CheckConstraint("action IN ('create','update')", name='chk_goods_import_items_action'),
+    )
+
+    import_id = db.Column(db.Integer, db.ForeignKey('goods_imports.id', ondelete='CASCADE'), primary_key=True)
+    goods_id = db.Column(db.Integer, db.ForeignKey('goods.id', ondelete='CASCADE'), primary_key=True)
+    action = db.Column(db.String(10), nullable=False, info={'description': 'create / update'})
+
+
+class GoodsExport(db.Model):
+    """商品导出任务（POST /goods/exports）。≤ 1,000 件在请求里同步生成，更多的在后台生成（进度 processed / total）。
+
+    文件存库（content），生成后保留 7 天（expires_at），到期由定时任务删内容、状态改 expired；记录保留，可按原条件重新导出。
+    filters / columns / lang / file_format / encoding 是导出条件；scope_warehouse_ids 是库存列与「有 / 无库存」筛选
+    用的仓库范围（建任务时按调用方解析好，后台生成时没有请求上下文）。
+    """
+    __tablename__ = 'goods_exports'
+
+    STATUSES = ('pending', 'running', 'completed', 'failed', 'expired')
+
+    __table_args__ = (
+        db.Index('idx_goods_exports_company_created', 'company_id', 'created_at'),
+        db.Index('idx_goods_exports_status', 'status', 'created_at'),
+        db.CheckConstraint("status IN ('pending','running','completed','failed','expired')",
+                           name='chk_goods_exports_status'),
+    )
+
+    id = db.Column(db.Integer, primary_key=True)
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id', ondelete='CASCADE'), nullable=True,
+                           info={'description': '公司ID（平台管理员不限公司时为空）'})
+    warehouse_id = db.Column(db.Integer, db.ForeignKey('warehouses.id', ondelete='SET NULL'), nullable=True,
+                             info={'description': '库存范围的仓库（为空 = 调用方可访问的全部仓库）'})
+    scope_warehouse_ids = db.Column(db.JSON, nullable=True,
+                                    info={'description': '库存范围的仓库 id 列表（为空 = 不限）'})
+    uses_stock = db.Column(db.Boolean, nullable=False, default=False,
+                           info={'description': '有库存列或「有 / 无库存」筛选（限仓库的员工只看自己仓库的）'})
+    filters = db.Column(db.JSON, nullable=True, info={'description': '筛选条件（同商品列表的参数）'})
+    columns = db.Column(db.JSON, nullable=False, info={'description': '列键（顺序 = 文件里的列序）'})
+    preset = db.Column(db.String(20), nullable=False, default='custom',
+                       info={'description': 'import_template / all / custom'})
+    lang = db.Column(db.String(10), nullable=False, info={'description': '表头语言 zh-CN / en-US / ja-JP'})
+    file_format = db.Column(db.String(10), nullable=False, info={'description': 'csv / xlsx'})
+    encoding = db.Column(db.String(20), nullable=True, info={'description': 'CSV：utf-8-sig / cp932；Excel 为空'})
+    status = db.Column(db.String(10), nullable=False, default='pending')
+    background = db.Column(db.Boolean, nullable=False, default=False, info={'description': '是否后台生成'})
+    total = db.Column(db.Integer, nullable=False, default=0, info={'description': '建任务时符合条件的件数'})
+    processed = db.Column(db.Integer, nullable=False, default=0, info={'description': '已写入的件数（进度）'})
+    row_count = db.Column(db.Integer, nullable=True, info={'description': '文件里的商品行数'})
+    unencodable_count = db.Column(db.Integer, nullable=True,
+                                  info={'description': 'Shift_JIS 写不下、有字符变成「?」的商品件数'})
+    file_name = db.Column(db.String(150), nullable=True)
+    file_size = db.Column(db.Integer, nullable=True)
+    content = db.deferred(db.Column(db.LargeBinary, nullable=True, info={'description': '文件内容'}))
+    error = db.Column(db.String(500), nullable=True, info={'description': '生成失败的原因'})
+    attempts = db.Column(db.Integer, nullable=False, default=0, info={'description': '已生成的次数（含重试）'})
+    source_export_id = db.Column(db.Integer, db.ForeignKey('goods_exports.id', ondelete='SET NULL'), nullable=True,
+                                 info={'description': '按哪条记录的条件重新导出的'})
+    created_by = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    created_at = db.Column(UTCDateTime, default=db.func.now())
+    started_at = db.Column(UTCDateTime, nullable=True)
+    heartbeat_at = db.Column(UTCDateTime, nullable=True, info={'description': '后台生成最近一次报进度的时刻'})
+    finished_at = db.Column(UTCDateTime, nullable=True)
+    expires_at = db.Column(UTCDateTime, nullable=True, info={'description': '文件删除的时刻'})
+
+    def to_dict(self) -> dict:
+        total = self.total or 0
+        progress = 100 if self.status == 'completed' else (
+            min(99, int((self.processed or 0) * 100 / total)) if total else 0)
+        return {
+            'id': self.id,
+            'company_id': self.company_id,
+            'warehouse_id': self.warehouse_id,
+            'status': self.status,
+            'background': self.background,
+            'filters': self.filters or {},
+            'columns': self.columns or [],
+            'column_count': len(self.columns or []),
+            'preset': self.preset,
+            'lang': self.lang,
+            'file_format': self.file_format,
+            'encoding': self.encoding,
+            'total': total,
+            'processed': self.processed or 0,
+            'progress': progress,
+            'row_count': self.row_count,
+            'unencodable_count': self.unencodable_count,
+            'file_name': self.file_name,
+            'file_size': self.file_size,
+            'downloadable': self.status == 'completed',
+            'error': self.error,
+            'attempts': self.attempts,
+            'source_export_id': self.source_export_id,
+            'created_by': self.created_by,
+            'created_by_user': _user_ref(self.created_by),
+            'created_at': _iso(self.created_at),
+            'started_at': _iso(self.started_at),
+            'finished_at': _iso(self.finished_at),
+            'expires_at': _iso(self.expires_at),
+        }

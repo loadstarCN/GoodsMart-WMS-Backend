@@ -432,6 +432,99 @@ expression indexes for equal codes, and an expression index
 numbers (`dn_carrier_shipments`, `delivery_tasks`, `asn`). The DN's current tracking number is a correlated subquery
 (same as the DN list); with many documents consider storing the current tracking number on the DN.
 
+## Goods Import / Export
+
+Code: `warehouse/goods/` (`columns.py` the column list, `tabular.py` CSV / Excel, `importer.py`, `exporter.py`,
+`file_views.py`). Permissions: import and import records `goods_add` / `goods_edit`; export `goods_read`. Files are
+stored in the database (`bytea`, like the export documents); Excel needs `openpyxl` (requirements.txt).
+
+### Columns
+
+- Import template = export preset `import_template`, 20 columns in this order: `code`, `name`, `unit`, `weight` (kg),
+  `length` / `width` / `height` (mm), `origin_country`, `manufacturer`, `brand`, `image_url`, `thumbnail_url`, `category`,
+  `tags`, `price`, `discount_price`, `currency`, `expiration_date`, `production_date`, `description`; `code` and `name`
+  are required.
+- Export only (ignored by the import): stock `stock_on_hand` (`total_stock`), `stock_available`
+  (`available_stock_for_sale`), `stock_pending_putaway` (`sorted_stock`), `stock_damaged` (`damage_stock`), summed over
+  the stock scope; system `is_active`, `created_at`, `updated_at` (default time zone), `created_by`. Preset `all` = 28
+  columns. Lot-management columns (method, shelf life, release period, …) do not exist yet (lots phase 2).
+- Headers per language: `zh-CN` / `en-US` / `ja-JP` (编码 / Code / コード, 重量 kg / Weight kg / 重量 kg, …). The import
+  recognises all of them, the column keys and common aliases (compared after NFKC, lower case, without spaces / brackets
+  / underscores). `GET /warehouse/goods/exports/columns`: groups, labels per language, presets.
+
+### Import
+
+- `GET /warehouse/goods/bulk_upload/template?format=csv|xlsx&lang=` — CSV is UTF-8 with BOM; without `lang` the headers
+  are the column keys (as before); invalid `lang` → 400 `10019`.
+- `POST /warehouse/goods/bulk_upload` (multipart): `file` (.csv / .xlsx, at most 10,000 data rows), `company_id`,
+  `overwrite` (`skip` / `append` / `override`; `active` is kept for old callers), `dry_run`, `import_token`, `encoding`
+  (`auto` / `utf-8` / `shift_jis`), `sheet`, `lang` (error file).
+  - Codes that already exist: `skip` = skipped; `append` = only blank fields are filled; `override` = non-empty cells
+    replace the values and **empty cells keep the old value** (clear a field in the goods editor). Until 2026-10-25
+    `override` cleared name, brand, price, image, description … when the cell was empty. `append` / `override` also
+    reactivate inactive goods. Empty thumbnail: new goods take the image URL; an existing thumbnail that was blank or
+    equal to the old image follows the new image, otherwise it is kept.
+  - CSV encoding `auto`: BOM or valid UTF-8 → UTF-8, else Shift_JIS (CP932). Excel: the first sheet unless `sheet`;
+    number / date cells are read as values, long numeric codes stay exact. Numbers may have thousands separators
+    (`1,200`) and full-width digits; dates `YYYY-MM-DD` / `YYYY/MM/DD`. Empty lines are skipped; `row` is the line in the
+    file (header = 1).
+  - `dry_run=true` writes nothing → every row with `action` `create` (`values`, `spec_missing`) / `update`
+    (`changes [{field, from, to}]`, `is_active` false → true for reactivation) / `unchanged` / `skip` / `error`
+    (`errors [{field, column, code, reason, value, message, …}]`), plus `summary`, `file {name, format, encoding,
+    encoding_detected, sheet, sheets, rows, columns}`, `columns`, `column_map`, `ignored_columns`, `read_only_columns` and
+    `import_token`.
+  - With `import_token`: rows with errors are skipped and the others imported (status `partial`). If the file / options
+    (`FILE_CHANGED`) or the planned result of a row including the old values shown (`DATA_CHANGED`) differ from the dry
+    run → 409 `16141`, nothing imported. Without `import_token` any error rejects the whole file with the first error
+    (400, details as before).
+  - Error reasons: `REQUIRED` (10006), `DUPLICATE` (16101, `first_row`), `INVALID_NUMBER` (10012; NaN / infinity 16100),
+    `NEGATIVE` (price 10012, others 16100), `OUT_OF_RANGE` (16100, `min` / `max`), `INVALID_COUNTRY` (10014),
+    `INVALID_DATE` (10017), `TOO_LONG` (10020, `max_length`), `DISCOUNT_ABOVE_PRICE` / `DISCOUNT_WITHOUT_PRICE` (10012).
+  - `POST /warehouse/goods/bulk_upload/errors` (same form) → the error rows before importing, in the original format (CSV
+    in its encoding / Excel): header + error rows + a last column 错误 / Error / エラー (a Shift_JIS file gets Japanese);
+    204 when there are none.
+- Records: every run (not dry runs) is recorded, also rejected ones: `GET /warehouse/goods/imports` (status
+  `completed` / `partial` / `failed`, counts, columns, `failure {code, message, details}`), `GET …/imports/<id>` (+ the
+  first 200 `error_rows`), `GET …/imports/<id>/file` (original), `GET …/imports/<id>/errors` (error file). Files are kept
+  30 days (then 409 `16142`), the record stays. The goods of an import:
+  `GET /warehouse/goods/?import_id=<id>[&import_action=create|update]`.
+
+### Export
+
+- Filters = the goods list parameters (`code`, `name`, `keyword`, `category`, `brand`, `manufacturer`, `tags`, `currency`,
+  `goods_codes`, `origin_missing`, `image_missing`, `spec_missing`, price / date ranges) and the new ones, also on
+  `GET /warehouse/goods/`: `is_active=all`, `has_stock` (`total_stock > 0` in the current warehouse, else the accessible
+  warehouses), `created_from` / `created_to` / `updated_from` / `updated_to` (a date in the default time zone, end day
+  included, or ISO 8601 with offset), `import_id` / `import_action`. Exports also take `filters.warehouse_id` (stock
+  scope; default the current warehouse, else every accessible warehouse).
+- `POST /warehouse/goods/exports/preview` (same body as below) → `{total, background, sync_limit, max_rows, too_large,
+  columns [{key, header}], …, unencodable}`; `unencodable` (CSV + Shift_JIS) = `{count, characters, items [{id, code,
+  name, columns, characters}]}`: goods whose text Shift_JIS cannot hold (written as `?`; 〜 ‖ − ¢ £ ¬ — are mapped to
+  their CP932 forms first). Headers Shift_JIS cannot hold (simplified Chinese) are written in Japanese.
+- `POST /warehouse/goods/exports` `{filters, columns | preset (import_template / all), file_format csv | xlsx, encoding
+  utf-8 (BOM) | shift_jis, lang}` — ≤ 1,000 goods: generated now (201, `completed`); more: 202 `pending`, generated in
+  the background (a thread in the API process, plus the `goods_files` job); poll `GET …/exports/<id>` (`processed`,
+  `total`, `progress`). At most 100,000 goods (400 `10022`); invalid body 400 `10021` (`field`).
+- `GET …/exports` (records), `GET …/exports/<id>/download` (409 `16142` unless `completed`), `POST …/exports/<id>/retry`
+  (failed only, else 409 `16143`), `POST …/exports/<id>/rerun` (new record with the same conditions,
+  `source_export_id`). Files are kept 7 days (then status `expired`); interrupted exports (no progress for 10 minutes)
+  are queued again, at most 3 attempts. Staff limited to some warehouses only see exports without stock data or with the
+  stock of the current warehouse.
+
+### DN bulk add: availability
+
+`GET /warehouse/inventory/availability?warehouse_id=&goods_codes=a,b,c` (or `POST` with `{goods_codes: [...]}`; at most
+1,000 codes; `inventory_read` or `dn_edit`) → `{warehouse_id, items: [{goods_id, code, name, unit, is_active,
+thumbnail_url, available_stock_for_sale, onhand_stock, dn_stock, locked_stock}], not_found: [codes]}` — the goods found
+in the requested order. Available = `onhand_stock − locked_stock − dn_stock` (standard locations); release periods of lots
+are not applied yet (no lot stock in phase 1). 400 `15019` (`field: goods_codes`) when codes are missing / too many. ASN
+bulk add reads names and units from `GET /warehouse/goods/?goods_codes=…&all=true` (split long lists to keep URLs short).
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `GOODS_EXPORT_THREAD` | `true` | Generate big exports in a background thread of the API process right away; `false` = only the `goods_files` job |
+| `GOODS_FILE_JOB_INTERVAL_MINUTES` | `1` | Interval of the `goods_files` job (pending / interrupted exports, deleting export files after 7 days and import files after 30 days); `0` = off |
+
 ## Webhook Integration
 
 WMS pushes event notifications to external systems via Webhook with HMAC-SHA256 signature verification.
@@ -1901,7 +1994,7 @@ Spec capture on receiving: `17020` invalid spec capture settings — ASN `spec_c
 all given, `remeasure` without every requested spec, invalid `note` (400, `field` / `details.missing`), `17023` specs can
 only be captured while the ASN is received or completed (409, `details {asn_id, status}`).
 
-Master data and permissions: `16100` invalid goods value (400), `16101` duplicate goods code in the CSV (400, with row numbers), `16102` invalid data value (400), `16103` inactive roles cannot be assigned (400), `16104` only company administrators can create / delete warehouses or change the manager (403), `16105` without company_all_access only API keys bound to yourself can be managed (403), `44004` master data referenced by documents or stock cannot be deleted — deactivate it instead (409, `details {entity, id, references}`), `44005` conflicts with existing data (409). Passwords: `10015` a new password must be 8-16 characters with an uppercase letter, a lowercase letter, a digit and a special character (`@$!%*?&`), nothing else (400, `field`, `details {min_length, max_length, special_characters}`; reset / change password, creating / editing users and staff). Built-in permissions / roles (`is_builtin`): `11011` a built-in permission cannot be renamed or deleted (409, `details {permission, reason}`), `11012` a built-in role (admin / company_admin / warehouse_admin / warehouse_operator) cannot be renamed, deactivated or deleted (409, `details {role, reason}`). Goods import: template `GET /warehouse/goods/bulk_upload/template`; errors `10004` / `10005` / `10006` / `10012` / `10014` / `16100` / `16101` carry `details {row, rows, code, columns, value}`, `10016` the file is not UTF-8 text.
+Master data and permissions: `16100` invalid goods value (400), `16101` duplicate goods code in the CSV (400, with row numbers), `16102` invalid data value (400), `16103` inactive roles cannot be assigned (400), `16104` only company administrators can create / delete warehouses or change the manager (403), `16105` without company_all_access only API keys bound to yourself can be managed (403), `44004` master data referenced by documents or stock cannot be deleted — deactivate it instead (409, `details {entity, id, references}`), `44005` conflicts with existing data (409). Passwords: `10015` a new password must be 8-16 characters with an uppercase letter, a lowercase letter, a digit and a special character (`@$!%*?&`), nothing else (400, `field`, `details {min_length, max_length, special_characters}`; reset / change password, creating / editing users and staff). Built-in permissions / roles (`is_builtin`): `11011` a built-in permission cannot be renamed or deleted (409, `details {permission, reason}`), `11012` a built-in role (admin / company_admin / warehouse_admin / warehouse_operator) cannot be renamed, deactivated or deleted (409, `details {role, reason}`). Goods import / export (see *Goods Import / Export*): `10004` not .csv / .xlsx, `10005` / `10006` / `10012` / `10014` / `16100` / `16101` carry `details {row, rows, code, columns, value}`, `10016` unreadable file (`details.reason` `UNKNOWN_ENCODING` / `NOT_UTF8` / `NOT_SHIFT_JIS` / `NOT_XLSX` / `NOT_CSV`), `10017` invalid date, `10018` more than 10,000 rows / Excel too large, `10019` invalid import parameter (`field`), `10020` text too long, `10021` invalid export request (`field`), `10022` more than 100,000 goods to export, `16141` the dry run is out of date (409, `details.reason` `FILE_CHANGED` / `DATA_CHANGED`), `16142` the file cannot be downloaded (409, `details.status`), `16143` only a failed export can be retried (409); availability `15019` (`field: goods_codes`).
 
 ## Related Projects
 

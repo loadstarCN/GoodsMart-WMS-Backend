@@ -1,3 +1,4 @@
+from flask import g, request
 from flask_restx import Resource
 from system.common import paginate,permission_required
 from warehouse.common import warehouse_required, add_warehouse_filter, require_warehouse_scope
@@ -5,8 +6,12 @@ from .schemas import (
     api_ns, inventory_model, inventory_pagination_parser, pagination_model,
     pending_putaway_summary_model, pending_putaway_summary_parser,
 )
+from .availability import availability, parse_codes
 from .pending import attach_pending_since
 from .services import InventoryService
+
+# 发货单批量添加要查可售量：建发货单的人（dn_edit）不一定有库存列表权限
+_AVAILABILITY_PERMISSIONS = ["all_access", "company_all_access", "inventory_read", "dn_edit"]
 
 
 @api_ns.doc(security="jsonWebToken")
@@ -86,6 +91,35 @@ class InventoryPendingPutawaySummary(Resource):
         args = pending_putaway_summary_parser.parse_args()
         filters = add_warehouse_filter({'company_id': args.get('company_id'), 'keyword': args.get('keyword')})
         return InventoryService.pending_putaway_summary(filters, args.get('overdue_days')), 200
+
+@api_ns.doc(security="jsonWebToken")
+@api_ns.route('/availability', '/availability/')
+class InventoryAvailability(Resource):
+    """发货单批量添加：按仓库批量查可售量（warehouse/inventory/availability.py）"""
+
+    @permission_required(_AVAILABILITY_PERMISSIONS)
+    @warehouse_required(force_warehouse=True)
+    def get(self):
+        """Available-for-sale quantity of many goods codes in one warehouse (adding goods to a DN in bulk)
+
+        Warehouse: `warehouse_id` or the X-WAREHOUSE-ID header (required, else 400 14003). `goods_codes`: comma
+        separated; trimmed, de-duplicated, at most 1,000; exact match on the goods of the warehouse's company
+        (POST with a JSON body {goods_codes: [...]} for long lists).
+        → {warehouse_id, items: [{goods_id, code, name, unit, is_active, thumbnail_url, available_stock_for_sale
+        (= onhand_stock - locked_stock - dn_stock, standard locations only; 0 without an inventory row), onhand_stock,
+        dn_stock, locked_stock}] (goods found, in the requested order), not_found: [codes not found]}.
+        Permission: inventory_read or dn_edit.
+        400 15019: goods_codes missing / more than 1,000 (field goods_codes).
+        """
+        return availability(g.warehouse, parse_codes(request.args.get('goods_codes'))), 200
+
+    @permission_required(_AVAILABILITY_PERMISSIONS)
+    @warehouse_required(force_warehouse=True)
+    def post(self):
+        """Same as GET, codes in the JSON body {goods_codes: [...]} (warehouse: warehouse_id query / X-WAREHOUSE-ID)"""
+        body = request.get_json(silent=True)
+        return availability(g.warehouse, parse_codes(body.get('goods_codes') if isinstance(body, dict) else None)), 200
+
 
 @api_ns.doc(security="jsonWebToken")
 @api_ns.route('/goods/<int:goods_id>/warehouse/<int:warehouse_id>')

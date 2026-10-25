@@ -96,6 +96,36 @@ def test_append_and_override_update_specs_category_tags_and_discount(client, acc
     assert (body['created'], body['updated'], body['skipped'], body['processed']) == (1, 0, 1, 1)
 
 
+def test_override_keeps_values_of_empty_cells(client, access_token):
+    """覆盖：空单元格一律保留原值（以前名称以外的品牌、价格、货币、单位、图片、描述、生产日期会被清空 / 改成默认值）"""
+    full = ('code,name,unit,manufacturer,brand,image_url,thumbnail_url,price,currency,production_date,description\n'
+            'OVR-1,Keep Me,box,Maker,BrandX,https://img/a.jpg,https://img/a_s.jpg,1000,USD,2025-01-02,Desc\n')
+    assert _upload(client, access_token, full).status_code == 200
+    header = full.split('\n')[0] + '\n'
+    response = _upload(client, access_token, header + 'OVR-1,Renamed,,,,,,,,,\n', overwrite='override')
+    body = response.get_json()
+    assert response.status_code == 200 and (body['updated'], body['unchanged']) == (1, 0), body
+    with client.application.app_context():
+        goods = Goods.query.filter_by(code='OVR-1', company_id=1).first()
+        assert goods.name == 'Renamed'
+        assert (goods.unit, goods.manufacturer, goods.brand, goods.currency) == ('box', 'Maker', 'BrandX', 'USD')
+        assert (goods.image_url, goods.thumbnail_url, float(goods.price)) == ('https://img/a.jpg',
+                                                                              'https://img/a_s.jpg', 1000)
+        assert goods.production_date.isoformat() == '2025-01-02' and goods.description == 'Desc'
+
+    # 内容没变：unchanged，不改 updated_at、不算 updated
+    body = _upload(client, access_token, header + 'OVR-1,Renamed,box,,,,,,,,\n', overwrite='override').get_json()
+    assert (body['updated'], body['unchanged'], body['processed']) == (0, 1, 1)
+
+    # 只给新图片、缩略图留空：缩略图原来不跟着图片 → 保留；跟着图片的商品 → 跟着新图片走
+    _upload(client, access_token, 'code,name,image_url\nOVR-2,Follow,https://img/b.jpg\n')
+    _upload(client, access_token, 'code,name,image_url\nOVR-1,Renamed,https://img/new.jpg\n'
+                                  'OVR-2,Follow,https://img/b2.jpg\n', overwrite='override')
+    with client.application.app_context():
+        assert Goods.query.filter_by(code='OVR-1').first().thumbnail_url == 'https://img/a_s.jpg'
+        assert Goods.query.filter_by(code='OVR-2').first().thumbnail_url == 'https://img/b2.jpg'
+
+
 def test_import_errors_carry_business_codes_and_details(client, access_token):
     details = _err(_upload(client, access_token, 'code,name\nX1,One\n', filename='goods.txt'), 10004)
     assert details['filename'] == 'goods.txt'
@@ -109,8 +139,13 @@ def test_import_errors_carry_business_codes_and_details(client, access_token):
     assert details['row'] == 2 and details['columns'] == ['weight']
     assert _err(_upload(client, access_token, 'code,name\nX1,One\nX1,Again\n'), 16101) == {
         'code': 'X1', 'rows': [2, 3], 'columns': ['code']}
+    # 编码自动识别：UTF-8、Shift_JIS 都解不开 → UNKNOWN_ENCODING；手动指定 utf-8 时 → NOT_UTF8
     assert _err(_upload(client, access_token, 'code,name\nX1,\xe9\n'.encode('latin-1')), 10016) == {
-        'reason': 'NOT_UTF8'}
+        'reason': 'UNKNOWN_ENCODING'}
+    response = client.post('/goods/bulk_upload', headers=_h(access_token), data={
+        'file': (io.BytesIO('code,name\nX1,商品\n'.encode('cp932')), 'goods.csv'), 'company_id': '1',
+        'encoding': 'utf-8'}, content_type='multipart/form-data')
+    assert _err(response, 10016) == {'reason': 'NOT_UTF8'}
 
     # 认不出的列：照常导入，在 ignored_columns 里列出
     body = _upload(client, access_token, 'code,name,colour\nX9,Nine,red\n').get_json()

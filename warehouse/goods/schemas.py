@@ -5,7 +5,7 @@ from system.user.schemas import user_simple_model as original_user_model  # 用�
 from warehouse.location.models import Location
 from warehouse.location.schemas import location_simple_model  # 位置序列化器
 from warehouse.company.schemas import comapny_simple_model as company_model  # 公司序列化器
-from warehouse.common.spec_capture import SPEC_CAPTURE_FIELDS
+from .filters import active_arg, codes_arg, import_action_arg, spec_missing_arg, time_bound
 from .services import SPEC_SOURCES
 
 # 初始化 Namespace
@@ -139,7 +139,8 @@ goods_model = api_ns.inherit('Goods', goods_base_model, {
 goods_pagination_parser = pagination_parser.copy()
 goods_pagination_parser.add_argument('name', type=str, help='Filter by goods name (partial match)')
 goods_pagination_parser.add_argument('code', type=str, help='Filter by goods code (exact match)')
-goods_pagination_parser.add_argument('is_active', type=inputs.boolean, help='Filter by active status')
+goods_pagination_parser.add_argument('is_active', type=active_arg,
+                                     help='true / false; all = active and inactive; default: active only')
 goods_pagination_parser.add_argument('manufacturer', type=str, help='Filter by manufacturer name (partial match)')
 goods_pagination_parser.add_argument('category', type=str, help='Filter by goods category')
 goods_pagination_parser.add_argument('tags', type=str, help='Filter by goods tags (comma-separated)')
@@ -155,7 +156,7 @@ goods_pagination_parser.add_argument('production_date_min', type=inputs.date_fro
 goods_pagination_parser.add_argument('production_date_max', type=inputs.date_from_iso8601, help='Filter by maximum production date')
 goods_pagination_parser.add_argument('warehouse_id', type=int, help='Filter by Warehouse ID')
 goods_pagination_parser.add_argument('keyword', type=str, help='Search by keyword in name, code, manufacturer, category, tags, brand')
-goods_pagination_parser.add_argument('goods_codes', type=lambda s: [code.strip() for code in s.split(',')], help='Goods Codes (comma separated)')
+goods_pagination_parser.add_argument('goods_codes', type=codes_arg, help='Goods Codes (comma separated)')
 goods_pagination_parser.add_argument('company_id', type=int, help='Filter by Company ID')
 goods_pagination_parser.add_argument('origin_missing', type=inputs.boolean,
                                      help='true: only goods without origin_country; false: only goods with it')
@@ -163,19 +164,24 @@ goods_pagination_parser.add_argument('image_missing', type=inputs.boolean,
                                      help='true: only goods without image_url; false: only goods with it')
 
 
-def _spec_missing_list(value):
-    """spec_missing=weight,dimensions：逗号分隔的采集项，不认识的 → 400"""
-    names = [name.strip() for name in str(value).split(',') if name.strip()]
-    unknown = [name for name in names if name not in SPEC_CAPTURE_FIELDS]
-    if unknown:
-        raise ValueError(f"unknown spec field(s): {', '.join(unknown)}; use {', '.join(SPEC_CAPTURE_FIELDS)}")
-    return names
-
-
 goods_pagination_parser.add_argument(
-    'spec_missing', type=_spec_missing_list,
+    'spec_missing', type=spec_missing_arg,
     help='Comma separated weight / dimensions / origin_country: only goods missing any of them (weight empty or <= 0; '
          'any of length / width / height empty or <= 0; origin_country empty)')
+for _name, _what in (('created_from', 'created at or after'), ('created_to', 'created at or before'),
+                     ('updated_from', 'updated at or after'), ('updated_to', 'updated at or before')):
+    goods_pagination_parser.add_argument(
+        _name, type=time_bound,
+        help=f'Only goods {_what}: YYYY-MM-DD (a day in the default time zone; the end day is included) or an ISO 8601 '
+             f'time with offset')
+goods_pagination_parser.add_argument(
+    'has_stock', type=inputs.boolean,
+    help='true: only goods with stock (total_stock > 0) in the current warehouse (X-WAREHOUSE-ID / warehouse_id; '
+         'without one: every accessible warehouse); false: only goods without stock there')
+goods_pagination_parser.add_argument('import_id', type=int,
+                                     help='Only goods created / updated by this import (GET /goods/imports)')
+goods_pagination_parser.add_argument('import_action', type=import_action_arg,
+                                     help='With import_id: create / update only')
 
 
 # GoodsLocation 分页解析器
@@ -224,9 +230,31 @@ goods_bulk_upload_parser.add_argument(
                         )
 
 goods_bulk_upload_parser.add_argument('company_id',
-                          type=int, 
-                          required=True, 
+                          type=int,
+                          required=True,
                           help='Company ID is required')
+goods_bulk_upload_parser.add_argument('dry_run', type=inputs.boolean, default=False,
+                                      help='true: validate only, nothing is written (row-by-row preview + import_token)')
+goods_bulk_upload_parser.add_argument('import_token', type=str,
+                                      help='import_token of the dry run: import the rows without errors, skip the '
+                                           'error rows; 409 16141 when the file / mode / data changed since')
+goods_bulk_upload_parser.add_argument('encoding', type=str, default='auto',
+                                      help='CSV encoding: auto (default; UTF-8, else Shift_JIS) / utf-8 / shift_jis')
+goods_bulk_upload_parser.add_argument('sheet', type=str, help='Excel: sheet name (default: the first sheet)')
+goods_bulk_upload_parser.add_argument('lang', type=str,
+                                      help='zh-CN / en-US / ja-JP: language of the error file (default: the language of '
+                                           'the file headers)')
+
+goods_template_parser = reqparse.RequestParser()
+goods_template_parser.add_argument('format', type=str, choices=('csv', 'xlsx'), default='csv', location='args',
+                                   help='csv (UTF-8 with BOM, default) / xlsx')
+goods_template_parser.add_argument('lang', type=str, location='args',
+                                   help='Header language zh-CN / en-US / ja-JP; default: column keys (code, name, …)')
+
+goods_file_list_parser = pagination_parser.copy()
+goods_file_list_parser.add_argument('status', type=str, location='args', help='Filter by status')
+goods_file_list_parser.add_argument('company_id', type=int, location='args',
+                                    help='Platform users: only this company')
 
 
 # 创建分页模型

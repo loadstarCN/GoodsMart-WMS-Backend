@@ -123,8 +123,9 @@ from werkzeug.exceptions import HTTPException
 # 业务码登记（账号 / 内置权限角色 / 商品导入）：
 # 10015  400  新密码不合规（8–16 位，含大小写字母、数字、特殊符号 @$!%*?&，不能有其它字符；system/user/password_policy.py）：
 #             field = password / new_password，details {min_length, max_length, special_characters}
-# 10016  400  商品导入文件不是 UTF-8 文本：field 无，details {reason: NOT_UTF8}（其余导入错误沿用 10004 / 10005 / 10006 /
-#             10012 / 10014 / 16100 / 16101，details 带 row / rows / code / columns / value）
+# 10016  400  商品导入文件读不了：field 无，details {reason: UNKNOWN_ENCODING（编码自动识别时 UTF-8、Shift_JIS 都解不开）/
+#             NOT_UTF8 / NOT_SHIFT_JIS（手动指定的编码解不开）/ NOT_XLSX / NOT_CSV}（其余导入错误沿用 10004 / 10005 / 10006 /
+#             10012 / 10014 / 16100 / 16101，details 带 row / rows / code / columns / value；新增的见下方「商品导入导出」）
 # 11011  409  内置权限（system/user/builtin.py）不能改代码 / 删除：details {permission, reason: RENAME | DELETE}
 # 11012  409  内置角色不能改名 / 停用 / 删除（权限照常分配）：details {role, reason: RENAME | DEACTIVATE | DELETE}
 #
@@ -136,6 +137,24 @@ from werkzeug.exceptions import HTTPException
 # 17022  400  规格采集请求不合法：既没有值也没有跳过原因；长宽高没给齐（field dimensions，details {missing}）；remeasure 模式
 #             没给齐要求的项（field spec_capture，details {missing}）；note 不是文字或超过 255 字（field note）
 # 17023  409  只有已收货（received）或已完成（completed，补采）的收货通知能采集规格：details {asn_id, status}
+#
+# 业务码登记（商品导入导出：warehouse/goods/importer.py、exporter.py；发货单批量添加的可售量 warehouse/inventory/availability.py）：
+# 10004  400  商品导入文件不是 .csv / .xlsx：details {filename}
+# 10017  400  导入的日期不合法（YYYY-MM-DD、YYYY/MM/DD 或 Excel 的日期单元格）：details {row, columns, value}
+# 10018  400  导入文件超过 10,000 行（details {reason: TOO_MANY_ROWS, max_rows}）或 Excel 解压后过大
+#             （details {reason: TOO_LARGE, max_bytes}）
+# 10019  400  导入参数不合法：field = encoding / sheet（details {sheet, sheets}）/ lang / import_token（格式不对）
+# 10020  400  导入的文字超过列的长度：details {row, columns, max_length}
+# 10021  400  导出请求不合法：field = filters / filters.<键> / columns（details {unknown} | {duplicated}；必须含 code）/
+#             preset / file_format / encoding / lang
+# 10022  400  导出超过 100,000 件：details {total, max_rows}
+# 16141  409  带 import_token 执行导入时与这次的校验结果不符，请重新校验：details {reason: FILE_CHANGED（文件 / 方式 / 编码 /
+#             工作表变了）| DATA_CHANGED（期间商品被改过，某行的结果或原值与预览不同）}；什么都不导入
+# 16142  409  导出文件不能下载：details {status: pending / running / failed / expired}；导入的原文件 / 错误行文件已过 30 天
+#             删除也用它（details {status: expired}）
+# 16143  409  只有生成失败（failed）的导出能重试：details {status}
+# 15019  另用于 GET / POST /inventory/availability：goods_codes 为空 / 超过 1,000 个（field goods_codes，
+#             details {max_codes, count}）
 
 class APIException(Exception):
     """API异常基类"""

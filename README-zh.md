@@ -369,6 +369,87 @@ GoodsMart-WMS-Backend/
 
 性能：每类只取 `limit` 条（第一页没取满时不再 count），q 太短只做精确比较。包含匹配（`ILIKE '%q%'`）用不上普通 B-tree 索引，数据量大以后建议在 PostgreSQL 上加 `pg_trgm` 的 GIN 索引（`goods.name`、`goods.code`、`dn.order_number`、`asn.order_number`、`recipients.name` / `organization`、`suppliers.name`、`locations.code`、`cycle_count_tasks.task_name`）；编码完全相同可加 `lower(code)` 表达式索引；运单号去分隔符比较可加表达式索引 `upper(replace(replace(replace(tracking_number, ' ', ''), '-', ''), E'\t', ''))`（`dn_carrier_shipments`、`delivery_tasks`、`asn`）。DN 的当前运单号是关联子查询（与 DN 列表同一口径），单据很多时可考虑在 DN 上冗余当前运单号。
 
+## 商品导入导出
+
+代码在 `warehouse/goods/`（`columns.py` 列清单、`tabular.py` CSV / Excel 读写、`importer.py`、`exporter.py`、`file_views.py`）。
+权限：导入与导入记录 `goods_add` / `goods_edit`；导出 `goods_read`。文件存库（`bytea`，与出口单证相同）；Excel 用 `openpyxl`
+（requirements.txt）。
+
+### 列
+
+- 导入模板 = 导出预设 `import_template`，20 列、顺序固定：`code`、`name`、`unit`、`weight`（kg）、`length` / `width` / `height`
+  （mm）、`origin_country`、`manufacturer`、`brand`、`image_url`、`thumbnail_url`、`category`、`tags`、`price`、
+  `discount_price`、`currency`、`expiration_date`、`production_date`、`description`；`code`、`name` 必填。
+- 只有导出才有（导入时忽略）：库存 `stock_on_hand`（`total_stock`）、`stock_available`（`available_stock_for_sale`）、
+  `stock_pending_putaway`（`sorted_stock`）、`stock_damaged`（`damage_stock`），按库存范围合计；系统 `is_active`、`created_at`、
+  `updated_at`（默认时区）、`created_by`。预设 `all` = 28 列。批次管理的列（管理方式、保质期、允收期、允发期……）商品表里还没有，
+  批次二期再加。
+- 表头按语言：`zh-CN` / `en-US` / `ja-JP`（编码 / Code / コード、重量 kg / Weight kg / 重量 kg……）。导入时三种语言、列键和常见别名
+  都认（NFKC、转小写、去掉空白 / 括号 / 下划线后比较）。`GET /warehouse/goods/exports/columns`：分组、各语言的表头、预设。
+
+### 导入
+
+- `GET /warehouse/goods/bulk_upload/template?format=csv|xlsx&lang=`：CSV 为 UTF-8 带 BOM；不给 `lang` 表头是列键（同以前）；
+  `lang` 不认识 → 400 `10019`。
+- `POST /warehouse/goods/bulk_upload`（multipart）：`file`（.csv / .xlsx，最多 10,000 行数据）、`company_id`、`overwrite`
+  （`skip` / `append` / `override`；`active` 只为旧调用方保留）、`dry_run`、`import_token`、`encoding`（`auto` / `utf-8` /
+  `shift_jis`）、`sheet`、`lang`（错误行文件的语言）。
+  - 编码已存在时：`skip` 跳过；`append` 只填原来为空的字段；`override` 有值的单元格替换原值，**空单元格一律保留原值、不清空**
+    （要清空在商品编辑里做）。2026-10-25 之前 `override` 遇到空单元格会清空名称以外的品牌、价格、图片、描述等。`append` /
+    `override` 同时把停用的商品恢复启用。缩略图留空：新增时取图片 URL；已有商品原缩略图为空或与原图片相同则跟着新图片走，否则保留。
+  - CSV 编码 `auto`：有 BOM 或内容是合法 UTF-8 → UTF-8，否则 Shift_JIS（CP932）。Excel：默认第一个工作表（`sheet` 可指定）；
+    数字 / 日期单元格按值读，长数字编码不走样。数字可带千位分隔（`1,200`）与全角数字；日期 `YYYY-MM-DD` / `YYYY/MM/DD`。
+    空行跳过；`row` = 文件里的行号（表头为第 1 行）。
+  - `dry_run=true` 不写任何东西 → 每一行的 `action`：`create`（`values`、`spec_missing`）/ `update`（`changes [{field, from,
+    to}]`，恢复启用为 `is_active` false → true）/ `unchanged` / `skip` / `error`（`errors [{field, column, code, reason, value,
+    message, …}]`），以及 `summary`、`file {name, format, encoding, encoding_detected, sheet, sheets, rows, columns}`、
+    `columns`、`column_map`、`ignored_columns`、`read_only_columns` 与 `import_token`。
+  - 带 `import_token` 执行：跳过错误行、导入其余（status `partial`）。文件 / 方式与预览时不同（`FILE_CHANGED`），或某行的结果
+    （含预览里显示的原值）不同（`DATA_CHANGED`，期间商品被改过）→ 409 `16141`，什么都不导入。不带 `import_token`：有任何错误整批
+    不导入，按第一个错误返回 400（details 同以前）。
+  - 错误原因：`REQUIRED`（10006）、`DUPLICATE`（16101，`first_row`）、`INVALID_NUMBER`（10012；NaN / 无穷 16100）、
+    `NEGATIVE`（价格 10012，其余 16100）、`OUT_OF_RANGE`（16100，`min` / `max`）、`INVALID_COUNTRY`（10014）、
+    `INVALID_DATE`（10017）、`TOO_LONG`（10020，`max_length`）、`DISCOUNT_ABOVE_PRICE` / `DISCOUNT_WITHOUT_PRICE`（10012）。
+  - `POST /warehouse/goods/bulk_upload/errors`（参数同上）→ 导入前下载错误行：原格式（CSV 同编码 / Excel），表头 + 错误行 +
+    末列「错误 / Error / エラー」（Shift_JIS 的文件用日文）；没有错误行 204。
+- 导入记录：每次执行（不含 dry_run）都记，整批被拒的也记：`GET /warehouse/goods/imports`（status `completed` / `partial` /
+  `failed`、各计数、列、`failure {code, message, details}`）、`GET …/imports/<id>`（另带前 200 行 `error_rows`）、
+  `GET …/imports/<id>/file`（原文件）、`GET …/imports/<id>/errors`（错误行文件）。文件保留 30 天（之后 409 `16142`），记录保留。
+  这次导入新增 / 更新的商品：`GET /warehouse/goods/?import_id=<id>[&import_action=create|update]`。
+
+### 导出
+
+- 筛选 = 商品列表的参数（`code`、`name`、`keyword`、`category`、`brand`、`manufacturer`、`tags`、`currency`、`goods_codes`、
+  `origin_missing`、`image_missing`、`spec_missing`、价格 / 日期区间），另有新增的（商品列表 `GET /warehouse/goods/` 也支持）：
+  `is_active=all`、`has_stock`（当前仓库、没有则可访问的仓库里 `total_stock > 0`）、`created_from` / `created_to` /
+  `updated_from` / `updated_to`（只给日期按默认时区当天、结束日含当天，或带偏移的 ISO 8601）、`import_id` / `import_action`。
+  导出另可给 `filters.warehouse_id`（库存范围；默认当前仓库，没有则可访问的全部仓库）。
+- `POST /warehouse/goods/exports/preview`（请求体同下）→ `{total, background, sync_limit, max_rows, too_large, columns [{key,
+  header}], …, unencodable}`；`unencodable`（CSV + Shift_JIS）= `{count, characters, items [{id, code, name, columns,
+  characters}]}`：文字里有 Shift_JIS 写不下的字符的商品（导出时写成 `?`；〜 ‖ − ¢ £ ¬ — 先换成 CP932 的对应字，不算）。
+  Shift_JIS 写不下的表头（简体字）改用日文表头。
+- `POST /warehouse/goods/exports` `{filters, columns | preset（import_template / all）, file_format csv | xlsx, encoding
+  utf-8（带 BOM）| shift_jis, lang}`：≤ 1,000 件当场生成（201，`completed`）；更多的 202 `pending`，后台生成（API 进程里的线程，
+  另有定时任务 `goods_files` 兜底），轮询 `GET …/exports/<id>`（`processed`、`total`、`progress`）。单次最多 100,000 件
+  （400 `10022`）；请求不合法 400 `10021`（`field`）。
+- `GET …/exports`（记录）、`GET …/exports/<id>/download`（不是 `completed` → 409 `16142`）、`POST …/exports/<id>/retry`（只有
+  失败的能重试，否则 409 `16143`）、`POST …/exports/<id>/rerun`（按原条件新建一条，`source_export_id`）。文件保留 7 天（之后
+  status `expired`）；中断的导出（10 分钟没有进度）重新排队，最多 3 次。限仓库的员工只看不含库存、或当前仓库库存的导出。
+
+### 发货单批量添加：可售量
+
+`GET /warehouse/inventory/availability?warehouse_id=&goods_codes=a,b,c`（或 `POST` `{goods_codes: [...]}`；最多 1,000 个编码；
+`inventory_read` 或 `dn_edit`）→ `{warehouse_id, items: [{goods_id, code, name, unit, is_active, thumbnail_url,
+available_stock_for_sale, onhand_stock, dn_stock, locked_stock}], not_found: [编码]}`，items 按请求顺序只列找到的商品。
+可售 = `onhand_stock − locked_stock − dn_stock`（standard 库位）；批次的允发期还没有（一期没有带批次的库存）。编码为空 / 过多 →
+400 `15019`（`field: goods_codes`）。收货通知批量添加用 `GET /warehouse/goods/?goods_codes=…&all=true` 取名称与单位（编码多时
+分批，URL 别太长）。
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `GOODS_EXPORT_THREAD` | `true` | 大导出建任务后立刻在 API 进程里起线程生成；`false` = 只靠定时任务 `goods_files` |
+| `GOODS_FILE_JOB_INTERVAL_MINUTES` | `1` | 定时任务 `goods_files` 的间隔（排队 / 中断的导出、删 7 天前的导出文件与 30 天前的导入文件）；`0` = 不跑 |
+
 ## Webhook 集成
 
 WMS 通过 Webhook 向外部系统推送事件通知，使用 HMAC-SHA256 签名验证。
@@ -1563,7 +1644,7 @@ stdout_logfile=/var/log/wms-api.out.log
 跳过原因、长宽高没给齐、`remeasure` 没给齐要求的项、`note` 不合法（400，`field` / `details.missing`）、`17023` 只有已收货
 （received）或已完成（completed，补采）的收货通知能采集（409，`details {asn_id, status}`）。
 
-主数据与权限：`16100` 商品数值不合法（400）、`16101` CSV 内商品编码重复（400，带行号）、`16102` 数据值不合法（400）、`16103` 不能分配已停用的角色（400）、`16104` 只有公司管理员能新建 / 删除仓库或更换负责人（403）、`16105` 没有公司管理权限时只能管理绑定自己的 API Key（403）、`44004` 被单据或库存引用的主数据不能删除，请改用停用（409，`details {entity, id, references}`）、`44005` 与已有数据冲突（409）。密码：`10015` 新密码须 8–16 位，含大写字母、小写字母、数字和特殊符号（`@$!%*?&`），不能有其它字符（400，`field`，`details {min_length, max_length, special_characters}`；忘记密码重置、修改密码、新建 / 修改用户与员工都查）。内置权限 / 角色（输出 `is_builtin`）：`11011` 内置权限不能改代码、不能删（409，`details {permission, reason}`），`11012` 内置角色（admin / company_admin / warehouse_admin / warehouse_operator）不能改名、停用、删除（409，`details {role, reason}`）。商品导入：模板 `GET /warehouse/goods/bulk_upload/template`；`10004` / `10005` / `10006` / `10012` / `10014` / `16100` / `16101` 带 `details {row, rows, code, columns, value}`，`10016` 文件不是 UTF-8 文本。
+主数据与权限：`16100` 商品数值不合法（400）、`16101` CSV 内商品编码重复（400，带行号）、`16102` 数据值不合法（400）、`16103` 不能分配已停用的角色（400）、`16104` 只有公司管理员能新建 / 删除仓库或更换负责人（403）、`16105` 没有公司管理权限时只能管理绑定自己的 API Key（403）、`44004` 被单据或库存引用的主数据不能删除，请改用停用（409，`details {entity, id, references}`）、`44005` 与已有数据冲突（409）。密码：`10015` 新密码须 8–16 位，含大写字母、小写字母、数字和特殊符号（`@$!%*?&`），不能有其它字符（400，`field`，`details {min_length, max_length, special_characters}`；忘记密码重置、修改密码、新建 / 修改用户与员工都查）。内置权限 / 角色（输出 `is_builtin`）：`11011` 内置权限不能改代码、不能删（409，`details {permission, reason}`），`11012` 内置角色（admin / company_admin / warehouse_admin / warehouse_operator）不能改名、停用、删除（409，`details {role, reason}`）。商品导入导出（见「商品导入导出」）：`10004` 不是 .csv / .xlsx，`10005` / `10006` / `10012` / `10014` / `16100` / `16101` 带 `details {row, rows, code, columns, value}`，`10016` 文件读不了（`details.reason` `UNKNOWN_ENCODING` / `NOT_UTF8` / `NOT_SHIFT_JIS` / `NOT_XLSX` / `NOT_CSV`），`10017` 日期不合法，`10018` 超过 10,000 行 / Excel 过大，`10019` 导入参数不合法（`field`），`10020` 文字超长，`10021` 导出请求不合法（`field`），`10022` 导出超过 100,000 件，`16141` 预校验结果已过时（409，`details.reason` `FILE_CHANGED` / `DATA_CHANGED`），`16142` 文件不能下载（409，`details.status`），`16143` 只有失败的导出能重试（409）；可售量 `15019`（`field: goods_codes`）。
 
 ## 关联项目
 

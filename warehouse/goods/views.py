@@ -1,13 +1,13 @@
-import csv
-import io
-from decimal import Decimal, InvalidOperation
+from datetime import date
+from decimal import Decimal
+
 from flask import g, make_response
 from flask_restx import Resource,abort
 
 from extensions import oss
 from extensions.cache import cache
 from extensions.error import BadRequestException, ForbiddenException, NotFoundException
-from system.common import paginate,permission_required,parse_date
+from system.common import paginate,permission_required
 from system.common.permissions import get_actor_company_id
 from warehouse.common import (
     require_actor_user_id,
@@ -15,6 +15,9 @@ from warehouse.common import (
     get_company_owned, get_warehouse_owned, require_fields,
 )
 from warehouse.company.services import CompanyService
+from . import importer, tabular
+from .columns import COLUMNS_BY_KEY, GOODS_IMPORT_COLUMNS, GOODS_IMPORT_SAMPLE_ROW, SHEET_TITLES, header_label
+from .filters import stock_scope
 from .models import Goods, GoodsLocation
 from .schemas import (
     api_ns,
@@ -29,59 +32,12 @@ from .schemas import (
     goods_pagination_model,
     upload_parser,
     goods_bulk_upload_parser,
+    goods_template_parser,
 )
 
-from .services import (
-    GoodsService, GoodsLocationService, clean_origin_country, clean_goods_numbers, goods_number_error,
-    resolve_spec_source,
-)
+from .services import GoodsService, GoodsLocationService, resolve_spec_source
 
-
-# 商品导入（CSV）的列：模板（GET /goods/bulk_upload/template）与导入读的是同一份清单，不会再出现
-# 「后端读 origin_country、模板里却没有这一列」。重量 kg，长宽高 mm（正整数），日期 YYYY-MM-DD
-GOODS_IMPORT_COLUMNS = (
-    'code', 'name', 'unit', 'weight', 'length', 'width', 'height', 'origin_country', 'manufacturer', 'brand',
-    'image_url', 'thumbnail_url', 'category', 'tags', 'price', 'discount_price', 'currency', 'expiration_date',
-    'production_date', 'description',
-)
-GOODS_IMPORT_REQUIRED_COLUMNS = ('code', 'name')
-GOODS_IMPORT_SAMPLE_ROW = (
-    'SAMPLE-001', 'Sample goods', 'pcs', '0.328', '140', '130', '13', 'JP', 'Sample Maker', 'Sample Brand',
-    'https://example.com/sample-001.jpg', '', 'Sample category', 'tag1,tag2', '1760', '1500', 'JPY', '', '2025-07-01',
-    'Sample description',
-)
-# 商品导入的业务码（失败都带 details，界面按 row / rows / code / columns 显示行号与列，按业务码翻译）：
-# 10004 不是 .csv；10005 缺必填列（details {columns}）；10006 某行必填值为空（{row, columns}）；
-# 10012 数值 / 价格不合法（{row, columns, value}）；10014 原产国不合法（{row, columns, value}）；
-# 16100 数值超出范围（{row, columns, field}）；16101 文件内商品编码重复（{code, rows}）；10016 文件读不了（不是 UTF-8 文本）
-GOODS_IMPORT_NOT_READABLE = 10016
-
-
-def _import_error(message, code, row=None, columns=None, **details):
-    """商品导入的错误：details 带 row（文件行号，表头是第 1 行）/ columns（相关列）等"""
-    payload = {}
-    if row is not None:
-        payload['row'] = row
-    if columns:
-        payload['columns'] = list(columns)
-    payload.update({k: v for k, v in details.items() if v is not None})
-    return BadRequestException(message, code, columns[0] if columns and len(columns) == 1 else None,
-                               details=payload)
-
-
-def _parse_csv_number(row, column, line_num):
-    """CSV 里的数值列：空值 → None；非数字 → 400 10012；NaN / Infinity → 400 16100（带行号）"""
-    raw = (row.get(column) or '').strip()
-    if not raw:
-        return None
-    try:
-        number = Decimal(raw)
-    except (InvalidOperation, ValueError):
-        raise _import_error(f"Row {line_num}: invalid number for '{column}': {raw}", 10012, line_num, [column],
-                            value=raw)
-    if not number.is_finite():
-        raise goods_number_error(column, line_num)
-    return number
+# 商品导入的列与业务码见 warehouse/goods/columns.py、importer.py（GOODS_IMPORT_COLUMNS 仍可从这里导入）
 
 
 class _GoodsOutput:
@@ -114,16 +70,6 @@ def _require_goods_visible(goods_id):
     if user is not None and user.type == 'staff' and not user.has_role('company_admin'):
         if not check_goods_access(goods_id):
             raise NotFoundException("Goods not found in the specified or accessible warehouse", 13003)
-
-
-def _parse_csv_origin_country(row, line_num):
-    """CSV 的 origin_country 列：空 → None；不是有效 ISO 3166-1 alpha-2 → 400（10014）"""
-    raw = (row.get('origin_country') or '').strip()
-    try:
-        return clean_origin_country(raw)
-    except BadRequestException:
-        raise _import_error(f"Row {line_num}: invalid origin_country: {raw}", 10014, line_num, ['origin_country'],
-                            value=raw)
 
 
 @api_ns.doc(security="jsonWebToken")
@@ -164,6 +110,15 @@ class GoodsList(Resource):
             'origin_missing': args.get('origin_missing'),
             'image_missing': args.get('image_missing'),
             'spec_missing': args.get('spec_missing'),
+            'created_from': args.get('created_from'),
+            'created_to': args.get('created_to'),
+            'updated_from': args.get('updated_from'),
+            'updated_to': args.get('updated_to'),
+            # 有 / 无库存：按当前仓库（没有则调用方可访问的仓库）
+            'has_stock': args.get('has_stock'),
+            'stock_warehouse_ids': stock_scope(),
+            'import_id': args.get('import_id'),
+            'import_action': args.get('import_action'),
             # 商品是公司级主数据：员工 / 公司级 API Key 强制只看本公司
             'company_id': get_actor_company_id() or args.get('company_id'),
         }
@@ -314,167 +269,132 @@ class GoodsUpload(Resource):
         file_url = oss.upload_file(uploaded_file, "goods/images/")
         return {"file_url": file_url}, 200
 
+
+_IMPORT_PERMISSIONS = ["all_access", "company_all_access", "goods_add", "goods_edit"]
+
+
+def _file_response(content, file_name, content_type):
+    response = make_response(content)
+    response.headers['Content-Type'] = content_type
+    response.headers['Content-Disposition'] = tabular.attachment_header(file_name)
+    response.headers['Access-Control-Expose-Headers'] = 'Content-Disposition'
+    response.headers['Cache-Control'] = 'private, no-store'
+    return response
+
+
+def _template_cell(key, value):
+    """Excel 模板的示例行：数值 / 日期按类型写（打开后能直接改）"""
+    if value in (None, ''):
+        return None
+    kind = COLUMNS_BY_KEY[key].kind
+    if kind == 'number':
+        return Decimal(value)
+    if kind == 'integer':
+        return int(value)
+    if kind == 'date':
+        return date.fromisoformat(value)
+    return value
+
+
 @api_ns.route('/bulk_upload/template')
 class GoodsBulkUploadTemplate(Resource):
-    @permission_required(["all_access","company_all_access","goods_add","goods_edit"])
+    @permission_required(_IMPORT_PERMISSIONS)
+    @api_ns.expect(goods_template_parser)
     def get(self):
-        """Download the goods import template (CSV, UTF-8 with BOM): the header lists every column the import reads
-        (including origin_country), followed by one sample row"""
-        buffer = io.StringIO()
-        writer = csv.writer(buffer, lineterminator='\n')
-        writer.writerow(GOODS_IMPORT_COLUMNS)
-        writer.writerow(GOODS_IMPORT_SAMPLE_ROW)
-        response = make_response('﻿' + buffer.getvalue())
-        response.headers['Content-Type'] = 'text/csv; charset=utf-8'
-        response.headers['Content-Disposition'] = 'attachment; filename="Goods_template.csv"'
-        return response
+        """Download the goods import template: the header lists every column the import reads, then one sample row
+
+        `format`: csv (default; UTF-8 with BOM) / xlsx (sheet "Goods" / "商品"; the code column is formatted as text).
+        `lang`: zh-CN / en-US / ja-JP headers (e.g. 编码 / Code / コード); without it the headers are the column keys
+        (code, name, weight, …). The import recognises all of them. Invalid lang → 400 10019.
+        """
+        args = goods_template_parser.parse_args()
+        lang = importer.resolve_lang(args.get('lang'))
+        header = [header_label(key, lang) for key in GOODS_IMPORT_COLUMNS]
+        if args.get('format') == 'xlsx':
+            kinds = ['text' if COLUMNS_BY_KEY[key].kind in ('text', 'country') else None
+                     for key in GOODS_IMPORT_COLUMNS]
+            sample = [_template_cell(key, value) for key, value in zip(GOODS_IMPORT_COLUMNS, GOODS_IMPORT_SAMPLE_ROW)]
+            content = tabular.write_xlsx(SHEET_TITLES.get(lang, 'Goods'), header, [sample], kinds)
+            return _file_response(content, 'Goods_template.xlsx', tabular.content_type('xlsx'))
+        content = tabular.write_csv(header, [GOODS_IMPORT_SAMPLE_ROW], 'utf-8-sig')
+        return _file_response(content, 'Goods_template.csv', tabular.content_type('csv'))
+
+
+def _import_request():
+    """multipart 参数 → importer.ImportRequest（公司归属、编码、语言校验）"""
+    args = goods_bulk_upload_parser.parse_args()
+    uploaded_file = args['file']
+    company_id = args.get('company_id')
+    # 权限检查：员工 / 公司级 API Key 只能导入到自己公司
+    actor_company_id = get_actor_company_id()
+    if actor_company_id is not None and company_id != actor_company_id:
+        raise ForbiddenException("You do not have permission to operate on this company.", 12001)
+    company = CompanyService.get_company(company_id)
+    encoding = tabular.normalize_encoding(args.get('encoding'))
+    if encoding is None:
+        raise BadRequestException("encoding must be auto, utf-8 or shift_jis", importer.PARAM_INVALID, 'encoding')
+    return args, importer.ImportRequest(
+        company_id=company_id, company=company, mode=(args.get('overwrite') or 'skip').lower(), encoding=encoding,
+        sheet=(args.get('sheet') or '').strip() or None, lang=importer.resolve_lang(args.get('lang')),
+        file_name=(uploaded_file.filename or '').replace('\\', '/').rsplit('/', 1)[-1].strip(),
+        content=uploaded_file.read(),
+    )
 
 
 @api_ns.route('/bulk_upload')
 class GoodsBulkUpload(Resource):
-    @permission_required(["all_access","company_all_access","goods_add","goods_edit"])
+    @permission_required(_IMPORT_PERMISSIONS)
     @api_ns.expect(goods_bulk_upload_parser)
     def post(self):
-        """Upload a bulk goods file based on CSV headers
+        """Import goods from a CSV / Excel (.xlsx) file (multipart/form-data)
 
-        Columns: see GET /goods/bulk_upload/template (code and name are required). Duplicate handling (`overwrite`):
-        skip / active / append (fill blank fields of existing goods) / override (non-empty values replace the
-        existing ones; blank weight, dimensions, origin_country, category, tags and discount_price never clear them).
+        Parameters: `file`, `company_id`, `overwrite` (codes that already exist: skip = add new only / append = fill
+        blank fields / override = non-empty cells replace the values, **empty cells keep them** / active = legacy,
+        reactivate only; append and override also reactivate inactive goods), `dry_run`, `import_token`, `encoding`
+        (CSV: auto (default; BOM or valid UTF-8 → UTF-8, else Shift_JIS) / utf-8 / shift_jis), `sheet` (Excel; default
+        the first sheet), `lang` (language of the error file, default the language of the headers).
+        Headers: column keys, zh-CN / en-US / ja-JP labels and common aliases (see GET /goods/bulk_upload/template);
+        code and name are required. At most 10,000 data rows.
 
-        Response: `{message, mode, processed, created, updated, skipped, columns, ignored_columns}` (the counts are for
-        the front end to build a translated message). Errors are 400 with a business code and `details`
-        (`row` = line number in the file, header is line 1; `rows`; `code`; `columns`; `value`): 10004 not a .csv,
-        10005 required columns missing, 10006 required value empty, 10012 invalid number / price, 10014 invalid
-        origin_country, 16100 number out of range, 16101 duplicate code in the file, 10016 the file is not UTF-8 text.
+        - `dry_run=true`: validates everything, writes nothing → `{dry_run, import_token, mode, file {name, format,
+          encoding, encoding_detected, sheet, sheets, rows, columns}, header_lang, columns, column_map [{index, header,
+          field}], ignored_columns, read_only_columns, summary {rows, create, update, unchanged, skip, error},
+          rows [{row, action: create | update | unchanged | skip | error, code, name, goods_id, values (create),
+          changes [{field, from, to}] (update), spec_missing, errors [{field, column, code, reason, value, message, …}]
+          (error)}]}`. `row` is the line in the file (header = line 1).
+        - with `import_token`: imports the rows without errors and skips the error rows; 409 16141 when the file /
+          options (FILE_CHANGED) or the result of a row (DATA_CHANGED) differ from the dry run — validate again.
+        - without `import_token`: any error → nothing imported, 400 with the first error (as before).
+        Response: `{message, import_id, status: completed | partial | failed, mode, processed, created, updated,
+        unchanged, skipped, errors, has_error_file, file, columns, ignored_columns, read_only_columns}`; every run is
+        recorded (GET /goods/imports).
+        Errors (400, `details` with `row` / `rows` / `code` / `columns` / `value`): 10004 not .csv / .xlsx, 10005
+        required columns missing, 10006 required value empty, 10012 invalid number / negative price / discount above
+        price, 10014 invalid origin_country, 10016 unreadable file (`details.reason` UNKNOWN_ENCODING / NOT_UTF8 /
+        NOT_SHIFT_JIS / NOT_XLSX / NOT_CSV), 10017 invalid date, 10018 more than 10,000 rows / Excel too large, 10019
+        invalid parameter (`field` encoding / sheet / lang / import_token), 10020 text too long, 16100 number out of
+        range, 16101 duplicate code in the file.
         """
-        args = goods_bulk_upload_parser.parse_args()
-        uploaded_file = args['file']
+        args, import_request = _import_request()
+        if args.get('dry_run'):
+            return importer.preview(import_request), 200
+        return importer.run(import_request, require_actor_user_id(), args.get('import_token')), 200
 
-        overwrite_mode = args.get('overwrite', 'skip').lower()
-        company_id = args.get('company_id')
 
+@api_ns.route('/bulk_upload/errors')
+class GoodsBulkUploadErrors(Resource):
+    @permission_required(_IMPORT_PERMISSIONS)
+    @api_ns.expect(goods_bulk_upload_parser)
+    def post(self):
+        """Error rows of a file before importing it (same multipart parameters as POST /goods/bulk_upload)
 
-        # 权限检查：员工 / 公司级 API Key 只能导入到自己公司
-        actor_company_id = get_actor_company_id()
-        if actor_company_id is not None and company_id != actor_company_id:
-            raise ForbiddenException("You do not have permission to operate on this company.", 12001)
-
-        company = CompanyService.get_company(company_id)
-        default_currency = company.default_currency if company else 'JPY'  # 默认货币为JPY
-
-        # 文件格式检查
-        if not uploaded_file.filename.lower().endswith('.csv'):
-            raise _import_error("Only CSV files are supported.", 10004, filename=uploaded_file.filename)
-
-        # 读取并解析CSV内容（UTF-8，带不带 BOM 都行）
-        try:
-            file_content = uploaded_file.read().decode('utf-8-sig')
-        except UnicodeDecodeError:
-            raise _import_error("The CSV file must be UTF-8 encoded text.", GOODS_IMPORT_NOT_READABLE,
-                                reason='NOT_UTF8')
-        reader = csv.DictReader(file_content.splitlines())
-
-        # 检查必须的列
-        header = [name for name in (reader.fieldnames or []) if name is not None]
-        missing_columns = [col for col in GOODS_IMPORT_REQUIRED_COLUMNS if col not in header]
-        if missing_columns:
-            raise _import_error(f"Missing required columns: {', '.join(missing_columns)}", 10005,
-                                columns=missing_columns)
-
-        goods_data = []
-        first_rows = {}  # code → 首次出现的行号（同一文件里同一编码出现两次 → 400 16101，而不是撞唯一键 500）
-        for row in reader:
-            line_num = reader.line_num
-            # 检查必填字段的值
-            missing_values = [col for col in GOODS_IMPORT_REQUIRED_COLUMNS if not (row.get(col) or '').strip()]
-            if missing_values:
-                raise _import_error(f"Row {line_num}: Missing values for {', '.join(missing_values)}", 10006,
-                                    line_num, missing_values)
-
-            code = row['code']
-            if code in first_rows:
-                raise BadRequestException(
-                    f"Row {line_num}: duplicate code '{code}' (first seen in row {first_rows[code]})", 16101,
-                    'code', details={'code': code, 'rows': [first_rows[code], line_num], 'columns': ['code']},
-                )
-            first_rows[code] = line_num
-
-            # 数值列可缺省；非数字 → 400 10012；NaN / Infinity / 超出范围 → 400 16100（带行号）
-            numbers = {field: _parse_csv_number(row, field, line_num)
-                       for field in ('weight', 'length', 'width', 'height', 'price', 'discount_price')}
-            price = numbers['price']
-            discount_price = numbers['discount_price']
-            if price is not None and price < 0:
-                raise _import_error(f"Row {line_num}: price must be >= 0", 10012, line_num, ['price'],
-                                    value=str(price))
-            if discount_price is not None and (price is None or discount_price > price):
-                raise _import_error(f"Row {line_num}: discount_price must be <= price", 10012, line_num,
-                                    ['discount_price', 'price'], value=str(discount_price))
-            clean_goods_numbers(numbers, row=line_num)
-            price = numbers['price']
-            discount_price = numbers['discount_price']
-
-            # 构建商品数据
-            goods_data.append({
-                # 基础信息
-                'code': row['code'],
-                'name': row['name'],
-
-                # 计量维度
-                'unit': row.get('unit') or 'pcs',  # 默认单位为件
-                'weight': numbers['weight'],
-                'length': numbers['length'],
-                'width': numbers['width'],
-                'height': numbers['height'],
-                'origin_country': _parse_csv_origin_country(row, line_num),
-
-                # 品牌信息
-                'manufacturer': row.get('manufacturer'),
-                'brand': row.get('brand'),
-
-                # 多媒体
-                'image_url': row.get('image_url'),
-                'thumbnail_url': row.get('thumbnail_url') or row.get('image_url'),  # 自动回退
-
-                # 分类标签
-                'category': row.get('category'),
-                'tags': row.get('tags'),
-
-                # 价格相关
-                'price': price,
-                'discount_price': discount_price,
-                'currency': row.get('currency') or default_currency,
-
-                # 日期信息
-                'expiration_date': parse_date(row.get('expiration_date')),
-                'production_date': parse_date(row.get('production_date')),
-
-                # 描述信息（入库前在 service 里按白名单清洗）
-                'description': row.get('description'),
-
-                # 系统字段
-                'company_id': company_id,
-                # 文件行号（与已有商品合并后价格校验失败时报给界面）
-                '_row': line_num,
-            })
-
-        # 批量创建商品
-        created_by = require_actor_user_id()
-        stats = {}
-        new_goods_list = GoodsService.bulk_create_goods(goods_data, created_by, override_mode=overwrite_mode,
-                                                        spec_source='import', stats=stats)
-
-        known = set(GOODS_IMPORT_COLUMNS)
-        return {
-            "message": f"Bulk upload successful. Processed {len(new_goods_list)} goods.",
-            "mode": overwrite_mode,
-            "processed": len(new_goods_list),
-            "created": stats.get('created', 0),
-            "updated": stats.get('updated', 0),
-            "skipped": stats.get('skipped', 0),
-            "columns": [name for name in header if name in known],
-            # 文件里认不出的列（拼错的列名等），导入时忽略
-            "ignored_columns": [name for name in header if name not in known],
-        }, 200
-
+        → 200 the file in its own format (CSV in its encoding / Excel) with the header and only the error rows, plus a
+        last column 错误 / Error / エラー (by `lang`, default the language of the headers); 204 when no row has errors.
+        File-level errors as for the import (400).
+        """
+        _args, import_request = _import_request()
+        result = importer.error_file_for(import_request)
+        if result is None:
+            return '', 204
+        return _file_response(*result)
 

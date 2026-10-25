@@ -192,6 +192,10 @@ class Config:
     # 自动视为签收（carriers.auto_sign_days）：定时任务的间隔见 scheduler.py（CARRIER_AUTO_SIGN_INTERVAL_MINUTES，
     # 默认 60，0 = 不跑）
 
+    # 商品导出（warehouse/goods/exporter.py）：超过 1,000 件的导出建任务后立刻在本进程起后台线程生成；
+    # 关掉时只靠定时任务 goods_files（GOODS_FILE_JOB_INTERVAL_MINUTES，默认 1 分钟）接着生成
+    GOODS_EXPORT_THREAD = env_bool('GOODS_EXPORT_THREAD', True)
+
 class DevelopmentConfig(Config):
     DEBUG = True # 只在开发环境中启用调试
     STOCK_GUARD = (os.getenv('STOCK_GUARD') or 'raise').strip().lower()   # 开发时绕过 StockService 直接报错
@@ -211,6 +215,7 @@ class TestingConfig(Config):
     WEBHOOK_URL_STRICT = False
     RATELIMIT_ENABLED = False
     SCHEDULER_ENABLED = False
+    GOODS_EXPORT_THREAD = False   # 测试库是内存 SQLite：后台导出由用例直接调 run_goods_file_jobs()
     SQLALCHEMY_DATABASE_URI = os.getenv('SQLALCHEMY_DATABASE_URI_TEST', 'sqlite:///test.db')  # 数据库连接
     REDIS_URL = os.getenv('REDIS_URL_TEST', 'redis://localhost:6379/0') # REDIS配置
     OSS_ENDPOINT = os.getenv('OSS_ENDPOINT_TEST')  # 阿里云 OSS Endpoint
