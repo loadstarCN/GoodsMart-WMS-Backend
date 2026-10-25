@@ -169,10 +169,10 @@ def test_seed_tops_up_builtin_role_permissions_without_removing(client, access_o
 
         # 管理员手工给作业员加的权限，再跑种子也保留；第二次运行什么都不改
         operator_role = Role.query.filter_by(name='warehouse_operator').one()
-        operator_role.permissions.append(Permission.query.filter_by(name='adjustment_read').one())
+        operator_role.permissions.append(Permission.query.filter_by(name='location_edit').one())
         db.session.commit()
         assert seed_builtin() == {'added_permissions': [], 'created_roles': [], 'granted': {}}
-        assert 'adjustment_read' in _role_permissions('warehouse_operator')
+        assert 'location_edit' in _role_permissions('warehouse_operator')
 
         # 内置的仓库角色不存在时新建（admin / company_admin 不新建）
         role = Role.query.filter_by(name='warehouse_admin').one()

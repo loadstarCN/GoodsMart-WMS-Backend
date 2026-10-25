@@ -172,6 +172,7 @@ _OPERATOR_READ = (
     'goods_read', 'location_read', 'inventory_read', 'asn_read', 'sorting_read', 'putaway_read', 'dn_read',
     'picking_read', 'packing_read', 'delivery_read', 'cycle_count_read', 'removal_read', 'transfer_read',
     'carrier_read', 'recipient_read',
+    'adjustment_read',  # PDA 商品详情的调整记录页签
 )
 # 现场 / PDA 作业：收货（PUT /asn/<id>/receive/ 要 asn_edit，后端没有单独的收货权限）、分拣、上架、拣货、打包、
 # 配送（完成发货 / 签收 / 运单号 / 揽收登记都是 delivery_edit）、盘点录入（cycle_count_edit）、下架、移库
