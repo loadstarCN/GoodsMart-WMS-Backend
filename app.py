@@ -86,6 +86,10 @@ def create_app():
     from tasks.commands import snapshot_cli
     app.cli.add_command(snapshot_cli)
 
+    # 库存底座：flask stock init-ledger / reconcile / audit / daily / rebuild-daily / metrics / replay
+    from warehouse.stock.commands import stock_cli
+    app.cli.add_command(stock_cli)
+
     from warehouse.carrier.commands import carrier_cli
     app.cli.add_command(carrier_cli)
 

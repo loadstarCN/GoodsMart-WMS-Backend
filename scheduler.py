@@ -23,6 +23,8 @@ def init_scheduler(app):
     webhook_interval = int(os.getenv('WEBHOOK_PUSH_INTERVAL_MINUTES', '1'))
     snapshot_hour = int(os.getenv('SNAPSHOT_HOUR', '2'))
     snapshot_minute = int(os.getenv('SNAPSHOT_MINUTE', '0'))
+    # 日终结存的检查时刻：每小时第 N 分钟（默认 7，避开整点的其它任务）
+    stock_daily_minute = int(os.getenv('STOCK_DAILY_MINUTE', '7'))
     # 承运商跟踪（自动完成发货 / 签收），默认每 30 分钟；0 = 不跑
     tracking_interval = int(os.getenv('CARRIER_TRACKING_INTERVAL_MINUTES', '30'))
     # 自动视为签收（carriers.auto_sign_days，没有 API 跟踪的运单），默认每 60 分钟；0 = 不跑
@@ -44,6 +46,14 @@ def init_scheduler(app):
             'hour': snapshot_hour,
             'minute': snapshot_minute,
             'misfire_grace_time': 3600,
+        },
+        # 日终结存 + 库存分析 + 对账（warehouse/stock/jobs.py）：每小时检查一次，各仓库按当地日界补生成前一天
+        {
+            'id': 'stock_daily',
+            'func': 'scheduler:_job_stock_daily',
+            'trigger': 'cron',
+            'minute': stock_daily_minute,
+            'misfire_grace_time': 1800,
         },
     ]
     if tracking_interval > 0:
@@ -150,6 +160,21 @@ def _job_carrier_auto_sign():
                 logger.info(f'[Scheduler] Carrier auto sign: {stats}')
         except Exception as e:
             logger.error(f'[Scheduler] Carrier auto sign failed: {e}')
+
+
+def _job_stock_daily():
+    """定时任务：补生成日终结存、库存分析，生成了新的一天时对账（差异只记日志告警）"""
+    app = scheduler.app
+    if app is None:
+        return
+    with app.app_context():
+        try:
+            from warehouse.stock.jobs import run_stock_daily
+            result = run_stock_daily()
+            if result['daily_balances'] or result['metrics']:
+                logger.info(f'[Scheduler] Stock daily: {result}')
+        except Exception as e:
+            logger.error(f'[Scheduler] Stock daily failed: {e}')
 
 
 def _job_inventory_snapshot():
