@@ -81,7 +81,7 @@ jobs:
       - name: Stock and concurrency tests on PostgreSQL
         run: |
           set -o pipefail
-          G0="tests/test_stock_ledger_matrix.py tests/test_stock_api.py tests/test_inventory.py tests/test_putaway.py
+          G0="tests/test_stock_ledger_matrix.py tests/test_stock_api.py tests/test_stock_legacy_fix.py tests/test_inventory.py tests/test_putaway.py
               tests/test_removal.py tests/test_transfer.py tests/test_adjustment.py tests/test_damaged_putaway.py"
           G1="tests/test_picking.py tests/test_packing.py tests/test_dn.py tests/test_inventory_guards.py
               tests/test_concurrent_transitions.py tests/test_process_followups.py tests/test_process_guards.py
