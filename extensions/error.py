@@ -122,7 +122,7 @@ from werkzeug.exceptions import HTTPException
 #             details {asn_id, enforcement, lines: [{asn_detail_id, goods_id, goods_code, goods_name, spec_pending}]}
 # 17022  400  规格采集请求不合法：既没有值也没有跳过原因；长宽高没给齐（field dimensions，details {missing}）；remeasure 模式
 #             没给齐要求的项（field spec_capture，details {missing}）；note 不是文字或超过 255 字（field note）
-# 17023  409  只有已收货（received）的收货通知能采集规格：details {asn_id, status}
+# 17023  409  只有已收货（received）或已完成（completed，补采）的收货通知能采集规格：details {asn_id, status}
 
 class APIException(Exception):
     """API异常基类"""

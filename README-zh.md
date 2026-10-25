@@ -224,8 +224,8 @@ GoodsMart-WMS-Backend/
   - `remeasure`：这一行还没采集过 → 要求的全部项。
   - 填了跳过原因的行、已关闭的收货通知、已完成的收货通知上没到货（`actual_quantity` 为 0）的行，都没有待采集。
 - **采集** `PUT /warehouse/asn/<id>/details/<detail_id>/spec`：要 `goods_edit` / `sorting_edit` / `packing_edit` 任一（与
-  `PUT /warehouse/goods/<id>/origin-country` 相同）；只有 `received` 的收货通知可以采集（否则 409 `17023`
-  `details {asn_id, status}`）：
+  `PUT /warehouse/goods/<id>/origin-country` 相同）；收货通知为 `received` 时可以采集，`completed` 后也可以补采（效果相同，
+  不会重推 `asn.completed`）；`pending` / `closed` → 409 `17023` `details {asn_id, status}`：
 
   ```json
   { "weight": 0.235, "length": 120, "width": 80, "height": 45, "origin_country": "CN",
@@ -1462,7 +1462,7 @@ stdout_logfile=/var/log/wms-api.out.log
 收货规格采集：`17020` 采集设置不合法——收货通知的 `spec_capture`、仓库默认规则（400，`field`）、`17021` 分拣完成被拦：
 分拣到的行还没采集规格、也没填跳过原因（409，`details {asn_id, enforcement, lines}`）、`17022` 采集请求不合法——既没有值也没有
 跳过原因、长宽高没给齐、`remeasure` 没给齐要求的项、`note` 不合法（400，`field` / `details.missing`）、`17023` 只有已收货
-（received）的收货通知能采集（409，`details {asn_id, status}`）。
+（received）或已完成（completed，补采）的收货通知能采集（409，`details {asn_id, status}`）。
 
 主数据与权限：`16100` 商品数值不合法（400）、`16101` CSV 内商品编码重复（400，带行号）、`16102` 数据值不合法（400）、`16103` 不能分配已停用的角色（400）、`16104` 只有公司管理员能新建 / 删除仓库或更换负责人（403）、`16105` 没有公司管理权限时只能管理绑定自己的 API Key（403）、`44004` 被单据或库存引用的主数据不能删除，请改用停用（409，`details {entity, id, references}`）、`44005` 与已有数据冲突（409）。密码：`10015` 新密码须 8–16 位，含大写字母、小写字母、数字和特殊符号（`@$!%*?&`），不能有其它字符（400，`field`，`details {min_length, max_length, special_characters}`；忘记密码重置、修改密码、新建 / 修改用户与员工都查）。内置权限 / 角色（输出 `is_builtin`）：`11011` 内置权限不能改代码、不能删（409，`details {permission, reason}`），`11012` 内置角色（admin / company_admin / warehouse_admin / warehouse_operator）不能改名、停用、删除（409，`details {role, reason}`）。商品导入：模板 `GET /warehouse/goods/bulk_upload/template`；`10004` / `10005` / `10006` / `10012` / `10014` / `16100` / `16101` 带 `details {row, rows, code, columns, value}`，`10016` 文件不是 UTF-8 文本。
 

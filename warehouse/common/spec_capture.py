@@ -16,7 +16,7 @@ DEFAULT_SPEC_CAPTURE_ENFORCEMENT = 'warn'
 SPEC_CAPTURE_SETTINGS_INVALID = 17020   # 400 采集设置不合法（收货通知的 spec_capture、仓库默认规则）
 SPEC_CAPTURE_BLOCKED = 17021            # 409 强制模式：分拣完成时还有未采集、也没填跳过原因的行
 SPEC_CAPTURE_REQUEST_INVALID = 17022    # 400 采集请求不合法
-SPEC_CAPTURE_NOT_ALLOWED = 17023        # 409 收货通知当前状态不能采集（只有 received 可以）
+SPEC_CAPTURE_NOT_ALLOWED = 17023        # 409 收货通知当前状态不能采集（只有 received / completed 可以）
 
 # 仓库新建 / 修改可写的列
 WAREHOUSE_SPEC_FIELDS = ('default_spec_capture_fields', 'default_spec_capture_mode', 'spec_capture_enforcement')

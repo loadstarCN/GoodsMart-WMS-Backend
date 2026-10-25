@@ -236,8 +236,9 @@ received. It is a general feature and **off by default** (no warehouse captures 
   - Nothing is pending on a line with a skip reason, on a closed ASN, or on a line of a completed ASN where nothing
     arrived (`actual_quantity` 0).
 - **Capture** `PUT /warehouse/asn/<id>/details/<detail_id>/spec` — any of `goods_edit` / `sorting_edit` /
-  `packing_edit` (like `PUT /warehouse/goods/<id>/origin-country`), only while the ASN is `received` (else 409 `17023`
-  `details {asn_id, status}`):
+  `packing_edit` (like `PUT /warehouse/goods/<id>/origin-country`), while the ASN is `received`, or later once it is
+  `completed` to catch up what was missed (same effect; `asn.completed` is not sent again); `pending` / `closed` → 409
+  `17023` `details {asn_id, status}`:
 
   ```json
   { "weight": 0.235, "length": 120, "width": 80, "height": 45, "origin_country": "CN",
@@ -1764,7 +1765,7 @@ Spec capture on receiving: `17020` invalid spec capture settings — ASN `spec_c
 `field`), `17021` completing sorting is blocked: sorted lines still need specs captured or a skip reason (409,
 `details {asn_id, enforcement, lines}`), `17022` invalid capture request — no value and no skip reason, dimensions not
 all given, `remeasure` without every requested spec, invalid `note` (400, `field` / `details.missing`), `17023` specs can
-only be captured while the ASN is received (409, `details {asn_id, status}`).
+only be captured while the ASN is received or completed (409, `details {asn_id, status}`).
 
 Master data and permissions: `16100` invalid goods value (400), `16101` duplicate goods code in the CSV (400, with row numbers), `16102` invalid data value (400), `16103` inactive roles cannot be assigned (400), `16104` only company administrators can create / delete warehouses or change the manager (403), `16105` without company_all_access only API keys bound to yourself can be managed (403), `44004` master data referenced by documents or stock cannot be deleted — deactivate it instead (409, `details {entity, id, references}`), `44005` conflicts with existing data (409). Passwords: `10015` a new password must be 8-16 characters with an uppercase letter, a lowercase letter, a digit and a special character (`@$!%*?&`), nothing else (400, `field`, `details {min_length, max_length, special_characters}`; reset / change password, creating / editing users and staff). Built-in permissions / roles (`is_builtin`): `11011` a built-in permission cannot be renamed or deleted (409, `details {permission, reason}`), `11012` a built-in role (admin / company_admin / warehouse_admin / warehouse_operator) cannot be renamed, deactivated or deleted (409, `details {role, reason}`). Goods import: template `GET /warehouse/goods/bulk_upload/template`; errors `10004` / `10005` / `10006` / `10012` / `10014` / `16100` / `16101` carry `details {row, rows, code, columns, value}`, `10016` the file is not UTF-8 text.
 

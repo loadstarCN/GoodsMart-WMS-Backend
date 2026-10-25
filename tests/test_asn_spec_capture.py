@@ -4,7 +4,8 @@
   取默认；修改（pending）只改给了的键
 - 待采集项：missing 按商品资料缺的项、remeasure 没采集过就全部；跳过原因、已关闭、已完成且没到货的行不算；
   spec_pending_count 与列表 spec_pending= 筛选（SQL）同一口径
-- PUT /asn/<id>/details/<detail_id>/spec：只有 received 可以（17023）；值写回商品、推 goods.spec_updated（source 默认
+- PUT /asn/<id>/details/<detail_id>/spec：received 或完成后补采（completed）可以，其他状态 17023；值写回商品、推
+  goods.spec_updated（source 默认
   receiving，可传 station）；长宽高一起、至少一个值或跳过原因、remeasure 要填齐（17022）；数值 16100、原产国 10014；
   记采集时刻与人；权限 goods_edit / sorting_edit / packing_edit
 - 分拣完成：warn 照常完成、响应 spec_pending 列出分拣到但没采集的行；block → 409 17021（跳过并填了原因的、没分拣到的行不拦）；
@@ -454,9 +455,68 @@ def test_complete_warn_lists_pending_and_webhook(client, access_token):
         pending = {d['goods_code']: d['spec_pending'] for d in event.payload['details']}
     assert pending == {'G001': ['origin_country'], 'G002': []}
 
-    # 完成后不能再采集
-    response = _capture(client, _h(access_token), asn_id, line_1['id'], {'origin_country': 'CN'})
-    assert response.status_code == 409 and response.get_json()['code'] == 17023
+
+def test_capture_after_completion(client, access_token):
+    """完成后补采：同样写回商品、推 goods.spec_updated、记采集时刻与人；不重推 asn.completed。
+    pending / closed 仍 409 17023"""
+    _set_warehouse(client, default_spec_capture_fields=ALL)
+    _set_goods(client, 2, origin_country='CN')
+    with client.application.app_context():
+        spec_key = _make_key(1)
+        api_key = APIKey(key=hash_api_key('spec-asn-late'), system_name='spec_asn_late', permissions=['all_access'])
+        api_key.webhook_url = 'http://127.0.0.1:9/webhook'
+        db.session.add(api_key)
+        db.session.commit()
+        asn_key = api_key.id
+    body = _create_asn(client, access_token)
+    asn_id = body['id']
+    with client.application.app_context():
+        db.session.get(ASN, asn_id).api_key_id = asn_key
+        db.session.commit()
+    task_id = _receive(client, access_token, asn_id)
+    _sort(client, access_token, task_id, [{'goods_id': 1, 'sorted_quantity': 5, 'damage_quantity': 0},
+                                          {'goods_id': 2, 'sorted_quantity': 3, 'damage_quantity': 0}])
+    assert client.put(f'/sorting/{task_id}/complete/', headers=_h(access_token)).status_code == 200
+    completed = _asn(client, access_token, asn_id)
+    assert completed['status'] == 'completed' and completed['spec_pending_count'] == 1
+    assert asn_id in _listed(client, access_token, spec_pending='true')
+    line_1 = _lines(completed)[1]
+
+    # 补采：员工账号（sorting_edit）
+    headers = _staff_token(client, 'late-sorter', ['sorting_edit', 'asn_read'])
+    response = _capture(client, headers, asn_id, line_1['id'], {'origin_country': 'vn'})
+    assert response.status_code == 200, response.get_json()
+    data = response.get_json()
+    assert data['spec_pending'] == [] and data['goods']['origin_country'] == 'VN'
+    assert data['spec_captured_at'] is not None
+    assert data['spec_captured_by_user']['user_name'] == 'late-sorter'
+    after = _asn(client, access_token, asn_id)
+    assert after['status'] == 'completed' and after['spec_pending_count'] == 0
+    assert asn_id not in _listed(client, access_token, spec_pending='true')
+
+    with client.application.app_context():
+        events = _events(spec_key)
+        assert len(events) == 1
+        assert events[0].payload['source'] == 'receiving'
+        assert events[0].payload['changed_fields'] == ['goods_origin_country']
+        assert events[0].payload['goods_origin_country'] == 'VN'
+        # asn.completed 只在完成时推过一次
+        assert WebhookEvent.query.filter_by(api_key_id=asn_key, event_type='asn.completed').count() == 1
+
+    # 完成后跳过同样可以
+    line_2 = _lines(after)[2]
+    response = _capture(client, _h(access_token), asn_id, line_2['id'], {'note': '商品破损'})
+    assert response.status_code == 200 and response.get_json()['spec_capture_note'] == '商品破损'
+
+    # pending / closed 仍不能采集
+    pending = _create_asn(client, access_token)
+    response = _capture(client, _h(access_token), pending['id'], pending['details'][0]['id'], {'origin_country': 'CN'})
+    assert (response.status_code, response.get_json()['code']) == (409, 17023)
+    assert response.get_json()['details'] == {'asn_id': pending['id'], 'status': 'pending'}
+    assert client.put(f"/asn/{pending['id']}/close/", headers=_h(access_token)).status_code == 200
+    response = _capture(client, _h(access_token), pending['id'], pending['details'][0]['id'], {'origin_country': 'CN'})
+    assert (response.status_code, response.get_json()['code']) == (409, 17023)
+    assert response.get_json()['details'] == {'asn_id': pending['id'], 'status': 'closed'}
 
 
 def test_complete_block_until_captured_or_skipped(client, access_token):

@@ -296,7 +296,8 @@ class ASNDetailSpec(Resource):
     @api_ns.marshal_with(asn_detail_model)
     def put(self, asn_id, detail_id):
         """
-        Capture (or skip) the specs of an ASN line while the ASN is received (else 409 17023).
+        Capture (or skip) the specs of an ASN line while the ASN is received, or later once it is completed
+        (catching up; else 409 17023).
         Requires any of goods_edit, sorting_edit or packing_edit (same as PUT /goods/<id>/origin-country).
         - weight (kg), length / width / height (mm, all three together), origin_country (ISO 3166-1 alpha-2): the
           given values are written to the goods master data (empty / null values are ignored, nothing is cleared;

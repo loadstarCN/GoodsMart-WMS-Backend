@@ -15,8 +15,9 @@
 - 分拣完成（SortingTaskService.complete_task）只看本单分拣到的商品（合格 + 破损 > 0），按仓库当前的
   spec_capture_enforcement：warn → 照常完成，分拣任务响应的 spec_pending 列出未采集的行；block → 还有未采集的行
   （跳过并填了原因的不算）→ 409 17021，details {asn_id, enforcement, lines}
-- 采集：PUT /asn/<id>/details/<detail_id>/spec（SpecCaptureService.capture），测到的值写回商品主数据
-  （GoodsService.update_goods，来源 spec_source 默认 receiving，可显式传 station 等；规格有变化照常推 goods.spec_updated）
+- 采集：PUT /asn/<id>/details/<detail_id>/spec（SpecCaptureService.capture），收货通知为 received 或 completed（完成后补采）
+  时可用，测到的值写回商品主数据（GoodsService.update_goods，来源 spec_source 默认 receiving，可显式传 station 等；规格有变化
+  照常推 goods.spec_updated）
 """
 from flask import g
 from sqlalchemy import Text, and_, cast, exists, func, or_
@@ -198,6 +199,9 @@ def pending_condition():
 # 采集
 # ---------------------------------------------------------------------------
 
+# 能采集的收货通知状态：收货后、分拣中（received），以及完成后补采（completed）；pending / closed → 409 17023
+CAPTURABLE_STATUSES = ('received', 'completed')
+
 def _invalid(message, field=None, details=None):
     return BadRequestException(message, SPEC_CAPTURE_REQUEST_INVALID, field, details=details)
 
@@ -259,7 +263,8 @@ class SpecCaptureService:
     @staticmethod
     @transactional
     def capture(asn, detail_id: int, data) -> ASNDetail:
-        """采集（或跳过）一行明细的规格：只有 received 的收货通知可以（否则 409 17023）。
+        """采集（或跳过）一行明细的规格：收货通知为 received，或已完成后补采（completed）；其他状态 409 17023。
+        补采与收货时采集相同：写回商品、推 goods.spec_updated、记采集时刻与人（asn.completed 已推送过，不再重推）。
 
         - remeasure 模式没填跳过原因时，单据的采集项要全部给出（400 17022，details {missing}）
         - 有值 → 写回商品主数据（规格有变化推 goods.spec_updated，source 见 parse）
@@ -268,11 +273,11 @@ class SpecCaptureService:
         """
         from .services import ASNService
 
-        # 先锁单据并重读状态：与分拣完成串行（完成时要么看到这次采集，要么这次因单据已完成 409）
+        # 先锁单据并重读状态：与分拣完成串行（block 模式下完成时要么看到这次采集，要么这次在完成之后、算补采）
         asn = lock_row(asn)
-        if asn.status != 'received':
+        if asn.status not in CAPTURABLE_STATUSES:
             raise ConflictException(
-                f"Specs can only be captured while the ASN is received (ASN {asn.id} is {asn.status})",
+                f"Specs can only be captured while the ASN is received or completed (ASN {asn.id} is {asn.status})",
                 SPEC_CAPTURE_NOT_ALLOWED, details={'asn_id': asn.id, 'status': asn.status})
         detail = ASNService.get_asn_detail(asn.id, detail_id)
         values, note, source = SpecCaptureService.parse(data)
