@@ -96,9 +96,17 @@ inventory_pagination_parser.add_argument(
          'sorted_damage_stock of it can only go to damaged locations)')
 
 # 待上架汇总（首页 / 侧栏的数字）：范围与库存列表相同（X-WAREHOUSE-ID / warehouse_id → 该仓库；否则调用方可访问的仓库）
+def _optional_warehouse_id(value):
+    """warehouse_id：空串（界面选「全部仓库」时带上的 warehouse_id=）= 没给仓库，按可访问的全部仓库汇总，不再 400"""
+    if value is None or not str(value).strip():
+        return None
+    return int(value)
+
+
 pending_putaway_summary_parser = api_ns.parser()
-pending_putaway_summary_parser.add_argument('warehouse_id', type=int, location='args',
-                                            help='Warehouse ID (or the X-WAREHOUSE-ID header)')
+pending_putaway_summary_parser.add_argument('warehouse_id', type=_optional_warehouse_id, location='args',
+                                            help='Warehouse ID (or the X-WAREHOUSE-ID header); empty / not given = '
+                                                 'every warehouse the caller can access')
 pending_putaway_summary_parser.add_argument('keyword', type=str, location='args',
                                             help='Goods keyword, same as GET /inventory/ (code / name / manufacturer '
                                                  '/ category / tags / brand)')

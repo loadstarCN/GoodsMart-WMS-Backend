@@ -301,7 +301,16 @@ def test_goods_code_exact_then_prefix_then_name(client, access_token):
     assert _highlighted(group['items'][0], 'code') == ['ABC']
     assert _highlighted(group['items'][1], 'code') == ['ABC']
     assert _highlighted(group['items'][2], 'title') == ['abc']
-    assert all(item['exact'] is False for item in group['items'])
+    # 编码完全相同（大小写不敏感）= exact：排在全部结果前面、也在 exact_matches 里；前缀 / 名称不是
+    assert [item['exact'] for item in group['items']] == [True, False, False]
+    assert [(item['type'], item['id']) for item in result['exact_matches']] == [('goods', exact)]
+    result = _search(client, _h(access_token), q='ABC-1')
+    assert result['groups'][0]['type'] == 'goods' and result['exact_matches'][0]['id'] == prefix
+    # 1 个字符：只比完全相同，同样 exact
+    with client.application.app_context():
+        single = _new_goods('Q', 'Single')
+    item = _item(_search(client, _h(access_token), q='q', types='goods'), 'goods', single)
+    assert item['exact'] is True and item['matched_goods'] is None
 
 
 def test_location_code(client, access_token):
@@ -541,3 +550,66 @@ def test_highlight_offsets_are_utf16(client, access_token):
     item = _item(_search(client, _h(access_token), q='抹茶', types='goods'), 'goods', goods_id)
     assert item['highlights'] == [{'field': 'title', 'start': 2, 'end': 4},
                                   {'field': 'columns.name', 'start': 2, 'end': 4}]
+
+
+# ---------------------------------------------------------------------------------------------
+# 发货任务的运单号、明细商品的 matched_goods
+# ---------------------------------------------------------------------------------------------
+
+def test_delivery_task_tracking_number_matches_like_the_dn(client, access_token):
+    with client.application.app_context():
+        task = DeliveryTask.query.filter_by(tracking_number='DT-TEST-001').one()
+        task.tracking_number = 'AB 7946-0000-01'
+        db.session.commit()
+        task_id, dn_id = task.id, task.dn_id
+
+    # 完整号码（去空白 / 连字符）：DN 与发货任务都 exact
+    result = _search(client, _h(access_token), q='ab7946000001')
+    item = _item(result, 'delivery', task_id)
+    assert item['exact'] is True and item['matched_field'] == 'tracking_number'
+    assert _highlighted(item) == ['AB 7946-0000-01']
+    assert {(x['type'], x['id']) for x in result['exact_matches']} >= {('dn', dn_id), ('delivery', task_id)}
+    # 6 位以上可以只输一段；太短只认完整号码
+    item = _item(_search(client, _h(access_token), q='946000', types='delivery'), 'delivery', task_id)
+    assert item['exact'] is False and item['matched_field'] == 'tracking_number' and _highlighted(item) == ['946-000']
+    assert task_id not in _ids(_search(client, _h(access_token), q='AB79', types='delivery'), 'delivery')
+
+    # 任务上还没有运单号：按 DN 的当前运单号（有效的自动 / 手工运单），副标题显示它
+    with client.application.app_context():
+        db.session.get(DeliveryTask, task_id).tracking_number = None
+        db.session.add(DNCarrierShipment(dn_id=dn_id, source='manual', status='active', tracking_number='7700 1122 33'))
+        db.session.commit()
+    item = _item(_search(client, _h(access_token), q='770011223', types='delivery'), 'delivery', task_id)
+    assert item['matched_field'] == 'tracking_number' and _highlighted(item) == ['7700 1122 3']
+    item = _item(_search(client, _h(access_token), q='7700-1122-33', types='delivery'), 'delivery', task_id)
+    assert item['exact'] is True
+
+
+def test_matched_goods_of_documents_and_tasks(client, access_token):
+    with client.application.app_context():
+        picking = get_picking_task()
+        dn = picking.dn
+        goods = Goods.query.filter_by(code='G001').first()
+        db.session.add(DNDetail(dn_id=dn.id, goods_id=goods.id, quantity=4, created_by=get_admin_user().id))
+        db.session.commit()
+        quantity = sum(detail.quantity for detail in dn.details if detail.goods_id == goods.id)
+        expected = {'goods_id': goods.id, 'code': 'G001', 'name': 'Sample Goods', 'quantity': quantity}
+        dn_id, picking_id = dn.id, picking.id
+
+    result = _search(client, _h(access_token), q='g001', types='dn,picking')
+    item = _item(result, 'dn', dn_id)
+    assert item['matched_field'] == 'goods_code' and item['matched_goods'] == expected
+    assert 'G001 Sample Goods' in item['subtitle']                    # 副标题照旧
+    assert _item(result, 'picking', picking_id)['matched_goods'] == expected
+    # 按名称命中同样给；按单号命中、明细商品不含关键字 → null
+    assert _item(_search(client, _h(access_token), q='sample goods', types='dn'), 'dn', dn_id)['matched_goods'][
+        'goods_id'] == goods.id
+    item = _item(_search(client, _h(access_token), q=f'DN-{dn_id}', types='dn'), 'dn', dn_id)
+    assert item['matched_goods'] is None
+
+    # 其余单据 / 任务：都有 matched_goods，数量为整数
+    result = _search(client, _h(access_token), q='Sample Goods')
+    for type_ in ('asn', 'sorting', 'packing', 'delivery', 'cyclecount', 'adjustment'):
+        matched = _group(result, type_)['items'][0]['matched_goods']
+        assert matched and matched['name'] == 'Sample Goods' and isinstance(matched['quantity'], int), type_
+    assert _group(result, 'goods')['items'][0]['matched_goods'] is None

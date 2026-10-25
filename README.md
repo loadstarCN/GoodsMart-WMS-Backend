@@ -358,19 +358,21 @@ Types (`type` = `url_hint.page`; the front end opens `/<page>/detail/<id>`) and 
 | `dn` | `number` (DN-163 / plain digits), `order_number`, `tracking_number` (the current waybill number, compared without spaces / hyphens like the DN list: the full number, or a part of 6+ characters), `recipient_name`, detail `goods_code` / `goods_name` |
 | `asn` | `number` (ASN-12), `order_number` (external order number), `tracking_number` (separators ignored), `supplier_name`, detail goods |
 | `sorting` | `number` (SORT-), `asn_number` (ASN- / plain digits), goods of the ASN's details |
-| `picking` / `packing` / `delivery` | `number` (PICK- / PACK- / DEL-), `dn_number` (DN- / plain digits), goods of the DN's details |
+| `picking` / `packing` / `delivery` | `number` (PICK- / PACK- / DEL-), `dn_number` (DN- / plain digits), goods of the DN's details; `delivery` also `tracking_number` (the task's own number or the DN's current one, compared like the DN list) |
 | `cyclecount` | `number` (CC-), `task_name`, detail goods |
 | `adjustment` | `number` (ADJ- / plain digits), `cyclecount_number` (source cycle count, CC- prefix only, as in the adjustment list), detail goods |
-| `goods` | `goods_code` (equal first, then prefix), `name` (contains) |
+| `goods` | `goods_code` (equal, case-insensitive = `exact: true`; then prefix), `name` (contains) |
 | `location` | `location_code` (equal / prefix / contains) |
 | `recipient` | `name`, `organization`. Only the name and city-level fields (city / state / country) are returned — no phone, email or street address |
 
 Detail goods: code equal / prefix (`goods_code`), name contains (`goods_name`); the subtitle then shows the first matching
-goods (code name).
+goods (code name), and `matched_goods` gives it as `{goods_id, code, name, quantity}` (quantity of that goods in the
+document: planned quantity; cycle counts: system quantity; adjustments: adjustment quantity; null when no detail goods
+matched).
 
 Matching and order: case-insensitive; `%` and `_` in LIKE match literally; document number prefixes are written as in
 the list keyword search (`DN-163`, `dn163`, `DN #163`); plain digits try document numbers and tracking numbers. Within
-a group: full document number (with prefix) / full tracking number (`exact: true`) → plain-digit number / related
+a group: full document number (with prefix) / full tracking number / the same goods code (`exact: true`) → plain-digit number / related
 document number / equal → prefix → contains, then id descending. Groups with an exact item come first, and all exact
 items are also listed in `exact_matches` (to pin them on top of the overall list).
 

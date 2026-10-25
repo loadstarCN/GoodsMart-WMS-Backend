@@ -321,16 +321,18 @@ GoodsMart-WMS-Backend/
 | `dn` | `number`（DN-163 / 纯数字）、`order_number`、`tracking_number`（当前有效运单号，去空白 / 连字符比较，同 DN 列表：完整号码，或 6 位以上的一段）、`recipient_name`、明细的 `goods_code` / `goods_name` |
 | `asn` | `number`（ASN-12）、`order_number`（外部订单号）、`tracking_number`（去分隔符比较）、`supplier_name`、明细商品 |
 | `sorting` | `number`（SORT-）、`asn_number`（ASN- / 纯数字）、所属 ASN 的明细商品 |
-| `picking` / `packing` / `delivery` | `number`（PICK- / PACK- / DEL-）、`dn_number`（DN- / 纯数字）、所属 DN 的明细商品 |
+| `picking` / `packing` / `delivery` | `number`（PICK- / PACK- / DEL-）、`dn_number`（DN- / 纯数字）、所属 DN 的明细商品；`delivery` 另按 `tracking_number`（任务自己的运单号或所属 DN 的当前运单号，与 DN 列表同一口径） |
 | `cyclecount` | `number`（CC-）、`task_name`、明细商品 |
 | `adjustment` | `number`（ADJ- / 纯数字）、`cyclecount_number`（来源盘点单，只认 CC- 前缀，同调整单列表）、明细商品 |
-| `goods` | `goods_code`（相同优先，其次前缀）、`name`（包含） |
+| `goods` | `goods_code`（完全相同、大小写不敏感 = `exact: true`；其次前缀）、`name`（包含） |
 | `location` | `location_code`（相同 / 前缀 / 包含） |
 | `recipient` | `name`、`organization`（公司名）。只返回名称与城市级别信息（城市 / 州省 / 国家），不返回电话、邮箱、详细地址 |
 
-明细商品：编码相同 / 前缀（`goods_code`）、名称包含（`goods_name`），副标题带上第一个命中的商品（编码 名称）。
+明细商品：编码相同 / 前缀（`goods_code`）、名称包含（`goods_name`），副标题带上第一个命中的商品（编码 名称），另给结构化的
+`matched_goods` `{goods_id, code, name, quantity}`（数量 = 这张单据里该商品的数量：计划量；盘点为系统数量，调整为调整量；没有按明细商品
+命中时为 null）。
 
-匹配与排序：大小写不敏感；LIKE 的 `%` `_` 按字面匹配；单号前缀的写法与各列表的关键字搜索一致（`DN-163`、`dn163`、`DN #163`）；纯数字同时试编号和运单号。组内：完整单号（带前缀）/ 完整运单号（`exact: true`）→ 纯数字编号 / 关联单号 / 完全相同 → 前缀 → 包含，同档按 id 倒序。有 exact 条目的组排在前面，全部 exact 条目另在 `exact_matches` 里（总列表置顶用）。
+匹配与排序：大小写不敏感；LIKE 的 `%` `_` 按字面匹配；单号前缀的写法与各列表的关键字搜索一致（`DN-163`、`dn163`、`DN #163`）；纯数字同时试编号和运单号。组内：完整单号（带前缀）/ 完整运单号 / 商品编码完全相同（`exact: true`）→ 纯数字编号 / 关联单号 / 完全相同 → 前缀 → 包含，同档按 id 倒序。有 exact 条目的组排在前面，全部 exact 条目另在 `exact_matches` 里（总列表置顶用）。
 
 权限与隔离：每类只在调用方有对应查看权限（`dn_read` `asn_read` `sorting_read` `picking_read` `packing_read` `delivery_read` `cycle_count_read` `adjustment_read` `goods_read` `location_read` `recipient_read`，或 `all_access` / `company_all_access`）时才搜，判断同 `permission_required`（API Key 按 key 的权限）；没有权限的类型不出现在 `types` / `counts` / `groups` 里，一类都没有 → 200 空结果（不 403）。数据范围直接用各模块列表的查询函数：公司 / 仓库隔离、默认只看启用的，与列表一致（单据 / 任务 / 库位按仓库范围，商品 / 收货方按公司）。
 

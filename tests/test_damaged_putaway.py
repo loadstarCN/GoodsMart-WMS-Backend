@@ -308,6 +308,24 @@ def test_pending_putaway_summary_for_putaway_operators(client, access_operator_t
     assert client.get('/inventory/pending-putaway/summary', headers=_h(access_operator_token)).status_code == 400
 
 
+def test_pending_putaway_summary_all_warehouses_for_company_admin(client, access_company_admin_token):
+    """公司管理员选「全部仓库」（不带仓库，或带空的 warehouse_id=）：按可访问的全部仓库汇总，warehouse_id 为 null"""
+    with client.application.app_context():
+        warehouse_a = get_warehouse().id
+        warehouse_b = Warehouse.query.filter_by(name='Warehouse Test').first().id
+        set_stock(get_goods().id, warehouse_a, pending=3, pending_damaged=1)
+        set_stock(get_goods().id, warehouse_b, pending=5)
+
+    for query in ('', '?warehouse_id='):
+        response = client.get(f'/inventory/pending-putaway/summary{query}', headers=_h(access_company_admin_token))
+        body = _ok(response)
+        assert (body['warehouse_id'], body['inventory_count'], body['total_quantity'], body['damaged_quantity']) == (
+            None, 2, 9, 1), query
+    body = _ok(client.get(f'/inventory/pending-putaway/summary?warehouse_id={warehouse_b}',
+                          headers=_h(access_company_admin_token)))
+    assert (body['warehouse_id'], body['total_quantity']) == (warehouse_b, 5)
+
+
 # ---------------------------------------------------------------------------
 # 待上架的停留时间：pending_since（先进先上）与汇总的超期件数
 # ---------------------------------------------------------------------------

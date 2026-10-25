@@ -45,6 +45,14 @@ highlight_model = api_ns.model('GlobalSearchHighlight', {
     'end': fields.Integer(description='End offset (exclusive)'),
 })
 
+matched_goods_model = api_ns.model('GlobalSearchMatchedGoods', {
+    'goods_id': fields.Integer(description='Goods ID'),
+    'code': fields.String(description='Goods code'),
+    'name': fields.String(description='Goods name'),
+    'quantity': fields.Integer(description='Quantity of this goods in the document (planned quantity; cycle counts: '
+                                           'system quantity; adjustments: adjustment quantity)'),
+})
+
 url_hint_model = api_ns.model('GlobalSearchUrlHint', {
     'page': fields.String(description='Front-end page type (= type): /<page>/detail/<id>'),
     'id': fields.Integer(description='Record ID'),
@@ -65,8 +73,11 @@ search_item_model = api_ns.model('GlobalSearchItem', {
         description='Best matching field: number / dn_number / asn_number / cyclecount_number / order_number / '
                     'tracking_number / recipient_name / supplier_name / task_name / goods_code / goods_name / '
                     'location_code / name / organization'),
-    'exact': fields.Boolean(description='Full document number (with prefix) or full tracking number matched; '
-                                        'such items come first'),
+    'exact': fields.Boolean(description='Full document number (with prefix), full tracking number or the same goods '
+                                        'code (case-insensitive) matched; such items come first'),
+    'matched_goods': fields.Nested(matched_goods_model, allow_null=True,
+                                   description='Documents / tasks: the first detail goods matching the keyword '
+                                               '(the subtitle shows its code and name too); null otherwise'),
     'highlights': fields.List(fields.Nested(highlight_model),
                               description='Matched ranges in the display texts'),
     'columns': fields.Raw(description='List columns of the type (only when exactly one type is searched)'),

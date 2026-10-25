@@ -75,8 +75,9 @@ class InventoryPendingPutawaySummary(Resource):
     def get(self):
         """Summary of the stock waiting to be put away (for the home page / sidebar badges)
 
-        Scope is the same as GET /inventory/: the warehouse in `warehouse_id` / `X-WAREHOUSE-ID`, else every
-        warehouse the caller can access (staff / API keys: their own company); `company_id` narrows it further.
+        Scope is the same as GET /inventory/: the warehouse in `warehouse_id` / `X-WAREHOUSE-ID`, else (not given or
+        an empty `warehouse_id=`, e.g. a company admin on "all warehouses") every warehouse the caller can access
+        (staff / API keys: their own company) with `warehouse_id: null`; `company_id` narrows it further.
         `keyword` filters the goods like GET /inventory/ (code / name / manufacturer / category / tags / brand).
         Counts only rows with `sorted_stock > 0`:
         - `inventory_count`: rows (= `total` of `GET /inventory/?pending_putaway=true` with the same scope)

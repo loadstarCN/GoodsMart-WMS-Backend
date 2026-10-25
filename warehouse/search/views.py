@@ -39,8 +39,10 @@ class GlobalSearch(Resource):
         - `scope`: warehouse (default; X-WAREHOUSE-ID / warehouse_id like the lists) / all (every accessible warehouse)
         - `limit`: items per type (default 5, max 50). With exactly one type: `page` / `per_page` and `columns`
         - Document numbers as shown (DN-163, PICK-5, CC-12 …) match exactly (`exact`: true, listed first, also in
-          `exact_matches`); so do full tracking numbers (spaces / hyphens ignored). Plain digits try numbers and
+          `exact_matches`); so do full tracking numbers (spaces / hyphens ignored; delivery tasks by their own number
+          or the DN's current one) and goods codes that are the same (case-insensitive). Plain digits try numbers and
           tracking numbers. Shorter than 2 characters: exact numbers / codes only
+        - `matched_goods` {goods_id, code, name, quantity}: documents / tasks matched by a detail goods
         - `highlights`: matched ranges in code / title / subtitle / columns.<key> (UTF-16 offsets, end exclusive)
         """
         args = search_parser.parse_args()

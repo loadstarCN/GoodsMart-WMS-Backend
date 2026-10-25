@@ -10,11 +10,13 @@
 
 匹配（大小写不敏感；LIKE 的 % _ 已转义；q 去首尾空白后最多 MAX_QUERY_LENGTH 个字符，多的截掉）：
 - 单号：复用列表的 number_conditions（DN-163 / PICK-5 / 纯数字……，前缀与列的对应同各列表）
-- 运单号：去空白 / 连字符比较，与 DN 列表同一口径（完整号码精确；TRACKING_PARTIAL_MIN 位以上可以只输一段）
-- 单据 / 作业任务另按明细里的商品编码（相同 / 前缀）、商品名称（包含）
+- 运单号：去空白 / 连字符比较，与 DN 列表同一口径（完整号码精确；TRACKING_PARTIAL_MIN 位以上可以只输一段）；
+  发货任务按自己的运单号或所属 DN 的当前运单号（同 DN 列表）
+- 单据 / 作业任务另按明细里的商品编码（相同 / 前缀）、商品名称（包含）；命中的第一件商品另给结构化的 matched_goods
+  {goods_id, code, name, quantity}（数量 = 这张单据里该商品的数量合计），副标题照旧带上编码与名称
 - q 少于 MIN_FUZZY_LENGTH 个字符：只比单号与商品 / 库位编码（完全相同）
-排序（rank）：0 完整单号（带前缀）/ 完整运单号（exact = true）→ 1 纯数字编号 / 关联单号 / 完全相同 → 2 前缀 → 3 包含；
-同级按 id 倒序。
+排序（rank）：0 完整单号（带前缀）/ 完整运单号 / 商品编码完全相同（exact = true）→ 1 纯数字编号 / 关联单号 / 完全相同
+→ 2 前缀 → 3 包含；同级按 id 倒序。
 高亮：highlights [{field, start, end}] 按返回的显示文本（code / title / subtitle / columns.<列>）计，UTF-16 码元下标
 （与 JavaScript 字符串下标一致），end 不含；运单号去分隔符匹配时换算回显示文本里的位置。
 """
@@ -263,16 +265,23 @@ def _tracking_matches(term, normalized_column, contains_condition):
     return matches
 
 
-def _matched_goods(term, goods_list):
-    """明细里第一个命中关键字的商品（副标题带上）：编码相同 / 前缀，或名称包含"""
+def _matched_goods(term, goods_rows):
+    """明细里第一个命中关键字的商品（副标题带上）：编码相同 / 前缀，或名称包含。
+    goods_rows = [(商品, 数量)] → (商品, 这张单据里它的数量合计)；没有命中 → (None, None)"""
     if not term.fuzzy:
-        return None
-    for goods in goods_list:
-        if goods is None:
-            continue
+        return None, None
+    rows = [(goods, quantity) for goods, quantity in goods_rows if goods is not None]
+    for goods, _quantity in rows:
         if term.code_prefix_spans(goods.code or '') or term.text_spans(goods.name or ''):
-            return goods
-    return None
+            return goods, sum(quantity or 0 for other, quantity in rows if other.id == goods.id)
+    return None, None
+
+
+def _goods_ref(goods, quantity):
+    """结构化的命中商品 matched_goods"""
+    if goods is None:
+        return None
+    return {'goods_id': goods.id, 'code': goods.code, 'name': goods.name, 'quantity': quantity}
 
 
 def _add_goods(text, term, goods):
@@ -321,7 +330,7 @@ class _SearchType:
         return None
 
     def build(self, obj, term, ctx, with_columns):
-        """→ (code: _Text, title: _Text, subtitle: _Text, status, warehouse_id, columns, column_spans)"""
+        """→ (code: _Text, title: _Text, subtitle: _Text, status, warehouse_id, columns, column_spans, matched_goods)"""
         raise NotImplementedError
 
     # ---------------------------------------------------------------------
@@ -365,7 +374,8 @@ class _SearchType:
                        for obj, row_rank, row_field in rows]
 
     def _item(self, obj, rank, field, term, ctx, with_columns):
-        code, title, subtitle, status, warehouse_id, columns, column_spans = self.build(obj, term, ctx, with_columns)
+        code, title, subtitle, status, warehouse_id, columns, column_spans, matched_goods = self.build(
+            obj, term, ctx, with_columns)
         highlights = code.highlights('code') + title.highlights('title') + subtitle.highlights('subtitle')
         if with_columns:
             for key, spans in (column_spans or {}).items():
@@ -384,6 +394,8 @@ class _SearchType:
             'matched_field': field,
             'exact': rank == RANK_EXACT,
             'highlights': highlights,
+            # 单据 / 作业任务按明细商品命中时：第一个命中的明细商品 {goods_id, code, name, quantity}；其余为 null
+            'matched_goods': matched_goods,
             'columns': columns if with_columns else None,
         }
 
@@ -415,7 +427,7 @@ class _DNSearch(_SearchType):
         shipping = (ctx or {}).get(dn.id) or {}
         tracking = shipping.get('tracking_number')
         recipient_name = _name(dn.recipient)
-        goods = _matched_goods(term, (detail.goods for detail in dn.details))
+        goods, quantity = _matched_goods(term, ((detail.goods, detail.quantity) for detail in dn.details))
         code = _Text(_code('DN', dn.id), term.number_spans('DN', dn.id))
         title = _Text(recipient_name, term.text_spans)
         subtitle = _Text(dn.order_number, term.text_spans).add(tracking, term.tracking_spans)
@@ -432,7 +444,7 @@ class _DNSearch(_SearchType):
         } if with_columns else None
         spans = {'recipient_name': term.text_spans, 'order_number': term.text_spans,
                  'tracking_number': term.tracking_spans}
-        return code, title, subtitle, dn.status, dn.warehouse_id, columns, spans
+        return code, title, subtitle, dn.status, dn.warehouse_id, columns, spans, _goods_ref(goods, quantity)
 
 
 class _ASNSearch(_SearchType):
@@ -458,7 +470,7 @@ class _ASNSearch(_SearchType):
 
     def build(self, asn, term, ctx, with_columns):
         supplier_name = _name(asn.supplier)
-        goods = _matched_goods(term, (detail.goods for detail in asn.details))
+        goods, quantity = _matched_goods(term, ((detail.goods, detail.quantity) for detail in asn.details))
         code = _Text(_code('ASN', asn.id), term.number_spans('ASN', asn.id))
         title = _Text(supplier_name, term.text_spans)
         subtitle = _Text(asn.order_number, term.text_spans).add(asn.tracking_number, term.tracking_spans)
@@ -473,7 +485,7 @@ class _ASNSearch(_SearchType):
         } if with_columns else None
         spans = {'supplier_name': term.text_spans, 'order_number': term.text_spans,
                  'tracking_number': term.tracking_spans}
-        return code, title, subtitle, asn.status, asn.warehouse_id, columns, spans
+        return code, title, subtitle, asn.status, asn.warehouse_id, columns, spans, _goods_ref(goods, quantity)
 
 
 class _TaskSearch(_SearchType):
@@ -486,9 +498,10 @@ class _TaskSearch(_SearchType):
         raise NotImplementedError
 
     def goods_of(self, task):
+        """明细商品 [(商品, 数量)]（matched_goods 的数量：计划量；盘点为系统数量，调整为调整量）"""
         return []
 
-    def describe(self, task, term, related_code, related_spans):
+    def describe(self, task, term, related_code, related_spans, ctx=None):
         """→ (标题, 副标题的开头部分)：默认标题 = 关联单号"""
         return _Text(related_code, related_spans), _Text()
 
@@ -499,8 +512,9 @@ class _TaskSearch(_SearchType):
         related_code = _code(related.prefix, related_id) if related else None
         related_spans = term.number_spans(related.prefix, related_id, related.plain) if related else None
         code = _Text(_code(self.code_prefix, task.id), term.number_spans(self.code_prefix, task.id))
-        title, subtitle = self.describe(task, term, related_code, related_spans)
-        _add_goods(subtitle, term, _matched_goods(term, self.goods_of(task))).add(_name(warehouse))
+        title, subtitle = self.describe(task, term, related_code, related_spans, ctx)
+        goods, quantity = _matched_goods(term, self.goods_of(task))
+        _add_goods(subtitle, term, goods).add(_name(warehouse))
         columns = {
             'task_type': self.name,
             'related_code': related_code,
@@ -509,7 +523,8 @@ class _TaskSearch(_SearchType):
             'warehouse_name': _name(warehouse),
         } if with_columns else None
         spans = {'related_code': related_spans} if related else {}
-        return code, title, subtitle, task.status, getattr(warehouse, 'id', None), columns, spans
+        return (code, title, subtitle, task.status, getattr(warehouse, 'id', None), columns, spans,
+                _goods_ref(goods, quantity))
 
 
 class _SortingSearch(_TaskSearch):
@@ -529,9 +544,9 @@ class _SortingSearch(_TaskSearch):
         return task.asn_id, getattr(task.asn, 'warehouse', None)
 
     def goods_of(self, task):
-        return [detail.goods for detail in task.asn.details] if task.asn else []
+        return [(detail.goods, detail.quantity) for detail in task.asn.details] if task.asn else []
 
-    def describe(self, task, term, related_code, related_spans):
+    def describe(self, task, term, related_code, related_spans, ctx=None):
         return _Text(related_code, related_spans), _Text(_name(task.asn.supplier) if task.asn else None)
 
 
@@ -547,9 +562,9 @@ class _DNTaskSearch(_TaskSearch):
         return task.dn_id, getattr(task.dn, 'warehouse', None)
 
     def goods_of(self, task):
-        return [detail.goods for detail in task.dn.details] if task.dn else []
+        return [(detail.goods, detail.quantity) for detail in task.dn.details] if task.dn else []
 
-    def describe(self, task, term, related_code, related_spans):
+    def describe(self, task, term, related_code, related_spans, ctx=None):
         subtitle = _Text()
         if task.dn is not None:
             subtitle.add(_name(task.dn.recipient)).add(task.dn.order_number)
@@ -586,9 +601,32 @@ class _DeliverySearch(_DNTaskSearch):
     def base_query(self, scope, company_id):
         return DeliveryTaskService.list_tasks(scope).options(joinedload(DeliveryTask.dn).selectinload(DN.details))
 
-    def describe(self, task, term, related_code, related_spans):
-        title, subtitle = super().describe(task, term, related_code, related_spans)
-        return title, subtitle.add(task.tracking_number)
+    def matches(self, term):
+        """明细商品之外，按运单号：任务自己的，或所属 DN 的当前运单号（与 DN 列表同一口径：去空白 / 连字符，完整号码 exact，
+        TRACKING_PARTIAL_MIN 位以上可以只输一段）"""
+        matches = super().matches(term)
+        if not term.fuzzy or not term.tracking:
+            return matches
+        own = _normalized_tracking_sql(DeliveryTask.tracking_number)
+        current = _normalized_tracking_sql(tracking_number_expression())
+        exact = or_(own == term.tracking, DeliveryTask.dn.has(current == term.tracking))
+        partial = None
+        if len(term.tracking) >= TRACKING_PARTIAL_MIN:
+            partial = or_(own.like(f'%{_escape_like(term.tracking)}%', escape='!'),
+                          DeliveryTask.dn.has(tracking_search_condition(term.text)))
+        matches.append(_Match('tracking_number', RANK_EXACT, exact, narrow=partial is not None))
+        if partial is not None:
+            matches.append(_Match('tracking_number', RANK_CONTAINS, partial))
+        return matches
+
+    def prepare(self, objects, scope, company_id, with_columns):
+        # 任务上还没有运单号（自动运单 / 文件方式导回之前）时副标题显示 DN 的当前运单号
+        return shipping_rows(task.dn_id for task in objects)
+
+    def describe(self, task, term, related_code, related_spans, ctx=None):
+        title, subtitle = super().describe(task, term, related_code, related_spans, ctx)
+        tracking = task.tracking_number or ((ctx or {}).get(task.dn_id) or {}).get('tracking_number')
+        return title, subtitle.add(tracking, term.tracking_spans)
 
 
 class _CycleCountSearch(_TaskSearch):
@@ -610,9 +648,9 @@ class _CycleCountSearch(_TaskSearch):
         return None, task.warehouse
 
     def goods_of(self, task):
-        return [detail.goods for detail in task.task_details]
+        return [(detail.goods, detail.system_quantity) for detail in task.task_details]
 
-    def describe(self, task, term, related_code, related_spans):
+    def describe(self, task, term, related_code, related_spans, ctx=None):
         return _Text(task.task_name, term.text_spans), _Text()
 
 
@@ -633,9 +671,9 @@ class _AdjustmentSearch(_TaskSearch):
         return task.cyclecount_id, task.warehouse
 
     def goods_of(self, task):
-        return [detail.goods for detail in task.details]
+        return [(detail.goods, detail.adjustment_quantity) for detail in task.details]
 
-    def describe(self, task, term, related_code, related_spans):
+    def describe(self, task, term, related_code, related_spans, ctx=None):
         # 标题 = 调整原因；没填原因时用来源盘点单号
         if not task.adjustment_reason:
             return _Text(related_code, related_spans), _Text()
@@ -643,16 +681,17 @@ class _AdjustmentSearch(_TaskSearch):
 
 
 class _GoodsSearch(_SearchType):
-    """商品：编码（相同优先，其次前缀）、名称（包含）。公司级主数据，范围同商品列表（company_id，不按仓库）"""
+    """商品：编码（完全相同 = exact，大小写不敏感；其次前缀）、名称（包含）。公司级主数据，范围同商品列表（company_id，不按仓库）"""
     name, permission, model = 'goods', 'goods_read', Goods
 
     def base_query(self, scope, company_id):
         return GoodsService.list_goods({**scope, 'company_id': company_id})
 
     def matches(self, term):
+        exact = _Match('goods_code', RANK_EXACT, term.equals(Goods.code), narrow=term.fuzzy)
         if not term.fuzzy:
-            return [_Match('goods_code', RANK_EQUAL, term.equals(Goods.code))]
-        return (_text_matches(term, Goods.code, 'goods_code', contains=False)
+            return [exact]
+        return ([exact, _Match('goods_code', RANK_PREFIX, term.starts(Goods.code))]
                 + _text_matches(term, Goods.name, 'name', exact=False, prefix=False))
 
     def prepare(self, objects, scope, company_id, with_columns):
@@ -677,7 +716,7 @@ class _GoodsSearch(_SearchType):
             columns = {'code': goods.code, 'name': goods.name, 'brand': goods.brand,
                        'thumbnail_url': goods.thumbnail_url, **stock}
         spans = {'code': term.code_prefix_spans, 'name': term.text_spans}
-        return code, title, subtitle, None, None, columns, spans
+        return code, title, subtitle, None, None, columns, spans, None
 
 
 class _LocationSearch(_SearchType):
@@ -714,7 +753,7 @@ class _LocationSearch(_SearchType):
             kinds, quantity = (ctx or {}).get(location.id, (0, 0))
             columns = {'code': location.code, 'location_type': location.location_type,
                        'warehouse_name': _name(location.warehouse), 'goods_count': kinds, 'quantity': quantity}
-        return code, title, subtitle, None, location.warehouse_id, columns, {'code': term.code_spans}
+        return code, title, subtitle, None, location.warehouse_id, columns, {'code': term.code_spans}, None
 
 
 class _RecipientSearch(_SearchType):
@@ -735,7 +774,7 @@ class _RecipientSearch(_SearchType):
         subtitle = _Text(recipient.locality).add(recipient.admin_area).add(recipient.country)
         columns = {'name': recipient.name, 'locality': recipient.locality, 'admin_area': recipient.admin_area,
                    'country': recipient.country} if with_columns else None
-        return _Text(), title, subtitle, None, None, columns, {'name': term.text_spans}
+        return _Text(), title, subtitle, None, None, columns, {'name': term.text_spans}, None
 
 
 _TYPES = {kind.name: kind for kind in (
