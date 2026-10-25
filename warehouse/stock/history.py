@@ -156,29 +156,30 @@ def import_legacy_snapshots(warehouse_id=None, before=None) -> dict:
     result = {}
     for warehouse in query.order_by(Warehouse.id).all():
         limit = before or ledger_start_date(warehouse.id) or clock.local_today(warehouse)
-        times = [as_utc(t) for (t,) in db.session.query(InventorySnapshot.snapshot_time)
-                 .filter(InventorySnapshot.warehouse_id == warehouse.id).distinct().all()]
-        batches = {}
-        for moment in sorted(times):
+        # 一次取齐再按批分组（快照时刻在 SQLite 上是数据库 now() 写的秒级字符串，按时刻等值查询对不上）
+        rows = (db.session.query(InventorySnapshot.snapshot_time, InventorySnapshot.goods_id,
+                                 InventorySnapshot.location_id, Location.location_type, InventorySnapshot.quantity)
+                .join(Location, Location.id == InventorySnapshot.location_id)
+                .filter(InventorySnapshot.warehouse_id == warehouse.id).all())
+        batches = defaultdict(lambda: defaultdict(int))
+        for moment, goods_id, location_id, location_type, quantity in rows:
+            batches[as_utc(moment)][(goods_id, location_id, location_type)] += int(quantity or 0)
+        chosen = {}
+        for moment in sorted(batches):
             day = clock.local_date(moment, warehouse) - timedelta(days=1)
-            if day < limit and day not in batches:
-                batches[day] = moment
+            if day < limit and day not in chosen:
+                chosen[day] = moment
         existing = {d for (d,) in db.session.query(StockDailyBalance.balance_date)
                     .filter(StockDailyBalance.warehouse_id == warehouse.id).distinct().all()}
         count = 0
-        for day, moment in sorted(batches.items()):
+        for day, moment in sorted(chosen.items()):
             if day in existing:
                 continue
-            rows = (db.session.query(InventorySnapshot.goods_id, InventorySnapshot.location_id, Location.location_type,
-                                     func.sum(InventorySnapshot.quantity))
-                    .join(Location, Location.id == InventorySnapshot.location_id)
-                    .filter(InventorySnapshot.warehouse_id == warehouse.id, InventorySnapshot.snapshot_time == moment)
-                    .group_by(InventorySnapshot.goods_id, InventorySnapshot.location_id, Location.location_type).all())
             db.session.add_all([
                 StockDailyBalance(balance_date=day, warehouse_id=warehouse.id, goods_id=goods_id, location_id=location_id,
-                                  stock_type=LOCATION_STOCK_TYPES.get(location_type, 'onhand'), quantity=int(quantity),
+                                  stock_type=LOCATION_STOCK_TYPES.get(location_type, 'onhand'), quantity=quantity,
                                   source='legacy_snapshot')
-                for goods_id, location_id, location_type, quantity in rows if quantity and quantity > 0])
+                for (goods_id, location_id, location_type), quantity in batches[moment].items() if quantity > 0])
             db.session.commit()
             count += 1
         result[warehouse.id] = count
