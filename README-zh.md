@@ -180,7 +180,7 @@ GoodsMart-WMS-Backend/
 
 ### 系统管理
 - **用户管理**: 注册、登录、JWT 令牌管理
-- **角色与权限**: RBAC 细粒度权限控制（84 项权限）
+- **角色与权限**: RBAC 细粒度权限控制（91 项内置权限）
 - **API Key**: 第三方系统集成，支持公司级数据隔离
 - **日志**: 请求日志与审计追踪
 - **IP 管控**: 黑白名单管理
@@ -198,6 +198,10 @@ GoodsMart-WMS-Backend/
 - 质量分拣（实际数量、损坏追踪）
 - 收货规格采集：按收货通知明细采集重量、尺寸、原产国（见下文；默认不开）
 - 上架至库位
+- 收货权限：`PUT /warehouse/asn/<id>/receive/` 与刷新到货跟踪（`POST /warehouse/asn/<id>/track`）接受 `asn_receive` 或
+  `asn_edit`；新建 / 修改 / 关闭 / 取消 / 删除收货通知及其明细仍要 `asn_edit`（`asn_delete`）。内置角色 `warehouse_operator`
+  用 `asn_receive` 代替 `asn_edit`（迁移 `c4e8a1f6b2d9` 从该角色上移除 `asn_edit`；要让作业员也能建单，请手工加回）。
+  分拣（含分拣完成时自动完成收货通知）只要 `sorting_edit`。
 
 #### 收货规格采集
 
@@ -257,7 +261,10 @@ GoodsMart-WMS-Backend/
 ### 库存运营
 - 实时库存追踪（多阶段：ASN → 已收货 → 已分拣 → 在库 → DN → 已拣货 → 已打包 → 已发货）
 - 库存调整（增减及原因追踪）
-- 盘点（带审批流程）
+- 盘点（带审批流程）。盘点作业——开始盘点（`PUT /warehouse/cyclecount/<id>/process/`）、录入实盘数
+  （`POST .../details-batch-save/`）、完成明细（`PUT .../details/<detail_id>/complete/`）、完成盘点单（`PUT .../complete/`）——
+  接受 `cycle_count_execute` 或 `cycle_count_edit`；新建 / 修改盘点单、增加 / 修改明细仍要 `cycle_count_edit`。内置角色
+  `warehouse_operator` 用 `cycle_count_execute` 代替 `cycle_count_edit`（迁移 `c4e8a1f6b2d9`）
 - 库位间调拨
 - 库存移除
 - 库存快照（每日定时）

@@ -152,12 +152,13 @@ class ASNReceiveResource(Resource):
     Calls the ASNService.receive_asn(asn_id) method.
     """
 
-    @permission_required(["all_access","company_all_access","asn_edit"])
+    # 作业员收货：asn_receive 或 asn_edit（新建 / 修改 / 关闭 / 取消收货通知仍只认 asn_edit）
+    @permission_required(["all_access","company_all_access","asn_receive","asn_edit"])
     @warehouse_required()
     @api_ns.marshal_with(asn_model)
     def put(self, asn_id):
         """
-        Mark a specific ASN as 'received'.
+        Mark a specific ASN as 'received' (requires asn_receive or asn_edit).
         - Returns 404 if ASN not found.
         """
         updated_asn = ASNService.receive_asn(_owned_asn(asn_id))

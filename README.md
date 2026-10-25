@@ -184,7 +184,7 @@ GoodsMart-WMS-Backend/
 
 ### System Management
 - **Users**: Registration, login, JWT token management
-- **Roles & Permissions**: RBAC with granular permission control (84 permissions)
+- **Roles & Permissions**: RBAC with granular permission control (91 built-in permissions)
 - **API Keys**: Third-party system integration with company-level isolation
 - **Logs**: Request logging and audit trail
 - **IP Control**: Whitelist/blacklist management
@@ -202,6 +202,11 @@ GoodsMart-WMS-Backend/
 - Quality sorting (actual quantity, damage tracking)
 - Spec capture on receiving: weight, dimensions and country of origin per ASN line (see below; off by default)
 - Putaway to storage locations
+- Receiving permission: `PUT /warehouse/asn/<id>/receive/` and refreshing the tracking (`POST /warehouse/asn/<id>/track`)
+  accept `asn_receive` or `asn_edit`; creating / editing / closing / cancelling / deleting an ASN and its lines still
+  needs `asn_edit` (`asn_delete`). The built-in `warehouse_operator` role has `asn_receive` instead of `asn_edit`
+  (migration `c4e8a1f6b2d9` removes `asn_edit` from that role; grant it again by hand if operators should create ASNs).
+  Sorting (including completing the ASN through sorting) only needs `sorting_edit`.
 
 #### Spec capture on receiving
 
@@ -273,7 +278,11 @@ received. It is a general feature and **off by default** (no warehouse captures 
 ### Inventory Operations
 - Real-time inventory tracking (multi-stage: ASN → received → sorted → onhand → DN → picked → packed → delivered)
 - Stock adjustment (increase/decrease with reason tracking)
-- Cycle counting (with approval workflow)
+- Cycle counting (with approval workflow). Counting — starting a count (`PUT /warehouse/cyclecount/<id>/process/`),
+  entering counts (`POST .../details-batch-save/`), completing a detail (`PUT .../details/<detail_id>/complete/`) and
+  completing the count (`PUT .../complete/`) — accepts `cycle_count_execute` or `cycle_count_edit`; creating / editing a
+  count and adding / editing its details still need `cycle_count_edit`. The built-in `warehouse_operator` role has
+  `cycle_count_execute` instead of `cycle_count_edit` (migration `c4e8a1f6b2d9`)
 - Stock transfer between locations
 - Stock removal
 - Inventory snapshots (daily scheduled)
