@@ -170,7 +170,8 @@ GoodsMart-WMS-Backend/
 │   ├── adjustment/            # Inventory: Stock adjustment
 │   ├── cyclecount/            # Inventory: Cycle counting
 │   ├── transfer/              # Inventory: Stock transfer
-│   └── removal/               # Inventory: Stock removal
+│   ├── removal/               # Inventory: Stock removal
+│   └── search/                # Global search (top-bar search box / result page)
 ├── tasks/                     # Scheduled tasks
 │   ├── commands.py            # Flask CLI (flask snapshot run)
 │   ├── snapshot.py            # Inventory snapshot logic
@@ -335,6 +336,101 @@ received. It is a general feature and **off by default** (no warehouse captures 
   string as null; a non-number or a negative value (≤ 0 for location dimensions) → 400 `16115`.
 - Cycle count and adjustment lists accept `keyword`: cycle counts by id, task name, goods / location code of a detail;
   adjustments by id, reason, goods code / name or location code of a detail.
+
+## Global Search
+
+`GET /warehouse/search` (a trailing slash works too): for the top-bar search box (Ctrl K) and the search result page.
+One keyword searches documents, tasks and master data at once; results are grouped by type. Code: `warehouse/search/`.
+
+| Parameter | Meaning |
+|-----------|---------|
+| `q` | Keyword, trimmed, at most 100 characters (the rest is cut). Shorter than 2 characters: only exact document numbers and goods / location codes. Empty: every group has 0 items |
+| `types` | Search only these types (comma separated or repeated): `dn` `asn` `sorting` `picking` `packing` `delivery` `cyclecount` `adjustment` `goods` `location` `recipient`; default all. Unknown → 400 `40000` (`field: types`, `details {unknown, allowed}`) |
+| `scope` | `warehouse` (default): the current warehouse, same as the lists (`X-WAREHOUSE-ID` header or `warehouse_id`; without one, company admins / company-bound API keys get all accessible warehouses, other staff must give one → 400 `14003`). `all`: ignore the current warehouse and use every warehouse the caller can access (company admin = all warehouses of the company, other staff = their assigned warehouses, company-bound API key = all warehouses of the company, platform admin = unrestricted). Anything else → 400 `40000` (`field: scope`) |
+| `limit` | Items per type, default 5, at most 50 |
+| `page` / `per_page` | Paging when exactly one type is searched (`per_page` defaults to `limit`, at most 50); every item then also carries the list columns `columns` |
+| `company_id` | Platform admins only: goods / recipients of this company only (same as the goods / recipient lists) |
+
+Types (`type` = `url_hint.page`; the front end opens `/<page>/detail/<id>`) and the matched field `matched_field`:
+
+| type | Searched fields |
+|------|-----------------|
+| `dn` | `number` (DN-163 / plain digits), `order_number`, `tracking_number` (the current waybill number, compared without spaces / hyphens like the DN list: the full number, or a part of 6+ characters), `recipient_name`, detail `goods_code` / `goods_name` |
+| `asn` | `number` (ASN-12), `order_number` (external order number), `tracking_number` (separators ignored), `supplier_name`, detail goods |
+| `sorting` | `number` (SORT-), `asn_number` (ASN- / plain digits), goods of the ASN's details |
+| `picking` / `packing` / `delivery` | `number` (PICK- / PACK- / DEL-), `dn_number` (DN- / plain digits), goods of the DN's details |
+| `cyclecount` | `number` (CC-), `task_name`, detail goods |
+| `adjustment` | `number` (ADJ- / plain digits), `cyclecount_number` (source cycle count, CC- prefix only, as in the adjustment list), detail goods |
+| `goods` | `goods_code` (equal first, then prefix), `name` (contains) |
+| `location` | `location_code` (equal / prefix / contains) |
+| `recipient` | `name`, `organization`. Only the name and city-level fields (city / state / country) are returned — no phone, email or street address |
+
+Detail goods: code equal / prefix (`goods_code`), name contains (`goods_name`); the subtitle then shows the first matching
+goods (code name).
+
+Matching and order: case-insensitive; `%` and `_` in LIKE match literally; document number prefixes are written as in
+the list keyword search (`DN-163`, `dn163`, `DN #163`); plain digits try document numbers and tracking numbers. Within
+a group: full document number (with prefix) / full tracking number (`exact: true`) → plain-digit number / related
+document number / equal → prefix → contains, then id descending. Groups with an exact item come first, and all exact
+items are also listed in `exact_matches` (to pin them on top of the overall list).
+
+Permissions and isolation: a type is searched only when the caller may read it (`dn_read` `asn_read` `sorting_read`
+`picking_read` `packing_read` `delivery_read` `cycle_count_read` `adjustment_read` `goods_read` `location_read`
+`recipient_read`, or `all_access` / `company_all_access`), checked like `permission_required` (API keys by the key's
+permissions). Types the caller may not read are absent from `types` / `counts` / `groups`; none at all → 200 with an
+empty result (not 403). The data scope comes straight from each module's list query: company / warehouse isolation and
+"active only by default" are the same as the lists (documents / tasks / locations by warehouse scope, goods / recipients
+by company).
+
+```json
+{
+  "q": "DN-163", "scope": "warehouse",
+  "types": ["dn", "asn", "picking"],
+  "counts": {"dn": 1, "asn": 0, "picking": 1},
+  "exact_matches": [{"type": "dn", "id": 163, "...": "..."}],
+  "groups": [
+    {"type": "dn", "total": 1, "page": 1, "per_page": 5, "pages": 1, "items": [
+      {"type": "dn", "id": 163, "code": "DN-163", "title": "Yamada Shop",
+       "subtitle": "ORD-1001 · 7946 0000 0001 · Tokyo WH", "status": "delivered", "warehouse_id": 1,
+       "url_hint": {"page": "dn", "id": 163}, "matched_field": "number", "exact": true,
+       "highlights": [{"field": "code", "start": 0, "end": 6}], "columns": null}
+    ]},
+    {"type": "picking", "total": 1, "...": "..."},
+    {"type": "asn", "total": 0, "page": 1, "per_page": 5, "pages": 0, "items": []}
+  ]
+}
+```
+
+- `counts`: matches per searched type (0 included). In single-type paging it has that type only; take the per-type
+  totals from the request without `types`.
+- `title` / `subtitle`: DN recipient / order number · tracking number · goods · warehouse; ASN supplier / order number ·
+  tracking number · goods · warehouse; sorting / picking / packing / delivery related document / supplier or recipient ·
+  order number (delivery also the tracking number) · goods · warehouse; cycle count task name / goods · warehouse;
+  adjustment reason (else the source cycle count) / source cycle count · goods · warehouse; goods name / brand ·
+  category; location description / warehouse; recipient name / city · state · country. Parts are joined by ` · `.
+- `status`: the raw status value (translated by the front end); null for master data.
+- `highlights`: matched ranges. `field` is the key of the display text (`code` / `title` / `subtitle` /
+  `columns.<key>`); `start` / `end` are UTF-16 code unit offsets (JavaScript string indexes), `end` exclusive; tracking
+  numbers matched without separators are mapped back to positions in the display text. Only parts that took part in the
+  match are marked (not the warehouse name, brand, …); a plain-digit document number marks the digits only.
+- `columns` (single type only):
+  - `dn`: `recipient_name` `carrier_name` `tracking_number` `status` `shipping_stage` `expected_shipping_date` `order_number` `warehouse_name`
+  - `asn`: `supplier_name` `status` `expected_arrival_date` `order_number` `tracking_number` `warehouse_name`
+  - tasks: `task_type` `related_code` `related_url_hint` `status` `warehouse_name`
+  - `goods`: `code` `name` `brand` `thumbnail_url` `available_stock_for_sale` `onhand_stock` (summed over the warehouses in scope, as in the inventory list)
+  - `location`: `code` `location_type` `warehouse_name` `goods_count` (goods with quantity > 0) `quantity`
+  - `recipient`: `name` `locality` `admin_area` `country`
+
+"Recent searches" live in the browser; the backend does not store them.
+
+Performance: every type fetches at most `limit` rows (no count when the first page is not full), and short keywords
+only do exact comparisons. Contains matching (`ILIKE '%q%'`) cannot use plain B-tree indexes; with large data, add
+`pg_trgm` GIN indexes on PostgreSQL (`goods.name`, `goods.code`, `dn.order_number`, `asn.order_number`,
+`recipients.name` / `organization`, `suppliers.name`, `locations.code`, `cycle_count_tasks.task_name`), `lower(code)`
+expression indexes for equal codes, and an expression index
+`upper(replace(replace(replace(tracking_number, ' ', ''), '-', ''), E'\t', ''))` for separator-insensitive tracking
+numbers (`dn_carrier_shipments`, `delivery_tasks`, `asn`). The DN's current tracking number is a correlated subquery
+(same as the DN list); with many documents consider storing the current tracking number on the DN.
 
 ## Webhook Integration
 

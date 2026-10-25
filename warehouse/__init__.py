@@ -24,6 +24,7 @@ from .transfer.schemas import api_ns as transfer_ns
 from .payment.schemas import api_ns as payment_ns
 # 库存流水；按库位 / 历史 / 分析 / 阈值的路由挂在 inventory 命名空间上（warehouse/stock/views.py）
 from .stock.views import api_ns as stock_ledger_ns
+from .search.schemas import api_ns as search_ns
 
 blueprint = Blueprint('warehouse_api', __name__)
 api = Api(
@@ -70,3 +71,4 @@ api.add_namespace(adjustment_ns, path='/adjustment')
 api.add_namespace(transfer_ns, path='/transfer')
 api.add_namespace(payment_ns, path='/payment')
 api.add_namespace(stock_ledger_ns, path='/stock-ledger')
+api.add_namespace(search_ns, path='/search')
