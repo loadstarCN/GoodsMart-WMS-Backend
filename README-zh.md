@@ -56,7 +56,8 @@ pip install -r requirements-dev.txt
 ```
 
 生产只装 `requirements.txt`；测试 / 开发用的包在 `requirements-dev.txt`（第一行 `-r requirements.txt`）。
-用 `./run_tests.sh`（或 `python -m pytest tests/`）跑测试，缺开发依赖时脚本会提示。
+用 `scripts/test_fast.sh`（并行，见[测试](#测试)）、`./run_tests.sh` 或 `python -m pytest tests/` 跑测试，
+缺开发依赖时脚本会提示。
 
 ### 3. 配置环境变量
 
@@ -1587,6 +1588,34 @@ WMS 不假设所有仓库在同一个时区（设计见 `doc/timezone-utc.md`）
 `.env` 一致、要转换的列）并打印 SQL；勾选 `apply` 才停 `wms-api`、把校验过的 `pg_dump -Fc` 备份写到 `/var/www/wms-backups`
 （0600，SHA-256 写进日志）、一个事务里转换、重启并探测 `/health`。提交前失败什么都没改；提交后不会自动回退（代码在转换后的
 结构上照常工作），看工作流日志、`pm2 logs wms-api` 和备份再处理。
+
+## 测试
+
+测试用 SQLite 内存库和 fakeredis，本机不需要 PostgreSQL / Redis（`pip install -r requirements-dev.txt` 装 pytest、
+pytest-xdist、fakeredis）。
+
+```bash
+scripts/test_fast.sh                        # 全量并行（pytest-xdist，进程数 = CPU 核数，最多 16），最后打印耗时
+scripts/test_fast.sh tests/test_asn.py      # 只跑某个文件 / 目录 / 用例（单进程）
+scripts/test_fast.sh -k revoke -x           # 其余参数原样交给 pytest
+WORKERS=8 scripts/test_fast.sh              # 指定并行进程数（WORKERS=0 不并行）
+PYTHON=../other/.venv/Scripts/python.exe scripts/test_fast.sh   # 指定解释器（默认依次找 .venv、venv、python3、python）
+```
+
+Windows：在 Git Bash 里运行脚本（`bash scripts/test_fast.sh`），或在 PowerShell / cmd 里直接调 pytest：
+全量 `.venv\Scripts\python.exe -m pytest tests -n auto --dist worksteal -q`，单文件
+`.venv\Scripts\python.exe -m pytest tests\test_asn.py`。`./run_tests.sh` 照旧单进程跑全部。
+
+为什么快、为什么互不影响（`tests/helpers.py`、`tests/conftest.py`）：
+
+- 每个进程只建一次表结构和基础数据（模板内存库）；每条用 `client` 的测试用 SQLite 的 backup API 复制一份（毫秒级），
+  应用的引擎用 `StaticPool` 绑在这份副本上。业务代码照常 commit / rollback，测试之间看不到彼此的数据。
+- Redis 换成 fakeredis，每个测试应用一个独立的假服务（token 吊销、IP 黑白名单、找回密码验证码）；限流用内存存储。
+  测试里连 6379 端口会直接让该测试失败。
+- 每条测试结束释放它建的应用：关引擎，并把 `Api` 从 flask-restx 的模块级命名空间上摘下（以前每条测试的应用和数据库都
+  被它们引用着释放不了，每个进程涨到好几 GB）。
+- PostgreSQL：`.github/workflows/test-postgres.yml` 用 `-p tests.pg_plugin` 跑库存 / 并发子集，每条测试重建表结构，不用
+  SQLite 模板库。
 
 ## 部署
 

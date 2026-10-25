@@ -1,5 +1,6 @@
 import datetime
 import os
+import sqlite3
 import sys
 import pytest
 from flask import Flask
@@ -9,13 +10,7 @@ import uuid
 # 扩展和系统工具
 from extensions import db, error, redis_client, limiter
 
-# 测试用内存版 Redis。本机没有 Redis 时每次访问都要等连接失败（Windows 上约 2 秒 / 次），
-# 而 JWT 吊销名单每个请求都查一次 Redis，全量测试会被拖到约 1 小时，吊销相关的测试也测不了。
-# 装了 fakeredis（requirements-dev.txt）就用它；没装则照旧连 REDIS_URL_TEST
-try:
-    import fakeredis
-except ImportError:  # pragma: no cover
-    fakeredis = None
+# Redis：tests/conftest.py 把 redis_client 换成 fakeredis（每个测试应用一个独立的内存 Redis），测试不连 6379
 from extensions.jwt import register_jwt_callbacks
 from system.third_party.models import APIKey
 from system.third_party.utils import hash_api_key
@@ -175,7 +170,14 @@ def set_stock(goods_id, warehouse_id=None, *, location_id=None, remark='test sto
         deltas[key] = target - current
     add_stock(goods_id, warehouse_id, location_id=location_id, remark=remark, **deltas)
 
-def setup_app():
+_LIVE_APPS = []    # setup_app 建的应用；每条测试结束由 release_apps() 释放（tests/conftest.py）
+
+
+def setup_app(db_connection=None):
+    """测试应用（与生产 app.py 相同的扩展、JWT 回调、请求钩子与命名空间）。
+
+    db_connection：给了就把引擎绑在这个 sqlite3 连接上（StaticPool，client 夹具传入从模板库复制出来的连接）；
+    不给则是一个空的内存库。"""
     app = Flask(__name__)
     config = TestingConfig()
 
@@ -183,12 +185,13 @@ def setup_app():
     app.config.from_object(config)
     # 确保测试环境使用内存数据库
     app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///:memory:'
+    if db_connection is not None:
+        # 内存库的 URI → Flask-SQLAlchemy 用 StaticPool（整个应用共用这一个连接，同原来的 :memory: 行为）
+        app.config['SQLALCHEMY_ENGINE_OPTIONS'] = {'creator': lambda: db_connection}
 
     db.init_app(app)
     jwt = JWTManager(app)
     redis_client.init_app(app)
-    if fakeredis is not None:
-        redis_client._redis_client = fakeredis.FakeStrictRedis()
     limiter.init_app(app)
 
     # 注册 JWT 回调（与生产 app.py 共用同一套：含停用用户拒绝、token 吊销）
@@ -235,7 +238,34 @@ def setup_app():
     api.add_namespace(third_party_ns, path='/api-keys')
     api.add_namespace(task_ns, path='/task')
 
+    app.extensions['tests.restx_api'] = api
+    _LIVE_APPS.append(app)
     return app
+
+
+def release_app(app):
+    """释放测试应用：关掉引擎（连接池里的连接），并把 Api 从各命名空间摘下来。
+
+    flask-restx 的 Api.add_namespace 会把 Api 记进模块级命名空间的 ns.apis 列表，不摘掉的话每条测试的
+    app → 引擎 → 内存库 → 已加载的全部 ORM 对象都永远释放不了（全量跑一组进程涨到 7–8 GB 的原因）"""
+    if app in _LIVE_APPS:
+        _LIVE_APPS.remove(app)
+    api = app.extensions.pop('tests.restx_api', None)
+    if api is not None:
+        for ns in api.namespaces:
+            while api in ns.apis:
+                ns.apis.remove(api)
+    if 'sqlalchemy' in app.extensions:
+        with app.app_context():
+            db.session.remove()
+            for engine in db.engines.values():
+                engine.dispose()
+
+
+def release_apps():
+    """释放本条测试里 setup_app 建的、还没释放的应用（tests/conftest.py 的 autouse 夹具在每条测试结束后调用）"""
+    while _LIVE_APPS:
+        release_app(_LIVE_APPS[-1])
 
 
 def init_test_data(app):
@@ -889,6 +919,33 @@ def open_test_ledger():
 # Fixtures
 # ---------------------------------------------------------
 
+# 模板库：每个测试进程只建一次表、灌一次基础数据（init_test_data，约 1 秒，其中 4 个账号的 scrypt 密码哈希就占一半），
+# 存在一个内存库里；每条测试用 SQLite 的 backup API 把它复制进一个新的内存连接（毫秒级），应用的引擎绑在这个连接上。
+# 每条测试仍是一个全新、独立的库：业务代码里的 commit / rollback 照常，测试之间互不影响。
+# tests/pg_plugin.py（PostgreSQL）把它关掉，照旧每条测试建库。
+USE_TEMPLATE_DB = True
+_TEMPLATE = {}
+
+
+def _template_db():
+    template = _TEMPLATE.get('connection')
+    if template is None:
+        app = setup_app()
+        with app.app_context():
+            init_test_data(app)
+        # 新的应用上下文：同原来的流程，init_test_data 没提交的改动随会话结束回滚，不进模板
+        template = sqlite3.connect(':memory:', check_same_thread=False)
+        with app.app_context():
+            raw = db.engine.raw_connection()   # StaticPool：就是刚灌好数据的那个连接
+            try:
+                raw.driver_connection.backup(template)
+            finally:
+                raw.close()
+        release_app(app)
+        _TEMPLATE['connection'] = template
+    return template
+
+
 @pytest.fixture
 def client():
     """
@@ -896,6 +953,18 @@ def client():
     - admin user + role
     - Adjustment, AdjustmentDetail, Goods, Location, etc.
     """
+    if USE_TEMPLATE_DB:
+        connection = sqlite3.connect(':memory:', check_same_thread=False)
+        _template_db().backup(connection)
+        app = setup_app(db_connection=connection)
+        try:
+            with app.test_client() as test_client:
+                yield test_client
+        finally:
+            release_app(app)
+            connection.close()
+        return
+
     app = setup_app()
     with app.app_context():
         # 使用通用方法初始化测试数据

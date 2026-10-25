@@ -77,9 +77,12 @@ def test_shipped_at_with_offset_is_stored_as_utc(client, access_token):
 @pytest.mark.parametrize('value, code', [
     ('not a time', 16050),
     (12345, 16050),
-    ((datetime.now(timezone.utc) + timedelta(days=1)).isoformat(), 16136),
+    pytest.param('future', 16136, id='future'),
 ])
 def test_invalid_shipped_at(client, access_token, value, code):
+    # Generate relative timestamps at execution time so xdist collects stable IDs.
+    if value == 'future':
+        value = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()
     _dn_id, task_id, _key = _domestic(client, access_token, 'ORD-SRC-3')
     response = _ship(client, access_token, task_id, shipped_at=value)
     assert response.status_code == 400 and response.get_json()['code'] == code, response.get_json()

@@ -1,8 +1,11 @@
 -r requirements.txt
 # 只用于测试 / 开发的依赖（生产部署只装 requirements.txt）
 # 安装：pip install -r requirements-dev.txt
+execnet==2.1.2
 fakeredis==2.38.0
 iniconfig==2.1.0
 pluggy==1.6.0
 pytest==8.4.1
+# 多进程并行跑测试（scripts/test_fast.sh：pytest -n auto）
+pytest-xdist==3.8.0
 sortedcontainers==2.4.0

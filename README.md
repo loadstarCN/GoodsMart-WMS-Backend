@@ -58,8 +58,8 @@ pip install -r requirements-dev.txt
 ```
 
 Production installs `requirements.txt` only; test / development tools live in `requirements-dev.txt`
-(it starts with `-r requirements.txt`). Run the tests with `./run_tests.sh` (or `python -m pytest tests/`);
-the script stops with a hint when the dev requirements are missing.
+(it starts with `-r requirements.txt`). Run the tests with `scripts/test_fast.sh` (parallel, see [Tests](#tests)),
+`./run_tests.sh` or `python -m pytest tests/`; the scripts stop with a hint when the dev requirements are missing.
 
 ### 3. Configuration
 
@@ -1936,6 +1936,35 @@ prints the statements; with `apply` it stops `wms-api`, writes a verified `pg_du
 `/var/www/wms-backups` (0600, SHA-256 in the log), converts in one transaction, restarts and probes `/health`. Before the
 commit a failure changes nothing; after the commit it is never undone automatically (the code works on the converted
 schema) — check the workflow log, `pm2 logs wms-api` and the backup.
+
+## Tests
+
+The tests run on an in-memory SQLite database and fakeredis: no local PostgreSQL or Redis is needed
+(`pip install -r requirements-dev.txt` installs pytest, pytest-xdist and fakeredis).
+
+```bash
+scripts/test_fast.sh                        # full suite in parallel (pytest-xdist, one worker per CPU, max 16); prints the elapsed time
+scripts/test_fast.sh tests/test_asn.py      # one file / directory / test id (single process)
+scripts/test_fast.sh -k revoke -x           # other arguments go to pytest
+WORKERS=8 scripts/test_fast.sh              # number of workers (WORKERS=0: no parallelism)
+PYTHON=../other/.venv/Scripts/python.exe scripts/test_fast.sh   # interpreter (default: .venv, venv, python3, python)
+```
+
+Windows: run the script from Git Bash (`bash scripts/test_fast.sh`), or call pytest directly in PowerShell / cmd:
+`.venv\Scripts\python.exe -m pytest tests -n auto --dist worksteal -q` (full suite) or
+`.venv\Scripts\python.exe -m pytest tests\test_asn.py` (one file). `./run_tests.sh` still runs everything in one process.
+
+How the suite stays fast and isolated (`tests/helpers.py`, `tests/conftest.py`):
+
+- Each process builds the schema and the fixture data once (a template in-memory database). Every test that uses `client`
+  gets its own copy through SQLite's backup API (milliseconds), bound to the app's engine with `StaticPool`. Business code
+  commits and rolls back as usual; tests never see each other's data.
+- Redis is fakeredis, one fake server per test app (token revocation, IP lists, reset codes); rate limiting uses in-memory
+  storage. A test that connects to port 6379 fails.
+- After each test its apps are released: engines disposed and the `Api` detached from the module-level flask-restx
+  namespaces (they used to keep every test's app and database alive, several GB per process).
+- PostgreSQL: `.github/workflows/test-postgres.yml` runs the stock / concurrency subset with `-p tests.pg_plugin`, which
+  rebuilds the schema for every test instead of using the SQLite template.
 
 ## Deployment
 

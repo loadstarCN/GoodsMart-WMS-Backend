@@ -4,7 +4,7 @@
 SQLite 测不出 FOR UPDATE 行锁、函数唯一索引、外键与类型约束在 PostgreSQL 上的差异（库存底座的加锁顺序就靠它验证）。
 - tests/helpers.py 写死了 sqlite:///:memory:：写进 Flask 配置的 sqlite 连接串一律换成 $WMS_TEST_DATABASE_URI
 - 每条测试前清空 public schema 再建表（上一条失败的拆卸不会漏到下一条）；测试结束释放引擎（每条测试建一个新 app / 引擎，
-  不释放连接会超过 max_connections）
+  不释放连接会超过 max_connections）。SQLite 下的模板库（tests/helpers.py USE_TEMPLATE_DB）在这里关掉
 - 种子数据（tests/helpers.py init_test_data）里有指向不存在的批次 id 的拣货 / 打包明细（SQLite 不查外键），插种子数据时
   session_replication_role = replica（不触发外键）；测试本身照常查外键。需要超级用户（CI 的 postgres 用户是）
 不设 WMS_TEST_DATABASE_URI 时什么都不做。
@@ -55,6 +55,7 @@ def _install():
     fsa_ext.SQLAlchemy._make_engine = make_engine
 
     import tests.helpers as helpers
+    helpers.USE_TEMPLATE_DB = False     # 不用 SQLite 模板库，照旧每条测试建库
     original_init = helpers.init_test_data
 
     def init_test_data(app):
