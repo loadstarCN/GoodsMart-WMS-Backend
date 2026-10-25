@@ -492,7 +492,7 @@ CSV 导入支持可选的 `origin_country` 列（已有商品：`append` 只补�
 - 库存列表新增筛选 `below_low_threshold=true` / `above_high_threshold=true`；待上架汇总支持 `keyword`（与列表一致）。
 - 写入守卫 `STOCK_GUARD`：`log`（默认，绕过统一服务改库存只记 warning 日志）/ `raise`（测试、开发默认，直接报错）/ `off`。
 - 维护命令：`flask stock init-ledger`（期初，流水为空时才执行）、`reconcile [--apply] [--sync-legacy-counters]`（校正，默认演练）、`audit`（对账，
-  有问题退出码 1）、`daily` / `rebuild-daily --from --to`（日终结存）、`metrics [--date]`（库存分析）、`replay [--apply] [--report 文件]`（历史流水回放，
+  有问题退出码 1）、`daily` / `rebuild-daily --from --to`（日终结存）、`metrics [--date]`（库存分析）、`fix-legacy-pending [--include-picked] [--apply]`（已确认的旧 bug 造成的计数差额校正：B-06 拣货下架误计入待上架、B-54 少打包差额留在已拣，默认演练）、`replay [--apply] [--report 文件]`（历史流水回放，
   默认演练、只出与旧快照逐批核对的差异报告）。
 - 定时任务：每小时（`STOCK_DAILY_MINUTE`，默认第 7 分钟）按各仓库当地日界补生成前一天的日终结存与库存分析，生成新的一天后对账（差异只记日志）。
 

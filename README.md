@@ -572,6 +572,8 @@ signing, transfer, adjustment) goes through one stock service (`warehouse/stock/
   development: refused) / `off`.
 - Maintenance: `flask stock init-ledger` (opening balances, only while the ledger is empty), `reconcile [--apply] [--sync-legacy-counters]`
   (dry run by default), `audit` (exit code 1 on problems), `daily` / `rebuild-daily --from --to`, `metrics [--date]`,
+  `fix-legacy-pending [--include-picked] [--apply]` (corrects counter differences of confirmed old bugs: B-06 picking
+  removals counted as pending, B-54 short-pack residue left in picked; dry run by default),
   `replay [--apply] [--report FILE]` (history replay, dry run by default: a report checked batch by batch against the old snapshots).
 - Scheduler: every hour (`STOCK_DAILY_MINUTE`, default minute 7) end-of-day balances and the analysis of the previous local day are
   generated per warehouse, followed by an audit (logged only).

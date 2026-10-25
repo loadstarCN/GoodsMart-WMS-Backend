@@ -47,6 +47,7 @@ MOVEMENT_TYPES = (
     'adjust_gain',        # 调整单完成·盘盈：（外）→ 库位
     'adjust_loss',        # 调整单完成·盘亏：库位 →（外）
     'lot_relabel',        # 批次补录 / 改标（二期）
+    'correction',         # 历史数据校正（已确认的旧 bug 造成的计数差额，reason 写 bug 编号，见 stock/legacy_fixes.py）
 )
 # 变动来源
 LEDGER_SOURCES = ('web', 'pda', 'api', 'system')

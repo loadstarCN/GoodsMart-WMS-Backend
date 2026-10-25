@@ -8,6 +8,8 @@
 - audit：对账，有问题时退出码 1
 - daily：补生成日终结存 + 库存分析（同定时任务）；rebuild-daily：重建一段日期的日终结存；metrics：重算某天的分析
 - replay：历史流水回放。默认演练，只输出与旧快照逐批核对的差异报告；--apply 才写入（见 warehouse/stock/replay.py）
+- fix-legacy-pending：已确认的旧 bug 造成的计数差额校正（B-06 拣货下架误计入待上架；--include-picked 另校正 B-54
+  少打包差额留在已拣）。默认演练只出报告；--apply 才写（见 warehouse/stock/legacy_fixes.py）
 """
 import json
 import sys
@@ -149,6 +151,47 @@ def replay_command(warehouse_id, apply_, report_path):
             if snapshot['abs_diff']:
                 click.echo(f"  snapshot {snapshot['balance_date']}: rows {snapshot['rows']}, "
                            f"mismatched {snapshot['mismatched_rows']}, abs diff {snapshot['abs_diff']}")
+    if report_path:
+        with open(report_path, 'w', encoding='utf-8') as handle:
+            json.dump(reports, handle, ensure_ascii=False, indent=1, default=str)
+        click.echo(f"report written to {report_path}")
+
+
+@stock_cli.command('fix-legacy-pending')
+@click.option('--warehouse', 'warehouse_id', type=int, default=None)
+@click.option('--apply', 'apply_', is_flag=True, help='Write the corrections (default: dry run, report only)')
+@click.option('--include-picked', is_flag=True,
+              help='Also move B-54 short-pack residue (left in picked before 2026-10-04) back to pending')
+@click.option('--report', 'report_path', default=None, help='Write the full JSON report to this file')
+@click.option('--limit', type=int, default=30, help='Goods rows to print per section (default 30)')
+def fix_legacy_pending_command(warehouse_id, apply_, include_picked, report_path, limit):
+    """B-06：2026-09-29 前拣货下架误计入待上架的校正（--include-picked：B-54 少打包差额留在已拣）。默认演练"""
+    from .legacy_fixes import fix_legacy_pending
+    reports = []
+    for warehouse in _warehouses(warehouse_id):
+        report = fix_legacy_pending(warehouse.id, apply=apply_, include_picked=include_picked)
+        reports.append(report)
+        click.echo(f"warehouse {warehouse.id} ({warehouse.name}) — {'APPLIED' if apply_ else 'dry run'}")
+        click.echo(f"  totals {report['totals']}")
+        rows = [r for r in report['pending'] if r['deduct'] or r['skipped']
+                or r['excess'] != r['picking_before_fix']]
+        click.echo("  B-06 goods: sorted (damaged) | derived = asn + removal_other + short_pack + cancel + b54 - putaway "
+                   "| picking_before_fix | excess | deduct")
+        for r in rows[:limit]:
+            click.echo(f"    {r['goods_id']}: {r['sorted_stock']} ({r['sorted_damage_stock']}) | {r['derived']} = "
+                       f"{r['asn_actual']} + {r['removal_other']} + {r['short_pack_return']} + {r['cancel_return']} + "
+                       f"{r['b54_return']} - {r['putaway']} | {r['picking_before_fix']} | {r['excess']} | {r['deduct']}"
+                       + (f" [{r['skipped']}]" if r['skipped'] else '')
+                       + (' [MISMATCH: excess != picking_before_fix]'
+                          if not r['skipped'] and r['excess'] != r['picking_before_fix'] else ''))
+        if len(rows) > limit:
+            click.echo(f"    … {len(rows) - limit} more (see --report)")
+        if include_picked:
+            click.echo("  B-54 goods: picked | in picking (DN status picked) | short pack before fix | residue | move")
+            picked_rows = [r for r in report['picked'] if r['move'] or r['residue'] or r['skipped']]
+            for r in picked_rows[:limit]:
+                click.echo(f"    {r['goods_id']}: {r['picked_stock']} | {r['in_picking']} | {r['short_pack_before_fix']} | "
+                           f"{r['residue']} | {r['move']}" + (f" [{r['skipped']}]" if r['skipped'] else ''))
     if report_path:
         with open(report_path, 'w', encoding='utf-8') as handle:
             json.dump(reports, handle, ensure_ascii=False, indent=1, default=str)

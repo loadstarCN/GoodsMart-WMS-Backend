@@ -199,7 +199,7 @@ class StockOp:
     """一次库存变动（同一仓库、同一单据）：若干笔 move，commit 时一起记账、写流水"""
 
     def __init__(self, warehouse_id, movement_type, *, doc_type=None, doc_id=None, doc_no=None, operator_id=AUTO,
-                 occurred_at=None, reason=None, remark=None, source=None):
+                 occurred_at=None, reason=None, remark=None, source=None, trace_id=None):
         if movement_type not in MOVEMENT_TYPES:
             raise ValueError(f"unknown movement_type {movement_type!r}")
         self.warehouse_id = warehouse_id
@@ -212,6 +212,7 @@ class StockOp:
         self.reason = reason
         self.remark = remark
         self.source = source
+        self.trace_id = trace_id      # 缺省 = 本事务的 trace_id（维护命令可指定，便于按批追溯）
         self.moves = []
         self.committed = False
 
@@ -417,7 +418,7 @@ class StockService:
             'operator_id': current_operator_id() if op.operator_id is AUTO else op.operator_id,
             'api_key_id': current_api_key_id(),
             'source': op.source or current_source(),
-            'trace_id': trace_id(),
+            'trace_id': op.trace_id or trace_id(),
         }
         lines = []
         with db.session.no_autoflush:
