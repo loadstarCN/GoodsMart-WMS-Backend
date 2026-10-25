@@ -87,11 +87,9 @@ def _create_asn(client, token, **extra):
 
 def _sorted_stock(client, goods_id, value=None):
     with client.application.app_context():
-        inventory = get_inventory_by_goods_id_and_warehouse_id(goods_id, 1)
         if value is not None:
-            inventory.sorted_stock = value
-            db.session.commit()
-        return inventory.sorted_stock
+            set_stock(goods_id, 1, pending=value, pending_damaged=0)
+        return get_inventory_by_goods_id_and_warehouse_id(goods_id, 1).sorted_stock
 
 
 # ---------------------------------------------------------------------------

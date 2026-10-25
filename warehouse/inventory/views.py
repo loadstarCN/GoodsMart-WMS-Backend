@@ -33,6 +33,9 @@ class InventoryList(Resource):
             'keyword': args.get('keyword'),
             # true：只返回还有待上架的行（sorted_stock > 0）
             'pending_putaway': args.get('pending_putaway'),
+            # true：可售低于补货阈值 / 高于积压阈值（阈值 -1 不算）
+            'below_low_threshold': args.get('below_low_threshold'),
+            'above_high_threshold': args.get('above_high_threshold'),
         }
 
         filters = add_warehouse_filter(filters)
@@ -69,6 +72,7 @@ class InventoryPendingPutawaySummary(Resource):
 
         Scope is the same as GET /inventory/: the warehouse in `warehouse_id` / `X-WAREHOUSE-ID`, else every
         warehouse the caller can access (staff / API keys: their own company); `company_id` narrows it further.
+        `keyword` filters the goods like GET /inventory/ (code / name / manufacturer / category / tags / brand).
         Counts only rows with `sorted_stock > 0`:
         - `inventory_count`: rows (= `total` of `GET /inventory/?pending_putaway=true` with the same scope)
         - `goods_count`: distinct goods
@@ -80,7 +84,7 @@ class InventoryPendingPutawaySummary(Resource):
         - `oldest_pending_since`: earliest `pending_since` (UTC, +00:00)
         """
         args = pending_putaway_summary_parser.parse_args()
-        filters = add_warehouse_filter({'company_id': args.get('company_id')})
+        filters = add_warehouse_filter({'company_id': args.get('company_id'), 'keyword': args.get('keyword')})
         return InventoryService.pending_putaway_summary(filters, args.get('overdue_days')), 200
 
 @api_ns.doc(security="jsonWebToken")

@@ -191,31 +191,38 @@ def test_removed_damaged_goods_stay_damaged(client, access_token):
 
 
 def test_inventory_service_keeps_sorted_damage_invariant(client):
-    """服务层：分拣完成的破损数不超过实收；上架扣减按库位类型；generic 更新也夹到 [0, sorted_stock]"""
+    """服务层：分拣完成的破损数不超过实收；上架（StockService putaway）扣减按库位类型"""
     from extensions.error import APIException
-    w = _world(client)
+    from warehouse.stock.service import Leg, StockOp
+    w = _locations(client, _world(client))
     g = w['g1']
+
+    def putaway(quantity, location_id, location_type):
+        StockOp(w['wh'], 'putaway').move(g, quantity, src=Leg.pending_for(location_type),
+                                         dst=Leg.at(location_id)).commit()
+
     with client.application.app_context():
         db.session.add(Inventory(goods_id=g, warehouse_id=w['wh'], received_stock=10))
         db.session.commit()
         InventoryService.asn_completed(g, w['wh'], 10, 4, 9)         # 破损记不过实收
+        db.session.commit()
         inv = db.session.get(Inventory, (g, w['wh']))
         assert (inv.sorted_stock, inv.sorted_damage_stock) == (4, 4)
 
         with pytest.raises(APIException) as exc:
-            InventoryService.putaway_completed(g, w['wh'], 1)         # 缺省按 standard
+            putaway(1, w['std1'], 'standard')
         assert exc.value.biz_code == 15016
         assert exc.value.details['good_pending'] == 0 and exc.value.details['damaged_pending'] == 4
+        db.session.rollback()
         with pytest.raises(APIException) as exc:
-            InventoryService.putaway_completed(g, w['wh'], 5, 'damaged')
+            putaway(5, w['dmg'], 'damaged')
         assert exc.value.biz_code == 15007
+        db.session.rollback()
 
-        InventoryService.putaway_completed(g, w['wh'], 3, 'damaged')
+        putaway(3, w['dmg'], 'damaged')
+        db.session.commit()
         inv = db.session.get(Inventory, (g, w['wh']))
-        assert (inv.sorted_stock, inv.sorted_damage_stock) == (1, 1)
-
-        InventoryService.update_inventory(g, w['wh'], {'sorted_stock': 0})
-        assert db.session.get(Inventory, (g, w['wh'])).sorted_damage_stock == 0
+        assert (inv.sorted_stock, inv.sorted_damage_stock, inv.damage_stock) == (1, 1, 3)
 
 
 # ---------------------------------------------------------------------------
@@ -280,9 +287,7 @@ def test_pending_putaway_summary_for_putaway_operators(client, access_operator_t
     """只有上架权限（putaway_read）的员工也能看汇总，范围是自己可访问的仓库（要带仓库）；没有权限 403"""
     with client.application.app_context():
         warehouse_id = get_warehouse().id
-        inventory = db.session.get(Inventory, (get_goods().id, warehouse_id))
-        inventory.sorted_stock, inventory.sorted_damage_stock = 5, 2
-        db.session.commit()
+        set_stock(get_goods().id, warehouse_id, pending=3, pending_damaged=2)
 
     response = client.get('/inventory/pending-putaway/summary',
                           headers={**_h(access_operator_token), 'X-WAREHOUSE-ID': str(warehouse_id)})
@@ -403,17 +408,15 @@ def test_pending_since_counts_removals_and_unknown_history(client, access_token)
         removed_at = RemovalRecord.query.filter_by(goods_id=g1, reason='other').one().removal_time
         inventory = db.session.get(Inventory, (g1, w['wh']))
         assert inventory.sorted_stock == 2
-        inventory.sorted_stock = 4        # 旧数据：比已知入账多 2 件（不知道什么时候进来的）
-        inventory.total_stock += 2
-        db.session.add(Inventory(goods_id=g2, warehouse_id=w['wh'], sorted_stock=3, total_stock=3))
-        db.session.commit()
+        # 旧数据：比已知入账多 2 件（不知道什么时候进来的）；商品 2 的 3 件完全没有入账记录
+        add_stock(g1, w['wh'], pending=2)
+        add_stock(g2, w['wh'], pending=3)
 
     row = _pending_row(client, access_token, g1, w['wh'])
     # 下架 2 件 + 10 天前分拣的 5 件里凑 2 件 → 最早一笔是 10 天前
     assert _parse(row['pending_since']) == now - timedelta(days=10)
     with client.application.app_context():
-        db.session.get(Inventory, (g1, w['wh'])).sorted_stock = 2
-        db.session.commit()
+        add_stock(g1, w['wh'], pending=-2)
     assert _parse(_pending_row(client, access_token, g1, w['wh'])['pending_since']).replace(microsecond=0) \
         == removed_at.replace(microsecond=0)
     # 列表统一 skip_none：pending_since 为 null 时不出现在行里

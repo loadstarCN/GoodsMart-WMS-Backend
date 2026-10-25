@@ -207,16 +207,22 @@ def test_picking_removal_does_not_inflate_sorted_stock(client):
         admin_id = get_admin_user().id
         before = get_inventory_by_goods_id_and_warehouse_id(goods.id, warehouse_id)
         sorted_before, onhand_before, total_before = before.sorted_stock, before.onhand_stock, before.total_stock
+        picked_before = before.picked_stock
 
-        # 拣货下架只能由拣货流程以 from_picking=True 内部调用（B-56）
+        # 拣货下架只能由拣货流程以 from_picking=True 内部调用（B-56）：并进拣货完成的那一笔 pick（库位 → 已拣）
+        from warehouse.stock.service import StockOp
+        stock_op = StockOp(warehouse_id, 'pick')
         RemovalService.create_removal_record({
             'goods_id': goods.id, 'location_id': location.id, 'quantity': 5,
-        }, admin_id, from_picking=True)
+        }, admin_id, from_picking=True, stock_op=stock_op)
+        stock_op.commit()
+        db.session.commit()
 
         after = get_inventory_by_goods_id_and_warehouse_id(goods.id, warehouse_id)
         assert after.sorted_stock == sorted_before
         assert after.onhand_stock == onhand_before - 5
-        assert after.total_stock == total_before - 5
+        assert after.picked_stock == picked_before + 5
+        assert after.total_stock == total_before
 
         # 普通下架仍进入待上架区，总量不变
         RemovalService.create_removal_record({
@@ -224,4 +230,4 @@ def test_picking_removal_does_not_inflate_sorted_stock(client):
         }, admin_id)
         again = get_inventory_by_goods_id_and_warehouse_id(goods.id, warehouse_id)
         assert again.sorted_stock == sorted_before + 5
-        assert again.total_stock == total_before - 5
+        assert again.total_stock == total_before

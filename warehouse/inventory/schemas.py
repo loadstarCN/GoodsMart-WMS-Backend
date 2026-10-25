@@ -85,6 +85,12 @@ inventory_pagination_parser.add_argument('low_stock_threshold', type=int, help='
 inventory_pagination_parser.add_argument('high_stock_threshold', type=int, help='High Stock Warning Threshold', location='args')
 inventory_pagination_parser.add_argument('keyword', type=str, help='Search by keyword in goods name, code, manufacturer, category, tags, brand', location='args')
 inventory_pagination_parser.add_argument(
+    'below_low_threshold', type=inputs.boolean, location='args',
+    help='true: available_stock_for_sale < low_stock_threshold (thresholds of -1 are disabled and never match)')
+inventory_pagination_parser.add_argument(
+    'above_high_threshold', type=inputs.boolean, location='args',
+    help='true: available_stock_for_sale > high_stock_threshold (thresholds of -1 never match)')
+inventory_pagination_parser.add_argument(
     'pending_putaway', type=inputs.boolean, location='args',
     help='true: only rows with stock waiting to be put away (sorted_stock > 0; '
          'sorted_damage_stock of it can only go to damaged locations)')
@@ -93,6 +99,9 @@ inventory_pagination_parser.add_argument(
 pending_putaway_summary_parser = api_ns.parser()
 pending_putaway_summary_parser.add_argument('warehouse_id', type=int, location='args',
                                             help='Warehouse ID (or the X-WAREHOUSE-ID header)')
+pending_putaway_summary_parser.add_argument('keyword', type=str, location='args',
+                                            help='Goods keyword, same as GET /inventory/ (code / name / manufacturer '
+                                                 '/ category / tags / brand)')
 pending_putaway_summary_parser.add_argument('company_id', type=int, location='args',
                                             help='Only warehouses of this company (platform users; staff / API keys '
                                                  'are already limited to their own company)')

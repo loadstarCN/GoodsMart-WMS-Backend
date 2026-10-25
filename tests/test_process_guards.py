@@ -537,7 +537,7 @@ def test_location_with_history_cannot_be_deleted(client, access_token):
 
     body = _err(client.delete(f"/location/{w['std1']}", headers=_h(access_token)), 409, 44009)
     assert body['details'] == {'entity': 'location', 'id': w['std1'],
-                               'references': {'putaway_records': 1, 'transfer_records': 1}}
+                               'references': {'putaway_records': 1, 'transfer_records': 1, 'stock_ledger': 2}}
     with client.application.app_context():
         assert db.session.get(Location, w['std1']) is not None
     # 有货仍是 16084

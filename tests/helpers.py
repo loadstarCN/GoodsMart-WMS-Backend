@@ -99,6 +99,80 @@ def warehouse_today():
 # 测试用 API Key 明文（helpers 里以哈希落库）
 TEST_API_KEY_PLAIN = 'test-plain-api-key-0000000000000000000000000000'
 
+
+# ---------------------------------------------------------
+# 造库存：一律经 StockService 记账（reconcile 流水），缓存 / 行表 / 流水保持一致（tests/conftest.py 的对账夹具）。
+# 直接改 Inventory / GoodsLocation 的数量会被库存写入守卫拦下（测试里 STOCK_GUARD = raise）
+# ---------------------------------------------------------
+_STOCK_TARGETS = {
+    'onhand': 'onhand', 'damaged': 'damaged', 'returned': 'return', 'pending': 'pending',
+    'pending_damaged': 'pending_damaged', 'picked': 'picked', 'packed': 'packed', 'in_transit': 'in_transit',
+}
+
+
+def _stock_location(warehouse_id, location_type, location_id=None):
+    """调增库位类别时放货的库位：给了 location_id 用它，否则该仓库该类型第一个启用库位（没有就新建一个）"""
+    if location_id is not None:
+        return db.session.get(Location, location_id)
+    location = (Location.query.filter_by(warehouse_id=warehouse_id, location_type=location_type, is_active=True)
+                .order_by(Location.id).first())
+    if location is None:
+        location = Location(warehouse_id=warehouse_id, code=f"TEST-{location_type.upper()}-{warehouse_id}",
+                            location_type=location_type, created_by=get_admin_user().id)
+        db.session.add(location)
+        db.session.flush()
+    return location
+
+
+def add_stock(goods_id, warehouse_id=None, *, location_id=None, remark='test stock', **deltas):
+    """按增减量造库存（onhand / damaged / returned / pending / pending_damaged / picked / packed / in_transit）：
+    增 = 从仓外进（reconcile）；减 = 出到仓外。库位类别调减按库位 id 顺序扣（给了 location_id 只扣该库位）"""
+    from warehouse.stock.models import LOCATION_TYPES_OF_STOCK
+    from warehouse.stock.service import Leg, StockOp
+    from warehouse.goods.models import GoodsLocation as _GoodsLocation
+    warehouse_id = warehouse_id or get_warehouse().id
+    op = StockOp(warehouse_id, 'reconcile', remark=remark)
+    for key, delta in deltas.items():
+        stock_type = _STOCK_TARGETS[key]
+        if not delta:
+            continue
+        location_type = LOCATION_TYPES_OF_STOCK.get(stock_type)
+        if location_type is None:
+            leg = Leg.of(stock_type)
+            op.move(goods_id, abs(delta), src=None if delta > 0 else leg, dst=leg if delta > 0 else None)
+        elif delta > 0:
+            op.move(goods_id, delta, dst=Leg.at(_stock_location(warehouse_id, location_type, location_id).id))
+        else:
+            remaining = -delta
+            rows = (_GoodsLocation.query.join(Location, Location.id == _GoodsLocation.location_id)
+                    .filter(_GoodsLocation.goods_id == goods_id, Location.warehouse_id == warehouse_id,
+                            Location.location_type == location_type)
+                    .order_by(_GoodsLocation.location_id).all())
+            for row in rows:
+                if location_id is not None and row.location_id != location_id:
+                    continue
+                take = min(remaining, row.quantity)
+                if take:
+                    op.move(goods_id, take, src=Leg.at(row.location_id))
+                    remaining -= take
+            assert remaining == 0, f"not enough {stock_type} stock to remove {-delta}"
+    op.commit()
+    db.session.commit()
+
+
+def set_stock(goods_id, warehouse_id=None, *, location_id=None, remark='test stock', **targets):
+    """把库存调到目标值（键同 add_stock；库位类别按该类型库位的合计，给了 location_id 只看该库位）"""
+    from warehouse.stock.audit import bucket_balances
+    warehouse_id = warehouse_id or get_warehouse().id
+    balances = bucket_balances(warehouse_id, [goods_id])
+    deltas = {}
+    for key, target in targets.items():
+        stock_type = _STOCK_TARGETS[key]
+        current = sum(quantity for (_w, _g, _lot, location, kind), quantity in balances.items()
+                      if kind == stock_type and (location_id is None or location == location_id))
+        deltas[key] = target - current
+    add_stock(goods_id, warehouse_id, location_id=location_id, remark=remark, **deltas)
+
 def setup_app():
     app = Flask(__name__)
     config = TestingConfig()
@@ -163,8 +237,11 @@ def setup_app():
 def init_test_data(app):
     """
     在 app 上下文中创建所有的模拟数据。
+    库存行（Inventory / GoodsLocation）直接插入，期间关掉库存写入守卫；最后按行表校正缓存并写期初流水
+    （同 flask stock init-ledger），之后的测试都在「缓存 = 行表 = 流水」的状态下开始（对账夹具见 tests/conftest.py）。
     """
-    with app.app_context():
+    from warehouse.stock import guard as stock_guard
+    with app.app_context(), stock_guard.suspended():
         db.create_all()
 
         # 创建权限
@@ -602,7 +679,7 @@ def init_test_data(app):
         db.session.commit()
 
 
-        
+
 
 
         # 6. 创建示例 DN 及其明细
@@ -643,7 +720,7 @@ def init_test_data(app):
             created_by=admin_user.id
         )
 
-        
+
         db.session.add_all([dn, dn2,dn3])
         db.session.flush()  # 使 dn.id 可用
 
@@ -786,15 +863,21 @@ def init_test_data(app):
         db.session.commit()
 
 
-        # 计算出正确的库存信息,前面插入的测试数据不是一一对应完全正确的
+        # 计算出正确的库存信息,前面插入的测试数据不是一一对应完全正确的（实物库存由 open_test_ledger 按行表校正）
         goods_list = db.session.query(Goods).all()
         for goods in goods_list:
-            # 获取goods存放的库位
             for inventory in goods.inventories:
-                # 获取库位的库存信息
-                InventoryService.update_and_calculate_stock(inventory.goods_id, inventory.warehouse_id)
                 InventoryService.update_and_calculate_asn_stock(inventory.goods_id, inventory.warehouse_id)
                 InventoryService.update_and_calculate_dn_stock(inventory.goods_id, inventory.warehouse_id)
+
+        # 实物库存：缓存 ← 行表，并把当前结存写成期初流水
+        open_test_ledger()
+
+
+def open_test_ledger():
+    """缓存 ← 行表，并把当前结存写成期初流水（opening）"""
+    from warehouse.stock.audit import reconcile
+    reconcile(apply=True, sync_legacy_counters=True, movement_type='opening', remark='test fixture opening')
 
 
 

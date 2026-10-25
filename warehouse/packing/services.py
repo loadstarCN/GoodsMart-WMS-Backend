@@ -475,7 +475,7 @@ class PackingTaskService:
         task = PackingTaskService._update_task_status(task, 'completed', operator_id)
 
         # 更新DN状态
-        DNService.packing_dn(task.dn)
+        DNService.packing_dn(task.dn, packing_task=task)
 
         return task
 

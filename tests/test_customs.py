@@ -75,8 +75,7 @@ def _prepare(client, *, profile=True, origins=None):
             company.export_signatory_title = 'Export Manager'
         for goods in Goods.query.filter_by(company_id=company.id).all():
             goods.origin_country = origins.get(goods.code)
-            inventory = get_inventory_by_goods_id_and_warehouse_id(goods.id, get_warehouse().id)
-            inventory.onhand_stock = 5000
+            set_stock(goods.id, get_warehouse().id, onhand=5000)
         db.session.commit()
 
 
@@ -125,8 +124,7 @@ def _force_packed(client, dn_id, packed=None, status='packed'):
                     goods_id=detail.goods_id, packed_quantity=quantity, operator_id=admin.id))
             detail.picked_quantity = detail.quantity
             detail.packed_quantity = quantity
-            inventory = get_inventory_by_goods_id_and_warehouse_id(detail.goods_id, dn.warehouse_id)
-            inventory.packed_stock = (inventory.packed_stock or 0) + quantity
+            add_stock(detail.goods_id, dn.warehouse_id, packed=quantity)
         dn.status = status
         db.session.commit()
         if status != 'packed':

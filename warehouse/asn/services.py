@@ -674,11 +674,14 @@ class ASNService:
         asn = ASNService._update_asn_status(asn, "completed")
         ASNService._update_and_calculate_quantity(asn)
 
-        # 更新库存信息
+        # 更新库存信息：实收按 sort_in 记账（库存流水，warehouse/stock/service.py），一张 ASN 一笔
+        from warehouse.stock.service import StockOp
+        stock_op = StockOp(asn.warehouse_id, 'sort_in', doc_type='asn', doc_id=asn.id, doc_no=asn.order_number)
         for detail in asn.details:
             # 实收 = 良品 + 破损；破损部分同时记进待上架·破损（sorted_damage_stock），之后只能上到 damaged 库位
             InventoryService.asn_completed(detail.goods_id, asn.warehouse_id, detail.quantity, detail.actual_quantity,
-                                           detail.damage_quantity or 0)
+                                           detail.damage_quantity or 0, op=stock_op, doc_line_id=detail.id)
+        stock_op.commit()
 
         webhook_emit('asn.completed', {
             'asn_id': asn.id, 'status': 'completed', 'order_number': asn.order_number,

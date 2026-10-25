@@ -476,21 +476,21 @@ def test_ensure_inventory_service_creates_once(client):
 
 
 def test_first_putaway_into_bin_recovers_from_concurrent_insert(client, access_token, monkeypatch):
-    """同一 (商品, 库位) 第一次被并发上架：加锁读的时候还没有行，插入撞 uix_goods_location → savepoint 后重新加锁读取"""
-    import warehouse.common.locks as locks
+    """同一 (商品, 库位) 第一次被并发上架：加锁读的时候还没有行，插入撞 uix_goods_location_lot → savepoint 后重新加锁读取"""
+    import warehouse.stock.service as stock_service
 
     w = _world(client)
     _inbound(client, access_token, w, [(w['g1'], 10)], [(w['g1'], w['std1'], 6)])
-    original = locks.lock_goods_location
+    original = stock_service.lock_goods_location
     misses = {'left': 1}
 
-    def stale_lock(goods_id, location_id):
+    def stale_lock(goods_id, location_id, lot_id=None):
         if misses['left']:
             misses['left'] -= 1
             return None
-        return original(goods_id, location_id)
+        return original(goods_id, location_id, lot_id)
 
-    monkeypatch.setattr(locks, 'lock_goods_location', stale_lock)
+    monkeypatch.setattr(stock_service, 'lock_goods_location', stale_lock)
     _ok(client.post('/putaway/', json={'goods_id': w['g1'], 'location_id': w['std1'], 'quantity': 3},
                     headers=_h(access_token)))
     monkeypatch.undo()

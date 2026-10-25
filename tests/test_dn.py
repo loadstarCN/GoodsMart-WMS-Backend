@@ -57,7 +57,7 @@ def test_create_dn_rejects_quantity_above_available_stock(client):
         inventory = Inventory.query.filter_by(
             goods_id=goods.id, warehouse_id=warehouse.id
         ).first()
-        inventory.onhand_stock = 1
+        set_stock(inventory.goods_id, inventory.warehouse_id, onhand=1)
         inventory.locked_stock = 0
         inventory.dn_stock = 0
         db.session.commit()
@@ -85,7 +85,7 @@ def test_create_dn_resolves_legacy_carrier_name_from_code(client):
         inventory = Inventory.query.filter_by(
             goods_id=goods.id, warehouse_id=warehouse.id
         ).first()
-        inventory.onhand_stock = 10
+        set_stock(inventory.goods_id, inventory.warehouse_id, onhand=10)
         inventory.locked_stock = 0
         inventory.dn_stock = 0
         db.session.commit()
@@ -112,7 +112,7 @@ def test_progress_dn_rejects_when_physical_stock_is_insufficient(client):
         inventory = Inventory.query.filter_by(
             goods_id=detail.goods_id, warehouse_id=dn.warehouse_id
         ).first()
-        inventory.onhand_stock = max(detail.quantity - 1, 0)
+        set_stock(inventory.goods_id, inventory.warehouse_id, onhand=max(detail.quantity - 1, 0))
         inventory.locked_stock = 0
         dn.status = 'pending'
         db.session.commit()
@@ -330,7 +330,7 @@ def test_create_dn_detail_rejects_quantity_above_available(client, access_token)
         dn = DN.query.first()
         goods = Goods.query.filter_by(code='G002').first()
         inventory = get_inventory_by_goods_id_and_warehouse_id(goods.id, dn.warehouse_id)
-        inventory.onhand_stock = 10
+        set_stock(inventory.goods_id, inventory.warehouse_id, onhand=10)
         inventory.locked_stock = 0
         inventory.dn_stock = 0
         dn_id, goods_id = dn.id, goods.id
@@ -369,7 +369,7 @@ def test_update_dn_detail(client, access_token):
         assert detail is not None
         # 种子库存不够 99，先把在库量抬高；本用例只验证字段更新
         inventory = get_inventory_by_goods_id_and_warehouse_id(detail.goods_id, dn.warehouse_id)
-        inventory.onhand_stock = 1000
+        set_stock(inventory.goods_id, inventory.warehouse_id, onhand=1000)
         dn_id, detail_id = dn.id, detail.id
         db.session.commit()
 
@@ -400,7 +400,7 @@ def test_update_dn_detail_rejects_quantity_above_available(client, access_token)
         other_lines = own_reserved - detail.quantity
         inventory.locked_stock = 0
         # 其它 DN 预占 = dn_stock - 本单预占；让本行最多只能改到 other_available
-        inventory.onhand_stock = inventory.dn_stock - own_reserved + other_lines + 15
+        set_stock(inventory.goods_id, inventory.warehouse_id, onhand=inventory.dn_stock - own_reserved + other_lines + 15)
         db.session.commit()
         detail_id = detail.id
         dn_id = dn.id
@@ -481,7 +481,7 @@ def test_sync_dn_details(client):
         new_goods_id = 2
         # 本用例只验证同步机制，把在库量抬高避免撞可用量校验（可用量校验见 test_sync_dn_details_rejects_over_available）
         inventory = get_inventory_by_goods_id_and_warehouse_id(existing_detail.goods_id, dn.warehouse_id)
-        inventory.onhand_stock = 1000
+        set_stock(inventory.goods_id, inventory.warehouse_id, onhand=1000)
         db.session.commit()
 
         # 测试混合操作（更新+新增+删除）
@@ -534,7 +534,7 @@ def test_sync_dn_details_rejects_over_available(client):
         inventory = get_inventory_by_goods_id_and_warehouse_id(goods_id, dn.warehouse_id)
         own_reserved = sum(d.quantity for d in dn.details if d.goods_id == goods_id)
         inventory.locked_stock = 0
-        inventory.onhand_stock = inventory.dn_stock - own_reserved + 50   # 本单可用 50
+        set_stock(inventory.goods_id, inventory.warehouse_id, onhand=inventory.dn_stock - own_reserved + 50)   # 本单可用 50
         db.session.commit()
 
         # 50 恰好可用
@@ -708,7 +708,7 @@ def test_dn_service_update_dn_detail(client):
         old_qty = detail.quantity
         old_remark = detail.remark
         inventory = get_inventory_by_goods_id_and_warehouse_id(detail.goods_id, dn.warehouse_id)
-        inventory.onhand_stock = 5000
+        set_stock(inventory.goods_id, inventory.warehouse_id, onhand=5000)
         db.session.commit()
 
         updated_detail = DNService.update_dn_detail(dn.id, detail.id, {

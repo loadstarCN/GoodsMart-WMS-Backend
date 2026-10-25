@@ -185,8 +185,9 @@ def test_inventory_service_asn_completed(client):
 
 def test_inventory_service_putaway_completed(client):
     """
-    测试上架完成：sorted_stock 减少，onhand_stock 增加
+    测试上架记账（StockService putaway）：sorted_stock 减少，onhand_stock 增加，total 不变
     """
+    from warehouse.stock.service import Leg, StockOp
     with client.application.app_context():
         inventory = get_inventory()
         goods_id = inventory.goods_id
@@ -197,16 +198,22 @@ def test_inventory_service_putaway_completed(client):
         InventoryService.asn_completed(goods_id, warehouse_id, 20, 20)
 
         initial_sort_stock = inventory.sorted_stock
+        initial_onhand = inventory.onhand_stock
+        initial_total = inventory.total_stock
 
-        InventoryService.putaway_completed(goods_id, warehouse_id, 10)
+        StockOp(warehouse_id, 'putaway').move(goods_id, 10, src=Leg.pending_for('standard'),
+                                              dst=Leg.at(get_location().id)).commit()
+        db.session.commit()
         assert inventory.sorted_stock == initial_sort_stock - 10
-
+        assert inventory.onhand_stock == initial_onhand + 10
+        assert inventory.total_stock == initial_total
 
 
 def test_inventory_service_picking_completed(client):
     """
-    测试拣货完成：dn_stock 减少，picked_stock 增加
+    测试拣货完成：dn_picked 只释放 dn_stock；实物由 pick 记账（库位 → 已拣）
     """
+    from warehouse.stock.service import Leg, StockOp
     with client.application.app_context():
         inventory = get_inventory()
         goods_id = inventory.goods_id
@@ -217,10 +224,13 @@ def test_inventory_service_picking_completed(client):
 
         initial_dn_stock = inventory.dn_stock
         initial_picked_stock = inventory.picked_stock
+        initial_onhand = inventory.onhand_stock
 
+        StockOp(warehouse_id, 'pick').move(goods_id, 2, src=Leg.at(get_location().id), dst=Leg.picked()).commit()
         InventoryService.dn_picked(goods_id, warehouse_id, 2, 2)
         assert inventory.dn_stock == initial_dn_stock - 2
         assert inventory.picked_stock == initial_picked_stock + 2
+        assert inventory.onhand_stock == initial_onhand - 2
 
 
 def test_partial_pick_releases_unpicked_dn_reservation(client):
@@ -235,7 +245,13 @@ def test_partial_pick_releases_unpicked_dn_reservation(client):
         )
 
         assert inventory.dn_stock == 0
-        assert inventory.picked_stock == initial_picked_stock + 1
+        # dn_picked 不再动实物（已拣由 pick 记账）
+        assert inventory.picked_stock == initial_picked_stock
+
+
+def _pick(goods_id, warehouse_id, quantity):
+    from warehouse.stock.service import Leg, StockOp
+    StockOp(warehouse_id, 'pick').move(goods_id, quantity, src=Leg.at(get_location().id), dst=Leg.picked()).commit()
 
 
 def test_inventory_service_packing_completed(client):
@@ -248,8 +264,7 @@ def test_inventory_service_packing_completed(client):
         warehouse_id = inventory.warehouse_id
 
         # 先保证有足够的 picked_stock
-        InventoryService.update_and_calculate_dn_stock(goods_id, warehouse_id)
-        InventoryService.dn_picked(goods_id, warehouse_id, 10, 10)
+        _pick(goods_id, warehouse_id, 10)
 
         initial_picked_stock = inventory.picked_stock
         initial_packed_stock = inventory.packed_stock
@@ -269,8 +284,7 @@ def test_inventory_service_delivery_completed(client):
         warehouse_id = inventory.warehouse_id
 
         # 确保有足够的 packed_stock
-        InventoryService.update_and_calculate_dn_stock(goods_id, warehouse_id)
-        InventoryService.dn_picked(goods_id, warehouse_id, 10, 10)
+        _pick(goods_id, warehouse_id, 10)
         InventoryService.dn_packed(goods_id, warehouse_id, 10)
 
         initial_packed_stock = inventory.packed_stock
@@ -293,8 +307,7 @@ def test_inventory_service_delivery_signed(client):
         warehouse_id = inventory.warehouse_id
 
         # 先保证有足够的 delivered_stock
-        InventoryService.update_and_calculate_dn_stock(goods_id, warehouse_id)
-        InventoryService.dn_picked(goods_id, warehouse_id, 10, 10)
+        _pick(goods_id, warehouse_id, 10)
         InventoryService.dn_packed(goods_id, warehouse_id, 10)
         InventoryService.dn_delivered(goods_id, warehouse_id, 10)
 
@@ -363,7 +376,7 @@ def test_check_stock_thresholds(client):
         warehouse_id = inventory.warehouse_id
 
         # 设置库存和阈值
-        inventory.onhand_stock = 50
+        set_stock(inventory.goods_id, inventory.warehouse_id, onhand=50)
         inventory.dn_stock = 10
         db.session.commit()
         InventoryService.set_low_stock_threshold(goods_id, warehouse_id, 30)
@@ -376,14 +389,14 @@ def test_check_stock_thresholds(client):
         assert status["is_above_high_threshold"] is False
 
         # 模拟低于低库存阈值的情况
-        inventory.onhand_stock = 20
+        set_stock(inventory.goods_id, inventory.warehouse_id, onhand=20)
         db.session.commit()
         status = InventoryService.check_stock_thresholds(goods_id, warehouse_id)
         assert status["is_below_low_threshold"] is True
         assert status["is_above_high_threshold"] is False
 
         # 模拟高于高库存阈值的情况
-        inventory.onhand_stock = 150
+        set_stock(inventory.goods_id, inventory.warehouse_id, onhand=150)
         db.session.commit()
         status = InventoryService.check_stock_thresholds(goods_id, warehouse_id)
         assert status["is_below_low_threshold"] is False

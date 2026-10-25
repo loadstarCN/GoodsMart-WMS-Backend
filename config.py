@@ -171,6 +171,11 @@ class Config:
     CUSTOMS_SIGNATURE_SIGNATORY_NAME = os.getenv('CUSTOMS_SIGNATURE_SIGNATORY_NAME') or None
     CUSTOMS_SIGNATURE_SIGNATORY_TITLE = os.getenv('CUSTOMS_SIGNATURE_SIGNATORY_TITLE') or None
 
+    # 库存写入守卫（warehouse/stock/guard.py）：发现绕过 StockService 直接改库存数量的代码。
+    # raise = 抛错拒绝写入（测试 / 开发）；log = 只记 warning 日志（logger stock.guard）照常写入；off = 不检查。
+    # 生产上线初期用 log 观察，稳定后改 raise
+    STOCK_GUARD = (os.getenv('STOCK_GUARD') or 'log').strip().lower()
+
     # 承运商对接（自动建运单）：账号 / 密钥 / 服务等按承运商在「承运商」编辑页设置（carrier_integrations，密钥用
     # SETTINGS_ENCRYPTION_KEY 加密），这里只放与承运商无关的时限。插件见 warehouse/carrier/integrations。
     # 每次请求的连接 / 读取超时（秒）
@@ -189,6 +194,7 @@ class Config:
 
 class DevelopmentConfig(Config):
     DEBUG = True # 只在开发环境中启用调试
+    STOCK_GUARD = (os.getenv('STOCK_GUARD') or 'raise').strip().lower()   # 开发时绕过 StockService 直接报错
     WEBHOOK_URL_STRICT = env_bool('WEBHOOK_URL_STRICT', False)
     SQLALCHEMY_ECHO=False # 打印SQL语句
     SQLALCHEMY_DATABASE_URI = os.getenv('SQLALCHEMY_DATABASE_URI_DEV', 'sqlite:///test.db')  # 数据库连接
@@ -201,6 +207,7 @@ class DevelopmentConfig(Config):
 
 class TestingConfig(Config):
     TESTING = True
+    STOCK_GUARD = 'raise'   # 测试里绕过 StockService 改库存直接报错
     WEBHOOK_URL_STRICT = False
     RATELIMIT_ENABLED = False
     SCHEDULER_ENABLED = False

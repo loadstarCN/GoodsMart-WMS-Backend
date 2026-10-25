@@ -11,6 +11,7 @@ from extensions.transaction import transactional
 from warehouse.common import require_positive_int, require_bulk_list, require_fields, require_source_api_key
 from warehouse.common import clock
 from warehouse.inventory.services import InventoryService
+from warehouse.stock.service import StockOp
 from warehouse.common.locks import lock_row, lock_inventory_rows, lock_order_key
 
 from warehouse.goods.services import GoodsService
@@ -1035,9 +1036,10 @@ class DNService:
 
     @staticmethod
     @transactional
-    def packing_dn(dn_or_id:int | DN) -> DN:
+    def packing_dn(dn_or_id:int | DN, packing_task=None) -> DN:
         """
         Mark a DN as 'packed' (例如打包操作)，仅当 DN 状态为 picked 时可变更为 packed
+        - packing_task：被完成的打包任务（打包完成时由调用方传入），记进库存流水的单据；没传取最新一条已完成的
         """
         # 锁 DN 行并重读状态（打包完成已先锁过 DN，同一事务重复加锁无副作用）
         dn = lock_row(DNService._get_instance(dn_or_id))
@@ -1048,11 +1050,22 @@ class DNService:
         dn = DNService._update_dn_status(dn, "packed")
         DNService._update_and_calculate_quantity(dn_or_id)
 
+        # 记账：一个打包任务一笔（pack 已拣 → 已打包；pack_short_return 少打包的差额 已拣 → 待上架）
+        if packing_task is None:
+            from warehouse.packing.models import PackingTask
+            packing_task = (PackingTask.query
+                            .filter(PackingTask.dn_id == dn.id, PackingTask.is_active == True,
+                                    PackingTask.status == 'completed')
+                            .order_by(PackingTask.id.desc()).first())
+        stock_op = StockOp(dn.warehouse_id, 'pack', doc_type='packing_task',
+                           doc_id=packing_task.id if packing_task is not None else None, doc_no=dn.order_number)
         for detail in dn.details:
             # 按实际打包量记 packed_stock（之后按此发货）；已拣未打包的差额由 dn_packed 退回 sorted_stock 待上架
             InventoryService.dn_packed(
-                detail.goods_id, dn.warehouse_id, detail.packed_quantity or 0, detail.picked_quantity or 0
+                detail.goods_id, dn.warehouse_id, detail.packed_quantity or 0, detail.picked_quantity or 0,
+                op=stock_op, doc_line_id=detail.id,
             )
+        stock_op.commit()
 
         # 创建发货任务
         from warehouse.delivery.services import DeliveryTaskService
@@ -1094,8 +1107,13 @@ class DNService:
             dn.delivered_at = shipped_at
         DNService._update_and_calculate_quantity(dn_or_id)
 
+        # 记账：ship 已打包 → 在途；业务发生时刻 = 实际发货时刻（承运商揽收时刻，可能早于记账时刻）
+        stock_op = StockOp(dn.warehouse_id, 'ship', doc_type='dn', doc_id=dn.id, doc_no=dn.order_number,
+                           occurred_at=dn.delivered_at)
         for detail in dn.details:
-            InventoryService.dn_delivered(detail.goods_id,dn.warehouse_id,detail.delivered_quantity)
+            InventoryService.dn_delivered(detail.goods_id, dn.warehouse_id, detail.delivered_quantity,
+                                          op=stock_op, doc_line_id=detail.id)
+        stock_op.commit()
 
         # tracking_number：取被完成的那条发货任务的运单号（调用方传入）；
         # 没传（直接调用）时取最新一条已完成的有效发货任务，不再用无排序的 .first()（同一 DN 有多条任务时可能取错）
@@ -1150,8 +1168,11 @@ class DNService:
         dn = DNService._update_dn_status(dn, "completed")
         DNService._update_and_calculate_quantity(dn_or_id)
 
+        # 记账：sign 在途 →（仓外）；自动视为签收、承运商跟踪没有操作人（source = system）
+        stock_op = StockOp(dn.warehouse_id, 'sign', doc_type='dn', doc_id=dn.id, doc_no=dn.order_number)
         for detail in dn.details:
-            InventoryService.dn_completed(detail.goods_id,dn.warehouse_id,detail.delivered_quantity)
+            InventoryService.dn_completed(detail.goods_id, dn.warehouse_id, detail.delivered_quantity,
+                                          op=stock_op, doc_line_id=detail.id)
 
         # tracking_number / shipped_at：签收的那条发货任务的运单号、DN 的发货时刻。dn.delivered 没送到（重试中）时
         # 来源系统靠它们补上发货信息
@@ -1166,6 +1187,8 @@ class DNService:
         # 完成时刻 = 签收时刻（人填的签收时间、或承运商的送达时刻），不是处理的时刻；没签收的任务按现在
         if signed_task is not None and signed_task.signed_at is not None:
             dn.completed_at = signed_task.signed_at
+        stock_op.occurred_at = dn.completed_at
+        stock_op.commit()
         webhook_emit('dn.completed', {
             'dn_id': dn.id, 'status': 'completed', 'order_number': dn.order_number,
             'tracking_number': signed_task.tracking_number if signed_task else None,
@@ -1324,13 +1347,18 @@ class DNService:
             raise ConflictException("Cannot cancel a DN that has already been shipped.", 16052)
 
         DNService._lock_inventories(dn)
+        # 记账：dn_cancel_return 已拣 / 已打包 → 待上架（按良品）
+        stock_op = StockOp(dn.warehouse_id, 'dn_cancel_return', doc_type='dn', doc_id=dn.id, doc_no=dn.order_number)
         for detail in dn.details:
             if dn.status == 'picked':
                 InventoryService.dn_cancelled_after_picking(
-                    detail.goods_id, dn.warehouse_id, picked_quantity=detail.picked_quantity or 0)
+                    detail.goods_id, dn.warehouse_id, picked_quantity=detail.picked_quantity or 0,
+                    op=stock_op, doc_line_id=detail.id)
             else:
                 InventoryService.dn_cancelled_after_picking(
-                    detail.goods_id, dn.warehouse_id, packed_quantity=detail.packed_quantity or 0)
+                    detail.goods_id, dn.warehouse_id, packed_quantity=detail.packed_quantity or 0,
+                    op=stock_op, doc_line_id=detail.id)
+        stock_op.commit()
 
         for task in [*picking_tasks, *packing_tasks, *delivery_tasks]:
             task.is_active = False

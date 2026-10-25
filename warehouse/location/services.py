@@ -31,6 +31,7 @@ class LocationService:
         from warehouse.picking.models import PickingTaskDetail
         from warehouse.putaway.models import PutawayRecord
         from warehouse.removal.models import RemovalRecord
+        from warehouse.stock.models import StockDailyBalance, StockLedger
         from warehouse.transfer.models import TransferRecord
 
         counts = {}
@@ -43,6 +44,8 @@ class LocationService:
             ('cycle_count_details', CycleCountTaskDetail.query.filter(CycleCountTaskDetail.location_id == location_id)),
             ('adjustment_details', AdjustmentDetail.query.filter(AdjustmentDetail.location_id == location_id)),
             ('inventory_snapshots', InventorySnapshot.query.filter(InventorySnapshot.location_id == location_id)),
+            ('stock_ledger', StockLedger.query.filter(StockLedger.location_id == location_id)),
+            ('stock_daily_balances', StockDailyBalance.query.filter(StockDailyBalance.location_id == location_id)),
         ):
             count = query.order_by(None).count()
             if count:
@@ -205,7 +208,10 @@ class LocationService:
                 f"Location {location.code} is referenced by history records ({detail}); deactivate it instead.",
                 44009, details={'entity': 'location', 'id': location.id, 'references': related}
             )
-        GoodsLocation.query.filter(GoodsLocation.location_id == location.id).delete(synchronize_session='fetch')
+        # 数量为 0 的行逐行删（不用批量 DELETE：库存写入守卫按行核对数量为 0，warehouse/stock/guard.py）
+        for row in GoodsLocation.query.filter(GoodsLocation.location_id == location.id).all():
+            db.session.delete(row)
+        db.session.flush()
         db.session.delete(location)
         # db.session.commit()
 

@@ -50,6 +50,10 @@ transfer_record_model = api_ns.inherit('TransferRecord', transfer_record_base_mo
 #    通过复制基础模型字段后删除只读字段（id、transfer_time）
 # -----------------------------
 transfer_record_input_fields = generate_input_fields(transfer_record_base_model)
+# 从破损 / 退货库位移回 standard 库位时必填（没给时非空的 remark 也算），否则 400 15018；写进库存流水的备注
+transfer_record_input_fields['reason'] = fields.String(
+    description='Why the stock is moved (required when moving from a damaged / return location to a standard '
+                'location, else 400 15018; a non-empty remark also counts). Written to the stock ledger remark')
 transfer_record_input_model = api_ns.model('TransferRecordInput', transfer_record_input_fields)
 
 # -----------------------------

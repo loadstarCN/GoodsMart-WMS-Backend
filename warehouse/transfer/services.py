@@ -5,12 +5,12 @@ from extensions.error import BadRequestException, NotFoundException
 from extensions.transaction import transactional
 from warehouse.common import (
     require_same_warehouse, require_positive_int, require_bulk_list, require_fields, lock_goods_location,
-    lock_inventory_rows, lock_or_create_goods_location, lock_stock_for_bulk,
+    lock_inventory_rows, lock_stock_for_bulk,
 )
 from warehouse.common.locks import lock_row
 from warehouse.goods.models import Goods
-from warehouse.inventory.services import InventoryService
 from warehouse.location.models import Location
+from warehouse.stock.service import Leg, StockOp
 from warehouse.location.services import LocationService
 from warehouse.common import clock
 from .models import TransferRecord
@@ -97,8 +97,10 @@ class TransferService:
         """
         创建一条新的移库记录（先减来源库位、后加目标库位，同一事务内两条库位记录都持锁）
 
-        :param data: dict，包含 goods_id, from_location_id, to_location_id, quantity, remark 等字段
+        :param data: dict，包含 goods_id, from_location_id, to_location_id, quantity, remark、reason 等字段
         :return: 新创建的 TransferRecord 实例
+        从破损 / 退货库位移回 standard 库位（货重新变成可售）必须填原因：reason（没给 reason 时非空的 remark 也算），
+        否则 400 15018；原因写进库存流水的备注，remark 为空时也记进移库记录的 remark
         """
         require_fields(data, 'goods_id', 'from_location_id', 'to_location_id', 'quantity')
         goods_id = data['goods_id']
@@ -112,6 +114,7 @@ class TransferService:
         to_location = get_object_or_404(Location, to_location_id)
         # 移库只在同一仓库内进行，跨仓库会让 Inventory 记账落到错误的仓库
         require_same_warehouse(from_location.warehouse_id, to_location.warehouse_id, 'to_location')
+        reason = TransferService._restore_reason(data, from_location, to_location)
         # 先给目标库位行加共享锁再判断启用状态（之后才锁库位库存行）：与并发的停用串行，停用库位不能再移入（400 16085）
         LocationService.require_active_location(lock_row(to_location, shared=True), 'to_location_id')
 
@@ -121,7 +124,6 @@ class TransferService:
         for location_id in sorted({from_location_id, to_location_id}):
             locked[location_id] = lock_goods_location(goods_id, location_id)
         from_goods_location_record = locked[from_location_id]
-        to_goods_location_record = locked[to_location_id]
 
         if from_goods_location_record is None:
             raise NotFoundException(
@@ -137,30 +139,42 @@ class TransferService:
             to_location_id=to_location_id,
             quantity=quantity,
             operator_id=created_by_id,
-            remark=data.get('remark', '')
+            remark=data.get('remark') or reason or ''
         )
         db.session.add(new_record)
         db.session.flush()
 
-        from_goods_location_record.quantity -= quantity
-        if from_goods_location_record.quantity == 0:
-            db.session.delete(from_goods_location_record)
-        else:
-            db.session.add(from_goods_location_record)
-
-
-        if to_goods_location_record is None:
-            # 创建新的库存信息（savepoint 兜底并发首次移入同一库位，B-107）
-            to_goods_location_record, _ = lock_or_create_goods_location(goods_id, to_location_id)
-        to_goods_location_record.quantity += quantity
-
-        db.session.add(to_goods_location_record)
-        db.session.flush()
-
-        #更新库存信息
-        InventoryService.update_and_calculate_stock(goods_id, to_location.warehouse_id)
+        # 记账：库位 → 库位（目标库位库存行没有就新建，savepoint 兜底并发首次移入同一库位，B-107）
+        StockOp(to_location.warehouse_id, 'transfer', doc_type='transfer', doc_id=new_record.id,
+                operator_id=created_by_id, remark=reason or data.get('remark') or None).move(
+            goods_id, quantity, src=Leg.at(from_location_id), dst=Leg.at(to_location_id),
+            errors={'insufficient': (15001, "Insufficient inventory in the specified location")}).commit()
         # db.session.commit()
         return new_record
+
+    # 移回 standard 库位要填原因的来源库位类型（破损品 / 退货品重新变成可售）
+    RESTORE_FROM_TYPES = frozenset({'damaged', 'return'})
+    REASON_MAX_LENGTH = 255
+
+    @staticmethod
+    def _restore_reason(data: dict, from_location: Location, to_location: Location):
+        """移库的原因（reason，没给时取 remark）。从破损 / 退货库位移回 standard 库位必须有 → 否则 400 15018"""
+        reason = data.get('reason')
+        if reason is not None and not isinstance(reason, str):
+            raise BadRequestException("reason must be a string", 15018, field='reason')
+        reason = (reason or '').strip() or (data.get('remark') if isinstance(data.get('remark'), str) else '').strip()
+        if len(reason) > TransferService.REASON_MAX_LENGTH:
+            raise BadRequestException(f"reason must be at most {TransferService.REASON_MAX_LENGTH} characters",
+                                      15018, field='reason')
+        if (from_location.location_type in TransferService.RESTORE_FROM_TYPES
+                and to_location.location_type == 'standard' and not reason):
+            raise BadRequestException(
+                f"Moving stock from a {from_location.location_type} location back to a standard location "
+                f"needs a reason.", 15018, field='reason',
+                details={'from_location_id': from_location.id, 'from_location_type': from_location.location_type,
+                         'to_location_id': to_location.id, 'to_location_type': to_location.location_type},
+            )
+        return reason or None
 
     @staticmethod
     def get_transfer_record(record_id: int) -> TransferRecord:

@@ -9,13 +9,14 @@ lock_row：单据 / 任务的状态转换、批次追加前锁单据行并重读
 
 全系统统一的加锁顺序（B-103）：
     父单据（ASN / DN / 调整单 / 盘点单）→ 任务行 → 库存行 Inventory（按 (goods_id, warehouse_id) 升序）
-    → 库位库存行 GoodsLocation（按 (goods_id, location_id) 升序）
+    → 库位库存行 GoodsLocation（按 (goods_id, location_id, 批次) 升序）
+    → 不在库位上的库存行 InventoryLotStock（按 (goods_id, 批次) 升序；只在持有同一商品 Inventory 行锁时才写）
+实物库存的读改写统一由 StockService（warehouse/stock/service.py）按这个顺序一次锁齐。
 一次操作涉及多个商品 / 库位时，先用 lock_inventory_rows / lock_inventory_pairs / lock_goods_location_keys
 按这个顺序把要动的行一次锁齐，之后逐行的 InventoryService._get_for_update / lock_goods_location 只是重入已持有的锁。
 两个请求商品顺序相反时不再互相等待（PostgreSQL 检测到死锁会中止其中一个 → 500）。
 库位行（Location）只在上架 / 移库 / 正向调整时加共享锁；持排他锁的一方（停用 / 修改 / 删除库位）不锁库存行，不参与这个顺序。
 """
-from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import lazyload
 
 from extensions.db import db
@@ -120,40 +121,24 @@ def lock_row(obj, *, shared: bool = False):
     return obj
 
 
-def lock_goods_location(goods_id: int, location_id: int):
-    """按 (goods_id, location_id) 加锁读取库位库存记录；不存在返回 None。"""
-    from warehouse.goods.models import GoodsLocation
-    return (
-        GoodsLocation.query
-        .options(lazyload('*'))
-        .filter_by(goods_id=goods_id, location_id=location_id)
-        .with_for_update()
-        .first()
-    )
+def lock_goods_location(goods_id: int, location_id: int, lot_id=None):
+    """按 (goods_id, location_id, 批次) 加锁读取库位库存记录；不存在返回 None。lot_id 为空 = 无批次那一行（一期全是）"""
+    from warehouse.stock.service import lock_goods_location as lock_stock_location
+    return lock_stock_location(goods_id, location_id, lot_id)
 
 
-def lock_or_create_goods_location(goods_id: int, location_id: int):
-    """加锁读取库位库存行；不存在则新建一行（quantity=0，由调用方加量），返回 (record, created)。
+def lock_or_create_goods_location(goods_id: int, location_id: int, lot_id=None):
+    """加锁读取库位库存行；不存在则新建一行（quantity=0，由 StockService 记账时加量），返回 (record, created)。
 
-    新建放在 savepoint 里（B-107）：同一 (goods_id, location_id) 第一次被并发上架 / 移入时，后到的一方
-    撞唯一约束 uix_goods_location → 只回滚 savepoint，再加锁读取对方已提交的行，不再 500。
+    新建放在 savepoint 里（B-107）：同一 (goods_id, location_id, 批次) 第一次被并发上架 / 移入时，后到的一方
+    撞唯一索引 uix_goods_location_lot → 只回滚 savepoint，再加锁读取对方已提交的行，不再 500。
     PostgreSQL 上后到的 INSERT 会等先到的事务结束：对方提交 → 唯一键冲突走这里；对方回滚 → 本次插入成功。
     """
-    from warehouse.goods.models import GoodsLocation
-    record = lock_goods_location(goods_id, location_id)
-    if record is not None:
-        return record, False
-    try:
-        with db.session.begin_nested():
-            record = GoodsLocation(goods_id=goods_id, location_id=location_id, quantity=0)
-            db.session.add(record)
-            db.session.flush()
-    except IntegrityError:
-        record = lock_goods_location(goods_id, location_id)
-        if record is None:
-            raise
-        return record, False
-    return record, True
+    from warehouse.stock.service import lock_goods_location as lock_stock_location, lock_or_create_goods_location
+    existing = lock_stock_location(goods_id, location_id, lot_id)
+    if existing is not None:
+        return existing, False
+    return lock_or_create_goods_location(goods_id, location_id, lot_id), True
 
 
 def lock_goods_locations_for_goods(goods_id: int, warehouse_id: int):

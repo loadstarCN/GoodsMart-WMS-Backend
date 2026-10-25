@@ -1,13 +1,10 @@
 from sqlalchemy import or_
 from extensions.db import *
 from extensions.transaction import transactional
-from warehouse.common import (
-    require_positive_int, require_bulk_list, require_fields, lock_inventory_rows, lock_or_create_goods_location,
-    lock_stock_for_bulk,
-)
+from warehouse.common import require_positive_int, require_bulk_list, require_fields, lock_stock_for_bulk
 from warehouse.common.locks import lock_row
 from warehouse.goods.models import Goods
-from warehouse.inventory.services import InventoryService
+from warehouse.stock.service import Leg, StockOp
 from warehouse.location.models import Location
 from warehouse.location.services import LocationService
 from warehouse.common import clock
@@ -105,17 +102,11 @@ class PutawayService:
         db.session.add(new_record)
         db.session.flush()
 
-        # 加锁顺序（B-103）：库存行先于库位库存行
-        lock_inventory_rows([goods_id], location.warehouse_id)
-        # 读改写商品库位记录全程持锁（SELECT ... FOR UPDATE）；没有就新建（savepoint 兜底并发首次上架，B-107）
-        goods_location_record, _ = lock_or_create_goods_location(goods_id, location_id)
-        goods_location_record.quantity += quantity
-
-        db.session.add(goods_location_record)
-        db.session.flush()
-
-        # 更新库存信息：破损品只能上到 damaged 库位（standard / return 库位只能用待上架的良品部分，超出 400 15016）
-        InventoryService.putaway_completed(goods_id, location.warehouse_id, quantity, location.location_type)
+        # 记账（StockService：库存行 → 库位库存行 → 待上架行依次加锁，库位库存行没有就新建）：待上架 → 库位。
+        # 破损品只能上到 damaged 库位（standard / return 库位只能用待上架的良品部分，超出 400 15016；不足 15007）
+        StockOp(location.warehouse_id, 'putaway', doc_type='putaway', doc_id=new_record.id,
+                operator_id=created_by_id, remark=data.get('remark') or None).move(
+            goods_id, quantity, src=Leg.pending_for(location.location_type), dst=Leg.at(location_id)).commit()
 
         # db.session.commit()
         return new_record

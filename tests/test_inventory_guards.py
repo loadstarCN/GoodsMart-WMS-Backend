@@ -229,9 +229,7 @@ def test_dn_packed_service_defaults_and_guards(client):
     from extensions.error import APIException
     w = _world(client)
     with client.application.app_context():
-        inventory = Inventory(goods_id=w['g1'], warehouse_id=w['wh'], picked_stock=5, total_stock=5)
-        db.session.add(inventory)
-        db.session.commit()
+        add_stock(w['g1'], w['wh'], picked=5)
         InventoryService.dn_packed(w['g1'], w['wh'], 2)              # 旧调用：已拣量缺省 = 打包量
         InventoryService.dn_packed(w['g1'], w['wh'], 1, 3)           # 少打包 2 件退回待上架
         inv = db.session.get(Inventory, (w['g1'], w['wh']))

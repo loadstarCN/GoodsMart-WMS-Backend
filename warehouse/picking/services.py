@@ -259,9 +259,8 @@ class PickingTaskService:
         """
         拣货明细的商品必须在 DN 明细内。
 
-        拣货下架走 picking_removed（不再计入 sorted_stock），计划外商品被下架后既不进
-        picked_stock 也不进待上架区，会从 total_stock 里凭空消失；与 sorting / packing
-        的「明细必须属于单据」保持一致。批次创建 / 明细改量校验本次涉及的商品，
+        拣货完成按 pick 记账（库位 → 已拣），计划外商品被拣出后不在 DN 明细里，打包 / 发货都不会结算它，
+        会永远留在已拣里；与 sorting / packing 的「明细必须属于单据」保持一致。批次创建 / 明细改量校验本次涉及的商品，
         complete 前对全部明细再验一次（拦历史脏数据）。
         """
         planned = {d.goods_id for d in task.dn.details}
@@ -607,14 +606,19 @@ class PickingTaskService:
 
         task = PickingTaskService._update_task_status(task, 'completed', operator_id)
 
+        # 记账：一个拣货任务一笔 pick（库位 → 已拣，doc = 拣货任务，doc_line = 拣货明细）
+        from warehouse.stock.service import StockOp
+        stock_op = StockOp(task.dn.warehouse_id, 'pick', doc_type='picking_task', doc_id=task.id,
+                           doc_no=task.dn.order_number, operator_id=operator_id)
         for detail in task.task_details:
-            # 创建下架记录：走 service 内部参数 from_picking（对外接口不接受 reason='picking'）
+            # 创建下架记录（只留历史）：走 service 内部参数 from_picking（对外接口不接受 reason='picking'）
             RemovalService.create_removal_record({
                 'goods_id': detail.goods_id,
                 'location_id': detail.location_id,
                 'quantity': detail.picked_quantity,
                 'remark': f'DN Picking: {task.dn.order_number}',
-            }, operator_id, from_picking=True)
+            }, operator_id, from_picking=True, stock_op=stock_op, doc_line_id=detail.id)
+        stock_op.commit()
 
         # 更新DN状态
         DNService.picking_dn(task.dn)

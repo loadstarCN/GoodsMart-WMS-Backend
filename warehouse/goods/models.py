@@ -195,10 +195,13 @@ class GoodsLocation(db.Model):
     """商品库位存储表"""
     __tablename__ = 'goods_locations'
 
+    # 唯一键 (goods_id, location_id, 批次)：无批次（lot_id 为空）按 0 算，同一商品同一库位仍只有一行无批次库存。
+    # 用函数唯一索引而不是 NULLS NOT DISTINCT（SQLite 不支持）。数量只能由 StockService 改（warehouse/stock/guard.py）
     __table_args__ = (
-        db.UniqueConstraint('goods_id', 'location_id', name='uix_goods_location'),
+        db.Index('uix_goods_location_lot', 'goods_id', 'location_id', db.text('coalesce(lot_id, 0)'), unique=True),
         db.Index('idx_goods_location_goods', 'goods_id'),
         db.Index('idx_goods_location_location', 'location_id'),
+        db.Index('idx_goods_location_lot', 'lot_id'),
         db.CheckConstraint("quantity >= 0", name='chk_non_negative_quantity'),
     )
 
@@ -216,6 +219,12 @@ class GoodsLocation(db.Model):
         nullable=False,
         index=True,
         info={'description': '关联库位ID（禁止删除有库存的库位）'}
+    )
+    lot_id = db.Column(
+        db.Integer,
+        db.ForeignKey('goods_lots.id', ondelete='RESTRICT'),
+        nullable=True,
+        info={'description': '批次（为空 = 无批次；一期一律为空，二期启用）'}
     )
     quantity = db.Column(
         db.Integer,

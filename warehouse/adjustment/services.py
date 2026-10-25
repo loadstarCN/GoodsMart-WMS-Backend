@@ -10,6 +10,7 @@ from warehouse.common.locks import (
 from warehouse.common import clock
 from warehouse.cyclecount.services import CycleCountTaskService
 from warehouse.inventory.services import InventoryService
+from warehouse.stock.service import Leg, StockOp
 from .models import Adjustment, AdjustmentDetail
 from dateutil.relativedelta import relativedelta
 from sqlalchemy import and_, func, case, extract
@@ -384,33 +385,31 @@ class AdjustmentService:
         # 再按 (goods_id, location_id) 升序逐行锁库位库存行（FOR UPDATE 读取，避免多 worker 并发下丢更新）
         changed = [d for d in adjustment.details if (d.adjustment_quantity or 0) != 0]
         lock_inventory_rows([d.goods_id for d in changed], adjustment.warehouse_id)
-        touched_goods_ids = []
+        # 记账：一张调整单一笔，盘盈 adjust_gain（仓外 → 库位）、盘亏 adjust_loss（库位 → 仓外），
+        # doc = 调整单，doc_line = 调整明细，reason = 调整原因
+        stock_op = StockOp(adjustment.warehouse_id, 'adjust_gain', doc_type='adjustment', doc_id=adjustment.id,
+                           operator_id=operator_id, reason=adjustment.adjustment_reason)
         for detail in sorted(adjustment.details, key=lambda d: lock_order_key(d.goods_id, d.location_id)):
             delta = detail.adjustment_quantity or 0
             if delta == 0:
                 continue
-            if detail.goods_id not in touched_goods_ids:
-                touched_goods_ids.append(detail.goods_id)
-            goods_location_record = AdjustmentService._lock_or_create_goods_location(adjustment, detail)
-            goods_location_record.quantity += delta
-
-            if goods_location_record.quantity < 0:
-                raise BadRequestException(f"Insufficient stock for goods_id={detail.goods_id} in location_id={detail.location_id}", 15002)
-            elif goods_location_record.quantity == 0:
-                db.session.delete(goods_location_record)
+            AdjustmentService._lock_or_create_goods_location(adjustment, detail)
+            if delta > 0:
+                stock_op.move(detail.goods_id, delta, dst=Leg.at(detail.location_id), movement_type='adjust_gain',
+                              doc_line_id=detail.id, remark=detail.remark or None)
             else:
-                db.session.add(goods_location_record)
-            db.session.flush()
-
-        # 更新库存（只重算动过库位库存的商品；库存行上面已锁，这里只是重入）
-        for goods_id in sorted(touched_goods_ids, key=lock_order_key):
-            InventoryService.update_and_calculate_stock(goods_id, adjustment.warehouse_id)
+                stock_op.move(detail.goods_id, -delta, src=Leg.at(detail.location_id), movement_type='adjust_loss',
+                              doc_line_id=detail.id, remark=detail.remark or None,
+                              errors={'insufficient': (15002, f"Insufficient stock for goods_id={detail.goods_id} "
+                                                              f"in location_id={detail.location_id}")})
+        stock_op.commit()
 
         return adjustment
 
     @staticmethod
     def _lock_or_create_goods_location(adjustment: Adjustment, detail: AdjustmentDetail):
-        """完成调整时取明细对应的库位库存行（FOR UPDATE）；正向调整且不存在时在锁下新建（quantity 先记 0）"""
+        """完成调整时取明细对应的库位库存行（FOR UPDATE）；正向调整且不存在时在锁下新建（quantity 先记 0，
+        由 StockService 记账时加量）"""
         from warehouse.location.models import Location
         from warehouse.location.services import LocationService
 

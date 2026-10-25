@@ -575,10 +575,7 @@ def test_create_batch_rejects_quantity_above_location_stock(client):
         PickingTaskService.process_task(task.id, admin_user.id)
         goods_id = task.dn.details[0].goods_id
         location = get_location()
-        stock = GoodsLocation.query.filter_by(
-            goods_id=goods_id, location_id=location.id
-        ).first()
-        stock.quantity = 1
+        set_stock(goods_id, location.warehouse_id, location_id=location.id, onhand=1)
         # Isolate this stock boundary from the seeded historical picking details.
         PickingTaskDetail.query.filter_by(picking_task_id=task.id).delete()
         db.session.flush()
@@ -675,9 +672,7 @@ def test_update_task_detail_quantity_is_bounded(client):
 
         # 库位库存 1，改到 2 → 16036
         PickingTaskService.update_task_detail(task.id, detail.id, {"picked_quantity": 1})
-        stock = GoodsLocation.query.filter_by(goods_id=detail.goods_id, location_id=detail.location_id).first()
-        stock.quantity = 1
-        db.session.flush()
+        set_stock(detail.goods_id, task.dn.warehouse_id, location_id=detail.location_id, onhand=1)
         with pytest.raises(BadRequestException) as excinfo:
             PickingTaskService.update_task_detail(task.id, detail.id, {"picked_quantity": 2})
         assert excinfo.value.biz_code == 16036
@@ -700,8 +695,7 @@ def test_complete_task_rejects_location_in_other_warehouse(client):
                                     location_type='standard', created_by=admin_user.id)
         db.session.add(foreign_location)
         db.session.flush()
-        db.session.add(GoodsLocation(goods_id=task.dn.details[0].goods_id,
-                                     location_id=foreign_location.id, quantity=100))
+        add_stock(task.dn.details[0].goods_id, other_warehouse.id, location_id=foreign_location.id, onhand=100)
         # 直接把一条明细挪到别仓库位，模拟被绕过校验的历史脏数据
         detail = task.task_details[0]
         detail.location_id = foreign_location.id

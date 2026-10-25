@@ -9,6 +9,7 @@ from warehouse.common import (
 from warehouse.goods.models import Goods
 from warehouse.inventory.services import InventoryService
 from warehouse.location.models import Location
+from warehouse.stock.service import Leg, StockOp
 from warehouse.common import clock
 from .models import RemovalRecord
 
@@ -89,14 +90,17 @@ class RemovalService:
 
     @staticmethod
     @transactional
-    def create_removal_record(data: dict, created_by_id: int, *, from_picking: bool = False) -> RemovalRecord:
+    def create_removal_record(data: dict, created_by_id: int, *, from_picking: bool = False,
+                              stock_op=None, doc_line_id: int | None = None) -> RemovalRecord:
         """
         创建一条新的下架记录
 
         :param data: dict，包含 goods_id, location_id, quantity, reason, remark 等字段
         :param from_picking: 仅拣货完成（PickingTaskService.complete_task）内部传 True：
-            reason 固定记为 'picking'，库存走 picking_removed（货由 dn_picked 计入 picked_stock）。
-            对外接口不传，reason 必须在 PUBLIC_REASONS 内，否则 400（16083）
+            reason 固定记为 'picking'，只留历史记录（pending.py、页签在用）；库存由拣货完成的 stock_op（pick：
+            库位 → 已拣）一并记账，这里只把这一笔加进去（doc_line_id = 拣货明细）。
+            对外接口不传，reason 必须在 PUBLIC_REASONS 内，否则 400（16083）；库存按 removal 记账：
+            库位 → 待上架（从 damaged 库位下架、或原因是 damage / damaged 的进待上架·破损）
         :return: 新创建的 RemovalRecord 实例
         """
         if from_picking:
@@ -135,21 +139,16 @@ class RemovalService:
         db.session.add(new_record)
         db.session.flush()
 
-        goods_location_record.quantity -= quantity
-        if goods_location_record.quantity == 0:
-            db.session.delete(goods_location_record)
-        else:
-            db.session.add(goods_location_record)
-        db.session.flush()
-
-        #更新库存信息：拣货下架的货走 picked_stock（由拣货流程记账），其它原因的下架进入待上架区。
+        # 记账：拣货下架的货走已拣（并进拣货完成的那一笔 pick），其它原因的下架进入待上架区。
         # 从 damaged 库位下架、或因破损（damage / damaged）下架的是破损品：记进待上架·破损，之后只能上到 damaged 库位
         if from_picking:
-            InventoryService.picking_removed(goods_id, location.warehouse_id, quantity)
+            stock_op.move(goods_id, quantity, src=Leg.at(location_id), dst=Leg.picked(), doc_line_id=doc_line_id)
         else:
             damaged = (location.location_type == 'damaged'
                        or reason in InventoryService.DAMAGED_REMOVAL_REASONS)
-            InventoryService.removal_completed(goods_id, location.warehouse_id, quantity, damaged=damaged)
+            StockOp(location.warehouse_id, 'removal', doc_type='removal', doc_id=new_record.id,
+                    operator_id=created_by_id, reason=reason, remark=data.get('remark') or None).move(
+                goods_id, quantity, src=Leg.at(location_id), dst=Leg.pending(damaged=damaged)).commit()
 
         # db.session.commit()
         return new_record

@@ -67,40 +67,6 @@ class InventoryService:
         )
 
     @staticmethod
-    def _clamp_sorted_damage(inventory: Inventory):
-        """不变式 0 ≤ sorted_damage_stock ≤ sorted_stock（破损部分是待上架的一部分）"""
-        sorted_stock = inventory.sorted_stock or 0
-        damaged = inventory.sorted_damage_stock or 0
-        inventory.sorted_damage_stock = max(0, min(damaged, sorted_stock))
-
-    @staticmethod
-    def take_sorted_for_putaway(inventory: Inventory, quantity: int, location_type: str):
-        """从待上架里扣 quantity 件上到 location_type 类型的库位（调用方已锁库存行）：
-        - damaged 库位：先扣破损部分（min(上架数, sorted_damage_stock)），其余扣良品部分
-        - standard / return 库位：只能用良品部分（sorted_stock − sorted_damage_stock），超出 → 400 15016，
-          details {good_pending, damaged_pending}
-        sorted_stock 照常减；待上架总量不足仍是 15007。"""
-        sorted_stock = inventory.sorted_stock or 0
-        damaged = min(inventory.sorted_damage_stock or 0, sorted_stock)
-        if sorted_stock < quantity:
-            raise BadRequestException("Not enough sort stock.", 15007)
-        good = sorted_stock - damaged
-        if location_type == 'damaged':
-            damaged -= min(quantity, damaged)
-        elif quantity > good:
-            raise BadRequestException(
-                f"Only {good} good item(s) of goods {inventory.goods_id} are waiting to be put away; "
-                f"{damaged} damaged item(s) can only be put away to a damaged location.",
-                15016, field='quantity',
-                details={'goods_id': inventory.goods_id, 'location_type': location_type, 'quantity': quantity,
-                         'good_pending': good, 'damaged_pending': damaged},
-            )
-        inventory.sorted_stock = sorted_stock - quantity
-        inventory.sorted_damage_stock = damaged
-        InventoryService._clamp_sorted_damage(inventory)
-
-
-    @staticmethod
     def get_inventory(goods_id: int, warehouse_id: int) -> Inventory:
         """
         通过 goods_id 和 warehouse_id 获取 Inventory 实例，如不存在则抛出 404
@@ -131,24 +97,35 @@ class InventoryService:
             query = query.filter(Inventory.low_stock_threshold <= filters['low_stock_threshold'])
         if filters.get('high_stock_threshold'):
             query = query.filter(Inventory.high_stock_threshold >= filters['high_stock_threshold'])
-            
+        # 低于补货阈值（可售 < low）/ 高于积压阈值（可售 > high）；阈值为 -1（不启用）的不算
+        sale = Inventory.onhand_stock - Inventory.locked_stock - Inventory.dn_stock
+        if filters.get('below_low_threshold'):
+            query = query.filter(Inventory.low_stock_threshold != -1, sale < Inventory.low_stock_threshold)
+        if filters.get('above_high_threshold'):
+            query = query.filter(Inventory.high_stock_threshold != -1, sale > Inventory.high_stock_threshold)
+
         if 'goods_codes' in filters or 'keyword' in filters:
             query = query.join(Goods)
         if filters.get('goods_codes'):
             query = query.filter(Goods.code.in_(filters['goods_codes']))
 
         # Search by keyword in goods name, code, manufacturer, category, tags, brand
-        if filters.get('keyword'):
-            query = query.filter(
-                func.lower(Goods.code).like(f"%{filters['keyword'].lower()}%") |
-                func.lower(Goods.name).like(f"%{filters['keyword'].lower()}%") |
-                func.lower(Goods.manufacturer).like(f"%{filters['keyword'].lower()}%") |
-                func.lower(Goods.category).like(f"%{filters['keyword'].lower()}%") |
-                func.lower(Goods.tags).like(f"%{filters['keyword'].lower()}%") |
-                func.lower(Goods.brand).like(f"%{filters['keyword'].lower()}%")
-            )
+        return InventoryService._keyword(query, filters.get('keyword'))
 
-        return query
+    @staticmethod
+    def _keyword(query, keyword):
+        """商品关键字（编码 / 名称 / 厂商 / 分类 / 标签 / 品牌包含，不分大小写）；query 已 join Goods"""
+        if not keyword:
+            return query
+        like = f"%{keyword.lower()}%"
+        return query.filter(
+            func.lower(Goods.code).like(like) |
+            func.lower(Goods.name).like(like) |
+            func.lower(Goods.manufacturer).like(like) |
+            func.lower(Goods.category).like(like) |
+            func.lower(Goods.tags).like(like) |
+            func.lower(Goods.brand).like(like)
+        )
 
     @staticmethod
     def _scoped(query, filters: dict):
@@ -166,7 +143,7 @@ class InventoryService:
     @staticmethod
     def pending_putaway_summary(filters: dict, overdue_days: int | None = None) -> dict:
         """待上架汇总（GET /inventory/pending-putaway/summary，首页 / 侧栏的数字）：范围同库存列表，
-        只算 sorted_stock > 0 的行 → {inventory_count, goods_count, total_quantity, damaged_quantity, good_quantity,
+        只算 sorted_stock > 0 的行（keyword 同列表）→ {inventory_count, goods_count, total_quantity, damaged_quantity, good_quantity,
         overdue_days, overdue_quantity, overdue_inventory_count, oldest_pending_since}（超期按先进先上，见 pending.py）"""
         from warehouse.common import clock
         from .pending import PENDING_PUTAWAY_OVERDUE_DAYS, overdue_summary
@@ -175,6 +152,9 @@ class InventoryService:
         query = db.session.query(Inventory.goods_id, Inventory.warehouse_id, Inventory.sorted_stock,
                                  Inventory.sorted_damage_stock).select_from(Inventory).join(
             Warehouse, Warehouse.id == Inventory.warehouse_id)
+        # keyword：与库存列表一致（商品编码 / 名称 / 厂商 / 分类 / 标签 / 品牌）
+        if filters.get('keyword'):
+            query = InventoryService._keyword(query.join(Goods, Goods.id == Inventory.goods_id), filters['keyword'])
         rows = InventoryService._scoped(query, filters).filter(Inventory.sorted_stock > 0).all()
         total = sum(int(row.sorted_stock or 0) for row in rows)
         damaged = sum(min(int(row.sorted_damage_stock or 0), int(row.sorted_stock or 0)) for row in rows)
@@ -196,35 +176,20 @@ class InventoryService:
     @transactional
     def create_inventory(data) -> Inventory:
         """
-        创建新的库存记录
-        :param data: 包含库存字段的 dict（必须包含 goods_id 和 warehouse_id）
+        新建一条库存记录（各库存量为 0）：实物库存只能经 StockService 记账（warehouse/stock/service.py），
+        这里只给 ensure_inventory 建全 0 行用
+        :param data: dict，必须包含 goods_id 和 warehouse_id；可带 remark
         :return: 新的 Inventory 实例
         """
         if 'goods_id' not in data or 'warehouse_id' not in data:
             raise BadRequestException("goods_id and warehouse_id are required to create an inventory record.", 16026)
-          
+
         new_inventory = Inventory(
             goods_id=data['goods_id'],
             warehouse_id=data['warehouse_id'],
-            total_stock=data.get('total_stock', 0),
-            onhand_stock=data.get('onhand_stock', 0),
-            locked_stock=data.get('locked_stock', 0),      # 初始化锁定库存
-            damage_stock=data.get('damage_stock', 0),
-            return_stock=data.get('return_stock', 0),
-            asn_stock=data.get('asn_stock', 0),
-            received_stock=data.get('received_stock', 0),
-            sorted_stock=data.get('sorted_stock', 0),
-            sorted_damage_stock=data.get('sorted_damage_stock', 0),
-            dn_stock=data.get('dn_stock', 0),
-            picked_stock=data.get('picked_stock', 0),
-            packed_stock=data.get('packed_stock', 0),        # 注意字段命名改为 packed_stock
-            delivered_stock=data.get('delivered_stock', 0),  # 注意字段命名改为 delivered_stock
             remark=data.get('remark', ""),
         )
-
-        InventoryService._clamp_sorted_damage(new_inventory)
         db.session.add(new_inventory)
-        # db.session.commit()
         return new_inventory
 
     @staticmethod
@@ -248,51 +213,6 @@ class InventoryService:
             if inventory is None:
                 raise
         return inventory
-
-    @staticmethod
-    @transactional
-    def update_inventory(goods_id: int, warehouse_id: int, data) -> Inventory:
-        """
-        更新库存记录
-        :param goods_id: 关联的商品 ID
-        :param warehouse_id: 仓库 ID
-        :param data: 包含更新字段的 dict
-        :return: 更新后的 Inventory 实例
-        """
-        inventory = InventoryService.get_inventory(goods_id, warehouse_id)
-
-        # 更新库存字段
-        inventory.total_stock = data.get('total_stock', inventory.total_stock)
-        inventory.onhand_stock = data.get('onhand_stock', inventory.onhand_stock)
-        inventory.locked_stock = data.get('locked_stock', inventory.locked_stock)      
-        inventory.damage_stock = data.get('damage_stock', inventory.damage_stock)
-        inventory.return_stock = data.get('return_stock', inventory.return_stock)
-        inventory.asn_stock = data.get('asn_stock', inventory.asn_stock)
-        inventory.received_stock = data.get('received_stock', inventory.received_stock)
-        inventory.sorted_stock = data.get('sorted_stock', inventory.sorted_stock)
-        inventory.sorted_damage_stock = data.get('sorted_damage_stock', inventory.sorted_damage_stock)
-        InventoryService._clamp_sorted_damage(inventory)
-        inventory.dn_stock = data.get('dn_stock', inventory.dn_stock)
-        inventory.picked_stock = data.get('picked_stock', inventory.picked_stock)        
-        inventory.packed_stock = data.get('packed_stock', inventory.packed_stock)        
-        inventory.delivered_stock = data.get('delivered_stock', inventory.delivered_stock)  
-        inventory.remark = data.get('remark', inventory.remark)  
-
-        # db.session.commit()
-        return inventory
-
-    @staticmethod
-    @transactional
-    def delete_inventory(goods_id: int, warehouse_id: int):
-        """
-        删除库存记录
-        :param goods_id: 关联的商品 ID
-        :param warehouse_id: 仓库 ID
-        :return: None
-        """        
-        inventory = InventoryService.get_inventory(goods_id, warehouse_id)
-        db.session.delete(inventory)
-        # db.session.commit()
 
     @staticmethod
     @transactional
@@ -344,30 +264,35 @@ class InventoryService:
     @staticmethod
     @transactional
     def asn_completed(goods_id: int, warehouse_id: int, quantity: int, actual_quantity: int,
-                      damage_quantity: int = 0):
+                      damage_quantity: int = 0, *, op=None, doc_line_id: int | None = None):
         """
         分拣完成：签收库存减少，分拣库存增加
         :param goods_id: 关联的商品 ID
         :param warehouse_id: 仓库 ID
         :param quantity: 签收数量
         :param actual_quantity: 实际分拣数量（良品 + 破损）
-        :param damage_quantity: 其中的破损数量：同时记进 sorted_stock 与 sorted_damage_stock（只能上到 damaged 库位）
+        :param damage_quantity: 其中的破损数量：记进待上架·破损（只能上到 damaged 库位）
+        :param op: 调用方的 StockOp（sort_in，带单据）；不传则单独记一笔
         这里的实际分拣数量可能小于签收数量，表示部分商品缺货，也有可能大于签收数量，表示多拣货
+        received_stock 不是实物（签收时按计划量占位），照旧在这里直接改、不记流水；实收按 sort_in 记账：
+        （仓外）→ 待上架·良品 / 待上架·破损
         """
+        from warehouse.stock.service import Leg, StockOp
         inventory = InventoryService._get_for_update(goods_id, warehouse_id)
         # 签收库存不足说明单据没有走过 asn_received（或库存已被别的流程扣走），
         # 静默清零会掩盖数据不一致，直接报错让调用方处理。
         if inventory.received_stock < quantity:
             raise BadRequestException("Not enough received stock.", 15006)
         inventory.received_stock -= quantity
-        # 分拣库存增加（破损是实收的一部分）
         actual_quantity = actual_quantity or 0
-        inventory.sorted_stock += actual_quantity
-        inventory.sorted_damage_stock = (inventory.sorted_damage_stock or 0) + max(
-            0, min(damage_quantity or 0, actual_quantity))
-        InventoryService._clamp_sorted_damage(inventory)
-        inventory.total_stock = InventoryService._calculate_total_stock(inventory)
-        # db.session.commit()
+        damaged = max(0, min(damage_quantity or 0, actual_quantity))
+        own = op is None
+        if own:
+            op = StockOp(warehouse_id, 'sort_in')
+        op.move(goods_id, actual_quantity - damaged, dst=Leg.pending(), doc_line_id=doc_line_id)
+        op.move(goods_id, damaged, dst=Leg.pending(damaged=True), doc_line_id=doc_line_id)
+        if own:
+            op.commit()
 
     @staticmethod
     @transactional
@@ -385,95 +310,46 @@ class InventoryService:
         inventory.received_stock -= quantity
         # db.session.commit()
 
-    @staticmethod
-    @transactional
-    def putaway_completed(goods_id: int, warehouse_id: int, quantity: int, location_type: str = 'standard'):
-        """
-        上架完成：分拣库存减少，现有库存增加
-        :param goods_id: 关联的商品 ID
-        :param warehouse_id: 仓库 ID
-        :param quantity: 上架数量
-        :param location_type: 目标库位类型（standard / damaged / return）：damaged 先扣待上架·破损；
-            standard / return 只能用良品部分，超出 → 400 15016（见 take_sorted_for_putaway）
-        """
-        inventory = InventoryService._get_for_update(goods_id, warehouse_id)
-        InventoryService.take_sorted_for_putaway(inventory, quantity, location_type)
-        db.session.flush()
-        InventoryService.update_and_calculate_stock(goods_id, warehouse_id)
-        # db.session.commit()
-
     # 这些原因的下架按破损品回到待上架（只能再上到 damaged 库位）；从 damaged 库位下架的也一样
     DAMAGED_REMOVAL_REASONS = frozenset({'damage', 'damaged'})
 
     @staticmethod
     @transactional
-    def removal_completed(goods_id: int, warehouse_id: int, quantity: int, damaged: bool = False):
+    def dn_picked(goods_id: int, warehouse_id: int, quantity: int, picked_quantity: int):
         """
-        下架完成：现有库存减少，货进入待上架
+        拣货完成：释放 DN 预占（dn_stock）。实物由拣货完成的 pick 记账（库位 → 已拣，warehouse/picking/services.py）
         :param goods_id: 关联的商品 ID
         :param warehouse_id: 仓库 ID
-        :param quantity: 下架数量
-        :param damaged: 下架的是破损品（从 damaged 库位下架，或下架原因是 damage / damaged）：
-            同时记进 sorted_damage_stock，之后只能上到 damaged 库位
-        """
-        inventory = InventoryService._get_for_update(goods_id, warehouse_id)
-        inventory.sorted_stock += quantity
-        if damaged:
-            inventory.sorted_damage_stock = (inventory.sorted_damage_stock or 0) + quantity
-        InventoryService._clamp_sorted_damage(inventory)
-        db.session.flush()
-        InventoryService.update_and_calculate_stock(goods_id, warehouse_id)
-        # db.session.commit()
-
-    @staticmethod
-    @transactional
-    def picking_removed(goods_id: int, warehouse_id: int, quantity: int):
-        """
-        拣货下架：只重算在库库存。拣出的货由 dn_picked 计入 picked_stock，
-        不能再进 sorted_stock，否则同一批货会在 total_stock 里被算两次，
-        且可以被再次"上架"回库位。
-        """
-        InventoryService._get_for_update(goods_id, warehouse_id)
-        InventoryService.update_and_calculate_stock(goods_id, warehouse_id)
-
-    @staticmethod
-    @transactional
-    def dn_picked(goods_id: int, warehouse_id: int, quantity: int,picked_quantity: int):
-        """
-        拣货完成：DN 库存减少，拣货库存增加
-        :param goods_id: 关联的商品 ID
-        :param warehouse_id: 仓库 ID
-        :param quantity: 拣货数量
+        :param quantity: 该 DN 该商品的计划量（整笔释放）
         :param picked_quantity: 实际拣货数量
-        注意：picked_quantity 可能小于 quantity，表示部分商品缺货
-        如果缺货的情况下需要重置 dn_stock 的值，否则会锁死商品dn数量。
+        注意：picked_quantity 可能小于 quantity，表示部分商品缺货；缺的部分不再继续预占（否则会锁死商品 dn 数量）
         """
         inventory = InventoryService._get_for_update(goods_id, warehouse_id)
         if inventory.dn_stock < picked_quantity:
             raise BadRequestException("Not enough DN stock.", 15008)
         # Release this DN's full reservation when picking closes. Only the
-        # physically picked amount moves to picked_stock; any short quantity
+        # physically picked amount moved to picked_stock (pick); any short quantity
         # becomes available to other DNs again.
         if inventory.dn_stock < quantity:
             raise BadRequestException("Not enough DN stock.", 15008)
         inventory.dn_stock -= quantity
-        inventory.picked_stock += picked_quantity
-        inventory.total_stock = InventoryService._calculate_total_stock(inventory)
-        # db.session.commit()
 
     @staticmethod
     @transactional
-    def dn_packed(goods_id: int, warehouse_id: int, quantity: int, picked_quantity: int | None = None):
+    def dn_packed(goods_id: int, warehouse_id: int, quantity: int, picked_quantity: int | None = None, *,
+                  op=None, doc_line_id: int | None = None):
         """
-        包装完成：拣货库存减少，包装库存增加
+        包装完成：已拣 → 已打包（pack）；少打包的差额 已拣 → 待上架良品（pack_short_return）
         :param goods_id: 关联的商品 ID
         :param warehouse_id: 仓库 ID
         :param quantity: 实际包装数量
         :param picked_quantity: 该 DN 该商品的已拣数量（缺省等于 quantity）
+        :param op: 调用方的 StockOp（带单据）；不传则单独记一笔
         注意：quantity 可能小于 picked_quantity，表示少打包。与拣货缺货时 dn_picked 释放整笔预占对应，
-        打包完成时按已拣量整笔扣 picked_stock，未打包的差额退回 sorted_stock（待上架），之后走上架放回库位；
-        否则差额会永久留在 picked_stock 里。差额只在两个分量之间搬动，total_stock 不变。
+        打包完成时按已拣量整笔扣已拣，未打包的差额退回待上架（按良品），之后走上架放回库位；
+        否则差额会永久留在已拣里。差额只在两个分量之间搬动，total_stock 不变。
         """
+        from warehouse.stock.service import Leg, StockOp
         if picked_quantity is None:
             picked_quantity = quantity
         if quantity > picked_quantity:
@@ -482,89 +358,63 @@ class InventoryService:
                 f"packed {quantity} > picked {picked_quantity}.",
                 16043
             )
-        inventory = InventoryService._get_for_update(goods_id, warehouse_id)
-        if inventory.picked_stock < picked_quantity:
-            raise BadRequestException("Not enough pick stock.", 15009)
-        inventory.picked_stock -= picked_quantity
-        inventory.packed_stock += quantity
-        # 少打包的差额回到待上架区（按良品：sorted_damage_stock 不变，0 ≤ 破损 ≤ 待上架仍成立）
-        inventory.sorted_stock += picked_quantity - quantity
-        inventory.total_stock = InventoryService._calculate_total_stock(inventory)
-        # db.session.commit()
+        own = op is None
+        if own:
+            op = StockOp(warehouse_id, 'pack')
+        op.move(goods_id, quantity, src=Leg.picked(), dst=Leg.packed(), movement_type='pack',
+                doc_line_id=doc_line_id)
+        op.move(goods_id, picked_quantity - quantity, src=Leg.picked(), dst=Leg.pending(),
+                movement_type='pack_short_return', doc_line_id=doc_line_id)
+        if own:
+            op.commit()
 
     @staticmethod
     @transactional
-    def dn_cancelled_after_picking(goods_id: int, warehouse_id: int, picked_quantity: int = 0, packed_quantity: int = 0):
+    def dn_cancelled_after_picking(goods_id: int, warehouse_id: int, picked_quantity: int = 0,
+                                   packed_quantity: int = 0, *, op=None, doc_line_id: int | None = None):
         """
-        取消已拣货 / 已打包（未发货）的 DN：货退回待上架（sorted_stock），之后走上架放回库位
-        :param picked_quantity: 还在 picked_stock 里的数量（DN 为 picked：该商品的已拣量）
-        :param packed_quantity: 还在 packed_stock 里的数量（DN 为 packed：该商品的已打包量；
-                                少打包的差额在打包完成时已退回 sorted_stock）
-        只在三个分量之间搬动，total_stock 不变；dn_stock 由调用方在 DN 关闭后重聚合
+        取消已拣货 / 已打包（未发货）的 DN：货退回待上架（按良品），之后走上架放回库位（dn_cancel_return）
+        :param picked_quantity: 还在已拣里的数量（DN 为 picked：该商品的已拣量）
+        :param packed_quantity: 还在已打包里的数量（DN 为 packed：该商品的已打包量；
+                                少打包的差额在打包完成时已退回待上架）
+        只在几个分量之间搬动，total_stock 不变；dn_stock 由调用方在 DN 关闭后重聚合
         """
-        picked_quantity = picked_quantity or 0
-        packed_quantity = packed_quantity or 0
-        if picked_quantity <= 0 and packed_quantity <= 0:
-            return
-        inventory = InventoryService._get_for_update(goods_id, warehouse_id)
-        if inventory.picked_stock < picked_quantity:
-            raise BadRequestException("Not enough pick stock.", 15009)
-        if inventory.packed_stock < packed_quantity:
-            raise BadRequestException("Not enough packed stock.", 15010)
-        inventory.picked_stock -= picked_quantity
-        inventory.packed_stock -= packed_quantity
-        # 退回待上架的按良品（sorted_damage_stock 不变）
-        inventory.sorted_stock += picked_quantity + packed_quantity
-        inventory.total_stock = InventoryService._calculate_total_stock(inventory)
+        from warehouse.stock.service import Leg, StockOp
+        own = op is None
+        if own:
+            op = StockOp(warehouse_id, 'dn_cancel_return')
+        op.move(goods_id, picked_quantity or 0, src=Leg.picked(), dst=Leg.pending(), doc_line_id=doc_line_id)
+        op.move(goods_id, packed_quantity or 0, src=Leg.packed(), dst=Leg.pending(), doc_line_id=doc_line_id)
+        if own:
+            op.commit()
 
     @staticmethod
     @transactional
-    def dn_delivered(goods_id: int, warehouse_id: int, quantity: int):
+    def dn_delivered(goods_id: int, warehouse_id: int, quantity: int, *, op=None, doc_line_id: int | None = None):
         """
-        发货完成：配送库存减少
-        :param goods_id: 关联的商品 ID
-        :param warehouse_id: 仓库 ID
-        :param quantity: 发货数量
+        发货完成：已打包 → 在途（ship）。在途不计入 total_stock
         """
-        inventory = InventoryService._get_for_update(goods_id, warehouse_id)
-        if inventory.packed_stock < quantity:
-            raise BadRequestException("Not enough packed stock.", 15010)
-        inventory.packed_stock -= quantity
-        inventory.delivered_stock += quantity
-        inventory.total_stock = InventoryService._calculate_total_stock(inventory)
-        # db.session.commit()
+        from warehouse.stock.service import Leg, StockOp
+        own = op is None
+        if own:
+            op = StockOp(warehouse_id, 'ship')
+        op.move(goods_id, quantity or 0, src=Leg.packed(), dst=Leg.in_transit(), doc_line_id=doc_line_id)
+        if own:
+            op.commit()
 
     @staticmethod
     @transactional
-    def dn_completed(goods_id: int, warehouse_id: int, quantity: int):
+    def dn_completed(goods_id: int, warehouse_id: int, quantity: int, *, op=None, doc_line_id: int | None = None):
         """
-        签收确认：减少已发货库存
-        :param goods_id: 关联的商品 ID
-        :param warehouse_id: 仓库 ID
-        :param quantity: 签收数量
+        签收确认：在途 →（仓外）（sign）
         """
-        inventory = InventoryService._get_for_update(goods_id, warehouse_id)
-        if inventory.delivered_stock < quantity:
-            raise BadRequestException("Not enough delivered stock.", 15011)
-        inventory.delivered_stock -= quantity
-        inventory.total_stock = InventoryService._calculate_total_stock(inventory)
-        # db.session.commit()
-
-    @staticmethod
-    @transactional
-    def dn_closed(goods_id: int, warehouse_id: int, quantity: int):
-        """
-        关闭 DN：将所有相关库存状态重置
-        :param goods_id: 关联的商品 ID
-        :param warehouse_id: 仓库 ID
-        :param quantity: 关闭数量
-        """
-        inventory = InventoryService._get_for_update(goods_id, warehouse_id)
-        if inventory.dn_stock < quantity:
-            raise BadRequestException("Not enough DN stock to close.", 15012)
-        inventory.dn_stock -= quantity
-        inventory.total_stock = InventoryService._calculate_total_stock(inventory)
-        # db.session.commit()
+        from warehouse.stock.service import Leg, StockOp
+        own = op is None
+        if own:
+            op = StockOp(warehouse_id, 'sign')
+        op.move(goods_id, quantity or 0, src=Leg.in_transit(), doc_line_id=doc_line_id)
+        if own:
+            op.commit()
 
     @staticmethod
     @transactional
@@ -619,34 +469,6 @@ class InventoryService:
             ),
         }
     
-    @staticmethod
-    @transactional
-    def update_and_calculate_stock(goods_id: int, warehouse_id: int):
-
-        from warehouse.goods.services import GoodsLocationService
-
-        """
-        更新库存并计算库存状态
-        :param goods_id: 关联的商品 ID
-        :param warehouse_id: 仓库 ID
-        """
-        inventory = InventoryService._get_for_update(goods_id, warehouse_id)
-        # 查找GoodsLocation表中的库存记录（这里假设支持传入 warehouse_id）
-        gl_record = GoodsLocationService.get_quantity_by_location_type(goods_id, warehouse_id)
-        
-        if 'standard' in gl_record:
-            inventory.onhand_stock = gl_record['standard']
-        if 'damaged' in gl_record:
-            inventory.damage_stock = gl_record['damaged']
-        if 'return' in gl_record:
-            inventory.return_stock = gl_record['return']
-        
-        # 使用私有方法计算总库存
-        inventory.total_stock = InventoryService._calculate_total_stock(inventory)
-        db.session.add(inventory)
-        db.session.flush()
-        # db.session.commit()
-
     @staticmethod
     @transactional
     def update_and_calculate_asn_stock(goods_id: int, warehouse_id: int):

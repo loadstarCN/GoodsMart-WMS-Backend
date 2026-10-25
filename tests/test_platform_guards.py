@@ -89,10 +89,7 @@ def _stock_in_b(goods, quantity=777):
                      location_type='standard', created_by=1)
     db.session.add(loc_b)
     db.session.commit()
-    db.session.add(Inventory(goods_id=goods.id, warehouse_id=wh_b.id, total_stock=quantity,
-                             onhand_stock=quantity, damage_stock=0, return_stock=0, dn_stock=0, asn_stock=0))
-    db.session.add(GoodsLocation(goods_id=goods.id, location_id=loc_b.id, quantity=quantity))
-    db.session.commit()
+    add_stock(goods.id, wh_b.id, location_id=loc_b.id, onhand=quantity)
     return loc_b
 
 

@@ -658,24 +658,6 @@ class GoodsLocationService:
         return query.order_by(GoodsLocation.id)
 
     @staticmethod
-    @transactional
-    def create_goods_location(data: dict) -> GoodsLocation:
-        """
-        创建新的 GoodsLocation。
-
-        :param data: 包含 GoodsLocation 数据的字典
-        :return: 新创建的 GoodsLocation 对象
-        """
-        new_goods_location = GoodsLocation(
-            goods_id=data['goods_id'],
-            location_id=data['location_id'],
-            quantity=data.get('quantity', 0)
-        )
-        db.session.add(new_goods_location)
-        # db.session.commit()
-        return new_goods_location
-
-    @staticmethod
     def get_goods_location(goods_location_id: int) -> GoodsLocation:
         """
         根据 ID 获取单个 GoodsLocation，如不存在则抛出 404。
@@ -684,33 +666,6 @@ class GoodsLocationService:
         :return: GoodsLocation 对象
         """        
         return get_object_or_404(GoodsLocation, goods_location_id)
-
-    @staticmethod
-    @transactional
-    def update_goods_location(goods_location_id: int, data: dict) -> GoodsLocation:
-        """
-        更新指定的 GoodsLocation 记录。
-
-        :param goods_location: 需要更新的 GoodsLocation 对象
-        :param data: 要更新的字段数据
-        :return: 更新后的 GoodsLocation 对象
-        """
-        goods_location = GoodsLocationService.get_goods_location(goods_location_id)
-        goods_location.quantity = data.get('quantity', goods_location.quantity)
-        # db.session.commit()
-        return goods_location
-
-    @staticmethod
-    @transactional
-    def delete_goods_location(goods_location_id: int):
-        """
-        删除指定的 GoodsLocation。
-
-        :param goods_location: 需要删除的 GoodsLocation 对象
-        """
-        goods_location = GoodsLocationService.get_goods_location(goods_location_id)
-        db.session.delete(goods_location)
-        # db.session.commit()
 
     @staticmethod
     def get_quantity_by_location_type(goods_id: int, warehouse_id: int):
