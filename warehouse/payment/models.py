@@ -1,4 +1,5 @@
 from extensions import db
+from extensions.db import UTCDateTime
 
 class Payment(db.Model):
     """支付记录主表
@@ -59,7 +60,7 @@ class Payment(db.Model):
         info={'description': '承运商ID'}
     )
     payment_time = db.Column(
-        db.DateTime,
+        UTCDateTime,
         nullable=True,
         info={'description': '实际支付时间'}
     )
@@ -81,12 +82,12 @@ class Payment(db.Model):
         info={'description': '创建人ID'}
     )
     created_at = db.Column(
-        db.DateTime,
+        UTCDateTime,
         default=db.func.now(),
         info={'description': '创建时间'}
     )
     updated_at = db.Column(
-        db.DateTime,
+        UTCDateTime,
         default=db.func.now(),
         onupdate=db.func.now(),
         index=True,

@@ -63,6 +63,8 @@ from werkzeug.exceptions import HTTPException
 #             shipping_options.<key>
 # 14019  400  出口资料 / 结构化地址（收件人、仓库、DN 的 ship_to）的字段不是文字或超长，zip_code 与 postal_code 不一致：
 #             field = 字段名（ship_to.latin.name 等）；14020 = 国家代码不是有效的 ISO 3166-1 alpha-2
+# 14022  400  仓库时区（warehouses.timezone）不是合法的 IANA 时区名（如 Asia/Tokyo、America/Los_Angeles）：field = timezone
+#             （doc/timezone-utc.md）
 # 16076 另有 reason SHIPPING_OPTIONS_LOCKED（建运单 / 导出后改运单服务选项）/ SHIP_TO_LOCKED（建运单 / 导出后改 DN 的
 #             收件地址 PUT /dn/<id>/ship-to）；16075 另用于作废导出时没有已导出的文件运单（details.waybill）
 # 16117  409  单证排不下：某块文字比一页还高（实际是收件人各字段都很长，如各约 240 个 CJK 字符），reportlab LayoutError。

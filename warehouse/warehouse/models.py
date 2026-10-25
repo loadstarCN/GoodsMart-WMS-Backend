@@ -1,4 +1,5 @@
 from extensions.db import *
+from extensions.db import UTCDateTime
 
 class Warehouse(db.Model):
     """仓库信息表
@@ -76,6 +77,14 @@ class Warehouse(db.Model):
         db.JSON, nullable=True,
         info={'description': '拉丁转写 {name, organization, address_line1, address_line2, locality, admin_area}'}
     )
+    # 仓库时区（IANA 名，如 Asia/Tokyo、America/Los_Angeles；doc/timezone-utc.md）。空 = 用默认时区
+    # （WMS_DEFAULT_TIMEZONE → WMS_TIMEZONE → UTC）。业务日期（实际发货日、单证日期、揽收日……）、不带时区的输入时刻、
+    # 界面显示都按它；生效值见 effective_timezone（warehouse/common/clock.py）
+    timezone = db.Column(
+        db.String(64),
+        nullable=True,
+        info={'description': '仓库时区（IANA 名，空 = 默认时区）'}
+    )
     company_id = db.Column(
         db.Integer, 
         db.ForeignKey('companies.id', ondelete='RESTRICT'),  # 阻止公司删除
@@ -100,12 +109,12 @@ class Warehouse(db.Model):
         info={'description': '创建人ID'}
     )
     created_at = db.Column(
-        db.DateTime, 
+        UTCDateTime, 
         default=db.func.now(),
         info={'description': '创建时间（自动记录）'}
     )
     updated_at = db.Column(
-        db.DateTime, 
+        UTCDateTime, 
         default=db.func.now(),
         onupdate=db.func.now(),
         info={'description': '最后更新时间（自动更新）'}
@@ -134,3 +143,9 @@ class Warehouse(db.Model):
         lazy='joined',  # 立即加载创建者
         info={'description': '创建者对象'}
     )
+
+    @property
+    def effective_timezone(self) -> str:
+        """生效时区：仓库设了的 → WMS_DEFAULT_TIMEZONE → WMS_TIMEZONE → UTC"""
+        from warehouse.common.clock import warehouse_timezone_name
+        return warehouse_timezone_name(self)

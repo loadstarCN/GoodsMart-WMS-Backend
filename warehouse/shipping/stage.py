@@ -16,13 +16,14 @@ DN / 发货任务列表每行的阶段、流程汇总接口的 stage 用的都�
     （pending / unknown / scheduled 且揽收日没过）
   - awaiting_handover：有运单、揽收已约好或不用约（scheduled / dropoff / none），等交给承运商
 「当前发货任务」= 最新的有效任务；承运商 = 当前发货任务的，没有用 DN 的（与建运单同一口径）。
-卡住的判定用 carrier_services.stale_after_seconds()，「揽收日没过」按仓库当地日期（DOCUMENT_TIMEZONE）。
+卡住的判定用 carrier_services.stale_after_seconds()，「揽收日没过」按揽收所属仓库的当地日期（仓库时区，
+warehouse/common/clock.py）。
 """
-from datetime import datetime, timedelta
+from datetime import timedelta
 
 from sqlalchemy import and_, case, exists, func, literal, or_, select
 
-from .common import local_today
+from warehouse.common import clock
 
 STAGE_PREPARING = 'preparing'
 STAGE_AWAITING_WAYBILL = 'awaiting_waybill'
@@ -41,10 +42,14 @@ TRACK_EXCEPTION = 'exception'
 CANCEL_IN_PROGRESS = 'cancel_in_progress'
 
 
-def _cutoffs(now=None, today=None):
+def _cutoffs(now=None, today=None, warehouse_id_column=None):
+    """(卡住的 pending 的截止时刻, 今天)。today 不给时：按 warehouse_id_column（揽收所属仓库）取各仓库当地的今天"""
     from warehouse.dn.carrier_services import stale_after_seconds
-    now = now or datetime.now()
-    return now - timedelta(seconds=stale_after_seconds()), today or local_today()
+    now = now or clock.now()
+    if today is None:
+        today = (clock.local_today_expression(warehouse_id_column) if warehouse_id_column is not None
+                 else clock.local_today())
+    return now - timedelta(seconds=stale_after_seconds()), today
 
 
 def _models():
@@ -94,8 +99,8 @@ def tracking_number_expression():
 
 def stage_expression(now=None, today=None):
     """shipping_stage 的 SQL 表达式（关联到外层查询的 DN）"""
-    stale_before, today = _cutoffs(now, today)
     DN, DeliveryTask, S, P, Carrier = _models()
+    stale_before, today = _cutoffs(now, today, P.warehouse_id)
 
     unresolved = exists().where(
         S.dn_id == DN.id,

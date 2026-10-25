@@ -3,6 +3,7 @@ from extensions.error import BadRequestException
 from extensions.transaction import transactional
 from warehouse.staff.models import Staff
 from warehouse.staff.services import StaffService
+from warehouse.common.clock import normalize_timezone_input
 from warehouse.common.address_format import (
     WAREHOUSE_ADDRESS_LIMITS, format_single_line, is_structured, parse_columns, postal_code_of,
 )
@@ -82,6 +83,7 @@ class WarehouseService:
         export_profile = normalize_export_profile(data, WAREHOUSE_EXPORT_FIELDS)
         structured = parse_columns(data, WAREHOUSE_ADDRESS_LIMITS)
         has_postal, postal_code = postal_code_of(data)
+        tz_name = normalize_timezone_input(data.get('timezone'))       # 不合法 400 14022
         manager_id = data.get('manager_id')
         manager = None  # 显式初始化
         if manager_id:
@@ -99,6 +101,7 @@ class WarehouseService:
             company_id=data['company_id'],
             manager_id=data.get('manager_id'),
             is_active=data.get('is_active', True),
+            timezone=tz_name,
             created_by=created_by_id
         )
         # 出口资料只设请求体里给了的字段（country_code 不给时走列默认值）
@@ -128,6 +131,8 @@ class WarehouseService:
         export_profile = normalize_export_profile(data, WAREHOUSE_EXPORT_FIELDS)
         structured = parse_columns(data, WAREHOUSE_ADDRESS_LIMITS)
         has_postal, postal_code = postal_code_of(data)
+        if 'timezone' in data:                                        # 只改请求里带了的；null / 空串 = 用默认时区
+            warehouse.timezone = normalize_timezone_input(data['timezone'])
 
         manager = None
         new_manager_id = data.get('manager_id')

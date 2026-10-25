@@ -135,7 +135,7 @@ def _inbound(client, token, w, quantity):
 def _create_dn(client, token, w, quantity):
     return _ok(client.post('/dn/', json={
         'warehouse_id': w['wh'], 'recipient_id': w['recipient'], 'shipping_address': 'B50',
-        'expected_shipping_date': date.today().isoformat(),
+        'expected_shipping_date': warehouse_today().isoformat(),
         'details': [{'goods_id': w['goods'], 'quantity': quantity}],
     }, headers=_h(token)))['id']
 

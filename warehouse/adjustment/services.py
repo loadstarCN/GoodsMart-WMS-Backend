@@ -6,6 +6,7 @@ from warehouse.common import require_fields, require_non_negative_int, require_c
 from warehouse.common.locks import (
     lock_row, lock_goods_location, lock_or_create_goods_location, lock_inventory_rows, lock_order_key,
 )
+from warehouse.common import clock
 from warehouse.cyclecount.services import CycleCountTaskService
 from warehouse.inventory.services import InventoryService
 from .models import Adjustment, AdjustmentDetail
@@ -325,10 +326,10 @@ class AdjustmentService:
             raise BadRequestException(f"Invalid status value: {new_status}", 14007)
 
         if adjustment.status == 'pending' and new_status == 'approved':
-            adjustment.approved_at = datetime.now()
+            adjustment.approved_at = clock.now()
             adjustment.approved_by = operator_id
         if adjustment.status == 'approved' and new_status == 'completed':
-            adjustment.completed_at = datetime.now()
+            adjustment.completed_at = clock.now()
             adjustment.operator_id = operator_id
         
         adjustment.status = new_status
@@ -533,7 +534,7 @@ class AdjustmentService:
             list: 符合前端图表要求的数据序列
         """
         # 计算时间范围
-        end_date = datetime.now()
+        end_date = clock.stats_now(filters)
         start_date = end_date - relativedelta(months=months-1)
         start_date = start_date.replace(day=1, hour=0, minute=0, second=0)
 
@@ -595,7 +596,7 @@ class AdjustmentService:
     @staticmethod
     def get_status_overview(filters=None):
         """获取各状态 Adjustment 在当前月、前一个月和去年同月的统计"""
-        now = datetime.now()
+        now = clock.stats_now(filters)
         current_year = now.year
         current_month = now.month
 

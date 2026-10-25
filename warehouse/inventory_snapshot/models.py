@@ -1,4 +1,5 @@
 from extensions import db
+from extensions.db import UTCDateTime
 
 class InventorySnapshot(db.Model):
     """库存快照表（按商品+仓库+时间维度管理）"""
@@ -40,7 +41,7 @@ class InventorySnapshot(db.Model):
     )
 
     snapshot_time = db.Column(
-        db.DateTime,
+        UTCDateTime,
         nullable=False,
         info={'description': '快照时间'}
     )

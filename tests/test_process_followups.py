@@ -48,7 +48,7 @@ def _sorting_task(client, token, w, lines):
 def _dn(client, token, w, lines):
     return _ok(client.post('/dn/', json={
         'warehouse_id': w['wh'], 'recipient_id': w['recipient'], 'shipping_address': 'x',
-        'expected_shipping_date': date.today().isoformat(),
+        'expected_shipping_date': warehouse_today().isoformat(),
         'details': [{'goods_id': g, 'quantity': q} for g, q in lines],
     }, headers=_h(token)))['id']
 

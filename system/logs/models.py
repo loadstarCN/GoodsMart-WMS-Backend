@@ -1,5 +1,5 @@
 from extensions import db  # 引用 extensions.py 中的 db
-from datetime import datetime
+from extensions.db import UTCDateTime
 
 
 class ActivityLog(db.Model):
@@ -36,7 +36,7 @@ class ActivityLog(db.Model):
     ip_address = db.Column(db.String(45), info={'description': 'IPv6兼容地址'})  # 支持IPv6
     processing_time = db.Column(db.Integer, info={'description': '处理时间（毫秒）'})  # 整型优化
     created_at = db.Column(
-        db.DateTime,
+        UTCDateTime,
         default=db.func.now(),
         nullable=False,
         index=True,

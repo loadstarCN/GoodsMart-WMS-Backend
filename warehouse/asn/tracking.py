@@ -21,6 +21,7 @@ from warehouse.carrier.integration_services import CarrierIntegrationService
 from warehouse.carrier.integrations.base import CarrierError, clock
 from warehouse.carrier.methods import methods_of
 from warehouse.common.locks import lock_row
+from warehouse.common import clock as wms_clock      # 时刻 / 时区（clock 是承运商时限用的单调时钟）
 from warehouse.dn.tracking_services import ERROR_MAX, MANUAL_BUDGET_SECONDS, NO_RESULT, _aware
 
 from .models import ASN
@@ -42,7 +43,7 @@ def from_older_shipment(result: dict, created_at) -> bool:
     """揽收 / 送达时刻比入库单创建早很多：运单号被承运商回收再用，查到的是旧包裹"""
     if created_at is None:
         return False
-    cutoff = created_at.astimezone() - OLD_SHIPMENT_MARGIN       # naive = 服务器本地时间
+    cutoff = created_at - OLD_SHIPMENT_MARGIN
     for key in ('picked_up_at', 'delivered_at'):
         moment = _aware(result.get(key))
         if moment is not None and moment < cutoff:
@@ -84,7 +85,7 @@ class ASNTrackingService:
         asn_id, created_at = asn.id, asn.created_at
         # 结束只读事务：调承运商期间不占着数据库事务
         db.session.rollback()
-        started = datetime.now()
+        started = wms_clock.now()
         try:
             results = adapter.track([number], deadline=clock() + MANUAL_BUDGET_SECONDS)
             result = results.get(number) or {'error': NO_RESULT}
@@ -112,7 +113,7 @@ class ASNTrackingService:
             return False
         if asn.tracking_synced_at is not None and asn.tracking_synced_at > started:
             return False
-        asn.tracking_synced_at = datetime.now()
+        asn.tracking_synced_at = wms_clock.now()
         if result.get('error'):
             detail = dict(asn.tracking_detail) if isinstance(asn.tracking_detail, dict) else {}
             detail['error'] = str(result['error'])[:ERROR_MAX]

@@ -7,7 +7,7 @@ import hashlib
 import io
 import re
 import zlib
-from datetime import date, datetime   # 放在 helpers 之后：helpers 以模块名导出了 datetime
+from datetime import date, datetime, timezone # 放在 helpers 之后：helpers 以模块名导出了 datetime
 from zoneinfo import ZoneInfo
 from system.webhook.models import WebhookEvent
 from warehouse.delivery.services import DeliveryTaskService
@@ -88,7 +88,7 @@ def _create_dn(client, token, customs='default', details=None, order_number='ORD
         'recipient_id': recipient_id,
         'warehouse_id': warehouse_id,
         'shipping_address': 'Hauptstrasse 1, 10115 Berlin',
-        'expected_shipping_date': date.today().isoformat(),
+        'expected_shipping_date': warehouse_today().isoformat(),
         'order_number': order_number,
         'details': details or [{'goods_code': 'G001', 'quantity': 3}, {'goods_code': 'G002', 'quantity': 2}],
     }
@@ -110,8 +110,8 @@ def _force_packed(client, dn_id, packed=None, status='packed'):
         packing = PackingTask(dn_id=dn.id, status='completed', is_active=True, created_by=admin.id)
         db.session.add_all([picking, packing])
         db.session.flush()
-        picking_batch = PickingBatch(picking_task_id=picking.id, operator_id=admin.id, operation_time=datetime.now())
-        packing_batch = PackingBatch(packing_task_id=packing.id, operator_id=admin.id, operation_time=datetime.now())
+        picking_batch = PickingBatch(picking_task_id=picking.id, operator_id=admin.id, operation_time=datetime.now(timezone.utc))
+        packing_batch = PackingBatch(packing_task_id=packing.id, operator_id=admin.id, operation_time=datetime.now(timezone.utc))
         db.session.add_all([picking_batch, packing_batch])
         db.session.flush()
         for detail in dn.details:
@@ -398,7 +398,7 @@ def test_issue_same_data_keeps_version_and_changed_data_bumps(client, access_tok
     assert [d['doc_type'] for d in body['documents']] == ['commercial_invoice', 'packing_list']
     assert all(d['status'] == 'issued' and d['size_bytes'] > 0 for d in body['documents'])
     assert body['documents'][0]['file_name'] == 'CI_INV-TEST-001_v1.pdf'
-    assert body['documents'][0]['invoice_date'] == datetime.now(ZoneInfo('Asia/Tokyo')).date().isoformat()
+    assert body['documents'][0]['invoice_date'] == warehouse_today().isoformat()      # DN 仓库当地的日期
     first_ids = [d['id'] for d in body['documents']]
 
     again = _issue(client, access_token, dn_id)

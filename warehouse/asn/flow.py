@@ -1,7 +1,8 @@
 """入库单流程汇总（GET /asn/<id>/flow，doc/shipping-flow.md §7.1）：入库单详情页按它渲染，不自己推算状态。
 
 一张入库单一条（轻量的）流程：创建 / 预计到货 → 在途（入库单的运单号）→ 到货收货 → 分拣 → 上架 → 完成。
-每一步给 state、实际发生的时刻 at（带时区偏移）、来源 source、界面要的概要 summary 和能做的操作 actions，
+每一步给 state、实际发生的时刻 at（UTC，带 +00:00；界面按顶层 timezone —— 入库单仓库的时区 —— 显示）、来源 source、
+界面要的概要 summary 和能做的操作 actions，
 结构与出库流程（warehouse/shipping/flow.py）相同，界面用同一套组件。
 
 - state：done / current / todo / warning（要人处理）/ blocked / skipped（不适用：没有运单号的在途、取消后没做的步骤……）
@@ -19,9 +20,11 @@ from sqlalchemy import func
 
 from extensions.db import db
 from warehouse.carrier.methods import methods_of, tracking_url as carrier_tracking_url
-from warehouse.dn.services import event_time
+from warehouse.common import clock
+# 先初始化出库包：warehouse.shipping.flow 引用 warehouse.dn 的服务，warehouse.dn 包初始化时又引用 shipping.flow
+import warehouse.dn.services  # noqa: F401,E402
 from warehouse.shipping.common import local_today
-from warehouse.shipping.flow import _action, _carrier_time, _problem, _step
+from warehouse.shipping.flow import _action, _at, _carrier_time, _problem, _step
 
 from .stage import STAGE_PUTAWAY, TRACK_DELIVERED, TRACK_EXCEPTION, putaway_pending, stage_of
 from .tracking import ASNTrackingService, tracking_number_of
@@ -82,8 +85,10 @@ class InboundFlowService:
             'asn_type': asn.asn_type,
             'order_number': asn.order_number,
             'warehouse_id': asn.warehouse_id,
+            # 入库单所属仓库的生效时区（doc/timezone-utc.md §3）：界面按它显示 at 等时刻、判断日期
+            'timezone': clock.warehouse_timezone_name(asn),
             'expected_arrival_date': asn.expected_arrival_date.isoformat() if asn.expected_arrival_date else None,
-            'closed_at': event_time(asn.closed_at) if asn.status == 'closed' else None,
+            'closed_at': _at(asn.closed_at) if asn.status == 'closed' else None,
             'supplier': {'id': supplier.id, 'name': supplier.name} if supplier is not None else None,
             'carrier': InboundFlowService._carrier_payload(carrier, methods, url),
             'tracking_number': number,
@@ -163,7 +168,7 @@ class InboundFlowService:
         completed = asn.status == 'completed'
         actual = sum(d.actual_quantity or 0 for d in details) if completed else None
         overdue = bool(asn.status == 'pending' and asn.expected_arrival_date is not None
-                       and asn.expected_arrival_date < local_today())
+                       and asn.expected_arrival_date < local_today(asn))      # 预计到货日已过（仓库当地日期）
         summary = {
             'line_count': len(details),
             'expected_quantity': f['expected_quantity'],
@@ -210,8 +215,8 @@ class InboundFlowService:
         sorted_qty, damage_qty = InboundFlowService._sorting_totals(asn)
         summary = {
             'task_ids': [task.id for task in tasks],
-            'tasks': [{'id': task.id, 'status': task.status, 'started_at': event_time(task.started_at),
-                       'completed_at': event_time(task.completed_at)} for task in tasks],
+            'tasks': [{'id': task.id, 'status': task.status, 'started_at': _at(task.started_at),
+                       'completed_at': _at(task.completed_at)} for task in tasks],
             'sorted_quantity': sorted_qty,
             'damage_quantity': damage_qty,
             'quantity': sorted_qty + damage_qty,
@@ -248,7 +253,7 @@ class InboundFlowService:
             'goods': [{'goods_id': r['goods_id'], 'code': getattr(goods.get(r['goods_id']), 'code', None),
                        'name': getattr(goods.get(r['goods_id']), 'name', None), 'quantity': r['quantity'],
                        'pending': r['pending']} for r in rows],
-            'last_putaway_at': event_time(last_at),
+            'last_putaway_at': _at(last_at),
             # 上架记录不带入库单：按待上架库存估算（见 stage.py）
             'estimated': True,
         }
@@ -259,7 +264,7 @@ class InboundFlowService:
     @staticmethod
     def _last_putaway_at(asn, goods_ids):
         """本单商品在本仓库最近一次上架的时刻（没有为 None）。待上架清零之前一定有分拣完成后的上架，所以不再按完成时刻
-        过滤（上架时刻是数据库的 now()，与 WMS 用 datetime.now() 写的完成时刻不一定是同一个时钟口径）"""
+        过滤（上架时刻是数据库的 now()，与 WMS 应用写的完成时刻不是同一个时钟）"""
         if not goods_ids:
             return None
         from warehouse.location.models import Location

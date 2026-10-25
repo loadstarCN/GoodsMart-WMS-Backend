@@ -192,7 +192,7 @@ def test_wholesale_payload_shape(client, access_token):
                'phone': '06-0000-0000', 'latin': None}
     response = client.post('/dn/', json={
         'recipient_id': recipient_id, 'warehouse_id': warehouse_id, 'shipping_address': WHOLESALE_RECIPIENT['address'],
-        'expected_shipping_date': date.today().isoformat(), 'order_number': 'WS-77', 'ship_to': ship_to,
+        'expected_shipping_date': warehouse_today().isoformat(), 'order_number': 'WS-77', 'ship_to': ship_to,
         'details': [{'goods_code': 'G001', 'quantity': 1}]}, headers=_h(access_token))
     assert response.status_code == 201, response.get_json()
     dn_id = response.get_json()['id']
@@ -228,7 +228,7 @@ def test_warehouse_structured_fields(client, access_token):
 # DN 的 ship_to / shipping_options
 
 def _dn_body(recipient_id, warehouse_id, **extra):
-    return {'recipient_id': recipient_id, 'warehouse_id': warehouse_id, 'expected_shipping_date': date.today().isoformat(),
+    return {'recipient_id': recipient_id, 'warehouse_id': warehouse_id, 'expected_shipping_date': warehouse_today().isoformat(),
             'details': [{'goods_code': 'G001', 'quantity': 1}], **extra}
 
 

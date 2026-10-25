@@ -228,6 +228,10 @@ def test_export_import_flow(client, access_token):
                        (4, 999999, ['401200000000'], 'not_found'), (5, None, ['401200000001'], 'not_found'),
                        (6, other_dn, [], 'invalid')]
     assert preview['rows'][0]['order_number'] == 'SHP-FILE-1' and preview['rows'][0]['primary'] is True
+    # 每行带 reason_code（界面按它出本地化文字）；matched 没有
+    assert [r['reason_code'] for r in preview['rows']] == [None, None, 'DN_NOT_FOUND', 'NOT_WMS_REFERENCE',
+                                                           'NO_TRACKING_NUMBER']
+    assert preview['rows'][0]['message'] is None and preview['rows'][3]['message']
     assert preview['summary'] == {'matched': 2, 'not_found': 2, 'already_has_number': 0, 'same_number': 0,
                                   'invalid': 1, 'skipped': 0,
                                   'dns': {'matched': 1, 'not_found': 1, 'already_has_number': 0, 'same_number': 0,
@@ -263,8 +267,16 @@ def test_export_import_flow(client, access_token):
     # 再导一次：same_number；号码不同：already_has_number
     again = _import(client, access_token, carrier_id, [[f'DN{dn_id}', '0', '', '401234567890']]).get_json()
     assert again['rows'][0]['result'] == 'same_number'
+    assert again['rows'][0]['reason_code'] == 'ALREADY_IMPORTED'
+    assert again['rows'][0]['existing_tracking_number'] == '401234567890'
     other = _import(client, access_token, carrier_id, [[f'DN{dn_id}', '0', '', '499999999999']]).get_json()
     assert other['rows'][0]['result'] == 'already_has_number' and '401234567890' in other['rows'][0]['message']
+    assert other['rows'][0]['reason_code'] == 'HAS_OTHER_NUMBER'
+    assert other['rows'][0]['existing_tracking_number'] == '401234567890'
+    # 号码已属于别的 DN：other_dn_id
+    owned = _import(client, access_token, carrier_id, [[f'DN{other_dn}', '0', '', '401234567890']]).get_json()
+    assert owned['rows'][0]['result'] == 'invalid' and owned['rows'][0]['reason_code'] == 'NUMBER_OWNED_BY_OTHER_DN'
+    assert owned['rows'][0]['other_dn_id'] == dn_id and owned['rows'][0]['existing_tracking_number'] == '401234567890'
 
     # 批次列表
     response = client.get(f'/dn/carrier-files/batches?carrier_id={carrier_id}', headers=_h(access_token))
@@ -313,6 +325,10 @@ def test_export_row_problems_block_the_whole_batch(client, access_token):
     third, _task = _packed_dn(client, access_token, 'SHP-FILE-3', carrier_id=other_id)
     rows = _export(client, access_token, carrier_id, [third]).get_json()['details']['rows']
     assert [p['code'] for p in rows[0]['problems']] == ['OTHER_CARRIER']
+    # 导入别的承运商的 DN：invalid，reason_code OTHER_CARRIER + other_carrier（界面拼「这张出库单的承运商是 …」）
+    row = _import(client, access_token, carrier_id, [[f'DN{third}', '0', '', '4012-3456-0003']]).get_json()['rows'][0]
+    assert (row['result'], row['reason_code'], row['other_carrier'], row['other_carrier_id']) == \
+        ('invalid', 'OTHER_CARRIER', 'Sagawa', other_id)
 
 
 def test_export_and_import_preconditions(client, access_token):

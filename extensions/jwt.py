@@ -8,7 +8,7 @@
 - jwt_cutoff:<user_id> 用户级吊销：iat 早于该时间戳的 token 全部失效（改密、重置密码、停用）
 """
 import time
-from datetime import datetime
+from extensions.db import utc_now
 
 from flask import current_app
 from flask_jwt_extended import JWTManager
@@ -83,7 +83,7 @@ def load_active_user(identity):
         if company is not None:
             if not company.is_active:
                 return None
-            if company.expired_at and company.expired_at < datetime.now():
+            if company.expired_at and company.expired_at < utc_now():
                 return None
     return user
 

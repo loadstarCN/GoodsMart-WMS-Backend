@@ -1,4 +1,5 @@
 from extensions.db import *
+from extensions.db import UTCDateTime
 
 class Company(db.Model):
     """企业信息表
@@ -70,19 +71,19 @@ class Company(db.Model):
         info={'description': '创建人ID'}
     )
     created_at = db.Column(
-        db.DateTime, 
+        UTCDateTime, 
         default=db.func.now(),
         info={'description': '创建时间（自动记录）'}
     )
     updated_at = db.Column(
-        db.DateTime, 
+        UTCDateTime, 
         default=db.func.now(),
         onupdate=db.func.now(),
         info={'description': '最后更新时间（自动更新）'}
     )
 
     expired_at = db.Column(
-        db.DateTime, 
+        UTCDateTime, 
         nullable=True,
         info={'description': '账户过期时间'}
     )

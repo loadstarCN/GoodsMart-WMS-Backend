@@ -77,7 +77,7 @@ def _offset(iso):
 
 
 def _create_asn(client, token, **extra):
-    body = {'warehouse_id': 1, 'supplier_id': 1, 'expected_arrival_date': (date.today() + timedelta(days=3)).isoformat(),
+    body = {'warehouse_id': 1, 'supplier_id': 1, 'expected_arrival_date': (warehouse_today() + timedelta(days=3)).isoformat(),
             'order_number': 'PO-FLOW-1', 'details': [{'goods_id': 1, 'quantity': 5}, {'goods_id': 2, 'quantity': 3}]}
     body.update(extra)
     response = client.post('/asn/', headers=_h(token), json=body)
@@ -172,7 +172,7 @@ def test_flow_without_tracking(client, access_token):
 
 
 def test_overdue_and_no_details(client, access_token):
-    asn_id = _create_asn(client, access_token, expected_arrival_date=(date.today() - timedelta(days=2)).isoformat())
+    asn_id = _create_asn(client, access_token, expected_arrival_date=(warehouse_today() - timedelta(days=2)).isoformat())
     flow = _flow(client, access_token, asn_id)
     assert [p['code'] for p in flow['problems']] == ['ARRIVAL_OVERDUE']
     assert flow['problems'][0]['step'] == 'received' and _steps(flow)['received']['summary']['overdue'] is True

@@ -136,7 +136,7 @@ def test_add_warehouse_filter_unscoped_caller_is_unfiltered(client):
 
 def _create_dn(client, token, **extra):
     body = {
-        'recipient_id': 1, 'shipping_address': 'X', 'expected_shipping_date': datetime.date.today().isoformat(),
+        'recipient_id': 1, 'shipping_address': 'X', 'expected_shipping_date': warehouse_today().isoformat(),
         'warehouse_id': 1, 'details': [{'goods_id': 2, 'quantity': 1}],
     }
     body.update(extra)

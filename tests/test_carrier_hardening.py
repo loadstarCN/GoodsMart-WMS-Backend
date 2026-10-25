@@ -16,7 +16,7 @@ from .test_carrier_shipment import (  # noqa: F401  fedex 是 fixture
     fedex, _cancel, _create, _dismiss, _get, _ready, _records, _ship_body, _states,
 )
 
-from datetime import datetime as _datetime, timedelta as _timedelta
+from datetime import datetime as _datetime, timedelta as _timedelta, timezone as _timezone
 from urllib.parse import urlparse
 
 import pytest
@@ -229,7 +229,7 @@ def test_cancel_refused_returns_to_active(client, access_token, fedex, refusal):
 
 def test_cancel_in_progress_and_stale(client, access_token, fedex):
     dn_id, task_id, _created = _active(client, access_token)
-    _set_record(client, dn_id, status='cancelling', reason='cancel_in_progress', updated_at=_datetime.now())
+    _set_record(client, dn_id, status='cancelling', reason='cancel_in_progress', updated_at=_datetime.now(_timezone.utc))
 
     view = _get(client, access_token, dn_id)
     assert (view['unresolved']['status'], view['unresolved']['reason']) == ('cancelling', 'cancel_in_progress')
@@ -245,7 +245,7 @@ def test_cancel_in_progress_and_stale(client, access_token, fedex):
     assert response.status_code == 409 and response.get_json()['code'] == 16079
 
     # 超过 stale_after_seconds（默认 10 分钟）没有落定：按结果不明（stale），可以重试
-    _set_record(client, dn_id, updated_at=_datetime.now() - _timedelta(minutes=11))
+    _set_record(client, dn_id, updated_at=_datetime.now(_timezone.utc) - _timedelta(minutes=11))
     view = _get(client, access_token, dn_id)
     assert (view['unresolved']['status'], view['unresolved']['reason']) == ('cancelling', 'stale')
     assert view['shipment']['reason'] == 'stale'

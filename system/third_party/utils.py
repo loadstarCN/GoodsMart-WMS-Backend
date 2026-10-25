@@ -1,6 +1,6 @@
 import hashlib
 import secrets
-from datetime import datetime
+from extensions.db import utc_now
 from flask import current_app, g, request
 from flask_jwt_extended import get_jwt_identity,verify_jwt_in_request
 from extensions import db, jwt
@@ -36,7 +36,7 @@ def _check_api_key_company(company_id):
     company = db.session.get(Company, company_id)
     if company is None or not company.is_active:
         raise UnauthorizedException("API key's company is not active", 11007)
-    if company.expired_at and company.expired_at < datetime.now():
+    if company.expired_at and company.expired_at < utc_now():
         raise UnauthorizedException("API key's company is expired", 11007)
 
 

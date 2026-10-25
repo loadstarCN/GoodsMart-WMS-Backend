@@ -127,8 +127,9 @@ GoodsMart-WMS-Backend/
 ├── app.py                     # Application entry point
 ├── config.py                  # Environment-based configuration
 ├── seed_permissions.py        # Permission seeding script
+├── timezone_conversion.py     # timestamp → timestamptz conversion (flask wms convert-utc, see Time Zones)
 ├── extensions/                # Flask extensions
-│   ├── db.py                  # SQLAlchemy
+│   ├── db.py                  # SQLAlchemy, UTCDateTime (time columns, UTC)
 │   ├── jwt.py                 # JWT authentication
 │   ├── redis.py               # Redis client
 │   ├── cache.py               # Cache layer
@@ -147,7 +148,8 @@ GoodsMart-WMS-Backend/
 │   ├── company/               # Tenant/company management
 │   ├── staff/                 # Staff management
 │   ├── department/            # Department management
-│   ├── warehouse/             # Warehouse management
+│   ├── warehouse/             # Warehouse management (incl. warehouse time zone)
+│   ├── common/                # Shared helpers (clock.py: current time, warehouse time zones, local dates)
 │   ├── location/              # Storage location management
 │   ├── goods/                 # Product management
 │   ├── inventory/             # Inventory management
@@ -567,7 +569,7 @@ shipment (`source: api`) is unfinished → 409 `16076`; a manual tracking number
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `DOCUMENT_TIMEZONE` | `Asia/Tokyo` | Time zone of the invoice date |
+| `DOCUMENT_TIMEZONE` | (unset) | Old name of `WMS_DEFAULT_TIMEZONE` (read when that is unset). The invoice date is the local date of the DN warehouse, see *Time Zones* |
 | `CUSTOMS_SIGNATURE_COMPANY_ID`, `CUSTOMS_SIGNATURE_FROM_DN_ID`, `CUSTOMS_SIGNATURE_SIGNATORY_NAME`, `CUSTOMS_SIGNATURE_SIGNATORY_TITLE`, `CUSTOMS_SIGNATURE_PATH` | (unset) | Optional company and first eligible DN ID, signer name/title, and absolute path to its authorized CI signature PNG. Keep the image outside the source checkout, readable only by the backend process. All five values are required. Earlier DNs keep the company's existing signer and unsigned CI. On eligible DNs, changing the image marks previously issued documents outdated. |
 | `CUSTOMS_PDF_FONT_PATH` | (unset) | TrueType font for the documents (`.ttf`, or the first font of a `.ttc`; CFF-outline OTF such as Noto Sans CJK is not supported). When set, all text is printed with it and the used glyphs are embedded in the PDF; to embed e.g. Japanese consignee text, pick a font with those glyphs (such as IPAexGothic). Characters the font lacks, and characters Helvetica cannot print when unset, fall back to reportlab's built-in Japanese CID font (not embedded; relies on the viewer's fonts) |
 
@@ -744,7 +746,9 @@ render — they do not derive states themselves:
   `api` (the order came from the source system; for `waybill` / `pickup`: created / booked through the carrier plugin) /
   `system`.
 - `summary` per step: `ordered` {order_number, dn_type, expected_shipping_date}; `picking` {task_ids, picked, planned};
-  `packing` {task_ids, packed, planned, package_count, gross_weight_kg, packages[]}; `documents` {required, customs,
+  `packing` {task_ids, packed, planned, package_count, gross_weight_kg, packages[], packages_required} (packages are
+  required — `PACKAGES_MISSING` when packed without any — for customs shipments, `api` waybills and file templates with a
+  `{package.*}` column without `|default`; not for domestic manual waybills); `documents` {required, customs,
   version, outdated, missing[], ready, documents[] (current document metas)}; `waybill` {method, tracking_number,
   source, service, service_name, label_document_id, label_download_path, shipment (same shape as
   `carrier-shipment.shipment`, or the latest cancelled API shipment), unresolved, can_create, blockers[]}; `pickup`
@@ -873,7 +877,7 @@ one the first DN's):
 ```json
 { "dry_run": true, "file_name": "b2.csv", "encoding": "cp932", "batch_id": null,
   "rows": [{"line": 2, "reference": "DN163", "dn_id": 163, "order_number": "SHP-1", "tracking_numbers": ["401234567890"],
-            "result": "matched", "message": null, "primary": true}, "..."],
+            "result": "matched", "reason_code": null, "message": null, "primary": true}, "..."],
   "summary": {"matched": 2, "not_found": 1, "already_has_number": 0, "same_number": 0, "invalid": 0, "skipped": 0,
               "dns": {"matched": 1, "not_found": 1, "already_has_number": 0, "same_number": 0, "invalid": 0}} }
 ```
@@ -888,6 +892,13 @@ one the first DN's):
   `DN<id>` reference), `already_has_number` (the DN has a different number — decide by hand), `same_number` (already
   imported; ignored), `invalid` (no tracking number, DN closed, another carrier, an unresolved API waybill, the number
   belongs to another DN, no open delivery task, shipped without an exported waybill).
+- Every row other than `matched` has a `reason_code` and an English `message` (fallback); the UI renders localized text
+  from `reason_code`: `not_found` → `DN_NOT_FOUND` / `NOT_WMS_REFERENCE` / `NO_REFERENCE`; `invalid` →
+  `NO_TRACKING_NUMBER` / `DN_CLOSED` / `OTHER_CARRIER` / `NUMBER_OWNED_BY_OTHER_DN` / `API_SHIPMENT_UNRESOLVED` /
+  `EXPORTED_FOR_OTHER_CARRIER` / `SHIPPED_WITHOUT_FILE_WAYBILL` / `NO_OPEN_TASK`; `same_number` → `ALREADY_IMPORTED` /
+  `ALREADY_SAVED`; `already_has_number` → `HAS_OTHER_NUMBER`. Fields for the text (only when present):
+  `existing_tracking_number` (the DN's current number / the number owned by another DN), `other_carrier` /
+  `other_carrier_id`, `other_dn_id`, `shipment_status`.
 - `dry_run: false` re-checks each DN under its lock and writes the `matched` ones in one transaction: an `exported`
   record becomes `active` (a DN that was never exported gets a new `file` waybill), the delivery task gets the main
   number (and the carrier if it had none) — the same as saving a tracking number, so tracking (`tracks_any_number`),
@@ -1485,7 +1496,7 @@ several shipments of that carrier, and its package count / total weight are the 
   `PICKUP_CARRIER_MISSING` / `CARRIER_NOT_INTEGRATED` / `PICKUP_NOT_SUPPORTED` / the integration problems of carrier
   shipments (`CARRIER_INTEGRATION_DISABLED`, `CARRIER_NOT_CONFIGURED`, …) / `PICKUP_ADDRESS_MISSING` /
   `PICKUP_ADDRESS_INVALID` / `PICKUP_PHONE_INVALID`.
-- **Times** are local to the warehouse (`DOCUMENT_TIMEZONE`, default `Asia/Tokyo`). FedEx: `readyDateTimestamp` carries
+- **Times** are local to the warehouse (its time zone, see *Time Zones*). FedEx: `readyDateTimestamp` carries
   the UTC offset (`2026-10-22T12:00:00+09:00`, as in FedEx's Japanese example) and `customerCloseTime` is local
   `HH:MM:SS`; `pickupDateType` is `SAME_DAY` for today, otherwise `FUTURE_DAY`. The carrier's cutoff time and access time
   limit the choices in the UI; the backend only checks the order of the times, the date range (today to 30 days ahead)
@@ -1565,6 +1576,70 @@ carrier-agnostic, in `warehouse/dn/tracking_services.py`:
 Accounts, keys, services etc. are stored per carrier in the integration settings, not in environment variables; the
 keys are encrypted with `SETTINGS_ENCRYPTION_KEY` (mandatory in production, see *Quick Start*).
 
+## Time Zones
+
+The WMS does not assume one time zone for all warehouses (design: `doc/timezone-utc.md`).
+
+- **Storage**: points in time are stored as `timestamptz` (UTC). Models use `UTCDateTime` (`extensions/db.py`), so Python
+  code always sees timezone-aware UTC `datetime`s; the current time is `warehouse/common/clock.now()`. Date-only fields
+  (expected / actual shipping date, invoice date, pickup date, …) stay `date` and mean the **local date of the warehouse**.
+- **Warehouse time zone**: `warehouses.timezone` — an IANA name such as `Asia/Tokyo` or `America/Los_Angeles`, optional,
+  set on warehouse create / update (`"timezone": null` or `""` = use the default; invalid → 400 `14022`, `field:
+  timezone`). Effective time zone = the warehouse's → `WMS_DEFAULT_TIMEZONE` → `WMS_TIMEZONE` → `UTC`. Business dates use
+  it: actual shipping date, invoice date, carrier ship date and file export date, pickup "today", "expected arrival
+  date has passed", automatic signing after N days (local calendar days). Input times without an offset (`shipped_at`,
+  `signed_at`, operation times, `payment_time`, `scheduled_date`, list filters …) are read in the time zone of the
+  document's warehouse; a date alone means local midnight (PDA signing).
+- **API output**: every time field is ISO 8601 in UTC with its offset (`2026-10-25T01:02:03+00:00`); date fields stay
+  `YYYY-MM-DD`. Warehouse objects — also when nested in documents, tasks and staff — carry `timezone` (effective); the
+  warehouse list / detail also carry `timezone_configured` (the warehouse's own setting; `null`, and omitted in list
+  rows, when it uses the default). DN and ASN detail and their flow endpoints (`GET /dn/<id>/shipping-flow`,
+  `GET /asn/<id>/flow`) carry a top-level `timezone` (the document's warehouse); list rows keep `warehouse_id`.
+  Courier pickups (`GET /dn/carrier-pickups`, availability) return `today` / `timezone` of the warehouse.
+- **Webhooks**: times in `dn.*` payloads (`started_at`, `picked_at`, `packed_at`, `shipped_at`, `signed_at`) are the same
+  instant written with the offset of the DN warehouse (`2026-10-23T13:03:00+09:00`); `goods.spec_updated` `changed_at`
+  uses the default time zone. Receivers parse them as before.
+- Monthly statistics take "this month" in the filtered warehouse's (else the default) time zone; the database groups
+  by month in its session time zone (`WMS_LEGACY_TIMEZONE` on PostgreSQL, UTC on SQLite).
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `WMS_TIMEZONE` | (unset) | Wall clock of data written by older versions, and the default time zone. Any IANA name (an invalid name stops the start). Also sets the process `TZ` (log times, `SNAPSHOT_HOUR` of the inventory snapshot) |
+| `WMS_DEFAULT_TIMEZONE` | `WMS_TIMEZONE`, else `UTC` | Time zone of warehouses without their own. The old `DOCUMENT_TIMEZONE` is still read when this is unset (its `Asia/Tokyo` default is gone) |
+| `WMS_LEGACY_TIMEZONE` | `WMS_TIMEZONE`, else `UTC` | Wall clock of the values in `timestamp` columns that are not converted yet. PostgreSQL sessions use it as their time zone, so the code works before and after the conversion |
+
+### Upgrading an existing installation
+
+Older versions stored the server's wall clock in `timestamp without time zone` columns. The new code reads them in
+`WMS_LEGACY_TIMEZONE`, so it works before and after the one-time conversion to `timestamptz`:
+
+1. Before starting the new version set `WMS_LEGACY_TIMEZONE` (or `WMS_TIMEZONE`) to the time zone the old values were
+   written in — the server / `TZ` of the old version, e.g. `Asia/Shanghai`. Optionally set `WMS_DEFAULT_TIMEZONE` and the
+   time zone of each warehouse.
+2. Deploy, `flask db upgrade` (adds `warehouses.timezone`), restart.
+3. Back up the database (`pg_dump -Fc`), preferably stop the application, then convert:
+
+   ```bash
+   flask wms convert-utc --legacy-tz Asia/Shanghai           # dry run: columns and statements
+   flask wms convert-utc --legacy-tz Asia/Shanghai --apply   # one transaction; asks for confirmation (--yes skips)
+   ```
+
+   Every `timestamp without time zone` column in `public` (except `alembic_version`) becomes `timestamptz` via
+   `USING col AT TIME ZONE '<legacy>'`, one `ALTER TABLE` per table; a row in `wms_timezone_migrations` prevents a
+   second run. Any error rolls the whole conversion back.
+4. Start the application again.
+
+New installations (tables created from the models) already use `timestamptz` and need no conversion; SQLite stores UTC.
+New migrations must declare time columns as `sa.DateTime(timezone=True)` (autogenerate renders `UTCDateTime` that way).
+
+Production runs the conversion with the manual workflow **Migrate WMS Time to UTC** (`.github/workflows/migrate-utc.yml`
+→ `scripts/manual/migrate_utc.py`, same `deploy-backend` concurrency group as deploys). Without `apply` it only checks
+(server commit, `/health`, migrations at the code head, the application's legacy time zone = `.env`, the column list) and
+prints the statements; with `apply` it stops `wms-api`, writes a verified `pg_dump -Fc` backup to
+`/var/www/wms-backups` (0600, SHA-256 in the log), converts in one transaction, restarts and probes `/health`. Before the
+commit a failure changes nothing; after the commit it is never undone automatically (the code works on the converted
+schema) — check the workflow log, `pm2 logs wms-api` and the backup.
+
 ## Deployment
 
 ### Automatic production deploy (GitHub Actions)
@@ -1609,7 +1684,7 @@ stdout_logfile=/var/log/wms-api.out.log
 | Inventory | 15000-15999 | 400 | Stock-related errors |
 | State | 16000-16999 | 400 | State transition errors |
 
-Business codes of the export-document features: `14019` export profile text too long, `14020` invalid country code, `16063` customs structure invalid, `16064` customs line goods code not in the DN / duplicated, `16065` shipped — customs data / packages / documents locked (409), `16066` invalid packages, `16067` packages cannot be edited in the current DN status (409), `16068` documents cannot be issued yet (409, `details.problems`), `16070` not an export DN (409), `16071` document not found (404), `16117` documents cannot be laid out — a text block (usually the consignee) is too long for one page; shorten it (409, `details {document, reason: LAYOUT_OVERFLOW}`). Carrier shipments (automatic): `16072` preconditions for creating / cancelling not met (409, `details.blockers`), `16073` the carrier returned an error or an unclear result (502, `details.errors` / `transaction_id` / `maybe_processed`), `16074` the carrier timed out or the time budget ran out (504, `details.budget_exhausted`), `16075` no carrier shipment to cancel / dismiss (409, `details.unresolved`), `16076` packages / customs data cannot be changed, or documents with different data cannot be issued, while a carrier shipment is pending, active, unclear or being cancelled (409, `details {reason: CARRIER_SHIPMENT_OPEN | DOCUMENT_DATA_CHANGED, status, carrier, carrier_shipment {id, status, tracking_number}}`), `16077` invalid `label_format`, or not supported by the carrier (400), `16078` tracking number / carrier differs from the active carrier shipment, or a delivery task is added / deleted while a carrier shipment exists (409), `16079` a carrier shipment request is pending or its result is unclear, or the shipment is being cancelled / the cancellation is unclear — no new shipment, tracking number or shipping (409, `details.unresolved`), `16093` the shipment / record named in a cancel / dismiss request is not the current one (409, `details {expected, actual}`), `16094` dismissing a record with a tracking number: the carrier did not confirm it is cancelled / not found (409), `16095` the carrier created the shipment but saving it in WMS failed; compensated (502, `details {error, compensation, unresolved, …}`). Carrier integrations: `16124` invalid integration settings (400, `field`: `adapter` / `enabled` / `settings.<key>` / `secrets.<key>`), `16125` the carrier has unfinished automatic shipments — its integration cannot be removed or switched to another plugin (409, `details.shipments`). Courier pickups: `16130` blockers (409, `details.blockers`), `16131` invalid pickup request (400, `field`), `16132` selected shipments cannot be scheduled (409, `details.shipments[{shipment_id, tracking_number, reason}]`), `16133` the pickup cannot be cancelled / dismissed in its current state (409, `details {pickup_id, status, reason, pickup_date}`); tracking: `16134` no active waybill that can be tracked through the API (409); carrier errors / timeouts as for shipments (`16073` / `16074`, `details.action` `pickup` / `pickup_cancel` / `pickup_availability`). No longer used: `16069` (formerly: documents missing or out of date on completion; completion no longer checks documents); the documents no longer print the tracking number or carrier: `16080` (formerly: tracking number on completion differs from the AWB printed on the CI), `16092` (formerly: carrier on completion differs from the one printed on the CI). Delivery tasks: `16090` the DN already has an unfinished delivery task (409, `details {delivery_task_id, status}`), `16091` DN with customs data or waybill records — not the current delivery task (409, `details {delivery_task_id, current_status}`), `16136` `shipped_at` in the future (400, `field: shipped_at`; an invalid one is `16050`). Shipping flow: `16135` invalid carrier method / pickup schedule / tracking page / `auto_sign_days` / file settings (`file_preset`, `file_template.<path>`, `file_account.<key>`), or a method that is not available (400, `field`); file mode: `16137` rows with problems — nothing exported (409, `details.rows[{dn_id, order_number, problems[{column, code, message}]}]`), `16138` file mode not available: invalid request / import file (400) or the carrier is not in file mode / its template is incomplete (409), with `field`; `16139` invalid shipping options (400, `field: options.<key>`); `16076` also with `details.reason: SHIPPING_OPTIONS_LOCKED` / `SHIP_TO_LOCKED`, `16075` also when there is no exported file waybill to discard (`details.waybill`); structured addresses use `14019` (not a string / too long / `zip_code` ≠ `postal_code`) and `14020` (country); `16130` also carries `PICKUP_METHOD_NOT_API`; `16131` manual pickups also use `field` `warehouse_id` / `confirmation_code`; carrier-shipment blockers `SCOPE_NOT_SUPPORTED` / `CUSTOMS_DATA_MISSING` / `CUSTOMS_NOT_SUPPORTED` / `WAYBILL_NOT_SUPPORTED` replace `NOT_EXPORT`. Errors may carry a structured `details` object.
+Business codes of the export-document features: `14019` export profile text too long, `14020` invalid country code, `16063` customs structure invalid, `16064` customs line goods code not in the DN / duplicated, `16065` shipped — customs data / packages / documents locked (409), `16066` invalid packages, `16067` packages cannot be edited in the current DN status (409), `16068` documents cannot be issued yet (409, `details.problems`), `16070` not an export DN (409), `16071` document not found (404), `16117` documents cannot be laid out — a text block (usually the consignee) is too long for one page; shorten it (409, `details {document, reason: LAYOUT_OVERFLOW}`). Carrier shipments (automatic): `16072` preconditions for creating / cancelling not met (409, `details.blockers`), `16073` the carrier returned an error or an unclear result (502, `details.errors` / `transaction_id` / `maybe_processed`), `16074` the carrier timed out or the time budget ran out (504, `details.budget_exhausted`), `16075` no carrier shipment to cancel / dismiss (409, `details.unresolved`), `16076` packages / customs data cannot be changed, or documents with different data cannot be issued, while a carrier shipment is pending, active, unclear or being cancelled (409, `details {reason: CARRIER_SHIPMENT_OPEN | DOCUMENT_DATA_CHANGED, status, carrier, carrier_shipment {id, status, tracking_number}}`), `16077` invalid `label_format`, or not supported by the carrier (400), `16078` tracking number / carrier differs from the active carrier shipment, or a delivery task is added / deleted while a carrier shipment exists (409), `16079` a carrier shipment request is pending or its result is unclear, or the shipment is being cancelled / the cancellation is unclear — no new shipment, tracking number or shipping (409, `details.unresolved`), `16093` the shipment / record named in a cancel / dismiss request is not the current one (409, `details {expected, actual}`), `16094` dismissing a record with a tracking number: the carrier did not confirm it is cancelled / not found (409), `16095` the carrier created the shipment but saving it in WMS failed; compensated (502, `details {error, compensation, unresolved, …}`). Carrier integrations: `16124` invalid integration settings (400, `field`: `adapter` / `enabled` / `settings.<key>` / `secrets.<key>`), `16125` the carrier has unfinished automatic shipments — its integration cannot be removed or switched to another plugin (409, `details.shipments`). Courier pickups: `16130` blockers (409, `details.blockers`), `16131` invalid pickup request (400, `field`), `16132` selected shipments cannot be scheduled (409, `details.shipments[{shipment_id, tracking_number, reason}]`), `16133` the pickup cannot be cancelled / dismissed in its current state (409, `details {pickup_id, status, reason, pickup_date}`); tracking: `16134` no active waybill that can be tracked through the API (409); carrier errors / timeouts as for shipments (`16073` / `16074`, `details.action` `pickup` / `pickup_cancel` / `pickup_availability`). No longer used: `16069` (formerly: documents missing or out of date on completion; completion no longer checks documents); the documents no longer print the tracking number or carrier: `16080` (formerly: tracking number on completion differs from the AWB printed on the CI), `16092` (formerly: carrier on completion differs from the one printed on the CI). Delivery tasks: `16090` the DN already has an unfinished delivery task (409, `details {delivery_task_id, status}`), `16091` DN with customs data or waybill records — not the current delivery task (409, `details {delivery_task_id, current_status}`), `16136` `shipped_at` in the future (400, `field: shipped_at`; an invalid one is `16050`). Shipping flow: `16135` invalid carrier method / pickup schedule / tracking page / `auto_sign_days` / file settings (`file_preset`, `file_template.<path>`, `file_account.<key>`), or a method that is not available (400, `field`); file mode: `16137` rows with problems — nothing exported (409, `details.rows[{dn_id, order_number, problems[{column, code, message}]}]`), `16138` file mode not available: invalid request / import file (400) or the carrier is not in file mode / its template is incomplete (409), with `field`; `16139` invalid shipping options (400, `field: options.<key>`); `16076` also with `details.reason: SHIPPING_OPTIONS_LOCKED` / `SHIP_TO_LOCKED`, `16075` also when there is no exported file waybill to discard (`details.waybill`); structured addresses use `14019` (not a string / too long / `zip_code` ≠ `postal_code`) and `14020` (country); `16130` also carries `PICKUP_METHOD_NOT_API`; `16131` manual pickups also use `field` `warehouse_id` / `confirmation_code`; carrier-shipment blockers `SCOPE_NOT_SUPPORTED` / `CUSTOMS_DATA_MISSING` / `CUSTOMS_NOT_SUPPORTED` / `WAYBILL_NOT_SUPPORTED` replace `NOT_EXPORT`. Warehouses: `14022` invalid time zone (not an IANA name, 400, `field: timezone`). Errors may carry a structured `details` object.
 
 Process rules (see "Process rules" above): `16110` DN has an unfinished carrier shipment — cancel it first (409), `16111` adjustment cancelled (409), `16112` adjustment cannot be cancelled in its status (409), `16113` adjustment line cannot be applied — the location no longer holds the goods / no location (409), `16114` cycle count has uncounted details (409, `details.detail_ids`), `16115` invalid numeric field (400, `field`), `16116` the ASN of a sorting task cannot be changed (409), `16120` transfer: the goods is not in the source location (404), `16121` the same `client_batch_id` was already submitted with different details (409, `details {client_batch_id, batch_id}`), `16122` the user who changed the adjustment details cannot approve it (409), `16123` invalid `client_batch_id` (400), `44009` location has history records — deactivate it instead (409). Tasks: `16088` the task is deactivated (its DN / ASN was cancelled, 409), `16089` a picking task with nothing picked cannot be completed (409).
 

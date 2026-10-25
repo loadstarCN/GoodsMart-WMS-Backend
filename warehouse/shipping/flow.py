@@ -1,7 +1,8 @@
 """出库单流程汇总（GET /warehouse/dn/<id>/shipping-flow，doc/shipping-flow.md §5）：Web 和 PDA 都按它渲染，不各自推算状态。
 
 一张出库单一条流程：下单 → 拣货 → 打包 →（要报关时）报关单证 → 运单 → 揽收 → 交承运商 → 运输中 → 签收。
-每一步给 state、实际发生的时刻 at（带时区偏移）、来源 source、界面要的概要 summary 和能做的操作 actions；
+每一步给 state、实际发生的时刻 at（UTC，带 +00:00；界面按顶层 timezone —— DN 仓库的时区 —— 显示）、来源 source、
+界面要的概要 summary 和能做的操作 actions；
 规则都用已有的服务（建运单的前置条件 / 运单状态、揽收概要、跟踪结果、报关视图），这里不另起一套。
 
 state：
@@ -17,15 +18,16 @@ actions[].key 见 ACTION_KEYS；enabled = false 时带 reason（英文句子）�
 from datetime import datetime
 
 from warehouse.carrier import file_settings
+from warehouse.carrier.file_templates import uses_package_fields
 from warehouse.carrier.methods import methods_of, tracking_url as carrier_tracking_url, tracking_url_template
 from warehouse.dn.carrier_services import CarrierShipmentService
 from warehouse.dn.customs_services import DOC_TYPES, CustomsService
 from warehouse.dn.models import CarrierPickup
 from warehouse.dn.pickup_services import CarrierPickupService
-from warehouse.dn.services import event_time
-from warehouse.dn.tracking_services import local_naive
+from warehouse.dn.tracking_services import carrier_time
 
 from extensions.db import db
+from warehouse.common import clock
 from . import options as shipping_options
 from .auto_sign import auto_sign_at, tracked_by_api
 from .common import current_delivery_task, is_locked, local_today
@@ -63,9 +65,14 @@ def _action(key, enabled=True, reason=None, code=None, **extra):
     return item
 
 
+def _at(value):
+    """接口输出的时刻：UTC 的 ISO 8601（+00:00，doc/timezone-utc.md §3）；None → None"""
+    return clock.utc_iso(value, timespec='seconds')
+
+
 def _step(key, state, at=None, source=None, summary=None, actions=None):
-    """at：WMS 时间列（naive，服务器本地时间）或已经带偏移的 ISO 串"""
-    return {'key': key, 'state': state, 'at': at if isinstance(at, str) else event_time(at), 'source': source,
+    """at：WMS 的时刻（带时区）或已经是 ISO 串（_carrier_time 换好的）"""
+    return {'key': key, 'state': state, 'at': at if isinstance(at, str) else _at(at), 'source': source,
             'summary': summary or {}, 'actions': actions or []}
 
 
@@ -76,8 +83,8 @@ def _problem(code, level, message, step, **extra):
 
 
 def _carrier_time(value):
-    """承运商给的 UTC ISO 时刻 → 带服务器时区偏移的 ISO 串（与其它步骤的 at 一致）；解析不了为 None"""
-    return event_time(local_naive(value)) if value else None
+    """承运商给的 ISO 时刻 → UTC 的 ISO 串（与其它步骤的 at 一致）；解析不了为 None"""
+    return _at(carrier_time(value)) if value else None
 
 
 class ShippingFlowService:
@@ -127,6 +134,8 @@ class ShippingFlowService:
             'order_number': dn.order_number,
             # 揽收按仓库约（界面带 X-WAREHOUSE-ID / warehouse_id）
             'warehouse_id': dn.warehouse_id,
+            # DN 所属仓库的生效时区（doc/timezone-utc.md §3）：界面按它显示 at 等时刻、判断日期
+            'timezone': clock.warehouse_timezone_name(dn),
             'route': route,
             'carrier': ShippingFlowService._carrier_payload(carrier, methods, url),
             'stage': stage_of(dn),
@@ -186,6 +195,21 @@ class ShippingFlowService:
         return _step('picking', 'current' if dn.status in PREPARING_STATUSES else 'todo', None, None, summary)
 
     @staticmethod
+    def _needs_packages(f) -> bool:
+        """这张 DN 要不要录箱子（没录时打包一步提示 PACKAGES_MISSING）：要报关（CI / PL 要箱数与毛重）、运单走插件
+        （建单按箱报重量 / 尺寸），或文件方式的模板有离不开箱子的列（file_templates.uses_package_fields）。
+        国内手工运单、文件模板的箱数有默认值时不需要（PDA 也没有国内件的箱子录入）。"""
+        if f['route'].get('requires_customs'):
+            return True
+        method = f['methods']['waybill']
+        if method == 'api':
+            return True
+        if method == 'file':
+            template = file_settings.template_of(f['carrier'])
+            return template is not None and uses_package_fields(template)
+        return False
+
+    @staticmethod
     def _packing(f):
         from warehouse.packing.models import PackingTask
         dn = f['dn']
@@ -209,9 +233,10 @@ class ShippingFlowService:
         else:
             edit = _action('edit_packages')
         actions = [edit]
+        summary['packages_required'] = ShippingFlowService._needs_packages(f)
         if dn.status in PACKED_OR_LATER or (dn.status == 'closed' and dn.packed_at is not None):
             state = 'done'
-            if dn.status == 'packed' and not packages:
+            if dn.status == 'packed' and not packages and summary['packages_required']:
                 state = 'warning'
                 f['problems'].append(_problem('PACKAGES_MISSING', 'warning', "No packages recorded", 'packing'))
             return _step('packing', state, dn.packed_at, 'warehouse', summary, actions)
@@ -378,14 +403,14 @@ class ShippingFlowService:
 
     @staticmethod
     def _export_info(record) -> dict:
-        """已导出、待导回运单号的文件运单 → {exported_at（最近一次导出，带偏移）, batch_id, file_name, export_count,
+        """已导出、待导回运单号的文件运单 → {exported_at（最近一次导出，UTC）, batch_id, file_name, export_count,
         exported_by: {id, user_name} | None}"""
         from warehouse.dn.models import CarrierFileBatch, _user_ref
         batch = db.session.get(CarrierFileBatch, record.file_batch_id) if record.file_batch_id else None
         data = record.carrier_data if isinstance(record.carrier_data, dict) else {}
         at = batch.created_at if batch is not None and batch.created_at else (record.updated_at or record.created_at)
         return {
-            'exported_at': event_time(at),
+            'exported_at': _at(at),
             'batch_id': record.file_batch_id,
             'file_name': batch.file_name if batch is not None else None,
             'export_count': int(data.get('export_count') or 1),
@@ -461,7 +486,7 @@ class ShippingFlowService:
 
         record = db.session.get(CarrierPickup, waybill.pickup_id) if waybill is not None and waybill.pickup_id \
             else None
-        today = local_today()
+        today = local_today(f['dn'])                     # 揽收日按仓库当地日期
         summary['pickup'] = CarrierPickupService.payload(record, today) if record is not None else None
         actions = ShippingFlowService._pickup_actions(f, record, today)
         if record is not None:
@@ -613,7 +638,7 @@ class ShippingFlowService:
         summary = {
             'estimated_delivery': (tracking or {}).get('estimated_delivery'),
             'auto_sign_days': days if not f['tracked'] else None,
-            'auto_sign_at': event_time(rule_at) if rule_at is not None and dn.status == 'delivered' else None,
+            'auto_sign_at': _at(rule_at) if rule_at is not None and dn.status == 'delivered' else None,
         }
         if dn.status == 'completed':
             at = (task.signed_at if task is not None and task.signed_at else None) or dn.completed_at
@@ -628,7 +653,7 @@ class ShippingFlowService:
                 f['problems'].append(_problem('AUTO_SIGN_BLOCKED', 'warning', tracking['problem'], 'delivered'))
             return _step('delivered', 'warning' if tracking.get('problem') else 'current', summary=summary,
                          actions=actions)
-        if dn.status == 'delivered' and rule_at is not None and rule_at <= datetime.now():
+        if dn.status == 'delivered' and rule_at is not None and rule_at <= clock.now():
             return _step('delivered', 'current', summary=summary, actions=actions)
         return _step('delivered', 'todo', summary=summary, actions=actions)
 

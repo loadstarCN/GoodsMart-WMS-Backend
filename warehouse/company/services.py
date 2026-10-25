@@ -2,18 +2,18 @@ from datetime import datetime
 from extensions.db import *
 from extensions.error import BadRequestException, ConflictException
 from extensions.transaction import transactional
+from warehouse.common import clock
 from warehouse.common.export_profile import COMPANY_EXPORT_FIELDS, normalize_export_profile
 from .models import Company
 
 
 def parse_expired_at(value):
-    """expired_at 接受 'YYYY-MM-DD'、ISO 字符串、datetime 或空值（空值表示不过期）"""
+    """expired_at 接受 'YYYY-MM-DD'、ISO 字符串、datetime 或空值（空值表示不过期）→ 带时区的 UTC。
+    公司没有仓库时区：不带偏移的（含只给日期 = 当天 00:00）按默认时区（WMS_DEFAULT_TIMEZONE → WMS_TIMEZONE → UTC）"""
     if value is None or value == '':
         return None
-    if isinstance(value, datetime):
-        return value
     try:
-        return datetime.fromisoformat(str(value).strip().replace('Z', '+00:00')).replace(tzinfo=None)
+        return clock.parse_input_datetime(value if isinstance(value, datetime) else str(value), None)
     except ValueError:
         raise BadRequestException("expired_at must be a date (YYYY-MM-DD) or ISO datetime", 14017)
 
@@ -44,10 +44,9 @@ class CompanyService:
             query = query.filter(Company.is_active == filters['is_active'])
         if filters.get('name'):
             query = query.filter(Company.name.ilike(f"%{filters['name']}%"))
-        if filters.get('expired_at_start'):
-            query = query.filter(Company.expired_at >= filters['expired_at_start'])
-        if filters.get('expired_at_end'):
-            query = query.filter(Company.expired_at <= filters['expired_at_end'])
+        # 只给日期：默认时区的那一天（expired_at_end 含当天）
+        query = clock.filter_time_range(query, Company.expired_at, filters.get('expired_at_start'),
+                                        filters.get('expired_at_end'))
 
 
         return query

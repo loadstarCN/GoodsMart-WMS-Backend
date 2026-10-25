@@ -1,4 +1,5 @@
 from extensions.db import *
+from extensions.db import UTCDateTime
 
 class Adjustment(db.Model):
     """库存调整主表
@@ -76,24 +77,24 @@ class Adjustment(db.Model):
         info={'description': '最后增 / 改 / 删明细的人（审批人不能是他，职责分离 B-105）；存量调整单为 NULL'}
     )
     created_at = db.Column(
-        db.DateTime,
+        UTCDateTime,
         default=db.func.now(),
         info={'description': '创建时间'}
     )
     updated_at = db.Column(
-        db.DateTime,
+        UTCDateTime,
         default=db.func.now(),
         onupdate=db.func.now(),
         index=True,  # 时间字段加索引
         info={'description': '最后更新时间'}
     )    
     approved_at = db.Column(
-        db.DateTime,
+        UTCDateTime,
         nullable=True,
         info={'description': '审批时间'}
     )    
     completed_at = db.Column(
-        db.DateTime,
+        UTCDateTime,
         nullable=True,
         info={'description': '完成时间'}
     )

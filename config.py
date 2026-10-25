@@ -2,21 +2,83 @@ import os
 import time
 from dotenv import load_dotenv
 from datetime import timedelta
+from functools import lru_cache
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 # 加载 .env 文件
 load_dotenv()
 
-# The warehouse stores wall-clock times in PostgreSQL timestamp columns without
-# a timezone.  Enable the Japan clock only after the one-time data conversion;
-# the maintenance command writes this flag after its backup and conversion.
-WMS_TIMEZONE = (os.getenv('WMS_TIMEZONE') or '').strip()
+# 时区（doc/timezone-utc.md）。时刻一律带时区（UTC）存储与计算，业务日期与界面按仓库时区。
+# - WMS_TIMEZONE：旧数据的墙上时间口径（还没转换成 timestamptz 的列、不带时区的输入）兼默认时区；任意合法的 IANA 名。
+#   设了就把进程时区（TZ）也设成它（日志时间、APScheduler 的库存快照 cron 按它）。
+# - WMS_DEFAULT_TIMEZONE：没设时区的仓库用的时区（不设取 WMS_TIMEZONE，再没有为 UTC）。
+#   旧名 DOCUMENT_TIMEZONE（单证日期时区）在 WMS_DEFAULT_TIMEZONE 没设时仍被读取（不合法的忽略并打 warning）。
+# - WMS_LEGACY_TIMEZONE：旧数据的墙上时间口径（不设取 WMS_TIMEZONE，再没有为 UTC）。PostgreSQL 连接的会话时区设成它，
+#   未转换的 timestamp 列与 db.func.now() 按它解释；转换（flask wms convert-utc / scripts/manual/migrate_utc.py）也按它。
+# 名字不合法 → RuntimeError，拒绝启动。
+def _timezone_env(name):
+    """读一个 IANA 时区名的环境变量：去空白，空 → ''；不是合法的 IANA 名 → RuntimeError"""
+    value = (os.getenv(name) or '').strip()
+    if value and not is_valid_timezone(value):
+        raise RuntimeError(f'{name}={value!r} is not a valid IANA time zone name (for example Asia/Tokyo, '
+                           'America/Los_Angeles or UTC)')
+    return value
+
+
+def is_valid_timezone(name) -> bool:
+    """name 是否是 zoneinfo 认得的 IANA 时区名（如 Asia/Tokyo、America/Los_Angeles、UTC）"""
+    if not isinstance(name, str) or not name.strip() or name != name.strip():
+        return False
+    return _zone_loads(name)
+
+
+@lru_cache(maxsize=512)
+def _zone_loads(name) -> bool:
+    # 系统 zoneinfo 目录里的非时区文件（Debian 的 localtime 指向 /etc/localtime 等）不算
+    if name in ('localtime', 'posixrules', 'Factory') or name.startswith(('posix/', 'right/')):
+        return False
+    try:
+        ZoneInfo(name)
+    except (ZoneInfoNotFoundError, ValueError, OSError):
+        return False
+    return True
+
+
+WMS_TIMEZONE = _timezone_env('WMS_TIMEZONE')
+WMS_DEFAULT_TIMEZONE = _timezone_env('WMS_DEFAULT_TIMEZONE')
+WMS_LEGACY_TIMEZONE = _timezone_env('WMS_LEGACY_TIMEZONE') or WMS_TIMEZONE or 'UTC'
+# 旧名 DOCUMENT_TIMEZONE：只在显式设置、且 WMS_DEFAULT_TIMEZONE 没设时当作默认时区（不再有 Asia/Tokyo 的默认值）
+_DOCUMENT_TIMEZONE_RAW = (os.getenv('DOCUMENT_TIMEZONE') or '').strip()
+DOCUMENT_TIMEZONE_IGNORED = None        # 不合法而被忽略的 DOCUMENT_TIMEZONE（check_runtime_config 打 warning）
+if not WMS_DEFAULT_TIMEZONE and _DOCUMENT_TIMEZONE_RAW:
+    if is_valid_timezone(_DOCUMENT_TIMEZONE_RAW):
+        WMS_DEFAULT_TIMEZONE = _DOCUMENT_TIMEZONE_RAW
+    else:
+        DOCUMENT_TIMEZONE_IGNORED = _DOCUMENT_TIMEZONE_RAW
 if WMS_TIMEZONE:
-    if WMS_TIMEZONE != 'Asia/Tokyo':
-        raise RuntimeError('WMS_TIMEZONE must be Asia/Tokyo')
+    # 进程时区：代码不再靠它算时刻（clock.now() 是 UTC），只影响日志与 APScheduler 的 cron 触发时刻
     os.environ['TZ'] = WMS_TIMEZONE
-    if not hasattr(time, 'tzset'):
-        raise RuntimeError('WMS_TIMEZONE requires time.tzset()')
-    time.tzset()
+    if hasattr(time, 'tzset'):
+        time.tzset()
+
+
+def _is_postgresql(uri) -> bool:
+    return str(uri or '').strip().lower().startswith(('postgresql', 'postgres:'))
+
+
+def _engine_options(uri, **options):
+    """SQLAlchemy 引擎参数。PostgreSQL 连接的会话时区固定为旧口径时区（WMS_LEGACY_TIMEZONE）：
+    还没转换的 timestamp 列上，带时区的绑定值、db.func.now() 都按它换成墙上时间，与读出时的解释（UTCDateTime）一致；
+    转换成 timestamptz 后会话时区不再影响数据（只影响 SQL 里的日期 / 年月提取），保留无害。
+    libpq 只在连接参数里没有 options 时才读环境变量 PGOPTIONS：这里显式给了 options，所以把 PGOPTIONS 并在前面
+    （部署流水线用 PGOPTIONS="-c lock_timeout=15s" 跑 flask db upgrade / 权限种子，不并进来锁等待上限会被静默丢掉）；
+    会话时区放在最后，PGOPTIONS 里另设的 timezone 不生效。"""
+    if _is_postgresql(uri):
+        pg_options = (os.getenv('PGOPTIONS') or '').strip()
+        timezone_option = f'-c timezone={WMS_LEGACY_TIMEZONE}'
+        options['connect_args'] = {'options': f'{pg_options} {timezone_option}' if pg_options else timezone_option}
+    return options
+
 
 _TRUE_VALUES = ('1', 'true', 'yes', 'on')
 _FALSE_VALUES = ('0', 'false', 'no', 'off')
@@ -95,8 +157,12 @@ class Config:
     # 加密敏感系统设置（SMTP 密码等）的 Fernet 密钥。生产环境必填（缺了拒绝启动）；
     # 开发 / 测试不设则退回数据库内自动生成的密钥（仅混淆）
     SETTINGS_ENCRYPTION_KEY = (os.getenv('SETTINGS_ENCRYPTION_KEY') or '').strip() or None
-    # 出口单证（商业发票 / 装箱单）：单证日期所用时区；可选 TTF 字体（不设用 Helvetica，非拉丁字符退回内置日文 CID 字体）
-    DOCUMENT_TIMEZONE = os.getenv('DOCUMENT_TIMEZONE', 'Asia/Tokyo')
+    # 时区（见文件开头）：仓库的生效时区 = warehouses.timezone → WMS_DEFAULT_TIMEZONE → WMS_TIMEZONE → UTC
+    # （warehouse/common/clock.py）；单证日期、实际发货日、揽收日等业务日期都按单据所属仓库的时区
+    WMS_TIMEZONE = WMS_TIMEZONE
+    WMS_DEFAULT_TIMEZONE = WMS_DEFAULT_TIMEZONE
+    WMS_LEGACY_TIMEZONE = WMS_LEGACY_TIMEZONE
+    # 出口单证（商业发票 / 装箱单）：可选 TTF 字体（不设用 Helvetica，非拉丁字符退回内置日文 CID 字体）
     CUSTOMS_PDF_FONT_PATH = os.getenv('CUSTOMS_PDF_FONT_PATH') or None
     # The CI signature image is a private runtime file, scoped to one exporter company.
     CUSTOMS_SIGNATURE_COMPANY_ID = os.getenv('CUSTOMS_SIGNATURE_COMPANY_ID') or None
@@ -126,6 +192,7 @@ class DevelopmentConfig(Config):
     WEBHOOK_URL_STRICT = env_bool('WEBHOOK_URL_STRICT', False)
     SQLALCHEMY_ECHO=False # 打印SQL语句
     SQLALCHEMY_DATABASE_URI = os.getenv('SQLALCHEMY_DATABASE_URI_DEV', 'sqlite:///test.db')  # 数据库连接
+    SQLALCHEMY_ENGINE_OPTIONS = _engine_options(SQLALCHEMY_DATABASE_URI)   # PostgreSQL：会话时区 = 旧口径时区
     REDIS_URL = os.getenv('REDIS_URL_DEV', 'redis://localhost:6379/0') # REDIS配置
     OSS_ENDPOINT = os.getenv('OSS_ENDPOINT_DEV')  # 阿里云 OSS Endpoint 地址
     OSS_BUCKET_NAME = os.getenv('OSS_BUCKET_NAME_DEV')  # 阿里云 OSS Bucket 名称
@@ -145,17 +212,15 @@ class TestingConfig(Config):
 
 class ProductionConfig(Config):
     DEBUG = False
-    SQLALCHEMY_ENGINE_OPTIONS = {
-        # 从连接池取连接时先探一下：数据库那边断掉的空闲连接（SSL connection has been closed unexpectedly）
-        # 换成新连接，不让拿到它的请求 500
-        'pool_pre_ping': True,
-        # db.func.now() is written into timezone-naive columns.  The PostgreSQL
-        # session must use the same wall clock as Python's datetime.now().
-        **({'connect_args': {'options': '-c timezone=Asia/Tokyo'}} if WMS_TIMEZONE else {}),
-    }
     # 生产默认严格校验 webhook 地址（显式设为 false 才关，启动时会打 warning）
     WEBHOOK_URL_STRICT = env_bool('WEBHOOK_URL_STRICT', True)
     SQLALCHEMY_DATABASE_URI = os.getenv('SQLALCHEMY_DATABASE_URI', 'sqlite:///test.db')  # 数据库连接    
+    SQLALCHEMY_ENGINE_OPTIONS = _engine_options(
+        SQLALCHEMY_DATABASE_URI,
+        # 从连接池取连接时先探一下：数据库那边断掉的空闲连接（SSL connection has been closed unexpectedly）
+        # 换成新连接，不让拿到它的请求 500
+        pool_pre_ping=True,
+    )
     REDIS_URL = os.getenv('REDIS_URL', 'redis://localhost:6379/0') # REDIS配置
     OSS_ENDPOINT = os.getenv('OSS_ENDPOINT')  # 阿里云 OSS Endpoint
     OSS_BUCKET_NAME = os.getenv('OSS_BUCKET_NAME')  # 阿里云 OSS Bucket 名称
@@ -190,6 +255,9 @@ def check_runtime_config(config, logger, flask_env=None, flask_env_set=None, env
 
     for name, raw in sorted(UNRECOGNIZED_BOOL_ENV.items()):
         logger.warning(f'{name}={raw!r} is not a recognised boolean (1/true/yes/on or 0/false/no/off); treated as False')
+    if DOCUMENT_TIMEZONE_IGNORED:
+        logger.warning(f'DOCUMENT_TIMEZONE={DOCUMENT_TIMEZONE_IGNORED!r} is not a valid IANA time zone and is ignored; '
+                       'set WMS_DEFAULT_TIMEZONE (or the time zone of each warehouse) instead')
 
     if flask_env == 'production':
         problems = []
@@ -214,6 +282,11 @@ def check_runtime_config(config, logger, flask_env=None, flask_env_set=None, env
             logger.warning('CORS_ORIGINS is "*" in production; set it to the admin/app domains')
         if not config.get('WEBHOOK_URL_STRICT'):
             logger.warning('WEBHOOK_URL_STRICT is off in production: webhook URLs may point to internal addresses (SSRF)')
+        if not (environ.get('WMS_LEGACY_TIMEZONE') or '').strip() and not (config.get('WMS_TIMEZONE') or '').strip():
+            # 旧版本写的 timestamp 列（还没 flask wms convert-utc）会被按 UTC 解释；新装的实例设 WMS_LEGACY_TIMEZONE=UTC 即可
+            logger.warning('Neither WMS_LEGACY_TIMEZONE nor WMS_TIMEZONE is set: timestamp columns not converted to '
+                           'timestamptz yet are read as UTC. If the database was written by an older version, set '
+                           'WMS_LEGACY_TIMEZONE to its time zone (see README "Time Zones"); otherwise set it to UTC.')
         return
 
     if not flask_env_set:

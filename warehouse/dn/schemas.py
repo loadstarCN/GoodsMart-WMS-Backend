@@ -11,6 +11,11 @@ from warehouse.common.address_format import dn_ship_to
 from .models import DN, DNDocument, _user_ref
 
 # 定义 DN 命名空间（类似于 ASN 的 api_ns）
+def _document_timezone(document):
+    from warehouse.common.clock import warehouse_timezone_name
+    return warehouse_timezone_name(document)
+
+
 api_ns = Namespace('dn', description='Delivery Note (DN) related operations', authorizations=authorizations)
 
 # 在当前 namespace 注册 user_model
@@ -69,7 +74,7 @@ dn_document_meta_model = api_ns.model('DNCustomsDocument', {
     'document_number': fields.String(),
     'invoice_date': fields.String(
         attribute=lambda x: x.invoice_date.isoformat() if getattr(x, 'invoice_date', None) else None,
-        description='YYYY-MM-DD (DOCUMENT_TIMEZONE)'),
+        description='YYYY-MM-DD (local date of the DN warehouse)'),
     'issued_at': fields.DateTime(),
     'issued_by': fields.Integer(description='User ID of the issuer'),
     'issued_by_user': fields.Raw(
@@ -231,6 +236,11 @@ asn_full_fields.update({
     'recipient': fields.Nested(recipient_model, readOnly=True, description='Details of the associated recipient'),
     'carrier': fields.Nested(carrier_model, readOnly=True, description='Details of the associated carrier'),
     'warehouse': fields.Nested(warehouse_model, readOnly=True, description='Details of the associated warehouse'),
+    # 单据所属仓库的生效时区（doc/timezone-utc.md §3）：界面按它显示本单的时刻、解释输入的时刻
+    'timezone': fields.String(
+        readOnly=True, attribute=lambda x: _document_timezone(x),
+        description='Effective IANA time zone of the DN warehouse; times are shown and naive input times are read '
+                    'in this zone'),
     'details': fields.List(fields.Nested(dn_detail_model), description='List of ASN details'),
     'customs': fields.Raw(
         readOnly=True,

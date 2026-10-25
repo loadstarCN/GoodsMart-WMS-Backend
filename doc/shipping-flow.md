@@ -114,7 +114,7 @@ tracking_url_template = None              # 公开查询页，如 'https://www.f
   "steps": [
     {"key": "ordered",   "state": "done", "at": "2026-10-15T16:56:51+09:00", "source": "api", "summary": {}, "actions": []},
     {"key": "picking",   "state": "done", "at": "...", "source": "warehouse", "summary": {"task_ids": [..], "picked": 14, "planned": 14}},
-    {"key": "packing",   "state": "done", "at": "...", "summary": {"task_ids": [..], "package_count": 1, "gross_weight_kg": 3.858}},
+    {"key": "packing",   "state": "done", "at": "...", "summary": {"task_ids": [..], "package_count": 1, "gross_weight_kg": 3.858, "packages_required": true}},
     {"key": "documents", "state": "done", "at": "...", "summary": {"version": 4, "outdated": false, "missing": []}},
     {"key": "waybill",   "state": "done", "at": "...", "source": "api",
        "summary": {"tracking_number": "878978126644", "source": "api", "service": "...", "label_document_id": 9, "shipment": {...}},
@@ -187,7 +187,9 @@ tracking_url_template = None              # 公开查询页，如 'https://www.f
 - 导入：`POST /warehouse/dn/carrier-files/import`（multipart：`file`、`carrier_id`、`dry_run`）→ 按 `reference_parse`
   解析出 DN，写运单号；一张 DN 多行（多件）= 多个运单号，第一个为主单号，其余进 `package_tracking_numbers`；
   `exported` → `active`（没导出过的 DN 也接受，直接建 `file` 运单）；同步到发货任务。逐行结果：`matched` /
-  `not_found` / `already_has_number`（号码不同，需人工决定）/ `same_number`（已导入过，忽略）/ `invalid`。
+  `not_found` / `already_has_number`（号码不同，需人工决定）/ `same_number`（已导入过，忽略）/ `invalid`；除 `matched` 外每行带
+  `reason_code`（界面出本地化文字）+ 英文 `message`（兜底）+ 拼文字用的字段（`existing_tracking_number`、`other_carrier`、
+  `other_dn_id`……，README「导入」）。
   `dry_run = true` 只返回预览，确认后再以 `dry_run = false` 提交。
 - 流程：运单步骤 `waybill_method = file` 时给 `export_file`（单张导出）/ `import_numbers` / `discard_export`；
   阶段 `awaiting_number` = 已导出待导回。列表工作队列：「待建运单」批量导出、「待导回」批量导入。

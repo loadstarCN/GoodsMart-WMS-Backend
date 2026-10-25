@@ -8,6 +8,7 @@ from extensions.error import (
 )
 from extensions.transaction import transactional
 from warehouse.common import require_positive_int, require_bulk_list, require_fields, require_source_api_key
+from warehouse.common import clock
 from warehouse.inventory.services import InventoryService
 from warehouse.common.locks import lock_row, lock_inventory_rows, lock_order_key
 
@@ -40,22 +41,23 @@ def parse_date_value(value, field: str):
     raise BadRequestException(f"{field} must be a date in YYYY-MM-DD format", 16050)
 
 
-def parse_datetime_value(value, field: str):
-    """ISO 8601 / 'YYYY-MM-DD HH:MM:SS' 字符串或 datetime；格式不对 → 400"""
-    if value is None or isinstance(value, datetime):
-        return value
-    if isinstance(value, str):
+def parse_datetime_value(value, field: str, where=None):
+    """用户输入的时刻：ISO 8601（带偏移的按偏移，不带的按 where —— 单据所属仓库 —— 的时区）/ 只给日期（仓库当地
+    00:00）/ datetime → 带时区的 UTC（warehouse/common/clock.parse_input_datetime）；格式不对 → 400 16050"""
+    if value is None:
+        return None
+    if isinstance(value, (str, datetime, date)):
         try:
-            return datetime.fromisoformat(value.strip().replace('Z', '+00:00'))
+            return clock.parse_input_datetime(value, where)
         except ValueError:
             pass
     raise BadRequestException(f"{field} must be an ISO 8601 datetime", 16050)
 
 
-def event_time(value):
-    """webhook 里的事件时刻：WMS 时间列（服务器本地时间，naive）→ 带时区偏移的 ISO 8601（如 2026-10-23T13:03:00+09:00）；
-    空 → None"""
-    return value.astimezone().isoformat(timespec='seconds') if value else None
+def event_time(value, where=None):
+    """webhook 里的事件时刻：同一时刻、用单据所属仓库（where：DN / ASN / 仓库）时区偏移的 ISO 8601
+    （如 2026-10-23T13:03:00+09:00；doc/timezone-utc.md §3），接收方照常解析；空 → None"""
+    return clock.local_iso(value, where) if value else None
 
 
 def resolve_company_id(data: dict, warehouse) -> int:
@@ -321,18 +323,19 @@ class DNService:
         if new_status not in DN.DN_STATUSES:
             raise BadRequestException(f"Invalid DN status: {new_status}", 14007)
         dn.status = new_status
+        now = clock.now()
         if new_status == 'in_progress':
-            dn.started_at = datetime.now()
+            dn.started_at = now
         elif new_status == 'picked':
-            dn.picked_at = datetime.now()
+            dn.picked_at = now
         elif new_status == 'packed':
-            dn.packed_at = datetime.now()
+            dn.packed_at = now
         elif new_status == 'delivered':
-            dn.delivered_at = datetime.now()
+            dn.delivered_at = now
         elif new_status == 'completed':
-            dn.completed_at = datetime.now()
+            dn.completed_at = now
         elif new_status == 'closed':
-            dn.closed_at = datetime.now()
+            dn.closed_at = now
         db.session.add(dn)
         db.session.flush()
         # db.session.commit()
@@ -962,7 +965,7 @@ class DNService:
 
         webhook_emit('dn.in_progress', {
             'dn_id': dn.id, 'status': 'in_progress', 'order_number': dn.order_number,
-            'started_at': event_time(dn.started_at),
+            'started_at': event_time(dn.started_at, dn),
         }, api_key_id=dn.api_key_id)
 
         return dn
@@ -995,7 +998,7 @@ class DNService:
         # 来源系统（批发站）据此显示仓库作业进度；拣少了能从 picked_quantity 提前看到
         webhook_emit('dn.picked', {
             'dn_id': dn.id, 'status': 'picked', 'order_number': dn.order_number,
-            'picked_at': event_time(dn.picked_at),
+            'picked_at': event_time(dn.picked_at, dn),
             'details': [
                 {
                     'goods_code': detail.goods.code if detail.goods else None,
@@ -1037,7 +1040,7 @@ class DNService:
 
         webhook_emit('dn.packed', {
             'dn_id': dn.id, 'status': 'packed', 'order_number': dn.order_number,
-            'packed_at': event_time(dn.packed_at),
+            'packed_at': event_time(dn.packed_at, dn),
             'details': [
                 {
                     'goods_code': detail.goods.code if detail.goods else None,
@@ -1057,8 +1060,8 @@ class DNService:
         """
         Mark a DN as 'delivered' (例如发货操作)，仅当 DN 状态为 packed 时可变更为 delivered
         - delivery_task：被完成的那条发货任务（完成发货时由调用方传入），dn.delivered 的 tracking_number 取它的运单号
-        - shipped_at：实际发货时刻（承运商揽收时刻，服务器本地时间），不传 = 现在；存为 delivered_at，
-          dn.delivered 的 shipped_at（带时区偏移）就是它 —— 来源系统按它记发货时间，不按收到推送的时刻
+        - shipped_at：实际发货时刻（承运商揽收时刻，带时区的 datetime），不传 = 现在；存为 delivered_at，
+          dn.delivered 的 shipped_at（仓库时区的偏移）就是它 —— 来源系统按它记发货时间，不按收到推送的时刻
         """
         # 锁 DN 行并重读状态（完成发货已先锁过 DN，同一事务重复加锁无副作用）
         dn = lock_row(DNService._get_instance(dn_or_id))
@@ -1093,7 +1096,7 @@ class DNService:
         payload = {
             'dn_id': dn.id, 'status': 'delivered', 'order_number': dn.order_number,
             'tracking_number': tracking_number,
-            'shipped_at': event_time(dn.delivered_at),
+            'shipped_at': event_time(dn.delivered_at, dn),
             'details': [
                 {
                     'goods_code': detail.goods.code,
@@ -1146,8 +1149,8 @@ class DNService:
         webhook_emit('dn.completed', {
             'dn_id': dn.id, 'status': 'completed', 'order_number': dn.order_number,
             'tracking_number': signed_task.tracking_number if signed_task else None,
-            'shipped_at': event_time(dn.delivered_at),
-            'signed_at': event_time(dn.completed_at),
+            'shipped_at': event_time(dn.delivered_at, dn),
+            'signed_at': event_time(dn.completed_at, dn),
             # 签收的来源：warehouse（手工）/ carrier（承运商跟踪自动）/ rule（自动视为签收）
             'signed_source': (signed_task.signed_source or 'warehouse') if signed_task else 'warehouse',
             'details': [
@@ -1313,7 +1316,7 @@ class DNService:
             task.is_active = False
             db.session.add(task)
 
-        now = datetime.now()
+        now = clock.now()
         for document in DNDocument.query.filter(DNDocument.dn_id == dn.id, DNDocument.status == 'issued').all():
             document.status = 'void'
             document.voided_at = now
@@ -1338,7 +1341,7 @@ class DNService:
             list: 符合前端图表要求的数据序列
         """
         # 计算时间范围
-        end_date = datetime.now()
+        end_date = clock.stats_now(filters)
         start_date = end_date - relativedelta(months=months-1)
         start_date = start_date.replace(day=1, hour=0, minute=0, second=0)
 
@@ -1423,7 +1426,7 @@ class DNService:
     @staticmethod
     def get_status_overview(filters=None):
         """获取各状态ASN在当前月、前一个月和去年同月的统计"""
-        now = datetime.now()
+        now = clock.stats_now(filters)
         current_year = now.year
         current_month = now.month
 

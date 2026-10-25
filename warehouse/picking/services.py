@@ -10,6 +10,7 @@ from warehouse.location.models import Location
 from warehouse.removal.services import RemovalService
 from .models import PickingTask, PickingTaskDetail, PickingTaskStatusLog,PickingBatch
 from extensions.transaction import transactional
+from warehouse.common import clock
 from dateutil.relativedelta import relativedelta
 from sqlalchemy import and_, func, case, extract
 from sqlalchemy.orm import selectinload, joinedload
@@ -404,7 +405,7 @@ class PickingTaskService:
 
         if not isinstance(data, dict):
             raise BadRequestException("Request body must be a JSON object", 16015)
-        op_time = parse_datetime_value(data.get('operation_time'), 'operation_time')
+        op_time = parse_datetime_value(data.get('operation_time'), 'operation_time', task.dn)
 
         # 1) 明细字段逐条校验
         details_data = PickingTaskService._parse_batch_details(data)
@@ -425,7 +426,7 @@ class PickingTaskService:
             picking_task_id=task.id,
             client_batch_id=client_batch_id,
             operator_id=operator_id,
-            operation_time=op_time or datetime.now(),
+            operation_time=op_time or clock.now(),
             remark=data.get('remark', '')
         )
         # flush 拿 new_batch.id；唯一约束兜底撞上时按已存在的批次重放 / 409
@@ -476,7 +477,7 @@ class PickingTaskService:
         data = pick_fields(data, ('operation_time', 'remark'))
 
         if data.get('operation_time') is not None:
-            batch.operation_time = parse_datetime_value(data['operation_time'], 'operation_time')
+            batch.operation_time = parse_datetime_value(data['operation_time'], 'operation_time', task.dn)
         if 'remark' in data:
             batch.remark = data['remark']
 
@@ -515,7 +516,7 @@ class PickingTaskService:
             raise BadRequestException(f"Invalid status value: {new_status}", 14007)
 
         old_status = task.status
-        now = datetime.now()
+        now = clock.now()
 
         # 设置新状态
         task.status = new_status
@@ -643,7 +644,7 @@ class PickingTaskService:
             list: 符合前端图表要求的数据序列
         """
         # 计算时间范围
-        end_date = datetime.now()
+        end_date = clock.stats_now(filters)
         start_date = end_date - relativedelta(months=months-1)
         start_date = start_date.replace(day=1, hour=0, minute=0, second=0)
 
@@ -709,7 +710,7 @@ class PickingTaskService:
     @staticmethod
     def get_status_overview(filters=None):
         """获取各状态ASN在当前月、前一个月和去年同月的统计"""
-        now = datetime.now()
+        now = clock.stats_now(filters)
         current_year = now.year
         current_month = now.month
 

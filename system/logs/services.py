@@ -19,13 +19,16 @@ class LogService:
         if filters.get('endpoint'):
             query = query.filter(ActivityLog.endpoint.ilike(f"%{filters['endpoint']}%"))
         if filters.get('method'):
-            query = query.filter(ActivityLog.method.ilike(f"%{filters['method']}%"))
+            # method 是枚举列（PostgreSQL 上是 method_enum 类型，没有 ILIKE 运算符 → 500）；参数只允许 GET / POST / PUT / DELETE，按等值筛
+            query = query.filter(ActivityLog.method == str(filters['method']).strip().upper())
         if filters.get('status_code') is not None:
             query = query.filter(ActivityLog.status_code == filters['status_code'])
         if filters.get('ip_address'):
             query = query.filter(ActivityLog.ip_address == filters['ip_address'])
         if filters.get('created_at'):
-            query = query.filter(ActivityLog.created_at >= filters['created_at'])
+            # 不带时区的按默认时区（WMS_DEFAULT_TIMEZONE → WMS_TIMEZONE → UTC）
+            from warehouse.common.clock import parse_input_datetime
+            query = query.filter(ActivityLog.created_at >= parse_input_datetime(filters['created_at']))
         # keyword 只搜 actor / endpoint，不搜请求响应正文（避免逐字盲猜正文中的凭证）
         if filters.get('keyword'):
             keyword = f"%{filters['keyword']}%"

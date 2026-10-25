@@ -1,4 +1,5 @@
 from extensions import db
+from extensions.db import UTCDateTime
 
 class PutawayRecord(db.Model):
     """货品上架记录表
@@ -47,7 +48,7 @@ class PutawayRecord(db.Model):
         info={'description': '操作员ID'}
     )
     putaway_time = db.Column(
-        db.DateTime, 
+        UTCDateTime, 
         default=db.func.now(),
         info={'description': '自动记录上架时间'}
     )

@@ -1,4 +1,5 @@
 from extensions import db
+from extensions.db import UTCDateTime
 
 class PickingTask(db.Model):
     """拣货任务主表
@@ -44,24 +45,24 @@ class PickingTask(db.Model):
         info={'description': '创建人ID'}
     )
     created_at = db.Column(
-        db.DateTime,
+        UTCDateTime,
         default=db.func.now(),
         info={'description': '任务创建时间'}
     )
     updated_at = db.Column(
-        db.DateTime,
+        UTCDateTime,
         default=db.func.now(),
         onupdate=db.func.now(),
         index=True,
         info={'description': '最后更新时间'}
     )
     started_at = db.Column(
-        db.DateTime,
+        UTCDateTime,
         nullable=True,
         info={'description': '实际开始时间'}
     )
     completed_at = db.Column(
-        db.DateTime,
+        UTCDateTime,
         nullable=True,
         info={'description': '实际完成时间'}
     )
@@ -148,7 +149,7 @@ class PickingTaskDetail(db.Model):
         info={'description': '实际拣货数量'}
     )
     picking_time = db.Column(
-        db.DateTime,
+        UTCDateTime,
         default=db.func.now(),
         info={'description': '操作时间'}
     )
@@ -218,7 +219,7 @@ class PickingBatch(db.Model):
         info={'description': '操作员ID'}
     )
     operation_time = db.Column(
-        db.DateTime,
+        UTCDateTime,
         default=db.func.now(),
         nullable=False,
         info={'description': '操作时间'}
@@ -272,7 +273,7 @@ class PickingTaskStatusLog(db.Model):
         info={'description': '操作人ID'}
     )
     changed_at = db.Column(
-        db.DateTime,
+        UTCDateTime,
         default=db.func.now(),
         index=True,
         info={'description': '变更时间'}

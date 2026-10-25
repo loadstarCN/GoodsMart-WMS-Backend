@@ -1,5 +1,6 @@
 from extensions import db  
 from werkzeug.security import generate_password_hash, check_password_hash
+from extensions.db import UTCDateTime
 
 
 # 定义 Role 与 Permission 的多对多关联表（增加级联策略）
@@ -64,12 +65,12 @@ class Role(db.Model):
         info={'description': '是否启用（默认激活）'}
     )
     created_at = db.Column(
-        db.DateTime, 
+        UTCDateTime, 
         default=db.func.now(),
         info={'description': '创建时间（自动记录）'}
     )
     updated_at = db.Column(
-        db.DateTime, 
+        UTCDateTime, 
         default=db.func.now(),
         onupdate=db.func.now(),
         info={'description': '最后更新时间（自动更新）'}
@@ -122,18 +123,18 @@ class User(db.Model):
         info={'description': '账户激活状态'}
     )
     created_at = db.Column(
-        db.DateTime, 
+        UTCDateTime, 
         default=db.func.now(),
         info={'description': '注册时间（自动记录）'}
     )
     updated_at = db.Column(
-        db.DateTime, 
+        UTCDateTime, 
         default=db.func.now(),
         onupdate=db.func.now(),
         info={'description': '最后更新时间（自动更新）'}
     )
     refresh_token_expires_at = db.Column(
-        db.DateTime,
+        UTCDateTime,
         nullable=True,
         info={'description': '刷新令牌过期时间'}
     )

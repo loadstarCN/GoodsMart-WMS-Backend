@@ -14,7 +14,6 @@
 import hashlib
 import json
 import re
-from datetime import datetime
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 
 from flask import current_app
@@ -23,6 +22,7 @@ from extensions.db import db
 from extensions.error import BadRequestException, ConflictException, NotFoundException
 from extensions.transaction import transactional
 from warehouse.common.countries import COUNTRY_NAMES_EN, is_valid_country, normalize_country
+from warehouse.common import clock
 from warehouse.country_rules import rules_for
 # 日本专有的检查（9 位统计品目番号等）搬到了国家规则包 warehouse/country_rules/jp.py，这里保留旧名
 from warehouse.country_rules.jp import JP_EXPORT_CODE_THRESHOLD_JPY, jp_export_code_problem  # noqa: F401
@@ -224,7 +224,7 @@ def _country_label(code) -> str:
     return f"{code} - {name}" if name else (code or '')
 
 
-# 业务日期时区搬到了 warehouse/shipping/common.py（document_timezone）；保留旧名给已有的引用方
+# 业务日期时区搬到了 warehouse/shipping/common.py（document_timezone：单据所属仓库的时区）；保留旧名给已有的引用方
 _document_timezone = document_timezone
 
 
@@ -514,7 +514,7 @@ class CustomsService:
 
     @staticmethod
     def _void_current_documents(dn: DN, reason: str) -> list:
-        now = datetime.now()
+        now = clock.now()
         voided = []
         for doc in DNDocument.query.filter(DNDocument.dn_id == dn.id, DNDocument.status == 'issued',
                                            DNDocument.doc_type.in_(DOC_TYPES)).all():
@@ -571,7 +571,7 @@ class CustomsService:
         for key, value in fields.items():
             setattr(snapshot, key, value)
         snapshot.created_by = user_id
-        snapshot.updated_at = datetime.now()
+        snapshot.updated_at = clock.now()
         db.session.flush()
         return True
 
@@ -1159,8 +1159,8 @@ class CustomsService:
             .scalar()
         )
         version = (max_version or 0) + 1
-        issued_at = datetime.now()
-        invoice_date = datetime.now(_document_timezone()).date()
+        issued_at = clock.now()
+        invoice_date = clock.local_date(issued_at, dn)     # 单证日期 = 签发时刻在仓库当地的日期
         meta = {'version': version, 'invoice_date': invoice_date.isoformat()}
 
         documents = []
@@ -1271,7 +1271,8 @@ class CustomsService:
                 'version': doc.version,
                 'document_number': doc.document_number,
                 'invoice_date': doc.invoice_date.isoformat() if doc.invoice_date else None,
-                'issued_at': doc.issued_at.isoformat() if doc.issued_at else None,
+                # webhook 里的时刻：DN 仓库时区的偏移（同 dn.* 的 shipped_at，warehouse/dn/services.event_time）
+                'issued_at': clock.local_iso(doc.issued_at, dn) if doc.issued_at else None,
                 'sha256': doc.sha256,
                 'size_bytes': doc.size_bytes,
                 'file_name': doc.file_name,

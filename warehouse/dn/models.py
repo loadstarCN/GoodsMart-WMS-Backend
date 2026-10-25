@@ -1,4 +1,5 @@
 from extensions.db import *
+from extensions.db import UTCDateTime
 
 
 def _user_ref(user_id):
@@ -144,24 +145,24 @@ class DN(db.Model):
         info={'description': '创建来源 API Key ID（用于定向 Webhook 推送）'}
     )
     created_at = db.Column(
-        db.DateTime,
+        UTCDateTime,
         default=db.func.now(),
         info={'description': '创建时间'}
     )
     updated_at = db.Column(
-        db.DateTime,
+        UTCDateTime,
         default=db.func.now(),
         onupdate=db.func.now(),
         index=True,  # 时间字段索引
         info={'description': '最后更新时间'}
     )
     # 状态时间字段统一命名规范
-    started_at = db.Column(db.DateTime, nullable=True, info={'description': '开始处理时间'})
-    picked_at = db.Column(db.DateTime, nullable=True, info={'description': '拣货完成时间'})
-    packed_at = db.Column(db.DateTime, nullable=True, info={'description': '打包完成时间'})
-    delivered_at = db.Column(db.DateTime, nullable=True, info={'description': '发货时间'})
-    completed_at = db.Column(db.DateTime, nullable=True, info={'description': '流程完成时间'})
-    closed_at = db.Column(db.DateTime, nullable=True, info={'description': '单据关闭时间'})
+    started_at = db.Column(UTCDateTime, nullable=True, info={'description': '开始处理时间'})
+    picked_at = db.Column(UTCDateTime, nullable=True, info={'description': '拣货完成时间'})
+    packed_at = db.Column(UTCDateTime, nullable=True, info={'description': '打包完成时间'})
+    delivered_at = db.Column(UTCDateTime, nullable=True, info={'description': '发货时间'})
+    completed_at = db.Column(UTCDateTime, nullable=True, info={'description': '流程完成时间'})
+    closed_at = db.Column(UTCDateTime, nullable=True, info={'description': '单据关闭时间'})
 
     # 关系加载策略优化
     warehouse = db.relationship(
@@ -262,12 +263,12 @@ class DNDetail(db.Model):
         info={'description': '创建人ID'}
     )
     create_time = db.Column(
-        db.DateTime,
+        UTCDateTime,
         default=db.func.now(),
         info={'description': '创建时间'}
     )
     update_time = db.Column(
-        db.DateTime,
+        UTCDateTime,
         default=db.func.now(),
         onupdate=db.func.now(),
         info={'description': '最后更新时间'}
@@ -332,9 +333,9 @@ class DNCustoms(db.Model):
         nullable=True,
         info={'description': '写入人ID'}
     )
-    created_at = db.Column(db.DateTime, default=db.func.now(), info={'description': '创建时间'})
+    created_at = db.Column(UTCDateTime, default=db.func.now(), info={'description': '创建时间'})
     updated_at = db.Column(
-        db.DateTime, default=db.func.now(), onupdate=db.func.now(),
+        UTCDateTime, default=db.func.now(), onupdate=db.func.now(),
         info={'description': '最后替换时间'}
     )
 
@@ -391,7 +392,7 @@ class DNPackage(db.Model):
         nullable=True,
         info={'description': '录入人ID'}
     )
-    created_at = db.Column(db.DateTime, default=db.func.now(), info={'description': '录入时间'})
+    created_at = db.Column(UTCDateTime, default=db.func.now(), info={'description': '录入时间'})
 
     dn = db.relationship(
         'DN',
@@ -445,21 +446,21 @@ class DNDocument(db.Model):
                          info={'description': 'commercial_invoice / packing_list / shipping_label'})
     version = db.Column(db.Integer, nullable=False, info={'description': '版本（同 DN 递增，发票与装箱单共用）'})
     document_number = db.Column(db.String(80), nullable=False, info={'description': '单证号（发票号）'})
-    invoice_date = db.Column(db.Date, nullable=False, info={'description': '单证日期（DOCUMENT_TIMEZONE）'})
+    invoice_date = db.Column(db.Date, nullable=False, info={'description': '单证日期（DN 仓库当地的日期）'})
     status = db.Column(db.String(10), nullable=False, default='issued', info={'description': 'issued / void'})
     sha256 = db.Column(db.String(64), nullable=False, info={'description': 'PDF 文件 SHA-256'})
     data_sha256 = db.Column(db.String(64), nullable=False, info={'description': '单证数据指纹（判断是否需要升版本）'})
     size_bytes = db.Column(db.Integer, nullable=False, info={'description': 'PDF 字节数'})
     file_name = db.Column(db.String(150), nullable=False, info={'description': '文件名'})
     content = db.deferred(db.Column(db.LargeBinary, nullable=False, info={'description': 'PDF 内容'}))
-    issued_at = db.Column(db.DateTime, default=db.func.now(), info={'description': '签发时间'})
+    issued_at = db.Column(UTCDateTime, default=db.func.now(), info={'description': '签发时间'})
     issued_by = db.Column(
         db.Integer,
         db.ForeignKey('users.id', ondelete='SET NULL'),
         nullable=True,
         info={'description': '签发人ID'}
     )
-    voided_at = db.Column(db.DateTime, nullable=True, info={'description': '作废时间'})
+    voided_at = db.Column(UTCDateTime, nullable=True, info={'description': '作废时间'})
     void_reason = db.Column(db.String(50), nullable=True, info={'description': '作废原因'})
 
     dn = db.relationship(
@@ -627,16 +628,16 @@ class DNCarrierShipment(db.Model):
         nullable=True,
         info={'description': '建单人ID'}
     )
-    created_at = db.Column(db.DateTime, default=db.func.now(), info={'description': '建单时间'})
-    updated_at = db.Column(db.DateTime, nullable=True, info={'description': '状态最后变化时间'})
-    cancelled_at = db.Column(db.DateTime, nullable=True, info={'description': '取消时间'})
+    created_at = db.Column(UTCDateTime, default=db.func.now(), info={'description': '建单时间'})
+    updated_at = db.Column(UTCDateTime, nullable=True, info={'description': '状态最后变化时间'})
+    cancelled_at = db.Column(UTCDateTime, nullable=True, info={'description': '取消时间'})
     cancelled_by = db.Column(
         db.Integer,
         db.ForeignKey('users.id', ondelete='SET NULL'),
         nullable=True,
         info={'description': '取消人ID'}
     )
-    dismissed_at = db.Column(db.DateTime, nullable=True, info={'description': '确认作废（dismissed）时间'})
+    dismissed_at = db.Column(UTCDateTime, nullable=True, info={'description': '确认作废（dismissed）时间'})
     dismissed_by = db.Column(
         db.Integer,
         db.ForeignKey('users.id', ondelete='SET NULL'),
@@ -653,7 +654,7 @@ class DNCarrierShipment(db.Model):
         db.JSON, nullable=True,
         info={'description': '最近一次跟踪结果 {status_text, picked_up_at, delivered_at, estimated_delivery, events[], '
                              'error}（查询失败时保留上次的结果，只更新 error）'})
-    tracking_synced_at = db.Column(db.DateTime, nullable=True, info={'description': '最近一次查跟踪的时间'})
+    tracking_synced_at = db.Column(UTCDateTime, nullable=True, info={'description': '最近一次查跟踪的时间'})
     tracking_problem = db.Column(
         db.String(500), nullable=True,
         info={'description': '按跟踪自动完成发货 / 签收没做成的原因（之后做成了清空）'})
@@ -821,16 +822,16 @@ class CarrierPickup(db.Model):
         nullable=True,
         info={'description': '预约人ID'}
     )
-    created_at = db.Column(db.DateTime, default=db.func.now(), info={'description': '预约时间'})
-    updated_at = db.Column(db.DateTime, nullable=True, info={'description': '状态最后变化时间'})
-    cancelled_at = db.Column(db.DateTime, nullable=True, info={'description': '取消时间'})
+    created_at = db.Column(UTCDateTime, default=db.func.now(), info={'description': '预约时间'})
+    updated_at = db.Column(UTCDateTime, nullable=True, info={'description': '状态最后变化时间'})
+    cancelled_at = db.Column(UTCDateTime, nullable=True, info={'description': '取消时间'})
     cancelled_by = db.Column(
         db.Integer,
         db.ForeignKey('users.id', ondelete='SET NULL'),
         nullable=True,
         info={'description': '取消人ID'}
     )
-    dismissed_at = db.Column(db.DateTime, nullable=True, info={'description': '确认作废时间'})
+    dismissed_at = db.Column(UTCDateTime, nullable=True, info={'description': '确认作废时间'})
     dismissed_by = db.Column(
         db.Integer,
         db.ForeignKey('users.id', ondelete='SET NULL'),
@@ -916,7 +917,7 @@ class CarrierFileBatch(db.Model):
         nullable=True,
         info={'description': '操作人ID'}
     )
-    created_at = db.Column(db.DateTime, default=db.func.now(), info={'description': '时间'})
+    created_at = db.Column(UTCDateTime, default=db.func.now(), info={'description': '时间'})
 
     def to_dict(self) -> dict:
         return {

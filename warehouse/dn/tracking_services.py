@@ -8,12 +8,11 @@ dn.tracking_updated / dn.completed）。本模块与具体承运商无关，查�
   delivered，或 DN 已完成（仓库手工签收了）但跟踪还没到送达（只更新显示）。定时任务每 CARRIER_TRACKING_INTERVAL_MINUTES
   分钟（默认 30）查一遍，最久没查的先查；配送页可以手动刷新一张（POST /dn/<id>/carrier-shipment/track，不看天数）。
 - 承运商已经经手（picked_up_at 有值，或状态是在途 / 派送中 / 已送达）而 DN 还是 packed：以建运单的人的名义完成发货
-  （同手动「完成发货」：pending 的发货任务先开始，不查单证，推 dn.delivered）。发货时刻 = 承运商的揽收时刻（换成服务器
-  本地时间）：完成时间、实际发货日、DN 的 delivered_at、dn.delivered 的 shipped_at 都是它，不是查到的时刻；
+  （同手动「完成发货」：pending 的发货任务先开始，不查单证，推 dn.delivered）。发货时刻 = 承运商的揽收时刻（带时区的
+  UTC）：完成时间、实际发货日（仓库当地日期）、DN 的 delivered_at、dn.delivered 的 shipped_at 都是它，不是查到的时刻；
   计划发货日晚于揽收日照样拦（16061）。
-- 已送达而 DN 是 delivered：签收发货任务（签收时间 = 承运商的送达时刻，换成服务器本地时间——与 WMS 其他时间列一样是
-  datetime.now() 的口径；早于完成发货时刻的按完成发货时刻），DN 完成（completed_at 同签收时间），推 dn.completed
-  （signed_at 同签收时间）。
+- 已送达而 DN 是 delivered：签收发货任务（签收时间 = 承运商的送达时刻，带时区的 UTC，与 WMS 其他时刻同一口径；
+  早于完成发货时刻的按完成发货时刻），DN 完成（completed_at 同签收时间），推 dn.completed（signed_at 同签收时间）。
 - 自动发货 / 签收做不成（计划发货日在后……）把原因记在运单的 tracking_problem（配送页显示），
   人处理后下一轮再试；做成了、或这一轮没有要做的就清空。手动完成发货 / 签收照常可用，谁先到算谁。
 - 跟踪结果存到运单记录（tracking_*）；状态 / 扫描记录有变化时推 dn.tracking_updated（只推给创建 DN 的 API Key）。
@@ -38,6 +37,7 @@ from warehouse.carrier.integrations.base import (
 )
 from warehouse.carrier.models import Carrier
 from warehouse.common.locks import lock_row
+from warehouse.common import clock as wms_clock      # 时刻 / 时区（clock 是承运商时限用的单调时钟）
 from .carrier_services import CarrierShipmentService, _config_number
 from warehouse.shipping.common import current_delivery_task
 from .models import DN, DNCarrierShipment
@@ -87,18 +87,18 @@ def _aware(value):
     return moment if moment.tzinfo is not None else moment.replace(tzinfo=timezone.utc)
 
 
-def local_naive(value):
-    """承运商的 UTC ISO 时刻 → 服务器本地时间（naive，与 WMS 其他时间列的 datetime.now() 同一口径）；
-    空 / 纯日期 / 解析不了 → None"""
+def carrier_time(value):
+    """承运商的 ISO 时刻 → 带时区的 UTC（与 WMS 其他时刻同一口径，doc/timezone-utc.md）；空 / 纯日期 / 解析不了 → None。
+    不带偏移的按 UTC（_aware）"""
     moment = _aware(value)
-    return moment.astimezone().replace(tzinfo=None) if moment else None
+    return moment.astimezone(timezone.utc) if moment else None
 
 
 def from_older_shipment(result: dict, created_at) -> bool:
-    """揽收 / 送达时刻明显早于建单（WMS 记录的本地时刻）：运单号被承运商回收再用，查到的是旧包裹"""
+    """揽收 / 送达时刻明显早于建单（WMS 记录的时刻）：运单号被承运商回收再用，查到的是旧包裹"""
     if created_at is None:
         return False
-    cutoff = created_at.astimezone() - OLD_SHIPMENT_MARGIN       # naive = 服务器本地时间
+    cutoff = created_at - OLD_SHIPMENT_MARGIN
     for key in ('picked_up_at', 'delivered_at'):
         moment = _aware(result.get(key))
         if moment is not None and moment < cutoff:
@@ -141,7 +141,7 @@ class CarrierTrackingService:
                             db.or_(DNCarrierShipment.tracking_status.is_(None),
                                    DNCarrierShipment.tracking_status != TRACK_DELIVERED)),
                 ),
-                DNCarrierShipment.created_at >= datetime.now() - timedelta(days=max_days()),
+                DNCarrierShipment.created_at >= wms_clock.now() - timedelta(days=max_days()),
             )
         else:
             query = query.filter(DNCarrierShipment.dn_id == dn_id, DN.status.in_(REFRESH_DN_STATUSES))
@@ -209,7 +209,7 @@ class CarrierTrackingService:
         plan = CarrierTrackingService._plan(CarrierTrackingService._targets(dn_id))
         # 结束只读事务：调承运商期间不占着数据库事务
         db.session.rollback()
-        started = datetime.now()
+        started = wms_clock.now()
         deadline = clock() + (budget or budget_seconds())
         for group in plan:
             adapter = CarrierIntegrationService.build(group['snapshot'])
@@ -320,7 +320,7 @@ class CarrierTrackingService:
         operator_id = CarrierTrackingService._operator(record, dn)
         if task.status == 'pending':
             DeliveryTaskService.process_task(task, operator_id)
-        DeliveryTaskService.complete_task(task, {}, operator_id, shipped_at=local_naive(picked_up_at), source='carrier')
+        DeliveryTaskService.complete_task(task, {}, operator_id, shipped_at=carrier_time(picked_up_at), source='carrier')
         logger.info("DN %s shipped automatically: carrier %s has shipment %s", dn.id, record.carrier,
                     record.tracking_number)
         return True
@@ -344,7 +344,7 @@ class CarrierTrackingService:
             raise AutoActionError(f"The carrier delivered the parcel, but DN {dn.id} has no shipped delivery task "
                                   "to sign")
         # 送达时刻早于完成发货（自动发货被挡了几天、或同一轮先发货再签收）：签收不早于发货
-        signed_at = local_naive(delivered_at) or datetime.now()
+        signed_at = carrier_time(delivered_at) or wms_clock.now()
         if task.completed_at is not None and signed_at < task.completed_at:
             signed_at = task.completed_at
         DeliveryTaskService.sign_task(task, {'signed_at': signed_at}, CarrierTrackingService._operator(record, dn),
@@ -368,7 +368,7 @@ class CarrierTrackingService:
             return False
         if record.tracking_synced_at is not None and record.tracking_synced_at > started:
             return False
-        record.tracking_synced_at = datetime.now()
+        record.tracking_synced_at = wms_clock.now()
         if problem is not KEEP:
             record.tracking_problem = problem[:PROBLEM_MAX] if problem else None
         if result.get('error'):

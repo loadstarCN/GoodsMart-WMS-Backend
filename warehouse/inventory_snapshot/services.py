@@ -2,6 +2,7 @@ from sqlalchemy import func
 from extensions.db import *
 from extensions.transaction import transactional
 from warehouse.goods.services import GoodsLocationService
+from warehouse.common import clock
 from .models import InventorySnapshot
 
 class InventorySnapshotService:
@@ -41,10 +42,9 @@ class InventorySnapshotService:
             query = query.filter(InventorySnapshot.location_id == filters['location_id'])
         if filters.get('warehouse_id'):
             query = query.filter(InventorySnapshot.warehouse_id == filters['warehouse_id'])
-        if filters.get('start_time'):
-            query = query.filter(InventorySnapshot.snapshot_time >= filters['start_time'])
-        if filters.get('end_time'):
-            query = query.filter(InventorySnapshot.snapshot_time <= filters['end_time'])
+        # 时间范围：只给日期的按所筛仓库当地的那一天（end_time 含当天），不带时区的时刻按仓库时区
+        query = clock.filter_time_range(query, InventorySnapshot.snapshot_time, filters.get('start_time'), filters.get('end_time'),
+                                          filters.get('warehouse_id'))
 
         return query
         

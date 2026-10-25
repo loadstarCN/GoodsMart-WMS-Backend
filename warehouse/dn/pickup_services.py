@@ -22,7 +22,8 @@
   → cancelled，运单 pickup_id 清空；明确拒绝 → 保持 scheduled；结果不明 → 保持 scheduled（reason cancel_unclear），可重试取消。
   手工记录的取消只改本地（不调承运商）。
 - pending 超过 stale_after_seconds() 按 unknown（reason stale）对外。
-- 日期 / 时间都是仓库当地的（DOCUMENT_TIMEZONE，默认 Asia/Tokyo，与运单的发货日同一口径）。
+- 日期 / 时间都是仓库当地的（仓库时区：仓库设了的 → WMS_DEFAULT_TIMEZONE → WMS_TIMEZONE → UTC，
+  warehouse/common/clock.py；与运单的发货日同一口径）。
 """
 import logging
 import re
@@ -41,6 +42,7 @@ from warehouse.carrier.integrations.base import STEP_PICKUP, CarrierError, clock
 from warehouse.carrier.models import Carrier
 from warehouse.common.countries import COUNTRY_NAMES_EN
 from warehouse.common.locks import lock_row
+from warehouse.common import clock as wms_clock      # 时刻 / 时区（clock 是承运商时限用的单调时钟）
 from .carrier_services import (
     ERROR_MESSAGE_MAX, CarrierShipmentService, _blocker, _carrier_api_exception, _unclear_reason,
     create_budget_seconds, stale_after_seconds,
@@ -80,12 +82,14 @@ def _maybe_cancelled(name) -> str:
             "(POST /warehouse/dn/carrier-pickups/<id>/cancel).")
 
 
-def _tz():
-    return document_timezone()
+def _tz(warehouse=None):
+    """揽收所在仓库的时区（warehouse：仓库 / 仓库 id / 揽收记录）"""
+    return document_timezone(warehouse)
 
 
-def local_today() -> date:
-    return datetime.now(_tz()).date()
+def local_today(warehouse=None) -> date:
+    """揽收所在仓库当地的今天"""
+    return wms_clock.local_today(warehouse)
 
 
 def _invalid(message, field):
@@ -121,7 +125,7 @@ class CarrierPickupService:
     @staticmethod
     def is_stale(record: CarrierPickup) -> bool:
         return (record is not None and record.status == 'pending' and record.created_at is not None
-                and (datetime.now() - record.created_at).total_seconds() > stale_after_seconds())
+                and (wms_clock.now() - record.created_at).total_seconds() > stale_after_seconds())
 
     @staticmethod
     def effective_status(record: CarrierPickup):
@@ -135,14 +139,14 @@ class CarrierPickupService:
         """这条预约还占着所带的运单：pending / unknown / scheduled，且揽收日没过"""
         if record is None or record.status not in ('pending', 'unknown', 'scheduled'):
             return False
-        return record.pickup_date >= (today or local_today())
+        return record.pickup_date >= (today or local_today(record.warehouse_id))
 
     @staticmethod
     def can_cancel(record: CarrierPickup, today: date = None) -> bool:
         """scheduled 且揽收日没过；插件预约的还要有确认号（取消时交给承运商）"""
         return (record is not None and record.status == 'scheduled'
                 and (record.source == SOURCE_MANUAL or bool(record.confirmation_code))
-                and record.pickup_date >= (today or local_today()))
+                and record.pickup_date >= (today or local_today(record.warehouse_id)))
 
     @staticmethod
     def can_dismiss(record: CarrierPickup) -> bool:
@@ -150,7 +154,7 @@ class CarrierPickupService:
 
     @staticmethod
     def payload(record: CarrierPickup, today: date = None) -> dict:
-        today = today or local_today()
+        today = today or local_today(record.warehouse_id)
         data = record.to_dict()
         data['status'], data['reason'] = CarrierPickupService.effective_status(record)
         data['past'] = record.pickup_date < today
@@ -164,7 +168,7 @@ class CarrierPickupService:
         """运单上显示的揽收概要（GET carrier-shipment 的 shipment.pickup）；没有预约为 None"""
         if record is None:
             return None
-        today = today or local_today()
+        today = today or local_today(record.warehouse_id)
         status, reason = CarrierPickupService.effective_status(record)
         return {
             'id': record.id,
@@ -358,7 +362,7 @@ class CarrierPickupService:
     @staticmethod
     def overview(warehouse, carrier_id=None) -> dict:
         """GET /dn/carrier-pickups"""
-        today = local_today()
+        today = local_today(warehouse)
         carrier = CarrierPickupService._carrier(warehouse, carrier_id)
         ctx = CarrierPickupService._collect(warehouse, carrier)
         integration = None
@@ -407,7 +411,7 @@ class CarrierPickupService:
             'integration': integration,
             'warehouse_id': warehouse.id,
             'today': today.isoformat(),
-            'timezone': str(_tz()),
+            'timezone': wms_clock.warehouse_timezone_name(warehouse),
             'can_create': api and not ctx['blockers'] and schedulable,
             # 手工记录揽收（api 的承运商也可以，承运商系统故障时）
             'can_record': carrier is not None and schedulable,
@@ -436,7 +440,8 @@ class CarrierPickupService:
             result = ctx['adapter'].pickup_availability(ctx['location'], deadline=deadline)
         except CarrierError as exc:
             raise _carrier_api_exception(exc, 'pickup_availability', ctx['snapshot']['adapter'])
-        result.update({'today': local_today().isoformat(), 'timezone': str(_tz())})
+        result.update({'today': local_today(warehouse).isoformat(),
+                       'timezone': wms_clock.warehouse_timezone_name(warehouse)})
         return result
 
     # ------------------------------------------------------------------
@@ -444,7 +449,7 @@ class CarrierPickupService:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def parse_request(data) -> dict:
+    def parse_request(data, warehouse=None) -> dict:
         """POST 请求体 → {carrier_id, shipment_ids, pickup_date, ready, close, remarks, notification_email}；
         不合法 400 16131"""
         if not isinstance(data, dict):
@@ -466,7 +471,7 @@ class CarrierPickupService:
         if len(ids) > MAX_SHIPMENTS:
             raise _invalid(f"At most {MAX_SHIPMENTS} shipments per pickup", 'shipment_ids')
 
-        today = local_today()
+        today = local_today(warehouse)
         try:
             pickup_date = date.fromisoformat(str(data.get('pickup_date') or '').strip())
         except ValueError:
@@ -506,7 +511,7 @@ class CarrierPickupService:
         """POST /dn/carrier-pickups（三段，见模块说明）。各段自己提交，不能在外层事务里调用。"""
         if getattr(g, 'transaction_depth', 0):
             raise RuntimeError("create pickup must not run inside another transaction")
-        request = CarrierPickupService.parse_request(data)
+        request = CarrierPickupService.parse_request(data, warehouse)
         deadline = clock() + create_budget_seconds()
         plan = CarrierPickupService._reserve(warehouse.id, user_id, request)
         state = {'sent': False, 'finalized': False}
@@ -544,7 +549,7 @@ class CarrierPickupService:
         weights = {s.id: CarrierPickupService._weight_kg(dn) for s, dn in shipments}
         total_weight = sum(weights.values(), Decimal(0))
         location = ctx['location']
-        now = datetime.now()
+        now = wms_clock.now()
         record = CarrierPickup(
             warehouse_id=warehouse_id,
             source=SOURCE_API,
@@ -569,14 +574,14 @@ class CarrierPickupService:
         for shipment, _dn in shipments:
             shipment.pickup_id = record.id
         db.session.flush()
-        today = local_today()
+        today = local_today(warehouse)
         return {
             'record_id': record.id,
             'snapshot': ctx['snapshot'],
             'location': location,
             'pickup': {
                 'pickup_date': request['pickup_date'], 'ready': request['ready'], 'close': request['close'],
-                'same_day': request['pickup_date'] == today, 'tz': _tz(),
+                'same_day': request['pickup_date'] == today, 'tz': _tz(warehouse),
                 'package_count': package_count, 'total_weight_kg': total_weight,
                 'remarks': request['remarks'], 'notification_email': request['notification_email'],
             },
@@ -594,7 +599,7 @@ class CarrierPickupService:
     @staticmethod
     def _lock_shipments(warehouse_id, carrier, ids) -> list:
         """锁所选运单行、逐张检查 → [(运单, DN)]；有不能带的 → 409 16132（details.shipments）"""
-        today = local_today()
+        today = local_today(warehouse_id)
         rows = (
             DNCarrierShipment.query
             .options(lazyload('*'))
@@ -644,7 +649,7 @@ class CarrierPickupService:
             raise _invalid("warehouse_id must be the current warehouse (X-WAREHOUSE-ID)", 'warehouse_id')
         if data.get('carrier_id') is None:
             raise _invalid("carrier_id is required", 'carrier_id')
-        request = CarrierPickupService.parse_request({**data, 'notification_email': None})
+        request = CarrierPickupService.parse_request({**data, 'notification_email': None}, warehouse_id)
         code = data.get('confirmation_code')
         if code is not None and (isinstance(code, bool) or not isinstance(code, (str, int))):
             raise _invalid("confirmation_code must be a string", 'confirmation_code')
@@ -663,7 +668,7 @@ class CarrierPickupService:
         carrier = CarrierPickupService._carrier(warehouse, request['carrier_id'])
         shipments = CarrierPickupService._lock_shipments(warehouse.id, carrier, request['shipment_ids'])
         weights = {s.id: CarrierPickupService._weight_kg(dn) for s, dn in shipments}
-        now = datetime.now()
+        now = wms_clock.now()
         integration = carrier.integration
         record = CarrierPickup(
             warehouse_id=warehouse.id,
@@ -770,7 +775,7 @@ class CarrierPickupService:
             if key == 'error_message':
                 value = str(value)[:ERROR_MESSAGE_MAX]
             setattr(record, key, value)
-        record.updated_at = datetime.now()
+        record.updated_at = wms_clock.now()
         if status == 'failed':
             CarrierPickupService._release(record)
         db.session.flush()
@@ -830,7 +835,7 @@ class CarrierPickupService:
         if not CarrierPickupService.can_cancel(record):
             raise CarrierPickupService._state_conflict(
                 record, "Only a scheduled pickup whose date has not passed can be cancelled.")
-        now = datetime.now()
+        now = wms_clock.now()
         record.status = 'cancelled'
         record.reason = None
         record.cancelled_at = now
@@ -884,7 +889,7 @@ class CarrierPickupService:
         """取消结果落库：只改仍是 scheduled 的记录（并发的另一次取消已落定的不覆盖）"""
         record = lock_row(db.session.get(CarrierPickup, record_id))
         if record.status == 'scheduled':
-            now = datetime.now()
+            now = wms_clock.now()
             record.status = status
             record.reason = reason
             record.error_message = str(error_message)[:ERROR_MESSAGE_MAX] if error_message else None
@@ -907,7 +912,7 @@ class CarrierPickupService:
         if not CarrierPickupService.can_dismiss(record):
             raise CarrierPickupService._state_conflict(
                 record, "Only a pickup request whose result is unclear can be dismissed.")
-        now = datetime.now()
+        now = wms_clock.now()
         record.status = 'dismissed'
         record.dismissed_at = now
         record.dismissed_by = user_id

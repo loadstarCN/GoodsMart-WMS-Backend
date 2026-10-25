@@ -9,7 +9,7 @@ from .test_customs import _create_dn, _force_packed, _prepare, _ship, _webhook_k
 from .test_carrier_shipment import fedex  # noqa: F401  fedex 是 fixture
 from .test_carrier_tracking import _shipped_ready
 
-from datetime import datetime, timedelta      # helpers 的 import * 会把 datetime 换成模块，放在它后面
+from datetime import datetime, timedelta, timezone # helpers 的 import * 会把 datetime 换成模块，放在它后面
 
 from system.webhook.models import WebhookEvent
 from warehouse.shipping import auto_sign
@@ -30,7 +30,7 @@ def _shipped(client, token, order_number, days_ago=10, tracking='MAN-1', key=Tru
     assert response.status_code == 200, response.get_json()
     with client.application.app_context():
         task = db.session.get(DeliveryTask, task_id)
-        task.completed_at = datetime.now().replace(microsecond=0) - timedelta(days=days_ago)
+        task.completed_at = datetime.now(timezone.utc).replace(microsecond=0) - timedelta(days=days_ago)
         db.session.commit()
     return dn_id, task_id, key_id
 
@@ -73,7 +73,7 @@ def test_not_due_or_disabled_is_not_signed(client, access_token):
     assert _sync(client)['signed'] == 0                     # 没设天数
     _set_days(client, 7)
     assert _sync(client)['signed'] == 0                     # 还没到期
-    assert _sync(client, now=datetime.now() + timedelta(days=5))['signed'] == 1
+    assert _sync(client, now=datetime.now(timezone.utc) + timedelta(days=5))['signed'] == 1
     with client.application.app_context():
         assert db.session.get(DeliveryTask, task_id).signed_source == 'rule'
 
@@ -85,7 +85,7 @@ def test_api_tracked_shipment_is_left_to_tracking(client, access_token, fedex):
         db.session.commit()
     assert _ship(client, access_token, task_id).status_code == 200
     with client.application.app_context():
-        db.session.get(DeliveryTask, task_id).completed_at = datetime.now() - timedelta(days=5)
+        db.session.get(DeliveryTask, task_id).completed_at = datetime.now(timezone.utc) - timedelta(days=5)
         db.session.commit()
     assert _sync(client)['signed'] == 0
     # 跟踪方式改成只给链接：没有 API 跟踪了，规则接手

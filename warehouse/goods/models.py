@@ -1,4 +1,5 @@
 from extensions import db
+from extensions.db import UTCDateTime
 
 class Goods(db.Model):
     """商品主表（支持多公司多仓库管理）"""
@@ -151,12 +152,12 @@ class Goods(db.Model):
         info={'description': '创建人ID'}
     )
     created_at = db.Column(
-        db.DateTime,
+        UTCDateTime,
         default=db.func.now(),
         info={'description': '创建时间'}
     )
     updated_at = db.Column(
-        db.DateTime,
+        UTCDateTime,
         default=db.func.now(),
         onupdate=db.func.now(),
         index=True,
@@ -223,12 +224,12 @@ class GoodsLocation(db.Model):
         info={'description': '当前库存数量'}
     )
     created_at = db.Column(
-        db.DateTime,
+        UTCDateTime,
         default=db.func.now(),
         info={'description': '入库时间'}
     )
     updated_at = db.Column(
-        db.DateTime,
+        UTCDateTime,
         default=db.func.now(),
         onupdate=db.func.now(),
         info={'description': '最后更新时间'}

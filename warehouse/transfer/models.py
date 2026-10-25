@@ -1,4 +1,5 @@
 from extensions import db
+from extensions.db import UTCDateTime
 
 class TransferRecord(db.Model):
     """移库记录表
@@ -63,7 +64,7 @@ class TransferRecord(db.Model):
         info={'description': '操作员ID'}
     )
     transfer_time = db.Column(
-        db.DateTime, 
+        UTCDateTime, 
         default=db.func.now(),
         info={'description': '自动记录操作时间'}
     )

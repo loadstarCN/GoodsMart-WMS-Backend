@@ -1,0 +1,51 @@
+# 一次性维护：把生产库的时刻列从 timestamp（日本时间的墙上时间）转换为 timestamptz（doc/timezone-utc.md §5）。
+# 先部署带 UTCDateTime 的后端版本（转换前后都能工作），再在 Actions 页面手动运行本工作流：
+#   - 默认只做检查（--dry-run）：代码版本、健康探测、迁移版本、旧口径时区、要转换的列，打印 SQL，什么都不改；
+#   - 勾选 apply 才执行：停 wms-api → pg_dump 备份（/var/www/wms-backups，0600，校验）→ 一个事务里转换并写标记表
+#     wms_timezone_migrations → 重启并探测 /health。
+# 与正常后端部署共享 deploy-backend 并发组，避免迁移期间有另一轮部署。
+name: Migrate WMS Time to UTC
+
+on:
+  workflow_dispatch:
+    inputs:
+      apply:
+        description: '执行转换（不勾选只做检查，什么都不改）'
+        type: boolean
+        default: false
+
+concurrency:
+  group: deploy-backend
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  migrate:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Back up and convert WMS time columns on server
+        uses: appleboy/ssh-action@0ff4204d59e8e51228ff73bce53f80d53301dee2 # v1.2.5
+        env:
+          DEPLOY_SHA: ${{ github.sha }}
+          HEALTH_URL: ${{ vars.BACKEND_HEALTH_URL || 'http://127.0.0.1:5002/health' }}
+          MODE: ${{ inputs.apply && '--apply' || '--dry-run' }}
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          command_timeout: 40m
+          envs: DEPLOY_SHA,HEALTH_URL,MODE
+          script: |
+            set -eu
+            cd /var/www/api_wms
+            if [ "$(git rev-parse HEAD)" != "$DEPLOY_SHA" ]; then
+              echo '[utc] server commit differs from this workflow; aborting before downtime'
+              exit 1
+            fi
+            echo "[utc] mode: $MODE"
+            FLASK_ENV=production SCHEDULER_ENABLED=False \
+              python scripts/manual/migrate_utc.py "$MODE" --health-url "$HEALTH_URL"

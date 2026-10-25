@@ -6,6 +6,7 @@ from extensions.transaction import transactional
 from warehouse.dn.models import DN, DNDetail
 from warehouse.goods.models import Goods
 from warehouse.common import require_positive_int, require_fields
+from warehouse.common import clock
 from warehouse.common.locks import lock_row
 from warehouse.common.validation import require_active_task
 from warehouse.dn.services import (
@@ -143,19 +144,17 @@ class DeliveryTaskService:
         payload['tracking_number'] = tracking
 
     @staticmethod
-    def _parse_shipped_at(value) -> datetime:
-        """手工完成发货的 shipped_at（实际交承运商的时刻）→ 服务器本地时间（naive，与其它时间列同一口径）。
-        ISO 8601（带不带时区偏移都行，不带按服务器本地时间）；格式不对 400 16050；晚于现在
+    def _parse_shipped_at(value, where=None) -> datetime:
+        """手工完成发货的 shipped_at（实际交承运商的时刻）→ 带时区的 UTC。
+        ISO 8601（带时区偏移的按偏移；不带的按 where —— 发货任务所属仓库 —— 的时区）；格式不对 400 16050；晚于现在
         （允许 SHIPPED_AT_CLOCK_SKEW 的终端时钟误差，误差内按现在）→ 400 16136（field shipped_at）。"""
         try:
-            moment = parse_datetime_value(value, 'shipped_at') if isinstance(value, (str, datetime)) else None
+            moment = parse_datetime_value(value, 'shipped_at', where) if isinstance(value, (str, datetime)) else None
         except BadRequestException:
             moment = None
         if moment is None:
             raise BadRequestException("shipped_at must be an ISO 8601 datetime", 16050, field='shipped_at')
-        if moment.tzinfo is not None:
-            moment = moment.astimezone().replace(tzinfo=None)
-        now = datetime.now()
+        now = clock.now()
         if moment > now + SHIPPED_AT_CLOCK_SKEW:
             raise BadRequestException("shipped_at must not be in the future", 16136, field='shipped_at')
         return min(moment, now)
@@ -420,7 +419,7 @@ class DeliveryTaskService:
             raise BadRequestException(f"Invalid status value: {new_status}", 14007)
 
         old_status = delivery.status
-        now = datetime.now()
+        now = clock.now()
 
         # 设置新状态
         delivery.status = new_status
@@ -430,8 +429,8 @@ class DeliveryTaskService:
             delivery.started_at = now
         elif old_status == 'in_progress' and new_status == 'completed':
             delivery.completed_at = now
-            # 这里也可同步将 actual_shipping_date 设置为当前日期/时间, 视业务而定:
-            delivery.actual_shipping_date = now
+            # 实际发货日 = 仓库当地的日期（complete_task 按实际交承运商的时刻再覆盖）
+            delivery.actual_shipping_date = clock.local_date(now, delivery)
         elif old_status == 'completed' and new_status == 'signed':
             delivery.signed_at = now
 
@@ -483,9 +482,9 @@ class DeliveryTaskService:
         - 海外件的自动运单进行中 / 结果不明 / 正在取消 → 409 16079（CustomsService.assert_ready_to_ship）
         - 海外件只能完成当前发货任务（CustomsService._delivery_task），别的任务 → 409 16091
         - 本 DN 已取消（含补偿取消）的自动运单号 → 409 16078（details.status = cancelled）
-        - shipped_at（承运商跟踪自动完成发货时传承运商的揽收时刻，服务器本地时间）：完成时间、实际发货日、DN 的发货时间
-          （dn.delivered 的 shipped_at）都记成它，计划发货日也按它检查；不传 = 现在。
-          手工完成发货可在请求体里带 shipped_at（实际交承运商的时刻，ISO 8601；格式不对 400 16050，
+        - shipped_at（承运商跟踪自动完成发货时传承运商的揽收时刻，带时区的 UTC）：完成时间、实际发货日（它在仓库当地的
+          日期）、DN 的发货时间（dn.delivered 的 shipped_at）都记成它，计划发货日也按它检查；不传 = 现在。
+          手工完成发货可在请求体里带 shipped_at（实际交承运商的时刻，ISO 8601，不带偏移的按仓库时区；格式不对 400 16050，
           晚于现在 400 16136），参数 shipped_at 优先
         - source：完成发货的来源（completed_source）：warehouse = 手工（默认）/ carrier = 承运商跟踪自动
         - 运单号 / 承运商改了时同步手填运单记录（source = manual，见 warehouse/shipping/waybills.py）
@@ -502,7 +501,7 @@ class DeliveryTaskService:
         DeliveryTaskService._assert_current_task(task)
 
         if shipped_at is None and isinstance(data, dict) and data.get('shipped_at') not in (None, ''):
-            shipped_at = DeliveryTaskService._parse_shipped_at(data.get('shipped_at'))
+            shipped_at = DeliveryTaskService._parse_shipped_at(data.get('shipped_at'), task)
         payload = pick_fields(data or {}, (
             'transportation_mode', 'carrier_id', 'tracking_number', 'shipping_cost', 'currency', 'remark',
         ))
@@ -514,7 +513,8 @@ class DeliveryTaskService:
         # 有有效的自动运单时，完成发货传了别的运单号 / 承运商 → 409 16078（相同或不传照常，相同时换成标准写法）；
         # 本 DN 已取消的自动运单号 → 409 16078
         DeliveryTaskService._guard_carrier_tracking(task, payload)
-        shipped_on = (shipped_at or datetime.now()).date()
+        # 实际发货日：交承运商的时刻在仓库当地是哪一天（doc/timezone-utc.md §2）
+        shipped_on = clock.local_date(shipped_at or clock.now(), task)
         DeliveryTaskService._assert_shipping_dates(task.expected_shipping_date, shipped_on)
 
         # 海外件：自动运单进行中 / 结果不明 / 正在取消 → 409 16079（单证不查）
@@ -559,7 +559,8 @@ class DeliveryTaskService:
         if task.status != 'completed':
             raise BadRequestException("Cannot sign a non-completed Delivery", 16024)
         
-        signed_at = parse_datetime_value((data or {}).get('signed_at'), 'signed_at')
+        # 签收时刻：不带时区的按仓库时区，只给日期（PDA）的按仓库当地 00:00
+        signed_at = parse_datetime_value((data or {}).get('signed_at'), 'signed_at', task)
 
         task = DeliveryTaskService._update_task_status(task, 'signed', operator_id)
         task.signed_source = source
@@ -621,7 +622,7 @@ class DeliveryTaskService:
             list: 符合前端图表要求的数据序列
         """
         # 计算时间范围
-        end_date = datetime.now()
+        end_date = clock.stats_now(filters)
         start_date = end_date - relativedelta(months=months-1)
         start_date = start_date.replace(day=1, hour=0, minute=0, second=0)
 
@@ -687,7 +688,7 @@ class DeliveryTaskService:
     @staticmethod
     def get_status_overview(filters=None):
         """获取各状态ASN在当前月、前一个月和去年同月的统计"""
-        now = datetime.now()
+        now = clock.stats_now(filters)
         current_year = now.year
         current_month = now.month
 

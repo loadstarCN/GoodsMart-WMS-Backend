@@ -17,7 +17,7 @@ import socket
 import threading
 import time
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from unittest import mock
 
 import pytest
@@ -319,7 +319,7 @@ def test_no_lock_or_transaction_held_while_sending(client, company_ids):
 
 
 def test_expired_lease_sending_event_is_reclaimed(client, company_ids):
-    now = datetime.now()
+    now = datetime.now(timezone.utc)
     with client.application.app_context():
         key_id = _make_key(company_ids[0])
         expired = _add_event(key_id, status='sending', attempts=1, lease_expires_at=now - timedelta(seconds=1))
@@ -342,9 +342,9 @@ def test_claim_rechecks_backoff_and_status(client, company_ids):
     """B-91：两个推送进程并发时，另一进程刚失败进入退避 / 正在发送的事件，重读时不会被领取"""
     with client.application.app_context():
         key_id = _make_key(company_ids[0])
-        in_backoff = _add_event(key_id, attempts=1, next_retry_at=datetime.now() + timedelta(minutes=30))
+        in_backoff = _add_event(key_id, attempts=1, next_retry_at=datetime.now(timezone.utc) + timedelta(minutes=30))
         sending = _add_event(key_id, status='sending', attempts=1,
-                             lease_expires_at=datetime.now() + timedelta(minutes=1))
+                             lease_expires_at=datetime.now(timezone.utc) + timedelta(minutes=1))
         assert services._claim_event(in_backoff) == (False, None)
         assert services._claim_event(sending) == (False, None)
 
@@ -358,7 +358,7 @@ def test_result_not_recorded_after_claim_was_taken_over(client, company_ids):
         assert claimed and job is not None
 
         event = db.session.get(WebhookEvent, event_id)
-        event.lease_expires_at = datetime.now() + timedelta(minutes=5)   # 另一个进程的新租约
+        event.lease_expires_at = datetime.now(timezone.utc) + timedelta(minutes=5)   # 另一个进程的新租约
         db.session.commit()
 
         services._record_result(job, requests.ConnectionError('late failure'))
@@ -501,8 +501,8 @@ def test_attempted_event_is_not_overwritten_and_old_one_is_voided(client, access
         assert new.next_retry_at == old.next_retry_at   # 退避不清零
 
         # 退避到期后只发新事件
-        new.next_retry_at = datetime.now() - timedelta(seconds=1)
-        old.next_retry_at = datetime.now() - timedelta(seconds=1)
+        new.next_retry_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+        old.next_retry_at = datetime.now(timezone.utc) - timedelta(seconds=1)
         db.session.commit()
         calls = []
         with mock.patch(POST, side_effect=_recorder(calls)):
@@ -524,7 +524,7 @@ def test_in_flight_event_is_voided_when_newer_exists(client, company_ids):
         db.session.commit()
         old = _events(key_id)[0]
         old.status, old.attempts = 'sending', 1
-        old.lease_expires_at = datetime.now() + timedelta(minutes=1)
+        old.lease_expires_at = datetime.now(timezone.utc) + timedelta(minutes=1)
         db.session.commit()
 
         emit_company_event(EVENT, {'n': 2, 'changed_fields': ['b']}, company_ids[0], dedupe_key='goods:1')
@@ -533,7 +533,7 @@ def test_in_flight_event_is_voided_when_newer_exists(client, company_ids):
         assert (old.status, old.payload['n']) == ('sending', 1)
         assert (new.status, new.payload['n']) == ('pending', 2)
 
-        old.lease_expires_at = datetime.now() - timedelta(seconds=1)   # 旧的那次没回写（进程被杀）
+        old.lease_expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)   # 旧的那次没回写（进程被杀）
         db.session.commit()
         calls = []
         with mock.patch(POST, side_effect=_recorder(calls)):
@@ -621,7 +621,7 @@ def test_retry_endpoint_rejects_in_flight_and_resends_failed(webhook_client, acc
     with client.application.app_context():
         key_id = _make_key(company_ids[0])
         in_flight = _add_event(key_id, status='sending', attempts=1,
-                               lease_expires_at=datetime.now() + timedelta(minutes=1))
+                               lease_expires_at=datetime.now(timezone.utc) + timedelta(minutes=1))
         failed = _add_event(key_id, status='failed', attempts=services.MAX_ATTEMPTS)
 
     assert client.post(f'/wh/webhook/{in_flight}/retry', headers=headers).status_code == 409

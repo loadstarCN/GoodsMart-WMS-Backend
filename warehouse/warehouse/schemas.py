@@ -14,6 +14,21 @@ api_ns = Namespace('warehouse', description='Warehouse operations', authorizatio
 # -----------------------------
 user_model = api_ns.model('User', original_user_model)
 
+def _effective_timezone(warehouse):
+    """输出的 timezone：仓库的生效时区（仓库设了的 → WMS_DEFAULT_TIMEZONE → WMS_TIMEZONE → UTC）"""
+    from warehouse.common.clock import configured_timezone, default_timezone_name
+    if isinstance(warehouse, dict):
+        name = warehouse.get('timezone_configured', warehouse.get('timezone'))
+        return name if isinstance(name, str) and name else default_timezone_name()
+    return configured_timezone(warehouse) or default_timezone_name()
+
+
+# 单据 / 任务里嵌的仓库对象都带生效时区（doc/timezone-utc.md §3），界面按它显示时间
+warehouse_timezone_field = fields.String(
+    attribute=_effective_timezone, readOnly=True,
+    description='Effective IANA time zone of the warehouse (its own, else WMS_DEFAULT_TIMEZONE / WMS_TIMEZONE / '
+                'UTC); times are shown and naive input times are read in this zone')
+
 # -----------------------------
 # 定义用于响应的简单 Warehouse 模型（仅包含 id 和 name）
 # -----------------------------
@@ -21,6 +36,7 @@ warehouse_simple_model = api_ns.model('WarehouseSimple', {
     'id': fields.Integer(readOnly=True, description='Warehouse ID'),
     'name': fields.String(required=True, description='Warehouse Name'),
     'default_currency': fields.String(description='Default Currency Code (ISO 4217 standard)', default='JPY'),
+    'timezone': warehouse_timezone_field,
 })
 
 # -----------------------------
@@ -49,6 +65,10 @@ warehouse_model = api_ns.model('Warehouse', {
     # 输出不给默认值：库里为空就返回 null（出单证时回退用公司的国家）
     'country_code': fields.String(description='Country (ISO 3166-1 alpha-2); null when not set'),
     'contact_name_en': fields.String(description='Warehouse contact person (English)'),
+    # 时区（doc/timezone-utc.md §2）：timezone 是生效值，timezone_configured 是仓库自己设的（可空）
+    'timezone': warehouse_timezone_field,
+    'timezone_configured': fields.String(attribute='timezone', readOnly=True,
+                                         description='Time zone set on the warehouse itself; null = default'),
     'company_id': fields.Integer(required=True, description='ID of the associated company'),
     'manager_id': fields.Integer(description='Manager ID'),
     'is_active': fields.Boolean(description='Is the warehouse active?'),
@@ -68,6 +88,10 @@ warehouse_input_fields = generate_input_fields(warehouse_model)
 # 输入：新建时不传 country_code 走列默认值 JP（只影响文档）
 warehouse_input_fields['country_code'] = fields.String(
     description='Country (ISO 3166-1 alpha-2); defaults to JP when omitted on create', default='JP')
+# 输入的 timezone 是仓库自己的设置：IANA 名（如 Asia/Tokyo）；null / 空串 = 用默认时区；不合法 400 14022
+warehouse_input_fields['timezone'] = fields.String(
+    description='IANA time zone of the warehouse such as Asia/Tokyo or America/Los_Angeles; null or empty = use the '
+                'default (WMS_DEFAULT_TIMEZONE / WMS_TIMEZONE / UTC)')
 warehouse_input_model = api_ns.model('WarehouseInput', warehouse_input_fields)
 
 # -----------------------------

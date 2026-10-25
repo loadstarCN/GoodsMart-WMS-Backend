@@ -1,5 +1,6 @@
 from extensions.db import *
 from sqlalchemy import Index, CheckConstraint
+from extensions.db import UTCDateTime
 
 class DeliveryTask(db.Model):
     """配送任务主表"""
@@ -112,28 +113,28 @@ class DeliveryTask(db.Model):
         info={'description': '创建人ID'}
     )
     created_at = db.Column(
-        db.DateTime,
+        UTCDateTime,
         default=db.func.now(),
         info={'description': '创建时间'}
     )
     updated_at = db.Column(
-        db.DateTime,
+        UTCDateTime,
         default=db.func.now(),
         onupdate=db.func.now(),
         info={'description': '最后更新时间'}
     )
     started_at = db.Column(
-        db.DateTime,
+        UTCDateTime,
         nullable=True,
         info={'description': '任务开始时间'}
     )
     completed_at = db.Column(
-        db.DateTime,
+        UTCDateTime,
         nullable=True,
         info={'description': '任务完成时间'}
     )
     signed_at = db.Column(
-        db.DateTime,
+        UTCDateTime,
         nullable=True,
         info={'description': '客户签收时间'}
     )
@@ -219,7 +220,7 @@ class DeliveryTaskStatusLog(db.Model):
         info={'description': '操作人ID'}
     )
     changed_at = db.Column(
-        db.DateTime,
+        UTCDateTime,
         default=db.func.now(),
         info={'description': '变更时间'}
     )

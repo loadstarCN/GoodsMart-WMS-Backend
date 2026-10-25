@@ -10,6 +10,7 @@ from warehouse.goods.models import Goods
 from warehouse.inventory.services import InventoryService
 from warehouse.location.models import Location
 from warehouse.location.services import LocationService
+from warehouse.common import clock
 from .models import PutawayRecord
 
 
@@ -36,10 +37,9 @@ class PutawayService:
             query = query.filter(PutawayRecord.location_id == filters['location_id'])
         if filters.get('operator_id'):
             query = query.filter(PutawayRecord.operator_id == filters['operator_id'])
-        if filters.get('start_time'):
-            query = query.filter(PutawayRecord.putaway_time >= filters['start_time'])
-        if filters.get('end_time'):
-            query = query.filter(PutawayRecord.putaway_time <= filters['end_time'])
+        # 时间范围：只给日期的按所筛仓库当地的那一天（end_time 含当天），不带时区的时刻按仓库时区
+        query = clock.filter_time_range(query, PutawayRecord.putaway_time, filters.get('start_time'), filters.get('end_time'),
+                                          filters.get('warehouse_id'))
 
         # 针对 Goods 相关的过滤，先统一 join 一次
         if any(key in filters for key in ['goods_code', 'keyword']):

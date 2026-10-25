@@ -12,6 +12,7 @@ from extensions.transaction import transactional
 from system.webhook.services import emit_company_events
 from warehouse.common.countries import normalize_country, is_valid_country
 from warehouse.common.references import ensure_not_referenced
+from warehouse.common import clock
 from warehouse.location.models import Location
 from .models import Goods, GoodsLocation
 from .sanitize import sanitize_description
@@ -169,7 +170,8 @@ def _spec_change(goods, before: dict, source: str):
     changed = [key for _, key in SPEC_FIELDS if before.get(key) != after.get(key)]
     if not changed:
         return None
-    return goods, after, changed, source, datetime.now().astimezone().isoformat(timespec='seconds')
+    # 商品是公司级的、没有仓库：changed_at 用默认时区（WMS_DEFAULT_TIMEZONE → WMS_TIMEZONE → UTC）的偏移
+    return goods, after, changed, source, clock.local_iso(clock.now())
 
 
 def _emit_spec_changes(changes: list):
@@ -506,7 +508,7 @@ class GoodsService:
             elif override_mode == 'active':
                 if not existing.is_active:
                     existing.is_active = True
-                    existing.updated_at = datetime.now()
+                    existing.updated_at = clock.now()
                     db.session.add(existing)
                 new_goods.append(existing)
                 
@@ -528,7 +530,7 @@ class GoodsService:
                     existing.origin_country = origin_country
                 spec_changes.append(_spec_change(existing, spec_before, spec_source))
                 existing.is_active = True
-                existing.updated_at = datetime.now()
+                existing.updated_at = clock.now()
                 db.session.add(existing)
                 new_goods.append(existing)
                 
@@ -542,7 +544,7 @@ class GoodsService:
                     existing.origin_country = origin_country
                 spec_changes.append(_spec_change(existing, spec_before, spec_source))
                 existing.is_active = True
-                existing.updated_at = datetime.now()
+                existing.updated_at = clock.now()
                 db.session.add(existing)
                 new_goods.append(existing)
 

@@ -58,6 +58,7 @@ from flask import current_app, g
 from sqlalchemy.exc import IntegrityError
 
 from extensions.db import db
+from warehouse.common import clock as wms_clock      # 时刻 / 时区（clock 是承运商时限用的单调时钟）
 from extensions.error import (
     APIException, BadGatewayException, BadRequestException, ConflictException, GatewayTimeoutException,
 )
@@ -69,7 +70,7 @@ from warehouse.carrier.methods import tracking_url
 from warehouse.carrier.models import Carrier
 from warehouse.common.address_format import dn_ship_to, latin_view, warehouse_address
 from warehouse.common.countries import COUNTRY_NAMES_EN
-from warehouse.shipping.common import LOCKED_DN_STATUSES, document_timezone
+from warehouse.shipping.common import LOCKED_DN_STATUSES
 from warehouse.shipping.route import scope_of, shipping_route
 from .customs_extension import CustomsExtension, allocate_commodity_weights  # noqa: F401  allocate_* 旧的引用位置
 from .customs_services import CustomsService
@@ -331,7 +332,7 @@ class CarrierShipmentService:
 
     @staticmethod
     def _expired(timestamp) -> bool:
-        return timestamp is not None and (datetime.now() - timestamp).total_seconds() > stale_after_seconds()
+        return timestamp is not None and (wms_clock.now() - timestamp).total_seconds() > stale_after_seconds()
 
     @staticmethod
     def is_stale(record: DNCarrierShipment) -> bool:
@@ -888,7 +889,7 @@ class CarrierShipmentService:
         if not ctx['customs'] or not adapter.trade_requirements_enabled():
             return {'enabled': False, 'documents': [], 'missing_documents': [], 'paper_documents': []}
         shipment = dict(ctx['shipment'])
-        shipment['ship_date'] = datetime.now(document_timezone()).date()
+        shipment['ship_date'] = wms_clock.local_today(dn)        # 发货日 = 仓库当地的今天
         try:
             regulatory = adapter.trade_requirements(shipment, deadline=clock() + 20)
         except CarrierError as exc:
@@ -997,13 +998,13 @@ class CarrierShipmentService:
         label = adapter.label_options(label_format)
 
         shipment = dict(ctx['shipment'])
-        shipment['ship_date'] = datetime.now(document_timezone()).date()
+        shipment['ship_date'] = wms_clock.local_today(dn)        # 发货日 = 仓库当地的今天
         if ctx['customs']:
             # 报关件：CI / PL 必须先签发（没有或已过期 → 用现有逻辑签发；随 pending 记录一起提交），
             # 开了电子单证时交给插件
             CustomsExtension.prepare_documents(dn, user_id, ctx['view'], adapter, shipment)
 
-        now = datetime.now()
+        now = wms_clock.now()
         record = DNCarrierShipment(
             dn_id=dn.id,
             source=SOURCE_API,
@@ -1210,7 +1211,7 @@ class CarrierShipmentService:
         record.tracking_number = tracking
         record.transaction_id = transaction_id or record.transaction_id
         record.etd_document_id = etd_document_id or record.etd_document_id
-        record.updated_at = datetime.now()
+        record.updated_at = wms_clock.now()
         db.session.flush()
 
     @staticmethod
@@ -1234,7 +1235,7 @@ class CarrierShipmentService:
         record.status = 'active'
         record.reason = None
         record.tracking_number = tracking
-        record.updated_at = datetime.now()
+        record.updated_at = wms_clock.now()
         db.session.flush()
 
         # 运单号：复用现有保存运单号的逻辑
@@ -1253,7 +1254,7 @@ class CarrierShipmentService:
                 ship_date = date.fromisoformat(str(result['ship_date'])[:10])
             except ValueError:
                 ship_date = None
-        ship_date = ship_date or datetime.now(document_timezone()).date()
+        ship_date = ship_date or wms_clock.local_today(dn)        # 发货日 = 仓库当地的今天
 
         label_doc = CarrierShipmentService._store_label(dn, tracking, ship_date, archive, user_id)
         record.package_tracking_numbers = result['package_tracking_numbers']
@@ -1342,7 +1343,7 @@ class CarrierShipmentService:
             logger.warning("carrier shipment record %s is %s, not pending; not changing it to %s",
                            record_id, record.status, status)
             return CarrierShipmentService.unresolved_payload(record)
-        now = datetime.now()
+        now = wms_clock.now()
         record.status = status
         for key, value in fields.items():
             if value is None:
@@ -1390,7 +1391,7 @@ class CarrierShipmentService:
             size_bytes=len(content),
             file_name=f"LABEL_{safe}.{archive['extension']}",
             content=content,
-            issued_at=datetime.now(),
+            issued_at=wms_clock.now(),
             issued_by=user_id,
         )
         db.session.add(doc)
@@ -1509,7 +1510,7 @@ class CarrierShipmentService:
             integration = CarrierShipmentService._cancel_integration(dn, record)
             return CarrierShipmentService._mark_cancelling(dn, record, user_id, 'dismiss', integration)
 
-        now = datetime.now()
+        now = wms_clock.now()
         record.reason = payload['reason']            # 卡住的 pending 记下 stale
         record.status = 'dismissed'
         record.dismissed_at = now
@@ -1528,7 +1529,7 @@ class CarrierShipmentService:
         origin_status, origin_reason = CarrierShipmentService.effective_status(record)
         live = record.status in LIVE_STATUSES
         if live:
-            now = datetime.now()
+            now = wms_clock.now()
             record.status = 'cancelling'
             record.reason = CANCEL_IN_PROGRESS
             record.cancelled_by = user_id
@@ -1623,7 +1624,7 @@ class CarrierShipmentService:
             return {'payload': None, 'error': CarrierShipmentService._cancel_error(
                 plan, outcome, CarrierShipmentService.unresolved(dn))}
 
-        now = datetime.now()
+        now = wms_clock.now()
         ours = not plan['live'] or record.updated_at == plan['marked_at']
         if outcome['result'] == 'confirmed':
             if plan['live'] or plan['mode'] == 'cancel':
@@ -1674,7 +1675,7 @@ class CarrierShipmentService:
     def _cleanup_after_cancel(dn: DN, record: DNCarrierShipment, user_id):
         """运单在承运商那边取消后（记录已落 cancelled / dismissed）：面单作废、发货任务上的这张运单号清掉。"""
         from warehouse.delivery.services import DeliveryTaskService
-        now = datetime.now()
+        now = wms_clock.now()
         if record.label_document_id:
             label = db.session.get(DNDocument, record.label_document_id)
             if label is not None and label.status == 'issued':
@@ -1764,5 +1765,5 @@ class CarrierShipmentService:
             return
         record.reason = reason
         record.error_message = str(message or '')[:ERROR_MESSAGE_MAX]
-        record.updated_at = datetime.now()
+        record.updated_at = wms_clock.now()
         db.session.flush()

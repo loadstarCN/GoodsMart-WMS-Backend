@@ -2,7 +2,8 @@ import hmac
 import re
 import secrets
 import threading
-from datetime import datetime, timedelta
+from datetime import timedelta
+from extensions.db import utc_now
 from flask import current_app
 from flask_jwt_extended import create_access_token, create_refresh_token
 from extensions.db import *
@@ -60,7 +61,7 @@ class UserService:
         # 将user变成staff类型
             from warehouse.staff.models import Staff
             staff = Staff.query.filter_by(id=user.id).first()
-            if staff.company.expired_at and  staff.company.expired_at < datetime.now():
+            if staff.company.expired_at and  staff.company.expired_at < utc_now():
                 raise UnauthorizedException("Company is expired", 11007)
             if not staff.company.is_active:
                 raise UnauthorizedException("Company is not active", 11007)
@@ -72,7 +73,7 @@ class UserService:
         refresh_expires_in = current_app.config['JWT_REFRESH_TOKEN_EXPIRES']
 
         # 更新用户模型的refresh_token及有效期（需持久化存储）
-        user.refresh_token_expires_at = datetime.now() + refresh_expires_in
+        user.refresh_token_expires_at = utc_now() + refresh_expires_in
         db.session.add(user)
         db.session.commit()
 
@@ -102,11 +103,11 @@ class UserService:
         # 检查当前refresh_token剩余有效期
         expires_at = current_user.refresh_token_expires_at  # 在User模型中记录
 
-        if expires_at is None or (expires_at - datetime.now()) < timedelta(hours=24):
+        if expires_at is None or (expires_at - utc_now()) < timedelta(hours=24):
             new_refresh_token = create_refresh_token(identity=current_user)
             refresh_expires_in = current_app.config['JWT_REFRESH_TOKEN_EXPIRES']
             # 更新用户模型的refresh_token及有效期（需持久化存储）
-            current_user.refresh_token_expires_at = datetime.now() + refresh_expires_in
+            current_user.refresh_token_expires_at = utc_now() + refresh_expires_in
             db.session.add(current_user)
             db.session.commit()
 

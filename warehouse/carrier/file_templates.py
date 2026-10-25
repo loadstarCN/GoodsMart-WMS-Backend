@@ -714,6 +714,22 @@ def _unit_text(unit: str) -> str:
     return 'bytes (Shift_JIS)' if unit == 'sjis_bytes' else 'characters'
 
 
+def uses_package_fields(template) -> bool:
+    """导出的列是否离不开箱子数据：有列用了 {package.*} 且没带 |default（带 |default 的，如预设的
+    {package.count|default:1}，没录箱子时按默认值导出）。打包这一步据此决定没录箱子要不要提示（PACKAGES_MISSING）"""
+    export = (template or {}).get('export') or {}
+    for index, column in enumerate(export.get('columns') or []):
+        try:
+            parts = compile_value(column.get('value') or '', f'export.columns[{index}].value')
+        except TemplateError:
+            continue
+        for part in parts:
+            if isinstance(part, tuple) and part[0][:1] == ('package',) and \
+                    not any(name == 'default' for name, _arg in part[1]):
+                return True
+    return False
+
+
 def render_rows(template: dict, contexts: list) -> list:
     """每张 DN 的上下文 → [{values: [每列文字], problems: [{column, column_index, code, message, ...}]}]。
     检查：REQUIRED（必填为空）、TOO_LONG（按 length_unit 超长；地址 / 姓名不截断，报错让人改）、

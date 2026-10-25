@@ -13,7 +13,8 @@ import logging
 import threading
 import time
 from collections import defaultdict
-from datetime import datetime, timedelta
+from datetime import timedelta
+from extensions.db import utc_now
 
 import requests
 from flask import current_app
@@ -259,7 +260,7 @@ def _has_newer_event(event):
 def _build_job(event, api_key):
     """组装本次推送的请求（在领取事务里算好，发送阶段不再碰数据库）"""
     payload_bytes = json.dumps(event.payload, ensure_ascii=False).encode('utf-8')
-    timestamp = str(int(datetime.now().timestamp()))
+    timestamp = str(int(utc_now().timestamp()))
 
     headers = {
         'Content-Type': 'application/json',
@@ -325,7 +326,7 @@ def _claim_locked(event):
 
     event.attempts += 1
     event.status = 'sending'
-    event.lease_expires_at = datetime.now() + timedelta(seconds=LEASE_SECONDS)
+    event.lease_expires_at = utc_now() + timedelta(seconds=LEASE_SECONDS)
     return _build_job(event, api_key)
 
 
@@ -338,7 +339,7 @@ def _claim_event(event_id):
     """
     event = WebhookEvent.query.filter(
         WebhookEvent.id == event_id,
-        _due_filter(datetime.now()),
+        _due_filter(utc_now()),
     ).with_for_update(skip_locked=True).populate_existing().first()
     if event is None:
         return False, None   # 已被别的推送进程处理 / 正锁着 / 已不到期
@@ -467,7 +468,7 @@ def _record_result(job, error):
     event.lease_expires_at = None
     if error is None:
         event.status = 'sent'
-        event.sent_at = datetime.now()
+        event.sent_at = utc_now()
         event.last_error = None
     else:
         # 错误信息不带目标 URL / 响应体，避免被用作内网探测的回显
@@ -478,7 +479,7 @@ def _record_result(job, error):
         else:
             # 固定 30 分钟间隔重试
             event.status = 'pending'
-            event.next_retry_at = datetime.now() + timedelta(seconds=RETRY_INTERVAL_SECONDS)
+            event.next_retry_at = utc_now() + timedelta(seconds=RETRY_INTERVAL_SECONDS)
     db.session.commit()
 
 
@@ -514,7 +515,7 @@ def _plan_batch(skip_key_ids):
     Returns:
         list[tuple[int, int]]: [(api_key_id, event_id), ...]
     """
-    due = _due_filter(datetime.now())
+    due = _due_filter(utc_now())
     is_broadcast = case((WebhookEvent.event_type.in_(SUBSCRIBABLE_EVENT_TYPES), 1), else_=0)
     key_ids = [row[0] for row in db.session.query(WebhookEvent.api_key_id).filter(due).distinct()]
 

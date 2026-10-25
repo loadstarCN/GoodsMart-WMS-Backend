@@ -16,9 +16,9 @@
 调用方应先锁 DN 行（与保存运单号、建运单同一把锁）。
 """
 import logging
-from datetime import datetime
 
 from extensions.db import db
+from warehouse.common import clock
 from warehouse.dn.models import DN, DNCarrierShipment
 
 logger = logging.getLogger(__name__)
@@ -94,7 +94,7 @@ def sync_manual(task, user_id):
         # api 运单：运单号由它定，不另写 manual 记录
         return None
     number = (task.tracking_number or '').strip() or None
-    now = datetime.now()
+    now = clock.now()
     if record is not None:
         if number is not None and _normalize(record.tracking_number) == _normalize(number) \
                 and record.carrier_id == task.carrier_id:
@@ -136,7 +136,7 @@ def sync_manual(task, user_id):
 def close_manual(dn: DN, reason: str, user_id=None):
     """未结束的 manual / file 运单记录 cancelled（不调承运商）：DN 取消（reason dn_cancelled）、
     带运单号的发货任务被删（cleared）"""
-    now = datetime.now()
+    now = clock.now()
     records = (
         DNCarrierShipment.query
         .filter(DNCarrierShipment.dn_id == dn.id, DNCarrierShipment.status.in_(OPEN_STATUSES),

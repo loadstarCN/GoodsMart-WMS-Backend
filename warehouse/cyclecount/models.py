@@ -1,4 +1,5 @@
 from extensions.db import *
+from extensions.db import UTCDateTime
 
 class CycleCountTask(db.Model):
     """循环盘点主任务表"""
@@ -27,7 +28,7 @@ class CycleCountTask(db.Model):
         info={'description': '关联仓库ID'}
     )
     scheduled_date = db.Column(
-        db.DateTime,
+        UTCDateTime,
         nullable=True,
         info={'description': '计划执行时间'}
     )
@@ -50,24 +51,24 @@ class CycleCountTask(db.Model):
         info={'description': '创建人ID'}
     )
     created_at = db.Column(
-        db.DateTime,
+        UTCDateTime,
         default=db.func.now(),  
         info={'description': '创建时间'}
     )
     updated_at = db.Column(
-        db.DateTime,
+        UTCDateTime,
         default=db.func.now(),
         onupdate=db.func.now(),
         index=True,  # 时间字段索引
         info={'description': '最后更新时间'}
     )
     started_at = db.Column(
-        db.DateTime,
+        UTCDateTime,
         nullable=True,
         info={'description': '实际开始时间'}
     )
     completed_at = db.Column(
-        db.DateTime,
+        UTCDateTime,
         nullable=True,
         info={'description': '完成时间'}
     )
@@ -154,13 +155,13 @@ class CycleCountTaskDetail(db.Model):
         info={'description': '操作人ID'}
     )
     updated_at = db.Column(
-        db.DateTime,
+        UTCDateTime,
         default=db.func.now(),
         onupdate=db.func.now(),
         info={'description': '最后更新时间'}
     )
     completed_at = db.Column(
-        db.DateTime,
+        UTCDateTime,
         nullable=True,
         info={'description': '明细完成时间'}
     )
@@ -229,7 +230,7 @@ class CycleCountTaskStatusLog(db.Model):
         info={'description': '操作人ID'}
     )
     changed_at = db.Column(
-        db.DateTime,
+        UTCDateTime,
         default=db.func.now(),
         index=True,  # 高频查询字段
         info={'description': '变更时间'}

@@ -321,7 +321,7 @@ def test_delete_picking_batch_with_details(client, access_token):
     _inbound(client, access_token, w, [(g, 10)], [(g, w['std1'], 10)])
     dn_id = _ok(client.post('/dn/', json={
         'warehouse_id': w['wh'], 'recipient_id': w['recipient'], 'shipping_address': 'x',
-        'expected_shipping_date': date.today().isoformat(), 'details': [{'goods_id': g, 'quantity': 4}],
+        'expected_shipping_date': warehouse_today().isoformat(), 'details': [{'goods_id': g, 'quantity': 4}],
     }, headers=_h(access_token)))['id']
     _ok(client.put(f'/dn/{dn_id}/progress/', headers=_h(access_token)))
     picking_id = _task_ids(client, PickingTask, dn_id=dn_id)[0]
@@ -467,7 +467,7 @@ def test_cancel_fully_packed_dn_voids_documents_and_emits_webhook(client, access
                                  ('commercial_invoice', 'void')):
             db.session.add(DNDocument(
                 dn_id=dn_id, doc_type=doc_type, version=1 if status == 'issued' else 0, document_number='INV-1',
-                invoice_date=date.today(), status=status, sha256='0' * 64, data_sha256='0' * 64, size_bytes=1,
+                invoice_date=warehouse_today(), status=status, sha256='0' * 64, data_sha256='0' * 64, size_bytes=1,
                 file_name=f'{doc_type}.pdf', content=b'x'))
         db.session.commit()
         key_id = key.id

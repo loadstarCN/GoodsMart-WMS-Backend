@@ -1,6 +1,7 @@
 import hashlib
 
 from extensions.db import db
+from extensions.db import UTCDateTime
 
 class Recipient(db.Model):
     """收件人信息表
@@ -88,12 +89,12 @@ class Recipient(db.Model):
         info={'description': '创建人ID'}
     )
     created_at = db.Column(
-        db.DateTime, 
+        UTCDateTime, 
         default=db.func.now(),
         info={'description': '创建时间（自动记录）'}
     )
     updated_at = db.Column(
-        db.DateTime, 
+        UTCDateTime, 
         default=db.func.now(),
         onupdate=db.func.now(),
         info={'description': '最后更新时间（自动更新）'}
@@ -182,9 +183,9 @@ class RecipientExternalMapping(db.Model):
     )
     display_name = db.Column(db.String(255), nullable=False)
     email = db.Column(db.String(255))
-    created_at = db.Column(db.DateTime, default=db.func.now())
+    created_at = db.Column(UTCDateTime, default=db.func.now())
     updated_at = db.Column(
-        db.DateTime, default=db.func.now(), onupdate=db.func.now()
+        UTCDateTime, default=db.func.now(), onupdate=db.func.now()
     )
 
     recipient = db.relationship('Recipient', back_populates='external_mapping')

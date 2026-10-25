@@ -11,6 +11,7 @@ from warehouse.goods.models import Goods
 from warehouse.goods.services import GoodsService, goods_spec_snapshot
 from warehouse.inventory.services import InventoryService
 from warehouse.common.locks import lock_row, lock_inventory_rows, lock_order_key
+from warehouse.common import clock
 from warehouse.supplier.models import Supplier
 from warehouse.warehouse.models import Warehouse
 from system.webhook.services import emit as webhook_emit
@@ -163,13 +164,13 @@ class ASNService:
         asn.status = new_status
 
         if new_status == 'received':
-            asn.received_at = datetime.now()
+            asn.received_at = clock.now()
         elif new_status == 'completed':
-            asn.completed_at = datetime.now()
+            asn.completed_at = clock.now()
         elif new_status == 'closed':
-            asn.closed_at = datetime.now()
+            asn.closed_at = clock.now()
 
-        asn.updated_at = datetime.now()
+        asn.updated_at = clock.now()
         db.session.add(asn)
         db.session.flush()
         # db.session.commit()
@@ -778,7 +779,7 @@ class ASNService:
             list: 符合前端图表要求的数据序列
         """
         # 计算时间范围
-        end_date = datetime.now()
+        end_date = clock.stats_now(filters)
         start_date = end_date - relativedelta(months=months-1)
         start_date = start_date.replace(day=1, hour=0, minute=0, second=0)
 
@@ -851,7 +852,7 @@ class ASNService:
     @staticmethod
     def get_status_overview(filters=None):
         """获取各状态ASN在当前月、前一个月和去年同月的统计"""
-        now = datetime.now()
+        now = clock.stats_now(filters)
         current_year = now.year
         current_month = now.month
 

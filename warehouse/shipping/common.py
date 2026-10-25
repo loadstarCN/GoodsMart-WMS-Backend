@@ -1,14 +1,12 @@
-"""发货共用的基础：DN 加锁、当前发货任务、发货后锁定、业务日期时区。
+"""发货共用的基础：DN 加锁、当前发货任务、发货后锁定、业务日期时区（按单据所属仓库，doc/timezone-utc.md）。
 
 原来散在 CustomsService 里（_lock / _delivery_task / is_locked / LOCKED_DN_STATUSES / _document_timezone），
 报关、运单、揽收、跟踪、流程汇总都引用这里；CustomsService 上保留同名的薄包装（测试与旧调用方照用）。
 """
-from datetime import date, datetime
-from zoneinfo import ZoneInfo
-
-from flask import current_app
+from datetime import date
 
 from extensions.error import ConflictException
+from warehouse.common import clock
 from warehouse.common.locks import lock_row
 
 LOCKED_DN_STATUSES = ('delivered', 'completed')       # 发货后锁定（报关快照 / 箱子 / 单证 / 运单）
@@ -45,16 +43,12 @@ def current_delivery_task(dn):
     )
 
 
-def document_timezone():
-    """业务日期（单证日期、实际发货日、揽收日）的时区：DOCUMENT_TIMEZONE（默认 Asia/Tokyo）；配错按 UTC。"""
-    tz_name = current_app.config.get('DOCUMENT_TIMEZONE') or 'Asia/Tokyo'
-    try:
-        return ZoneInfo(tz_name)
-    except Exception:  # noqa: BLE001 — 配错时区不能让出单证 500
-        current_app.logger.warning("Invalid DOCUMENT_TIMEZONE %r, falling back to UTC", tz_name)
-        return ZoneInfo('UTC')
+def document_timezone(warehouse=None):
+    """业务日期（单证日期、实际发货日、揽收日）的时区：单据所属仓库的时区（warehouse/common/clock.py：仓库设了的 →
+    WMS_DEFAULT_TIMEZONE → WMS_TIMEZONE → UTC）。warehouse 可以是仓库、仓库 id 或带 warehouse 的单据；不给 = 默认时区。"""
+    return clock.warehouse_timezone(warehouse)
 
 
-def local_today() -> date:
-    """仓库当地（DOCUMENT_TIMEZONE）的今天"""
-    return datetime.now(document_timezone()).date()
+def local_today(warehouse=None) -> date:
+    """仓库（或单据所属仓库）当地的今天；不给 = 默认时区的今天"""
+    return clock.local_today(warehouse)

@@ -32,7 +32,7 @@ def _run_to_packed(client, token, w, api_key_id, pick, pack):
     _inbound(client, token, w, [(g, 10)], [(g, w['std1'], 10)])
     dn_id = _ok(client.post('/dn/', json={
         'warehouse_id': w['wh'], 'recipient_id': w['recipient'], 'shipping_address': 'x',
-        'expected_shipping_date': date.today().isoformat(), 'order_number': 'SHP-PROGRESS-1',
+        'expected_shipping_date': warehouse_today().isoformat(), 'order_number': 'SHP-PROGRESS-1',
         'details': [{'goods_id': g, 'quantity': 4}],
     }, headers=_h(token)))['id']
     if api_key_id:

@@ -13,7 +13,7 @@ from .test_carrier_shipment import _create, _ready, fedex  # noqa: F401  fedex �
 from .test_carrier_pickup import _WAREHOUSE, _tomorrow, _wh
 from .test_isolation_outbound import _make_company_b
 
-from datetime import datetime, timedelta      # helpers 的 import * 会把 datetime 换成模块，放在它后面
+from datetime import datetime, timedelta, timezone # helpers 的 import * 会把 datetime 换成模块，放在它后面
 
 from sqlalchemy import select
 from sqlalchemy.dialects import postgresql
@@ -129,7 +129,11 @@ def test_export_flow_through_fedex(client, access_token, fedex):
     assert steps['handover']['state'] == 'current'
 
     # 完成发货 → 运输中
-    shipped = (datetime.now() - timedelta(hours=1)).replace(microsecond=0)
+    # 一小时前，但不早于仓库当地今天 0 点（实际发货日不能早于计划发货日 = 今天，否则当地凌晨跑会 400 16061）
+    from warehouse.common import clock
+    with client.application.app_context():
+        today_start = clock.local_midnight(clock.local_today())
+    shipped = max(datetime.now(timezone.utc) - timedelta(hours=1), today_start).replace(microsecond=0)
     assert _ship(client, access_token, task_id, shipped_at=shipped.isoformat()).status_code == 200
     flow = _assert_stage(client, access_token, dn_id, 'in_transit')
     steps = _steps(flow)
@@ -227,6 +231,49 @@ def test_domestic_manual_flow(client, access_token):
     assert next(i for i in items if i['id'] == task_id)['shipping_stage'] == 'in_transit'
 
 
+def test_packages_missing_only_when_packages_are_needed(client, access_token):
+    """没录箱子：国内手工运单不提示（PDA 也没有国内件的箱子录入）；插件运单、文件模板有离不开箱子的列
+    （不带 |default 的 {package.*}）时才提示 PACKAGES_MISSING。预设的 {package.count|default:1} 不算"""
+    from warehouse.carrier.presets import raw_preset
+    _prepare(client)
+    with client.application.app_context():
+        get_recipient().country = 'JP'
+        db.session.commit()
+    dn_id = _create_dn(client, access_token, customs=None, order_number='ORD-FLOW-NOPKG').get_json()['id']
+    task_id = _force_packed(client, dn_id)
+    with client.application.app_context():
+        db.session.get(DeliveryTask, task_id).carrier_id = get_carrier().id
+        db.session.commit()
+
+    def packing():
+        flow = _flow(client, access_token, dn_id)
+        step = _steps(flow)['packing']
+        missing = [p for p in flow['problems'] if p['code'] == 'PACKAGES_MISSING']
+        return step['state'], step['summary']['packages_required'], missing
+
+    def set_carrier(**fields):
+        with client.application.app_context():
+            carrier = get_carrier()
+            for key, value in fields.items():
+                setattr(carrier, key, value)
+            db.session.commit()
+
+    assert packing() == ('done', False, [])                                        # 手工运单（默认）
+    set_carrier(waybill_method='file', file_preset='jp.yamato_b2cloud')
+    assert packing() == ('done', False, [])                                        # 箱数有默认值
+    columns = [dict(c) for c in raw_preset('jp.yamato_b2cloud')['export']['columns']]
+    for column in columns:
+        column['value'] = column['value'].replace('{package.count|default:1}', '{package.count}')
+    set_carrier(file_template={'export': {'columns': columns}})
+    state, required, missing = packing()
+    assert (state, required, [p['step'] for p in missing]) == ('warning', True, ['packing'])
+    set_carrier(waybill_method='api', file_preset=None, file_template=None)
+    assert packing()[:2] == ('warning', True)                                      # 插件运单
+    set_carrier(waybill_method='manual')
+    assert client.put(f'/dn/{dn_id}/packages', json={'packages': PACKAGES}, headers=_h(access_token)).status_code == 200
+    assert packing() == ('done', False, [])
+
+
 def test_preparing_exception_and_closed(client, access_token):
     _prepare(client)
     pending = _create_dn(client, access_token, customs=None, order_number='ORD-FLOW-P').get_json()['id']
@@ -236,8 +283,8 @@ def test_preparing_exception_and_closed(client, access_token):
     dn_id, task_id = _domestic(client, access_token, 'ORD-FLOW-X')
     with client.application.app_context():
         db.session.add(DNCarrierShipment(dn_id=dn_id, source='api', carrier='fedex', carrier_id=get_carrier().id,
-                                         status='unknown', reason='timeout', created_at=datetime.now(),
-                                         updated_at=datetime.now()))
+                                         status='unknown', reason='timeout', created_at=datetime.now(timezone.utc),
+                                         updated_at=datetime.now(timezone.utc)))
         db.session.commit()
     flow = _assert_stage(client, access_token, dn_id, 'exception')
     assert _steps(flow)['waybill']['state'] == 'warning'
@@ -251,7 +298,7 @@ def test_preparing_exception_and_closed(client, access_token):
     with client.application.app_context():
         DNCarrierShipment.query.filter_by(dn_id=dn_id).one().status = 'dismissed'
         dn = db.session.get(DN, dn_id)
-        dn.picked_at = dn.packed_at = datetime.now()        # _force_packed 不记这两个时刻
+        dn.picked_at = dn.packed_at = datetime.now(timezone.utc)        # _force_packed 不记这两个时刻
         db.session.commit()
     assert client.put(f'/dn/{dn_id}/cancel/', headers=_h(access_token)).status_code == 200
     flow = _assert_stage(client, access_token, dn_id, 'closed')

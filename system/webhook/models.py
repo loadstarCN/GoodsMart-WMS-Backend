@@ -1,8 +1,8 @@
 """Webhook 事件模型"""
-from datetime import datetime
 
 from extensions import db
 from sqlalchemy.dialects.postgresql import JSON
+from extensions.db import UTCDateTime, utc_now
 
 
 class WebhookEvent(db.Model):
@@ -31,12 +31,12 @@ class WebhookEvent(db.Model):
     status = db.Column(db.String(20), nullable=False, default='pending', index=True)
     # 已尝试次数：领取发送时就 +1 并提交，进程在发送中途被杀也会计数，不会无限重来
     attempts = db.Column(db.Integer, nullable=False, default=0)
-    next_retry_at = db.Column(db.DateTime)
+    next_retry_at = db.Column(UTCDateTime)
     # sending 租约到期时间：到期仍是 sending（进程被杀 / 卡死）就视为可重新领取；其他状态为空
-    lease_expires_at = db.Column(db.DateTime, nullable=True)
+    lease_expires_at = db.Column(UTCDateTime, nullable=True)
 
-    created_at = db.Column(db.DateTime, default=datetime.now)
-    sent_at = db.Column(db.DateTime)
+    created_at = db.Column(UTCDateTime, default=utc_now)
+    sent_at = db.Column(UTCDateTime)
     last_error = db.Column(db.Text)
 
     # 关联

@@ -28,7 +28,7 @@ def test_expired_company_token_rejected(client):
     with client.application.app_context():
         user = get_company_admin_user()
         token = create_access_token(identity=user)
-        user.company.expired_at = datetime.datetime.now() - datetime.timedelta(days=1)
+        user.company.expired_at = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=1)
         db.session.commit()
 
     response = client.get('/company/', headers={'Authorization': f'Bearer {token}'})
@@ -129,7 +129,7 @@ def test_company_admin_cannot_extend_own_company(client, access_company_admin_to
     with client.application.app_context():
         company = get_company_by_id(company_id)
         assert company.name == 'Renamed Co'
-        assert company.expired_at == datetime.datetime(2030, 1, 1)
+        assert company.expired_at == datetime.datetime(2030, 1, 1, tzinfo=datetime.timezone.utc)
         assert company.is_active is True
 
     # 不能创建公司、列表只看到自己公司

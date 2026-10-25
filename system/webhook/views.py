@@ -1,5 +1,5 @@
 """Webhook 事件推送日志 — 视图"""
-from datetime import datetime
+from extensions.db import utc_now
 
 from flask_restx import Resource, abort
 from extensions import db
@@ -104,7 +104,7 @@ class WebhookEventRetry(Resource):
 
         if event.status == 'sent':
             abort(400, '该事件已推送成功，无需重试')
-        if event.status == 'sending' and event.lease_expires_at and event.lease_expires_at > datetime.now():
+        if event.status == 'sending' and event.lease_expires_at and event.lease_expires_at > utc_now():
             abort(409, '该事件正在推送中，请稍后再试')
 
         # 不受次数限制：计数清零后立即推送一次（Key 已停用 / 已有更新的同对象事件则直接作废）

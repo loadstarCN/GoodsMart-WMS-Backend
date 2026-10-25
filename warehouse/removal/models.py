@@ -1,4 +1,5 @@
 from extensions.db import *
+from extensions.db import UTCDateTime
 
 class RemovalRecord(db.Model):
     """货品下架记录表
@@ -51,7 +52,7 @@ class RemovalRecord(db.Model):
         info={'description': '操作员ID'}
     )
     removal_time = db.Column(
-        db.DateTime, 
+        UTCDateTime, 
         default=db.func.now(),
         info={'description': '自动记录操作时间'}
     )

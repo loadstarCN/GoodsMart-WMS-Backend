@@ -4,6 +4,7 @@ from extensions.error import BadRequestException, ConflictException, NotFoundExc
 from extensions.transaction import transactional
 from warehouse.common import require_bulk_list, require_fields, require_non_negative_int, require_company_goods
 from warehouse.common.locks import lock_row
+from warehouse.common import clock
 from warehouse.goods.models import Goods
 from .models import (
     CycleCountTask,
@@ -14,6 +15,15 @@ from warehouse.goods.services import GoodsLocationService, GoodsService
 from dateutil.relativedelta import relativedelta
 from sqlalchemy import and_, func, case, extract
 from datetime import datetime, timedelta
+
+def _scheduled_date(value, warehouse_id):
+    """计划盘点时间（用户填的）→ 带时区的 UTC：带偏移的按偏移，不带的按任务仓库的时区，只给日期 = 当地 00:00；
+    格式不对 400 16050"""
+    try:
+        return clock.parse_input_datetime(value, warehouse_id)
+    except ValueError:
+        raise BadRequestException("scheduled_date must be an ISO 8601 datetime", 16050, field='scheduled_date')
+
 
 class CycleCountTaskService:
 
@@ -69,10 +79,13 @@ class CycleCountTaskService:
             # 否则按用户传入的值进行过滤
             query = query.filter(CycleCountTask.is_active == filters['is_active'])
 
+        # 计划时间的筛选：不带时区的按所筛仓库的时区（没筛仓库按默认时区）
         if filters.get('scheduled_start_date'):
-            query = query.filter(CycleCountTask.scheduled_date >= filters['scheduled_start_date'])
+            query = query.filter(CycleCountTask.scheduled_date >= clock.parse_input_datetime(
+                filters['scheduled_start_date'], filters.get('warehouse_id')))
         if filters.get('scheduled_end_date'):
-            query = query.filter(CycleCountTask.scheduled_date <= filters['scheduled_end_date'])
+            query = query.filter(CycleCountTask.scheduled_date <= clock.parse_input_datetime(
+                filters['scheduled_end_date'], filters.get('warehouse_id')))
 
         # 搜索id，task_name，在detail中的goods.code，在detail中的location.code
         if filters.get('keyword'):
@@ -106,7 +119,7 @@ class CycleCountTaskService:
         new_task = CycleCountTask(
             task_name=data.get('task_name'),
             warehouse_id=data['warehouse_id'],
-            scheduled_date=data.get('scheduled_date'),
+            scheduled_date=_scheduled_date(data.get('scheduled_date'), data['warehouse_id']),
             status='pending',
             is_active=True,
             created_by=created_by_id
@@ -149,7 +162,8 @@ class CycleCountTaskService:
 
         # 白名单：只允许改任务名和计划时间；status / is_active / created_by 忽略
         task.task_name = data.get('task_name', task.task_name)
-        task.scheduled_date = data.get('scheduled_date', task.scheduled_date)
+        if 'scheduled_date' in data:
+            task.scheduled_date = _scheduled_date(data['scheduled_date'], task.warehouse_id)
 
         # db.session.commit()
         return task
@@ -297,7 +311,7 @@ class CycleCountTaskService:
             raise BadRequestException(f"Invalid status value: {new_status}", 14007)
 
         old_status = task.status
-        now = datetime.now()
+        now = clock.now()
 
         # 设置新状态
         task.status = new_status
@@ -382,7 +396,7 @@ class CycleCountTaskService:
             raise BadRequestException(f"Invalid detail status value: {new_status}", 14001)
 
         old_status = detail.status
-        now = datetime.now()
+        now = clock.now()
         
         detail.status = new_status
         detail.operator_id = operator_id  # 也可记录最后一次操作人
@@ -475,7 +489,7 @@ class CycleCountTaskService:
         示例：根据一组 goods_id 自动创建一个 CycleCountTask，并生成对应的明细。
         """
         task = CycleCountTaskService.create_task({
-            'task_name': f"Cycle Count Task - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            'task_name': f"Cycle Count Task - {clock.local_now(warehouse_id).strftime('%Y-%m-%d %H:%M:%S')}",
             'warehouse_id': warehouse_id,
             'status': 'pending',
             'is_active': True
@@ -522,7 +536,7 @@ class CycleCountTaskService:
             list: 符合前端图表要求的数据序列
         """
         # 计算时间范围
-        end_date = datetime.now()
+        end_date = clock.stats_now(filters)
         start_date = end_date - relativedelta(months=months-1)
         start_date = start_date.replace(day=1, hour=0, minute=0, second=0)
 
@@ -584,7 +598,7 @@ class CycleCountTaskService:
     @staticmethod
     def get_status_overview(filters=None):
         """获取各状态ASN在当前月、前一个月和去年同月的统计"""
-        now = datetime.now()
+        now = clock.stats_now(filters)
         current_year = now.year
         current_month = now.month
 

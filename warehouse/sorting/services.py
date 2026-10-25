@@ -9,6 +9,7 @@ from warehouse.common import require_non_negative_int, require_fields, delete_ba
 from warehouse.common.locks import lock_row
 from warehouse.common.batch_idempotency import parse_client_batch_id, find_batch, replay_or_conflict, insert_batch
 from warehouse.common.validation import require_active_task
+from warehouse.common import clock
 from warehouse.asn.models import ASN
 from warehouse.asn.services import ASNService
 from .models import SortingTask, SortingTaskDetail, SortingTaskStatusLog, SortingBatch
@@ -46,13 +47,12 @@ class SortingTaskService:
         return require_active_task(lock_row(task), 'Sorting Task')
 
     @staticmethod
-    def _parse_datetime(value):
-        """operation_time：接受 None / datetime / ISO8601 字符串"""
-        if value is None or isinstance(value, datetime):
-            return value
-        if isinstance(value, str):
+    def _parse_datetime(value, where=None):
+        """operation_time：None / datetime / ISO 8601 字符串 → 带时区的 UTC（不带偏移的按 where —— 任务所属仓库 ——
+        的时区，warehouse/common/clock.parse_input_datetime）"""
+        if value is None or isinstance(value, (str, datetime)):
             try:
-                return datetime.fromisoformat(value)
+                return clock.parse_input_datetime(value, where)
             except ValueError:
                 pass
         raise BadRequestException("operation_time must be an ISO8601 datetime", 14021)
@@ -133,7 +133,7 @@ class SortingTaskService:
 
         # 状态切换逻辑
         task.status = new_status
-        now = datetime.now()
+        now = clock.now()
         if old_status == 'pending' and new_status == 'in_progress':
             task.started_at = now
         elif old_status == 'in_progress' and new_status == 'completed':
@@ -467,7 +467,7 @@ class SortingTaskService:
             sorting_task_id=task.id,
             client_batch_id=client_batch_id,
             operator_id=operator_id,
-            operation_time=SortingTaskService._parse_datetime(data.get('operation_time')) or datetime.now(),
+            operation_time=SortingTaskService._parse_datetime(data.get('operation_time'), task.asn) or clock.now(),
             remark=data.get('remark', '')
         )
         # flush 拿新批次 ID；唯一约束兜底撞上时按已存在的批次重放 / 409
@@ -509,7 +509,7 @@ class SortingTaskService:
         batch = SortingTaskService.get_batch(task.id, batch_id)
 
         if 'operation_time' in data:
-            batch.operation_time = SortingTaskService._parse_datetime(data['operation_time']) or batch.operation_time
+            batch.operation_time = SortingTaskService._parse_datetime(data['operation_time'], task.asn) or batch.operation_time
         if 'remark' in data:
             batch.remark = data['remark']
 
@@ -602,7 +602,7 @@ class SortingTaskService:
             list: 符合前端图表要求的数据序列
         """
         # 计算时间范围
-        end_date = datetime.now()
+        end_date = clock.stats_now(filters)
         start_date = end_date - relativedelta(months=months-1)
         start_date = start_date.replace(day=1, hour=0, minute=0, second=0)
 
@@ -668,7 +668,7 @@ class SortingTaskService:
     @staticmethod
     def get_status_overview(filters=None):
         """获取各状态ASN在当前月、前一个月和去年同月的统计"""
-        now = datetime.now()
+        now = clock.stats_now(filters)
         current_year = now.year
         current_month = now.month
 

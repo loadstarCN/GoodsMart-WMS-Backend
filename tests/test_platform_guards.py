@@ -16,7 +16,7 @@ from .helpers import *  # noqa: F401,F403  先导入：helpers 里的 `import da
 
 import io
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from sqlalchemy import event
@@ -454,7 +454,7 @@ def test_api_key_rejected_when_company_unavailable(client, mode):
     with client.application.app_context():
         company = get_company()
         if mode == 'expired':
-            company.expired_at = datetime.now() - timedelta(days=1)
+            company.expired_at = datetime.now(timezone.utc) - timedelta(days=1)
         else:
             company.is_active = False
         db.session.commit()
@@ -486,7 +486,7 @@ def test_api_key_without_company_rejected_when_bound_staff_company_expired(clien
     with client.application.app_context():
         op = User.query.filter_by(user_name='operator').first()
         plain = _api_key(None, ['inventory_read'], user_id=op.id)
-        get_company().expired_at = datetime.now() - timedelta(minutes=1)
+        get_company().expired_at = datetime.now(timezone.utc) - timedelta(minutes=1)
         db.session.commit()
         wh_a_id = _wh_a().id
     response = client.get('/inventory/', headers={'X-API-KEY': plain, 'X-WAREHOUSE-ID': str(wh_a_id)})

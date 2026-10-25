@@ -1,4 +1,5 @@
 from extensions import db
+from extensions.db import UTCDateTime
 
 class Inventory(db.Model):
     """库存核心表（按商品+仓库维度管理）"""
@@ -127,13 +128,13 @@ class Inventory(db.Model):
     )
     # 时间字段（优化索引策略）
     create_at = db.Column(
-        db.DateTime,
+        UTCDateTime,
         default=db.func.now(),
         index=True,
         info={'description': '首次入库时间'}
     )
     update_at = db.Column(
-        db.DateTime,
+        UTCDateTime,
         default=db.func.now(),
         onupdate=db.func.now(),
         index=True,

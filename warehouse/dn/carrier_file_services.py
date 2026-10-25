@@ -19,7 +19,6 @@
 - 批次（GET /warehouse/dn/carrier-files/batches）：最近的导出 / 导入记录。
 """
 import re
-from datetime import datetime
 
 from extensions.db import db
 from extensions.error import BadRequestException, ConflictException, NotFoundException
@@ -33,8 +32,9 @@ from warehouse.common.address_format import dn_ship_to, format_single_line, ware
 from warehouse.common.countries import COUNTRY_NAMES_EN
 from warehouse.common.ownership import get_company_owned
 from warehouse.common.permissions import check_warehouse_access
+from warehouse.common import clock
 from warehouse.shipping import options as shipping_options
-from warehouse.shipping.common import current_delivery_task, document_timezone, local_today, lock_dn
+from warehouse.shipping.common import current_delivery_task, local_today, lock_dn
 from warehouse.shipping.waybills import SOURCE_FILE, current_waybill, exported_waybill
 
 from .models import DN, CarrierFileBatch, DNCarrierShipment
@@ -81,6 +81,17 @@ def parse_dn_ids(value) -> list:
         if dn_id not in ids:
             ids.append(dn_id)
     return ids
+
+
+def _reason(code, message, **fields):
+    """导入预览一行的说明：reason_code（界面按它出本地化文字）+ 英文 message（兜底）+ 拼文字用的字段
+    （existing_tracking_number / other_carrier / other_carrier_id / other_dn_id / shipment_status，没有的不给）。
+
+    reason_code：not_found → DN_NOT_FOUND / NOT_WMS_REFERENCE / NO_REFERENCE；invalid → NO_TRACKING_NUMBER / DN_CLOSED /
+    OTHER_CARRIER / NUMBER_OWNED_BY_OTHER_DN / API_SHIPMENT_UNRESOLVED / EXPORTED_FOR_OTHER_CARRIER /
+    SHIPPED_WITHOUT_FILE_WAYBILL / NO_OPEN_TASK；same_number → ALREADY_IMPORTED / ALREADY_SAVED；
+    already_has_number → HAS_OTHER_NUMBER"""
+    return {'reason_code': code, 'message': message, **{k: v for k, v in fields.items() if v is not None}}
 
 
 def _problem(code, message, column=None, **extra):
@@ -159,7 +170,7 @@ class CarrierFileService:
                 'expected_shipping_date': dn.expected_shipping_date, 'special_handling': dn.special_handling,
                 'packaging_info': dn.packaging_info,
             },
-            'ship_date': today or local_today(),
+            'ship_date': today or local_today(dn),           # 发货日 = 仓库当地的今天
             'ship_to': ship_to,
             'shipper': shipper,
             'goods': {'summary': ' / '.join(names) or None, 'first_name': names[0] if names else None,
@@ -244,7 +255,7 @@ class CarrierFileService:
                           and dns[i].warehouse.company_id == carrier.company_id), None)
             warehouse_id = first.warehouse_id if first is not None else None
 
-        today = local_today()
+        today = local_today(warehouse_id)               # 一批文件只属于一个仓库：发货日按它当地的今天
         rows, problem_rows = [], []
         for dn_id in ids:
             dn = dns[dn_id]
@@ -269,8 +280,8 @@ class CarrierFileService:
                 "(nothing was exported)", FILE_ROWS_INVALID,
                 details={'rows': problem_rows, 'total': len(ids)})
 
-        now = datetime.now()
-        local_now = datetime.now(document_timezone())
+        now = clock.now()
+        local_now = clock.local_now(warehouse_id)       # 文件名里的时刻：仓库当地时间
         file_name = CarrierFileService._file_name(carrier, template, local_now)
         content = write_csv(template, [values for _dn, values, _ctx in rows])
         batch = CarrierFileBatch(carrier_id=carrier.id, warehouse_id=warehouse_id, kind='export',
@@ -321,54 +332,69 @@ class CarrierFileService:
 
     @staticmethod
     def _evaluate(dn, carrier, numbers):
-        """一张 DN 导入这些运单号的结果 → (result, message, 已导出的运单记录 | None)"""
+        """一张 DN 导入这些运单号的结果 → (result, 说明, 已导出的运单记录 | None)。
+        说明 = _reason(...)：reason_code + 英文 message + 界面拼本地化文字用的字段；matched 为 None"""
         if dn is None:
-            return 'not_found', "No such DN in this warehouse", None
+            return 'not_found', _reason('DN_NOT_FOUND', "No such DN in this warehouse"), None
         if dn.status == 'closed':
-            return 'invalid', "The DN is closed (cancelled)", None
+            return 'invalid', _reason('DN_CLOSED', "The DN is closed (cancelled)"), None
         if not numbers:
-            return 'invalid', "No tracking number", None
+            return 'invalid', _reason('NO_TRACKING_NUMBER', "No tracking number"), None
         from .carrier_services import CarrierShipmentService
         task = current_delivery_task(dn)
         dn_carrier = CarrierShipmentService.carrier_of(dn, task)
         if dn_carrier is not None and dn_carrier.id != carrier.id:
-            return 'invalid', f"The DN's carrier is {dn_carrier.name}, not {carrier.name}", None
+            return 'invalid', _reason('OTHER_CARRIER', f"The DN's carrier is {dn_carrier.name}, not {carrier.name}",
+                                      other_carrier=dn_carrier.name, other_carrier_id=dn_carrier.id), None
         owned = (DNCarrierShipment.query
                  .filter(DNCarrierShipment.dn_id != dn.id, DNCarrierShipment.status.in_(('active', 'cancelling')),
                          DNCarrierShipment.tracking_number.in_(numbers))
                  .first())
         if owned is not None:
-            return 'invalid', f"Tracking number {owned.tracking_number} already belongs to DN {owned.dn_id}", None
+            return 'invalid', _reason('NUMBER_OWNED_BY_OTHER_DN',
+                                      f"Tracking number {owned.tracking_number} already belongs to DN {owned.dn_id}",
+                                      existing_tracking_number=owned.tracking_number, other_dn_id=owned.dn_id), None
         record = current_waybill(dn)
         main = _normalize(numbers[0])
         if record is not None:
             if record.source == 'api' and record.status in DNCarrierShipment.UNRESOLVED_STATUSES:
-                return 'invalid', ("The carrier shipment request created through the integration is unresolved "
-                                   f"({record.status})"), None
+                return 'invalid', _reason('API_SHIPMENT_UNRESOLVED',
+                                          "The carrier shipment request created through the integration is unresolved "
+                                          f"({record.status})", shipment_status=record.status), None
             if record.status == 'exported':
                 if record.carrier_id != carrier.id:
-                    return 'invalid', "The DN was exported for another carrier", None
+                    other = db.session.get(Carrier, record.carrier_id) if record.carrier_id else None
+                    return 'invalid', _reason('EXPORTED_FOR_OTHER_CARRIER', "The DN was exported for another carrier",
+                                              other_carrier=other.name if other is not None else None,
+                                              other_carrier_id=record.carrier_id), None
                 return 'matched', None, record
             existing = {_normalize(record.tracking_number)} | {_normalize(n) for n in
                                                                 (record.package_tracking_numbers or [])}
             if main == _normalize(record.tracking_number) or all(_normalize(n) in existing for n in numbers):
-                return 'same_number', f"Already imported ({record.tracking_number})", None
-            return 'already_has_number', f"The DN already has tracking number {record.tracking_number}", None
+                return 'same_number', _reason('ALREADY_IMPORTED', f"Already imported ({record.tracking_number})",
+                                              existing_tracking_number=record.tracking_number), None
+            return 'already_has_number', _reason(
+                'HAS_OTHER_NUMBER', f"The DN already has tracking number {record.tracking_number}",
+                existing_tracking_number=record.tracking_number), None
         if task is not None and task.tracking_number:
             if main == _normalize(task.tracking_number):
-                return 'same_number', f"Already saved ({task.tracking_number})", None
-            return 'already_has_number', f"The DN already has tracking number {task.tracking_number}", None
+                return 'same_number', _reason('ALREADY_SAVED', f"Already saved ({task.tracking_number})",
+                                              existing_tracking_number=task.tracking_number), None
+            return 'already_has_number', _reason(
+                'HAS_OTHER_NUMBER', f"The DN already has tracking number {task.tracking_number}",
+                existing_tracking_number=task.tracking_number), None
         if dn.status in SHIPPED:
-            return 'invalid', "The DN has been shipped without an exported file waybill", None
+            return 'invalid', _reason('SHIPPED_WITHOUT_FILE_WAYBILL',
+                                      "The DN has been shipped without an exported file waybill"), None
         if task is None or task.status not in OPEN_TASK_STATUSES:
-            return 'invalid', "The DN has no open delivery task (it is not packed yet)", None
+            return 'invalid', _reason('NO_OPEN_TASK', "The DN has no open delivery task (it is not packed yet)"), None
         return 'matched', None, None
 
     @staticmethod
     def _apply(dn, carrier, numbers, record, batch, user_id):
         """写入一张 DN 的运单号（DN 已锁）：exported → active，没导出过的建 file 运单；同步到发货任务"""
         from warehouse.delivery.services import DeliveryTaskService
-        now = datetime.now()
+        now = clock.now()
         main, rest = numbers[0], numbers[1:]
         data = dict((record.carrier_data if record is not None else None) or {})
         data.update({'preset': carrier.file_preset, 'import_batch_id': batch.id,
@@ -419,16 +445,16 @@ class CarrierFileService:
         for row in parsed['rows']:
             line = {'line': row['line'], 'reference': row['reference'], 'dn_id': row['dn_id'], 'order_number': None,
                     'tracking_numbers': [row['tracking_number']] if row['tracking_number'] else [],
-                    'result': None, 'message': None}
+                    'result': None, 'reason_code': None, 'message': None}
             lines.append(line)
             if row['dn_id'] is None:
                 line['result'] = 'not_found'
-                line['message'] = (f"Reference {row['reference']} is not a WMS DN reference" if row['reference']
-                                   else "No reference")
+                line.update(_reason('NOT_WMS_REFERENCE', f"Reference {row['reference']} is not a WMS DN reference")
+                            if row['reference'] else _reason('NO_REFERENCE', "No reference"))
                 continue
             if not row['tracking_number']:
                 line['result'] = 'invalid'
-                line['message'] = "No tracking number"
+                line.update(_reason('NO_TRACKING_NUMBER', "No tracking number"))
                 continue
             group = groups.setdefault(row['dn_id'], {'numbers': [], 'lines': []})
             group['lines'].append(line)
@@ -448,13 +474,13 @@ class CarrierFileService:
 
     @staticmethod
     def _decide(group, dn, carrier):
-        result, message, record = CarrierFileService._evaluate(dn, carrier, group['numbers'])
-        group.update(result=result, message=message, record=record)
+        result, reason, record = CarrierFileService._evaluate(dn, carrier, group['numbers'])
+        group.update(result=result, record=record)
         for index, line in enumerate(group['lines']):
             line['dn_id'] = dn.id if dn is not None else line['dn_id']
             line['order_number'] = dn.order_number if dn is not None else None
             line['result'] = result
-            line['message'] = message
+            line.update(reason or {'reason_code': None, 'message': None})
             if result == 'matched':
                 line['primary'] = index == 0            # 第一个号码为主单号，其余进 package_tracking_numbers
 
@@ -477,7 +503,7 @@ class CarrierFileService:
         lines, groups = CarrierFileService._plan(parsed)
         batch = CarrierFileBatch(carrier_id=carrier.id, warehouse_id=warehouse_id, kind='import',
                                  file_name=(file_name or '')[:255] or None, row_count=len(lines), created_by=user_id,
-                                 created_at=datetime.now())
+                                 created_at=clock.now())
         db.session.add(batch)
         db.session.flush()
         applied = []
@@ -509,7 +535,7 @@ class CarrierFileService:
         if record is None:
             raise ConflictException("The DN has no exported file waybill to discard.", 16075,
                                     details={'waybill': None})
-        now = datetime.now()
+        now = clock.now()
         record.status = 'cancelled'
         record.reason = 'discarded'
         record.cancelled_at = now

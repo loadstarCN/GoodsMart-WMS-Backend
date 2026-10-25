@@ -13,6 +13,7 @@ from warehouse.common import require_positive_int, require_bulk_list, delete_bat
 from warehouse.common.locks import lock_row
 from warehouse.common.batch_idempotency import parse_client_batch_id, find_batch, replay_or_conflict, insert_batch
 from warehouse.common.validation import require_active_task
+from warehouse.common import clock
 from warehouse.dn.services import DNService, pick_fields, parse_datetime_value
 from dateutil.relativedelta import relativedelta
 from sqlalchemy import and_, func, case, extract
@@ -180,7 +181,7 @@ class PackingTaskService:
                 PackingTaskService._assert_within_picked(task, {detail.goods_id: delta})
             detail.packed_quantity = new_quantity
         if data.get('packing_time') is not None:
-            detail.packing_time = parse_datetime_value(data['packing_time'], 'packing_time')
+            detail.packing_time = parse_datetime_value(data['packing_time'], 'packing_time', task.dn)
         # db.session.commit()
         return detail
 
@@ -250,14 +251,15 @@ class PackingTaskService:
         return [(d.goods_id, d.packed_quantity or 0) for d in batch.details]
 
     @staticmethod
-    def _parse_batch_details(data) -> list:
-        """明细字段逐条校验：goods_id 必填、packed_quantity 正整数（缺字段 400 而非 500）"""
+    def _parse_batch_details(data, where=None) -> list:
+        """明细字段逐条校验：goods_id 必填、packed_quantity 正整数（缺字段 400 而非 500）；
+        packing_time 不带时区的按 where（任务所属 DN 的仓库）的时区"""
         details_data = []
         for raw in require_bulk_list(data.get('details') or [], 'details', allow_empty=True):
             details_data.append({
                 'goods_id': require_positive_int(raw.get('goods_id'), 'goods_id', 16034),
                 'packed_quantity': require_positive_int(raw.get('packed_quantity'), 'packed_quantity'),
-                'packing_time': parse_datetime_value(raw.get('packing_time'), 'packing_time') or datetime.now(),
+                'packing_time': parse_datetime_value(raw.get('packing_time'), 'packing_time', where) or clock.now(),
             })
         return details_data
 
@@ -305,7 +307,7 @@ class PackingTaskService:
         client_batch_id = parse_client_batch_id(data)
         existing = find_batch(PackingBatch, 'packing_task_id', task.id, client_batch_id)
         if existing is not None:
-            incoming = PackingTaskService._incoming_rows(PackingTaskService._parse_batch_details(data))
+            incoming = PackingTaskService._incoming_rows(PackingTaskService._parse_batch_details(data, task.dn))
             return replay_or_conflict(existing, client_batch_id, PackingTaskService._batch_rows, incoming), False
 
         if task.status != 'in_progress':
@@ -313,10 +315,10 @@ class PackingTaskService:
 
         if not isinstance(data, dict):
             raise BadRequestException("Request body must be a JSON object", 16015)
-        op_time = parse_datetime_value(data.get('operation_time'), 'operation_time')
+        op_time = parse_datetime_value(data.get('operation_time'), 'operation_time', task.dn)
 
         # 1) 明细字段逐条校验
-        details_data = PackingTaskService._parse_batch_details(data)
+        details_data = PackingTaskService._parse_batch_details(data, task.dn)
 
         # 2) 权威校验：商品必须在 DN 明细内，累计已打包量（现有 + 本次）不得超过已拣量
         incoming_by_goods = {}
@@ -330,7 +332,7 @@ class PackingTaskService:
             packing_task_id=task.id,
             client_batch_id=client_batch_id,
             operator_id=operator_id,
-            operation_time=op_time or datetime.now(),
+            operation_time=op_time or clock.now(),
             remark=data.get('remark', '')
         )
         # flush 拿 new_batch.id；唯一约束兜底撞上时按已存在的批次重放 / 409
@@ -382,7 +384,7 @@ class PackingTaskService:
         data = pick_fields(data, ('operation_time', 'remark'))
 
         if data.get('operation_time') is not None:
-            batch.operation_time = parse_datetime_value(data['operation_time'], 'operation_time')
+            batch.operation_time = parse_datetime_value(data['operation_time'], 'operation_time', task.dn)
         if 'remark' in data:
             batch.remark = data['remark']
 
@@ -420,7 +422,7 @@ class PackingTaskService:
             raise BadRequestException(f"Invalid status value: {new_status}", 14007)
 
         old_status = task.status
-        now = datetime.now()
+        now = clock.now()
 
         task.status = new_status
         if old_status == 'pending' and new_status == 'in_progress':
@@ -516,7 +518,7 @@ class PackingTaskService:
             list: 符合前端图表要求的数据序列
         """
         # 计算时间范围
-        end_date = datetime.now()
+        end_date = clock.stats_now(filters)
         start_date = end_date - relativedelta(months=months-1)
         start_date = start_date.replace(day=1, hour=0, minute=0, second=0)
 
@@ -582,7 +584,7 @@ class PackingTaskService:
     @staticmethod
     def get_status_overview(filters=None):
         """获取各状态ASN在当前月、前一个月和去年同月的统计"""
-        now = datetime.now()
+        now = clock.stats_now(filters)
         current_year = now.year
         current_month = now.month
 

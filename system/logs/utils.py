@@ -1,5 +1,5 @@
 import json,os,uuid
-from datetime import datetime
+from extensions.db import utc_now
 from flask import request,g,current_app
 from flask_jwt_extended import verify_jwt_in_request, current_user,get_jwt_identity
 from extensions import db
@@ -84,7 +84,7 @@ def before_request_logging():
     if request.method not in ['POST', 'PUT', 'DELETE']:
         return  # 不记录非目标方法的请求
 
-    g.start_time = datetime.now()  # 记录请求开始时间
+    g.start_time = utc_now()  # 记录请求开始时间
     g.actor = "Unknown"  # 默认操作人员
 
     # 用户角色验证
@@ -110,8 +110,8 @@ def after_request_logging(response):
     if request.method not in ['POST', 'PUT', 'DELETE']:
         return response  # 不记录非目标方法的请求
 
-    start_time = g.get('start_time') or datetime.now()
-    processing_time_ms = (datetime.now() - start_time).total_seconds() * 1000  # 保留小数部分
+    start_time = g.get('start_time') or utc_now()
+    processing_time_ms = (utc_now() - start_time).total_seconds() * 1000  # 保留小数部分
 
     # 请求 / 响应体：敏感端点整体不记录；其余递归脱敏。任何一步失败都不影响主请求，
     # 也不能让这条操作在审计里消失，所以退化为记录 [redacted]。

@@ -6,12 +6,12 @@
 - 对象：DN 是 delivered、当前发货任务是 completed（有完成时刻）、承运商（当前发货任务的，没有用 DN 的）设了 auto_sign_days、
   这张 DN 的有效运单没有经 API 跟踪（warehouse/dn/tracking_services.py 的口径：承运商 tracking_method = api、插件
   supports_tracking、插件建的或插件 tracks_any_number），且完成时刻 + N 天 ≤ 现在。
-- 签收时刻 signed_at = 完成时刻 + N 天（不是跑任务的时刻）；signed_source = rule；操作人 = 运单的建单人，没有用 DN 的创建人。
+- 签收时刻 signed_at = 完成时刻 + N 天（仓库当地的日历日；不是跑任务的时刻）；signed_source = rule；操作人 = 运单的建单人，没有用 DN 的创建人。
 - 走手工签收同一个逻辑（DeliveryTaskService.sign_task：DN completed、推 dn.completed，signed_source = rule）。
 - 每张自己一个事务，一张失败不影响别的；任何时候都可以手工确认签收（填实际时刻）。
 """
 import logging
-from datetime import datetime, timedelta
+from datetime import timedelta, timezone
 
 from sqlalchemy import func
 
@@ -19,6 +19,7 @@ from extensions.db import db
 from extensions.transaction import transactional
 from warehouse.carrier.models import Carrier
 from warehouse.common.locks import lock_row
+from warehouse.common import clock
 from warehouse.delivery.models import DeliveryTask
 from warehouse.dn.models import DN
 
@@ -29,13 +30,15 @@ logger = logging.getLogger(__name__)
 
 SOURCE_RULE = 'rule'
 BATCH_LIMIT = 500           # 一轮最多处理这么多张（其余下一轮）
+DST_SLACK = timedelta(hours=3)
 
 
 def auto_sign_at(task, days):
-    """规则签收的时刻：完成发货时刻 + days 天；没有完成时刻 / 没设天数为 None"""
+    """规则签收的时刻：完成发货时刻 + days 天（按仓库当地的日历日加：跨夏令时切换也是当地的同一钟点；带时区的 UTC）；
+    没有完成时刻 / 没设天数为 None"""
     if task is None or task.completed_at is None or not days:
         return None
-    return task.completed_at + timedelta(days=int(days))
+    return (clock.to_local(task.completed_at, task) + timedelta(days=int(days))).astimezone(timezone.utc)
 
 
 def tracked_by_api(dn) -> bool:
@@ -66,14 +69,15 @@ class AutoSignService:
             .order_by(DeliveryTask.completed_at, DeliveryTask.id)
             .all()
         )
+        # 预筛按 24 小时 × N 天、留几小时余量（当地日历日跨夏令时差一小时），到期在 _sign 里按 auto_sign_at 精确判
         due = [(dn_id, task_id) for dn_id, task_id, completed_at, days in rows
-               if completed_at + timedelta(days=days) <= now]
+               if completed_at + timedelta(days=days) - DST_SLACK <= now]
         return due[:BATCH_LIMIT]
 
     @staticmethod
     def sync(now=None) -> dict:
         """一轮：到期的签收 → {signed, skipped, errors}（skipped = 有 API 跟踪 / 已不满足条件）"""
-        now = now or datetime.now()
+        now = now or clock.now()
         stats = {'signed': 0, 'skipped': 0, 'errors': 0}
         candidates = AutoSignService._candidates(now)
         db.session.rollback()

@@ -17,7 +17,7 @@ def test_staff_login_with_valid_company(client):
     with client.application.app_context():
         admin_user = get_company_admin_user()
         company = get_company()
-        company.expired_at = datetime.datetime.now() + timedelta(days=1)
+        company.expired_at = datetime.datetime.now(datetime.timezone.utc) + timedelta(days=1)
         db.session.add(company)
         db.session.commit()
 
@@ -52,7 +52,7 @@ def test_staff_login_with_expired_company(client):
 
         admin_user = get_company_admin_user()
         company = get_company()
-        company.expired_at = datetime.datetime.now() - timedelta(days=1)
+        company.expired_at = datetime.datetime.now(datetime.timezone.utc) - timedelta(days=1)
         db.session.add(company)
         db.session.commit()
 

@@ -3,7 +3,7 @@ from extensions.db import *
 from extensions.redis import redis_client
 from extensions.transaction import transactional
 from .models import IPBlacklist, IPWhitelist
-from datetime import datetime
+from extensions.db import utc_now
 
 
 def _sync_redis(set_name: str, ip_address: str, add: bool):
@@ -48,7 +48,7 @@ class LimiterService:
         ip_address = data['ip_address']
         reason = data.get('reason')
 
-        new_blacklist_item = IPBlacklist(ip_address=ip_address, reason=reason, timestamp=datetime.now())
+        new_blacklist_item = IPBlacklist(ip_address=ip_address, reason=reason, timestamp=utc_now())
         db.session.add(new_blacklist_item)
         _sync_redis('blacklist', ip_address, add=True)
 
@@ -93,7 +93,7 @@ class LimiterService:
         ip_address = data['ip_address']
         reason = data.get('reason')
 
-        new_whitelist_item = IPWhitelist(ip_address=ip_address, reason=reason, timestamp=datetime.now())
+        new_whitelist_item = IPWhitelist(ip_address=ip_address, reason=reason, timestamp=utc_now())
         db.session.add(new_whitelist_item)
         _sync_redis('whitelist', ip_address, add=True)
 

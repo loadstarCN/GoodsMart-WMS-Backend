@@ -28,7 +28,7 @@ def _domestic(client, token, order_number='ORD-SRC-1'):
         db.session.get(DN, dn_id).api_key_id = key_id
         task = db.session.get(DeliveryTask, task_id)
         task.carrier_id = get_carrier().id
-        task.expected_shipping_date = (datetime.now() - timedelta(days=3)).date()
+        task.expected_shipping_date = (datetime.now(timezone.utc) - timedelta(days=3)).date()
         db.session.commit()
     return dn_id, task_id, key_id
 
@@ -40,7 +40,7 @@ def _payload(client, key_id, event_type):
 
 def test_complete_with_shipped_at_and_sources(client, access_token):
     dn_id, task_id, key_id = _domestic(client, access_token)
-    shipped = (datetime.now() - timedelta(days=1)).replace(microsecond=0)
+    shipped = (datetime.now(timezone.utc) - timedelta(days=1)).replace(microsecond=0)
     response = _ship(client, access_token, task_id, shipped_at=shipped.isoformat())
     assert response.status_code == 200, response.get_json()
     assert response.get_json()['completed_source'] == 'warehouse'
@@ -52,7 +52,7 @@ def test_complete_with_shipped_at_and_sources(client, access_token):
     delivered = _payload(client, key_id, 'dn.delivered')
     assert datetime.fromisoformat(delivered['shipped_at']) == shipped.astimezone()
 
-    signed = (datetime.now() - timedelta(hours=2)).replace(microsecond=0)
+    signed = (datetime.now(timezone.utc) - timedelta(hours=2)).replace(microsecond=0)
     response = client.put(f'/delivery/{task_id}/sign/', json={'signed_at': signed.isoformat()},
                           headers=_h(access_token))
     assert response.status_code == 200, response.get_json()
@@ -62,7 +62,7 @@ def test_complete_with_shipped_at_and_sources(client, access_token):
     assert datetime.fromisoformat(completed['signed_at']) == signed.astimezone()
 
 
-def test_shipped_at_with_offset_is_converted_to_local_time(client, access_token):
+def test_shipped_at_with_offset_is_stored_as_utc(client, access_token):
     _dn_id, task_id, _key = _domestic(client, access_token, 'ORD-SRC-2')
     moment = datetime(2026, 10, 1, 3, 0, tzinfo=timezone.utc)
     with client.application.app_context():
@@ -71,13 +71,13 @@ def test_shipped_at_with_offset_is_converted_to_local_time(client, access_token)
     response = _ship(client, access_token, task_id, shipped_at='2026-10-01T03:00:00Z')
     assert response.status_code == 200, response.get_json()
     with client.application.app_context():
-        assert db.session.get(DeliveryTask, task_id).completed_at == moment.astimezone().replace(tzinfo=None)
+        assert db.session.get(DeliveryTask, task_id).completed_at == moment      # 带时区的 UTC
 
 
 @pytest.mark.parametrize('value, code', [
     ('not a time', 16050),
     (12345, 16050),
-    ((datetime.now() + timedelta(days=1)).isoformat(), 16136),
+    ((datetime.now(timezone.utc) + timedelta(days=1)).isoformat(), 16136),
 ])
 def test_invalid_shipped_at(client, access_token, value, code):
     _dn_id, task_id, _key = _domestic(client, access_token, 'ORD-SRC-3')

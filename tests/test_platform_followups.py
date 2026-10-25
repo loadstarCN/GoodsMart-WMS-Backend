@@ -836,7 +836,7 @@ def test_document_and_shipment_carry_user_ref(client):
         dn = DN.query.first()
         doc = DNDocument(dn_id=dn.id, doc_type='commercial_invoice', version=1, document_number='CI-REF-1', status='issued',
                          sha256='0' * 64, size_bytes=1, file_name='ci.pdf', content=b'x', issued_by=admin.id,
-                         invoice_date=_date.today(), data_sha256='0' * 64)
+                         invoice_date=warehouse_today(), data_sha256='0' * 64)
         shipment = DNCarrierShipment(dn_id=dn.id, carrier='fedex', status='failed', created_by=admin.id)
         db.session.add_all([doc, shipment])
         db.session.flush()

@@ -89,6 +89,13 @@ sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 # 导入配置类
 from config import TestingConfig
 
+def warehouse_today():
+    """测试仓库当地的今天：业务日期（计划 / 实际发货日、单证日期……）按仓库时区算（doc/timezone-utc.md）。测试仓库没设时区，
+    用默认时区（WMS_DEFAULT_TIMEZONE → WMS_TIMEZONE → UTC）。不用 date.today()（那是本机时区）"""
+    from warehouse.common import clock
+    return clock.local_today()
+
+
 # 测试用 API Key 明文（helpers 里以哈希落库）
 TEST_API_KEY_PLAIN = 'test-plain-api-key-0000000000000000000000000000'
 
@@ -758,7 +765,7 @@ def init_test_data(app):
             method='GET',
             status_code=200,
             ip_address='127.0.0.1',
-            created_at=datetime.datetime.now()
+            created_at=datetime.datetime.now(datetime.timezone.utc)
         )
         db.session.add(log1)
         db.session.commit()

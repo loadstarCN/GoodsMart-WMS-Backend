@@ -1,5 +1,6 @@
 from extensions.db import *
 from sqlalchemy.ext.hybrid import hybrid_property
+from extensions.db import UTCDateTime
 
 class Location(db.Model):
     """仓库库位信息表
@@ -79,12 +80,12 @@ class Location(db.Model):
         info={'description': '创建人ID'}
     )
     created_at = db.Column(
-        db.DateTime, 
+        UTCDateTime, 
         default=db.func.now(),
         info={'description': '创建时间（自动记录）'}
     )
     updated_at = db.Column(
-        db.DateTime, 
+        UTCDateTime, 
         default=db.func.now(),
         onupdate=db.func.now(),
         info={'description': '最后更新时间（自动更新）'}

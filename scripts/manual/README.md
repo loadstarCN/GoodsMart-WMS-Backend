@@ -7,3 +7,9 @@
 
 它们此前放在仓库根目录、文件名以 `test_` 开头，容易被当成 pytest 用例误跑。现在移到这里，且不在 `tests/` 目录下，`pytest tests/` 不会收集到。
 运行前请确认 `FLASK_ENV` 指向的是你想操作的环境。
+
+一次性维护命令（只经手动 GitHub Actions 工作流运行，见各自的文档）：
+
+- `migrate_jst.py`：上海时间 → 日本时间的历史数据迁移（已执行，`doc/timezone-jst.md`）。
+- `migrate_utc.py`：时刻列 `timestamp` → `timestamptz`（工作流 `Migrate WMS Time to UTC`，`--dry-run` / `--apply`，
+  `doc/timezone-utc.md` §5）。自建实例用 `flask wms convert-utc`。

@@ -13,6 +13,11 @@ from .stage import STAGES as INBOUND_STAGES, inbound_stage_of
 # -----------------------------
 # 初始化 ASN 命名空间
 # -----------------------------
+def _document_timezone(document):
+    from warehouse.common.clock import warehouse_timezone_name
+    return warehouse_timezone_name(document)
+
+
 api_ns = Namespace('asn', description='ASN operations', authorizations=authorizations)
 user_model = api_ns.model('User', original_user_model)
 
@@ -147,6 +152,11 @@ asn_full_fields.update({
     'supplier': fields.Nested(supplier_model, readOnly=True, description='Details of the associated supplier'),
     'carrier': fields.Nested(carrier_model, readOnly=True, description='Details of the associated carrier'),
     'warehouse': fields.Nested(warehouse_model, readOnly=True, description='Details of the associated warehouse'),
+    # 单据所属仓库的生效时区（doc/timezone-utc.md §3）：界面按它显示本单的时刻、解释输入的时刻
+    'timezone': fields.String(
+        readOnly=True, attribute=lambda x: _document_timezone(x),
+        description='Effective IANA time zone of the ASN warehouse; times are shown and naive input times are read '
+                    'in this zone'),
     'details': fields.List(fields.Nested(asn_detail_model), description='List of ASN details')
 })
 

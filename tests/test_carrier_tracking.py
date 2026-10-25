@@ -34,7 +34,7 @@ IT = {'date': '2026-10-23T09:00:00+09:00', 'derivedStatusCode': 'IT', 'eventType
                                                          'countryCode': 'US'}}
 DL = {'date': '2026-10-25T14:00:00+02:00', 'derivedStatusCode': 'DL', 'eventType': 'DL',
       'eventDescription': 'Delivered', 'scanLocation': {'city': 'BERLIN', 'countryCode': 'DE'}}
-CREATED_AT = datetime(2026, 10, 21, 15, 0, 0)        # 运单记录的建单时刻（服务器本地时间）
+CREATED_AT = datetime(2026, 10, 21, 15, 0, 0, tzinfo=timezone.utc)      # 运单记录的建单时刻
 TEXT = {'OC': 'Label created', 'PU': 'Picked up', 'IT': 'In transit', 'DL': 'Delivered', 'DE': 'Delivery exception'}
 
 
@@ -81,8 +81,8 @@ def _state(client, dn_id, task_id):
 
 
 def _local(iso):
-    """承运商的时刻 → 服务器本地时间（naive，WMS 时间列的口径）"""
-    return datetime.fromisoformat(iso).astimezone().replace(tzinfo=None)
+    """承运商的时刻 → 带时区的 UTC（WMS 时刻的口径，doc/timezone-utc.md）"""
+    return datetime.fromisoformat(iso).astimezone(timezone.utc)
 
 
 def _events(client, key_id):
@@ -182,8 +182,8 @@ def test_delivered_on_packed_dn_ships_then_signs(client, access_token, fedex):
     assert (stats['shipped'], stats['signed']) == (1, 1)
     state = _state(client, dn_id, task_id)
     assert (state['dn'], state['task']) == ('completed', 'signed')
-    # 12:00 UTC → 服务器本地时间（与 datetime.now() 同一口径）
-    assert state['signed_at'] == datetime(2026, 10, 25, 12, 0, tzinfo=timezone.utc).astimezone().replace(tzinfo=None)
+    # 承运商的送达时刻（12:00 UTC），带时区的 UTC
+    assert state['signed_at'] == datetime(2026, 10, 25, 12, 0, tzinfo=timezone.utc)
     assert state['tracking']['delivered_at'] == '2026-10-25T12:00:00+00:00'
     events = _events(client, key_id)
     assert [e[0] for e in events] == ['dn.delivered', 'dn.completed', 'dn.tracking_updated']
@@ -213,7 +213,7 @@ def test_blocked_shipping_is_recorded_then_retried(client, access_token, fedex):
     """计划发货日在后：自动发货做不成（16061）→ tracking_problem；改好后下一轮做成并清空"""
     dn_id, task_id, key_id = _shipped_ready(client, access_token, fedex)
     with client.application.app_context():
-        db.session.get(DeliveryTask, task_id).expected_shipping_date = date.today() + timedelta(days=3)
+        db.session.get(DeliveryTask, task_id).expected_shipping_date = warehouse_today() + timedelta(days=3)
         db.session.commit()
     fedex.set(TRACK, (200, _track_body('PU', [OC, PU])))
 
@@ -386,13 +386,13 @@ def test_cancelled_or_fresher_record_is_not_overwritten(client, access_token, fe
     result = {'status': TRACK_IN_TRANSIT, 'code': 'IT', 'events': []}
     with client.application.app_context():
         record = db.session.get(DNCarrierShipment, record_id)
-        record.tracking_synced_at = datetime.now()
+        record.tracking_synced_at = datetime.now(timezone.utc)
         db.session.commit()
-        assert CarrierTrackingService._save(record_id, AWB, result, None, datetime.now() - timedelta(minutes=1)) is False
+        assert CarrierTrackingService._save(record_id, AWB, result, None, datetime.now(timezone.utc) - timedelta(minutes=1)) is False
         record = db.session.get(DNCarrierShipment, record_id)
         record.status = 'cancelled'
         db.session.commit()
-        assert CarrierTrackingService._save(record_id, AWB, result, None, datetime.now()) is False
+        assert CarrierTrackingService._save(record_id, AWB, result, None, datetime.now(timezone.utc)) is False
         assert db.session.get(DNCarrierShipment, record_id).tracking_status is None
     assert _events(client, key_id) == []
 

@@ -15,7 +15,7 @@ import base64
 import hashlib
 import io
 import json
-from datetime import datetime as _datetime, timedelta as _timedelta
+from datetime import datetime as _datetime, timedelta as _timedelta, timezone as _timezone
 from decimal import Decimal
 from http.client import RemoteDisconnected
 from urllib.parse import urlparse
@@ -1115,7 +1115,7 @@ def test_dismiss_unknown_record(client, access_token, fedex):
 def test_stale_pending_becomes_dismissable(client, access_token, fedex):
     dn_id, task_id = _ready(client, access_token)
     with client.application.app_context():
-        now = _datetime.now()
+        now = _datetime.now(_timezone.utc)
         record = DNCarrierShipment(dn_id=dn_id, carrier='fedex', status='pending', sender_country='JP',
                                    created_at=now, updated_at=now)
         db.session.add(record)
@@ -1124,7 +1124,7 @@ def test_stale_pending_becomes_dismissable(client, access_token, fedex):
 
     def set_age(seconds):
         with client.application.app_context():
-            db.session.get(DNCarrierShipment, record_id).created_at = _datetime.now() - _timedelta(seconds=seconds)
+            db.session.get(DNCarrierShipment, record_id).created_at = _datetime.now(_timezone.utc) - _timedelta(seconds=seconds)
             db.session.commit()
 
     # 进行中：不能建单、不能确认作废、不能存运单号

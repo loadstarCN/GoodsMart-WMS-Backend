@@ -9,7 +9,7 @@ from .test_carrier_shipment import (  # noqa: F401
 )
 from .test_customs import PACKAGES, _create_dn, _force_packed, _h, _prepare, _ship
 
-from datetime import datetime as _datetime, timedelta as _timedelta
+from datetime import datetime as _datetime, timedelta as _timedelta, timezone as _timezone
 
 import requests
 
@@ -51,6 +51,7 @@ def pickup_fedex(client, fedex):
         warehouse = get_warehouse()
         warehouse.phone = '075-123-4567'
         warehouse.contact_name_en = 'Warehouse Staff'
+        warehouse.timezone = 'Asia/Tokyo'       # 京都仓：揽收的日期 / 时间按仓库时区（doc/timezone-utc.md）
         db.session.commit()
         _WAREHOUSE['id'] = warehouse.id
     return fedex
@@ -79,7 +80,7 @@ def _shipment(client, token, order_number=None, carrier_id=None):
 
 
 def local_today():
-    """仓库当地今天（DOCUMENT_TIMEZONE 默认 Asia/Tokyo）"""
+    """仓库当地今天（pickup_fedex 把测试仓库的时区设成 Asia/Tokyo）"""
     return _datetime.now(ZoneInfo('Asia/Tokyo')).date()
 
 
@@ -377,7 +378,7 @@ def test_stale_pending_is_unknown(client, access_token, pickup_fedex):
         record = CarrierPickup(warehouse_id=get_warehouse().id, carrier='fedex', carrier_id=get_carrier().id,
                                status='pending',
                                pickup_date=local_today(), ready_time='12:00', close_time='18:00', package_count=2,
-                               total_weight_kg=6.5, created_at=_datetime.now() - _timedelta(hours=1))
+                               total_weight_kg=6.5, created_at=_datetime.now(_timezone.utc) - _timedelta(hours=1))
         db.session.add(record)
         db.session.flush()
         db.session.get(DNCarrierShipment, shipment_id).pickup_id = record.id

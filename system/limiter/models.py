@@ -1,5 +1,5 @@
 from extensions import db
-from datetime import datetime
+from extensions.db import UTCDateTime
 
 class IPBlacklist(db.Model):
     """IP黑名单表"""
@@ -19,7 +19,7 @@ class IPBlacklist(db.Model):
     )
     reason = db.Column(db.String(255))
     timestamp = db.Column(
-        db.DateTime, 
+        UTCDateTime, 
         default=db.func.now(),
         index=True,
         info={'description': '创建时间'}
@@ -57,7 +57,7 @@ class IPWhitelist(db.Model):
     )
     reason = db.Column(db.String(255))
     timestamp = db.Column(
-        db.DateTime, 
+        UTCDateTime, 
         default=db.func.now(),
         index=True,
         info={'description': '创建时间'}

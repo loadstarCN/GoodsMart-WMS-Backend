@@ -109,7 +109,7 @@ def _picked_dn(client, token, w, lines, picks):
     """建 DN → 开始 → 拣货完成，返回 (dn_id, packing_task_id)。picks: [(goods_id, location_id, qty)]"""
     dn_id = _ok(client.post('/dn/', json={
         'warehouse_id': w['wh'], 'recipient_id': w['recipient'], 'shipping_address': 'x',
-        'expected_shipping_date': date.today().isoformat(),
+        'expected_shipping_date': warehouse_today().isoformat(),
         'details': [{'goods_id': g, 'quantity': q} for g, q in lines],
     }, headers=_h(token)))['id']
     _ok(client.put(f'/dn/{dn_id}/progress/', headers=_h(token)))

@@ -1,4 +1,7 @@
+from datetime import timezone
+
 from extensions.db import *
+from extensions.db import UTCDateTime
 
 class ASN(db.Model):
     """到货通知单主表
@@ -95,29 +98,29 @@ class ASN(db.Model):
         info={'description': '创建来源 API Key ID（用于定向 Webhook 推送）'}
     )
     created_at = db.Column(
-        db.DateTime,
+        UTCDateTime,
         default=db.func.now(),
         info={'description': '创建时间'}
     )
     updated_at = db.Column(
-        db.DateTime,
+        UTCDateTime,
         default=db.func.now(),
         onupdate=db.func.now(),
         index=True,  # 时间字段索引
         info={'description': '最后更新时间'}
     )
     received_at = db.Column(
-        db.DateTime,
+        UTCDateTime,
         nullable=True,
         info={'description': '收货完成时间'}
     )
     completed_at = db.Column(
-        db.DateTime,
+        UTCDateTime,
         nullable=True,
         info={'description': '流程完成时间'}
     )
     closed_at = db.Column(
-        db.DateTime,
+        UTCDateTime,
         nullable=True,
         info={'description': '单据关闭时间'}
     )
@@ -136,7 +139,7 @@ class ASN(db.Model):
                              'error}'}
     )
     tracking_synced_at = db.Column(
-        db.DateTime,
+        UTCDateTime,
         nullable=True,
         info={'description': '最近一次查询跟踪的时刻'}
     )
@@ -156,8 +159,8 @@ class ASN(db.Model):
             'estimated_delivery': detail.get('estimated_delivery'),
             'events': detail.get('events') or [],
             'error': detail.get('error'),
-            # 带时区偏移（同 warehouse.dn.services.event_time）
-            'synced_at': (self.tracking_synced_at.astimezone().isoformat(timespec='seconds')
+            # 接口输出的时刻一律 UTC（+00:00，doc/timezone-utc.md §3）
+            'synced_at': (self.tracking_synced_at.astimezone(timezone.utc).isoformat(timespec='seconds')
                           if self.tracking_synced_at else None),
             'problem': None,
         }
@@ -280,12 +283,12 @@ class ASNDetail(db.Model):
         info={'description': '创建人ID'}
     )
     create_time = db.Column(
-        db.DateTime,
+        UTCDateTime,
         default=db.func.now(),
         info={'description': '创建时间'}
     )
     update_time = db.Column(
-        db.DateTime,
+        UTCDateTime,
         default=db.func.now(),
         onupdate=db.func.now(),
         info={'description': '最后更新时间'}

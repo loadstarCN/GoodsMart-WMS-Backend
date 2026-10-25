@@ -1,5 +1,8 @@
 # WMS 日本时间迁移（一次性）
 
+> 后续：时刻改为带时区（UTC）存储、按仓库时区显示，见 `doc/timezone-utc.md`；本次之后 `WMS_TIMEZONE` 表示旧数据的
+> 墙上时间口径与默认时区，不再限定 `Asia/Tokyo`。
+
 WMS 的仓库现场和管理端均在日本。当前生产 PostgreSQL 会话是 `Asia/Shanghai`；后端
 `datetime.now()` 与数据库 `now()` 写入的是同一套上海墙上时间。数据库字段大多是
 `timestamp without time zone`，因此仅改服务器时区会让历史记录与新记录相差一小时。

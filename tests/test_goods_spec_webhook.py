@@ -13,7 +13,7 @@ import hmac
 import io
 import json
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from unittest import mock
 
 import pytest
@@ -499,7 +499,7 @@ def test_failed_pending_event_is_superseded_not_overwritten(client, company_ids)
         emit_company_event(EVENT, {'n': 1, 'changed_fields': ['a']}, company_ids[0], dedupe_key='goods:1')
         db.session.commit()
         event = _events(key_id)[0]
-        retry_at = datetime.now() + timedelta(minutes=30)
+        retry_at = datetime.now(timezone.utc) + timedelta(minutes=30)
         event.attempts = 9
         event.next_retry_at = retry_at
         db.session.commit()

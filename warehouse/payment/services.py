@@ -7,9 +7,19 @@ from warehouse.dn.models import DN
 from warehouse.inventory.services import InventoryService
 from warehouse.common.locks import lock_row
 from warehouse.common.ownership import require_warehouse_scope
+from warehouse.common import clock
 from warehouse.warehouse.models import Warehouse
 from .models import Payment
 from datetime import datetime
+
+def _payment_time(value, delivery):
+    """用户填的支付时刻 → 带时区的 UTC：带偏移的按偏移，不带的按发货单所属仓库的时区（只给日期 = 当地 00:00）；
+    格式不对 400 16050"""
+    try:
+        return clock.parse_input_datetime(value, delivery)
+    except ValueError:
+        raise BadRequestException("payment_time must be an ISO 8601 datetime", 16050, field='payment_time')
+
 
 class PaymentService:
 
@@ -106,7 +116,7 @@ class PaymentService:
             payment_method=data['payment_method'],
             status='pending',
             carrier_id=carrier.id,
-            payment_time=data.get('payment_time'),
+            payment_time=_payment_time(data.get('payment_time'), delivery),
             remark=data.get('remark'),
             is_active=data.get('is_active', True),
             created_by=created_by_id
@@ -135,7 +145,8 @@ class PaymentService:
         payment.payment_method = data.get('payment_method', payment.payment_method)
         payment.amount = data.get('amount', payment.amount)
         payment.currency = data.get('currency', payment.currency)
-        payment.payment_time = data.get('payment_time', payment.payment_time)
+        if 'payment_time' in data:
+            payment.payment_time = _payment_time(data['payment_time'], payment.delivery)
         payment.remark = data.get('remark', payment.remark)
         payment.is_active = data.get('is_active', payment.is_active)
 
@@ -172,7 +183,7 @@ class PaymentService:
             raise BadRequestException("Cannot process a non-pending Payment", 16007)
 
         payment.status = 'paid'
-        payment.payment_time = datetime.now()
+        payment.payment_time = clock.now()
         # db.session.commit()
         return payment
 

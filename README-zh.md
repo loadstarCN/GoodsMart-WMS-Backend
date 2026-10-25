@@ -123,8 +123,9 @@ GoodsMart-WMS-Backend/
 ├── app.py                     # 应用入口
 ├── config.py                  # 多环境配置
 ├── seed_permissions.py        # 权限数据初始化脚本
+├── timezone_conversion.py     # 时刻列 timestamp → timestamptz 的转换（flask wms convert-utc，见「时区」）
 ├── extensions/                # Flask 扩展
-│   ├── db.py                  # SQLAlchemy 数据库
+│   ├── db.py                  # SQLAlchemy 数据库、UTCDateTime（时刻列，UTC）
 │   ├── jwt.py                 # JWT 认证
 │   ├── redis.py               # Redis 客户端
 │   ├── cache.py               # 缓存层
@@ -143,7 +144,8 @@ GoodsMart-WMS-Backend/
 │   ├── company/               # 租户/公司管理
 │   ├── staff/                 # 员工管理
 │   ├── department/            # 部门管理
-│   ├── warehouse/             # 仓库管理
+│   ├── warehouse/             # 仓库管理（含仓库时区）
+│   ├── common/                # 共用工具（clock.py：当前时刻、仓库时区、当地日期）
 │   ├── location/              # 库位管理
 │   ├── goods/                 # 商品管理
 │   ├── inventory/             # 库存管理
@@ -481,7 +483,7 @@ DN 须为 `picked` 或 `packed`（否则 409 `16067`）；箱子归发货，国�
 
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
-| `DOCUMENT_TIMEZONE` | `Asia/Tokyo` | 单证日期所用时区 |
+| `DOCUMENT_TIMEZONE` | （不设） | `WMS_DEFAULT_TIMEZONE` 的旧名（它没设时读取）。单证日期是 DN 仓库当地的日期，见「时区」 |
 | `CUSTOMS_SIGNATURE_COMPANY_ID`、`CUSTOMS_SIGNATURE_FROM_DN_ID`、`CUSTOMS_SIGNATURE_SIGNATORY_NAME`、`CUSTOMS_SIGNATURE_SIGNATORY_TITLE`、`CUSTOMS_SIGNATURE_PATH` | （不设） | 可选的出口公司 ID、首个启用签名的 DN ID、签署人姓名和职务，以及授权签名 PNG 的绝对路径；五项须同时配置。图片须保存在源码目录之外、仅后端进程可读。较早的 DN 维持原签署人和未签名 CI；启用后的 DN 更换签名图片会使已签发单证显示为过期。 |
 | `CUSTOMS_PDF_FONT_PATH` | （不设） | 单证用的 TrueType 字体（`.ttf`，或 `.ttc` 的第 1 个字体；不支持 CFF 轮廓的 OTF，如 Noto Sans CJK）。设了就用它印全部文字，字体子集嵌入 PDF；要让收件人的日文等也嵌入，选带这些字形的字体（如 IPAexGothic）。字体里没有的字符、以及不设时 Helvetica 印不出的字符，退回 reportlab 内置的日文 CID 字体（不嵌入，依赖阅读器的字体） |
 
@@ -627,7 +629,8 @@ DN 须为 `picked` 或 `packed`（否则 409 `16067`）；箱子归发货，国�
 - `steps[].at`：这一步实际发生的时刻（ISO 8601，带时区偏移）；`source`：`warehouse` / `carrier` / `rule` / `api`（下单来自来源系统；
   `waybill` / `pickup` 步骤为经承运商插件建的运单 / 约的揽收）/ `system`。
 - 各步骤的 `summary`：`ordered` {order_number, dn_type, expected_shipping_date}；`picking` {task_ids, picked, planned}；
-  `packing` {task_ids, packed, planned, package_count, gross_weight_kg, packages[]}；`documents` {required, customs, version,
+  `packing` {task_ids, packed, planned, package_count, gross_weight_kg, packages[], packages_required}（要录箱子 —— 打包完
+  没录时提示 `PACKAGES_MISSING` —— 的是要报关的件、`api` 运单、文件模板有不带 `|default` 的 `{package.*}` 列的；国内手工运单不要）；`documents` {required, customs, version,
   outdated, missing[], ready, documents[]（当前单证的元数据）}；`waybill` {method, tracking_number, source, service, service_name,
   label_document_id, label_download_path, shipment（同 `carrier-shipment.shipment`，没有当前运单时为最近一张已取消的插件运单）,
   unresolved, can_create, blockers[]}；`pickup` {method, pickup（揽收记录或 null）, contact, schedule}；`handover`
@@ -735,7 +738,7 @@ service_options, account_fields, missing_account_fields, can_import, tracking_ur
 ```json
 { "dry_run": true, "file_name": "b2.csv", "encoding": "cp932", "batch_id": null,
   "rows": [{"line": 2, "reference": "DN163", "dn_id": 163, "order_number": "SHP-1", "tracking_numbers": ["401234567890"],
-            "result": "matched", "message": null, "primary": true}, "..."],
+            "result": "matched", "reason_code": null, "message": null, "primary": true}, "..."],
   "summary": {"matched": 2, "not_found": 1, "already_has_number": 0, "same_number": 0, "invalid": 0, "skipped": 0,
               "dns": {"matched": 1, "not_found": 1, "already_has_number": 0, "same_number": 0, "invalid": 0}} }
 ```
@@ -747,6 +750,12 @@ service_options, account_fields, missing_account_fields, can_import, tracking_ur
 - `result`：`matched`（会写入 / 已写入）、`not_found`（本公司 / 本仓库没有这张 DN，或匹配键不是 `DN<id>`）、`already_has_number`
   （DN 已有不同的运单号，需人工决定）、`same_number`（已导入过，忽略）、`invalid`（没有运单号、DN 已关闭、承运商不同、插件运单
   结果不明、号码已属于别的 DN、没有未完成的发货任务、没导出过就已发货）。
+- 除 `matched` 外每行带 `reason_code` 与英文 `message`（兜底），界面按 `reason_code` 出本地化文字：`not_found` → `DN_NOT_FOUND` /
+  `NOT_WMS_REFERENCE` / `NO_REFERENCE`；`invalid` → `NO_TRACKING_NUMBER` / `DN_CLOSED` / `OTHER_CARRIER` /
+  `NUMBER_OWNED_BY_OTHER_DN` / `API_SHIPMENT_UNRESOLVED` / `EXPORTED_FOR_OTHER_CARRIER` / `SHIPPED_WITHOUT_FILE_WAYBILL` /
+  `NO_OPEN_TASK`；`same_number` → `ALREADY_IMPORTED` / `ALREADY_SAVED`；`already_has_number` → `HAS_OTHER_NUMBER`。拼文字用的
+  字段（有才给）：`existing_tracking_number`（DN 已有的 / 已属于别的 DN 的号码）、`other_carrier` / `other_carrier_id`、
+  `other_dn_id`、`shipment_status`。
 - `dry_run: false`：逐张 DN 加锁后重新判断，在一个事务里写入 `matched` 的：`exported` 记录 → `active`（没导出过的 DN 直接建
   `file` 运单），主单号写到发货任务上（任务没有承运商时一并设上）——与保存运单号同一套逻辑，跟踪（`tracks_any_number`）、
   揽收、流程都与其它运单一样。记一个导入批次（`batch_id`）。
@@ -1225,7 +1234,7 @@ python scripts/fedex_sandbox_smoke.py [--label-format A4|THERMAL|both] [--packag
   `CARRIER_NOT_INTEGRATED` / `PICKUP_NOT_SUPPORTED` / 与自动运单相同的
   对接问题（`CARRIER_INTEGRATION_DISABLED`、`CARRIER_NOT_CONFIGURED` 等）/ `PICKUP_ADDRESS_MISSING` / `PICKUP_ADDRESS_INVALID` /
   `PICKUP_PHONE_INVALID`。
-- **时间**：日期 / 时间都是仓库当地的（`DOCUMENT_TIMEZONE`，默认 `Asia/Tokyo`）。FedEx：`readyDateTimestamp` 带时区偏移
+- **时间**：日期 / 时间都是仓库当地的（仓库时区，见「时区」）。FedEx：`readyDateTimestamp` 带时区偏移
   （`2026-10-22T12:00:00+09:00`，FedEx 示例集里日本的写法），`customerCloseTime` 为当地 `HH:MM:SS`；揽收日是今天时
   `pickupDateType` = `SAME_DAY`，否则 `FUTURE_DAY`。承运商返回的截止时间（准备好时间不能更晚）与最短间隔由前端用来限制下拉选项，
   后端只校验先后、日期范围（今天起 30 天内）与插件的留言长度（`max_remarks`），其余由承运商判断。
@@ -1289,6 +1298,61 @@ Track API，FedEx 开发者项目里要开通 Track API）。实现在 `warehous
 
 账号、密钥、服务等按承运商存在对接设置里，不用环境变量；密钥用 `SETTINGS_ENCRYPTION_KEY` 加密（生产环境必须设置，见「快速开始」）。
 
+## 时区
+
+WMS 不假设所有仓库在同一个时区（设计见 `doc/timezone-utc.md`）。
+
+- **存储**：时刻一律存 `timestamptz`（UTC）。模型用 `extensions/db.py` 的 `UTCDateTime`，Python 里拿到的都是带时区的 UTC
+  `datetime`；当前时刻用 `warehouse/common/clock.now()`。只有日期的字段（计划 / 实际发货日、单证日期、揽收日……）保持
+  `date`，表示**仓库当地**的日期。
+- **仓库时区**：`warehouses.timezone`——IANA 名，如 `Asia/Tokyo`、`America/Los_Angeles`，可空，新建 / 编辑仓库时设置
+  （`"timezone": null` 或 `""` = 用默认；不合法 → 400 `14022`，`field: timezone`）。生效时区 = 仓库的 → `WMS_DEFAULT_TIMEZONE`
+  → `WMS_TIMEZONE` → `UTC`。业务日期都按它：实际发货日、单证日期、运单发货日与文件导出的发货日、揽收的「今天」、
+  「预计到货日已过」、自动视为签收的 N 天（当地日历日）。不带偏移的输入时刻（`shipped_at`、`signed_at`、作业时间、
+  `payment_time`、`scheduled_date`、列表的时间筛选……）按单据所属仓库的时区解释；只给日期的按当地 00:00（PDA 签收）。
+- **接口输出**：所有时刻字段都是带偏移的 ISO 8601（UTC，`2026-10-25T01:02:03+00:00`）；日期字段仍是 `YYYY-MM-DD`。
+  仓库对象（包括嵌在单据、任务、员工里的）带 `timezone`（生效值）；仓库列表 / 详情另带 `timezone_configured`（仓库自己设的；
+  用默认时为 `null`，列表行里省略）。DN、ASN 详情和它们的流程接口（`GET /dn/<id>/shipping-flow`、`GET /asn/<id>/flow`）带
+  顶层 `timezone`（单据所属仓库的）；列表行保留 `warehouse_id`。揽收（`GET /dn/carrier-pickups`、可约时间）返回该仓库的
+  `today` / `timezone`。
+- **Webhook**：`dn.*` 里的时刻（`started_at`、`picked_at`、`packed_at`、`shipped_at`、`signed_at`）是同一时刻、用 DN 仓库时区的
+  偏移表示（`2026-10-23T13:03:00+09:00`）；`goods.spec_updated` 的 `changed_at` 用默认时区。接收方照常解析。
+- 月度统计的「本月」按所筛仓库（没筛按默认）的时区；数据库按会话时区分月（PostgreSQL 为 `WMS_LEGACY_TIMEZONE`，SQLite 为 UTC）。
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `WMS_TIMEZONE` | （不设） | 旧版本写入数据的墙上时间口径，兼默认时区。任意 IANA 名（不合法拒绝启动）。也设成进程时区 `TZ`（日志时间、库存快照的 `SNAPSHOT_HOUR`） |
+| `WMS_DEFAULT_TIMEZONE` | `WMS_TIMEZONE`，再没有为 `UTC` | 没设时区的仓库用的时区。没设它时仍读旧名 `DOCUMENT_TIMEZONE`（原来的 `Asia/Tokyo` 默认值取消） |
+| `WMS_LEGACY_TIMEZONE` | `WMS_TIMEZONE`，再没有为 `UTC` | 还没转换的 `timestamp` 列里旧数据的墙上时间。PostgreSQL 连接的会话时区设成它，代码在转换前后都能正确工作 |
+
+### 已有实例的升级
+
+旧版本在 `timestamp without time zone` 列里存服务器的墙上时间。新代码按 `WMS_LEGACY_TIMEZONE` 解释它们，所以在一次性转换成
+`timestamptz` 之前、之后都能正确工作：
+
+1. 启动新版本**之前**把 `WMS_LEGACY_TIMEZONE`（或 `WMS_TIMEZONE`）设成旧数据写入时的时区——旧版本服务器 / `TZ` 的时区，
+   如 `Asia/Shanghai`。按需设 `WMS_DEFAULT_TIMEZONE` 和各仓库的时区。
+2. 部署、`flask db upgrade`（加 `warehouses.timezone`）、重启。
+3. 备份数据库（`pg_dump -Fc`），最好先停应用，再转换：
+
+   ```bash
+   flask wms convert-utc --legacy-tz Asia/Shanghai           # 只列出要转换的列和 SQL
+   flask wms convert-utc --legacy-tz Asia/Shanghai --apply   # 一个事务里执行；会要求确认（--yes 跳过）
+   ```
+
+   `public` 下所有 `timestamp without time zone` 列（不含 `alembic_version`）按 `USING col AT TIME ZONE '<旧口径时区>'`
+   改为 `timestamptz`，每张表一条 `ALTER TABLE`；`wms_timezone_migrations` 里记一行，防止重复执行。任何一步出错整体回滚。
+4. 再启动应用。
+
+新装的实例由模型建表，本来就是 `timestamptz`，不需要转换；SQLite 存的就是 UTC。以后的迁移里时间列一律写
+`sa.DateTime(timezone=True)`（autogenerate 会把 `UTCDateTime` 写成这样）。
+
+生产用手动工作流 **Migrate WMS Time to UTC**（`.github/workflows/migrate-utc.yml` → `scripts/manual/migrate_utc.py`，与部署共用
+`deploy-backend` 并发组）转换。不勾选 `apply` 只做检查（服务器提交、`/health`、迁移已到代码的最新版本、应用的旧口径时区与
+`.env` 一致、要转换的列）并打印 SQL；勾选 `apply` 才停 `wms-api`、把校验过的 `pg_dump -Fc` 备份写到 `/var/www/wms-backups`
+（0600，SHA-256 写进日志）、一个事务里转换、重启并探测 `/health`。提交前失败什么都没改；提交后不会自动回退（代码在转换后的
+结构上照常工作），看工作流日志、`pm2 logs wms-api` 和备份再处理。
+
 ## 部署
 
 ### 生产自动部署（GitHub Actions）
@@ -1333,7 +1397,7 @@ stdout_logfile=/var/log/wms-api.out.log
 | 库存错误 | 15000-15999 | 400 | 库存相关错误 |
 | 状态错误 | 16000-16999 | 400 | 状态流转错误 |
 
-出口单证相关业务码：`14019` 出口资料文本超长、`14020` 国家代码不合法、`16063` 报关结构不合法、`16064` 报关行商品编码不在 DN 明细或重复、`16065` 已发货不可改（409）、`16066` 箱子数据不合法、`16067` 当前状态不能改箱子（409）、`16068` 单证条件不全（409，`details.problems`）、`16070` 不是海外单（409）、`16071` 单证不存在（404）、`16117` 单证排不下——某块文字（通常是收件人信息）一页放不下，请缩短（409，`details {document, reason: LAYOUT_OVERFLOW}`）。承运商运单（自动建运单）：`16072` 建单 / 取消的前置条件不满足（409，`details.blockers`）、`16073` 承运商返回错误或结果不明（502，`details.errors` / `transaction_id` / `maybe_processed`）、`16074` 承运商超时或时间预算用完（504，`details.budget_exhausted`）、`16075` 没有可取消 / 可确认作废的运单记录（409，`details.unresolved`）、`16076` 有进行中 / 有效 / 结果不明 / 取消中的运单时不能改箱子或报关数据，也不能签发数据有变化的单证（409，`details {reason: CARRIER_SHIPMENT_OPEN | DOCUMENT_DATA_CHANGED, status, carrier, carrier_shipment {id, status, tracking_number}}`）、`16077` `label_format` 不合法或该承运商不支持（400）、`16078` 运单号 / 承运商与有效的自动运单不一致，或有自动运单时新建 / 删除发货任务（409）、`16079` 有结果不明 / 进行中的建单记录，或运单正在取消 / 取消结果不明——不能建单、存运单号、发货（409，`details.unresolved`）、`16093` 取消 / 确认作废请求里的目标与当前记录不符（409，`details {expected, actual}`）、`16094` 确认作废带运单号的记录时承运商没有确认已取消 / 不存在（409）、`16095` 承运商已建好运单但 WMS 写库失败，已补偿处理（502，`details {error, compensation, unresolved, …}`）。承运商在线对接：`16124` 对接设置不合法（400，`field`：`adapter` / `enabled` / `settings.<key>` / `secrets.<key>`）、`16125` 承运商还有未结束的自动运单，不能删除对接或换插件（409，`details.shipments`）。上门揽收：`16130` 前置条件不满足（409，`details.blockers`）、`16131` 预约参数不合法（400，`field`）、`16132` 所选运单不能预约（409，`details.shipments[{shipment_id, tracking_number, reason}]`）、`16133` 当前状态不能取消 / 作废（409，`details {pickup_id, status, reason, pickup_date}`）；跟踪：`16134` 没有能经 API 跟踪的有效运单（409）；承运商报错 / 超时同运单（`16073` / `16074`，`details.action` 为 `pickup` / `pickup_cancel` / `pickup_availability`）。已不再使用：`16069`（原：完成发货时单证缺失或已过期；完成发货不再查单证）；单证不再印运单号和承运商：`16080`（原：完成发货时运单号与 CI 上印的 AWB 不一致）、`16092`（原：完成发货时承运商与 CI 上印的不一致）。发货任务：`16090` DN 已有未完成的发货任务（409，`details {delivery_task_id, status}`）、`16091` 有报关快照或运单记录的 DN 不是当前发货任务（409，`details {delivery_task_id, current_status}`）、`16136` `shipped_at` 晚于现在（400，`field: shipped_at`；格式不对为 `16050`）。发货流程：`16135` 承运商对接方式 / 集荷安排 / 查询页 / `auto_sign_days` / 文件方式设置（`file_preset`、`file_template.<位置>`、`file_account.<key>`）不合法，或所选方式现在不可选（400，`field`）；文件方式：`16137` 有行有问题、整批不导出（409，`details.rows[{dn_id, order_number, problems[{column, code, message}]}]`）、`16138` 文件方式用不了：请求 / 导入文件不合法（400）或承运商不是文件方式 / 模板不全（409），带 `field`；`16139` 运单服务选项不合法（400，`field: options.<key>`）；`16076` 另有 `details.reason: SHIPPING_OPTIONS_LOCKED` / `SHIP_TO_LOCKED`，`16075` 另用于没有可作废的已导出文件运单（`details.waybill`）；结构化地址用 `14019`（不是文字 / 超长 / `zip_code` 与 `postal_code` 不同）与 `14020`（国家代码）；`16130` 另有 `PICKUP_METHOD_NOT_API`；`16131` 手工揽收另有 `field` `warehouse_id` / `confirmation_code`；建运单的 blocker `SCOPE_NOT_SUPPORTED` / `CUSTOMS_DATA_MISSING` / `CUSTOMS_NOT_SUPPORTED` / `WAYBILL_NOT_SUPPORTED` 取代 `NOT_EXPORT`。错误响应可能带结构化的 `details`。
+出口单证相关业务码：`14019` 出口资料文本超长、`14020` 国家代码不合法、`16063` 报关结构不合法、`16064` 报关行商品编码不在 DN 明细或重复、`16065` 已发货不可改（409）、`16066` 箱子数据不合法、`16067` 当前状态不能改箱子（409）、`16068` 单证条件不全（409，`details.problems`）、`16070` 不是海外单（409）、`16071` 单证不存在（404）、`16117` 单证排不下——某块文字（通常是收件人信息）一页放不下，请缩短（409，`details {document, reason: LAYOUT_OVERFLOW}`）。承运商运单（自动建运单）：`16072` 建单 / 取消的前置条件不满足（409，`details.blockers`）、`16073` 承运商返回错误或结果不明（502，`details.errors` / `transaction_id` / `maybe_processed`）、`16074` 承运商超时或时间预算用完（504，`details.budget_exhausted`）、`16075` 没有可取消 / 可确认作废的运单记录（409，`details.unresolved`）、`16076` 有进行中 / 有效 / 结果不明 / 取消中的运单时不能改箱子或报关数据，也不能签发数据有变化的单证（409，`details {reason: CARRIER_SHIPMENT_OPEN | DOCUMENT_DATA_CHANGED, status, carrier, carrier_shipment {id, status, tracking_number}}`）、`16077` `label_format` 不合法或该承运商不支持（400）、`16078` 运单号 / 承运商与有效的自动运单不一致，或有自动运单时新建 / 删除发货任务（409）、`16079` 有结果不明 / 进行中的建单记录，或运单正在取消 / 取消结果不明——不能建单、存运单号、发货（409，`details.unresolved`）、`16093` 取消 / 确认作废请求里的目标与当前记录不符（409，`details {expected, actual}`）、`16094` 确认作废带运单号的记录时承运商没有确认已取消 / 不存在（409）、`16095` 承运商已建好运单但 WMS 写库失败，已补偿处理（502，`details {error, compensation, unresolved, …}`）。承运商在线对接：`16124` 对接设置不合法（400，`field`：`adapter` / `enabled` / `settings.<key>` / `secrets.<key>`）、`16125` 承运商还有未结束的自动运单，不能删除对接或换插件（409，`details.shipments`）。上门揽收：`16130` 前置条件不满足（409，`details.blockers`）、`16131` 预约参数不合法（400，`field`）、`16132` 所选运单不能预约（409，`details.shipments[{shipment_id, tracking_number, reason}]`）、`16133` 当前状态不能取消 / 作废（409，`details {pickup_id, status, reason, pickup_date}`）；跟踪：`16134` 没有能经 API 跟踪的有效运单（409）；承运商报错 / 超时同运单（`16073` / `16074`，`details.action` 为 `pickup` / `pickup_cancel` / `pickup_availability`）。已不再使用：`16069`（原：完成发货时单证缺失或已过期；完成发货不再查单证）；单证不再印运单号和承运商：`16080`（原：完成发货时运单号与 CI 上印的 AWB 不一致）、`16092`（原：完成发货时承运商与 CI 上印的不一致）。发货任务：`16090` DN 已有未完成的发货任务（409，`details {delivery_task_id, status}`）、`16091` 有报关快照或运单记录的 DN 不是当前发货任务（409，`details {delivery_task_id, current_status}`）、`16136` `shipped_at` 晚于现在（400，`field: shipped_at`；格式不对为 `16050`）。发货流程：`16135` 承运商对接方式 / 集荷安排 / 查询页 / `auto_sign_days` / 文件方式设置（`file_preset`、`file_template.<位置>`、`file_account.<key>`）不合法，或所选方式现在不可选（400，`field`）；文件方式：`16137` 有行有问题、整批不导出（409，`details.rows[{dn_id, order_number, problems[{column, code, message}]}]`）、`16138` 文件方式用不了：请求 / 导入文件不合法（400）或承运商不是文件方式 / 模板不全（409），带 `field`；`16139` 运单服务选项不合法（400，`field: options.<key>`）；`16076` 另有 `details.reason: SHIPPING_OPTIONS_LOCKED` / `SHIP_TO_LOCKED`，`16075` 另用于没有可作废的已导出文件运单（`details.waybill`）；结构化地址用 `14019`（不是文字 / 超长 / `zip_code` 与 `postal_code` 不同）与 `14020`（国家代码）；`16130` 另有 `PICKUP_METHOD_NOT_API`；`16131` 手工揽收另有 `field` `warehouse_id` / `confirmation_code`；建运单的 blocker `SCOPE_NOT_SUPPORTED` / `CUSTOMS_DATA_MISSING` / `CUSTOMS_NOT_SUPPORTED` / `WAYBILL_NOT_SUPPORTED` 取代 `NOT_EXPORT`。仓库：`14022` 时区不合法（不是 IANA 时区名，400，`field: timezone`）。错误响应可能带结构化的 `details`。
 
 作业流程（见上文「作业流程规则」）：`16110` DN 有未结束的承运商运单，请先取消运单（409）、`16111` 调整单已取消（409）、`16112` 调整单当前状态不能取消（409）、`16113` 调整明细无法执行：库位上已没有该商品 / 明细没有库位（409）、`16114` 盘点单有未录入的明细（409，`details.detail_ids`）、`16115` 数值字段不合法（400，`field`）、`16116` 分拣任务的 ASN 不能改（409）、`16120` 移库来源库位没有这个商品（404）、`16121` 同一个 `client_batch_id` 已提交过不同的明细（409，`details {client_batch_id, batch_id}`）、`16122` 修改过调整单明细的人不能审批（409）、`16123` `client_batch_id` 不合法（400）、`44009` 库位有历史记录，请改用停用（409）。任务：`16088` 任务已停用（所属 DN / ASN 已取消，409）、`16089` 拣货一件都没拣不能完成（409）。
 
