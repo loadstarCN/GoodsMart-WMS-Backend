@@ -13,6 +13,7 @@ from warehouse.common.validation import require_active_task
 from warehouse.common import clock
 from warehouse.asn.models import ASN
 from warehouse.asn.services import ASNService
+from warehouse.asn.spec_capture import assert_capturable_on_complete
 from .models import SortingTask, SortingTaskDetail, SortingTaskStatusLog, SortingBatch
 
 class SortingTaskService:
@@ -557,6 +558,9 @@ class SortingTaskService:
             raise BadRequestException("Cannot complete a non-in_progress Sorting Task", 16008)
 
         SortingTaskService._assert_within_planned(task)
+        # 规格采集：仓库为 block 时分拣到的商品还有未采集（也没填跳过原因）的 → 409 17021；warn 照常完成，
+        # 响应的 spec_pending 列出这些行（warehouse/asn/spec_capture.py）
+        assert_capturable_on_complete(task.asn)
 
         task = SortingTaskService._update_task_status(task, 'completed', operator_id)
 

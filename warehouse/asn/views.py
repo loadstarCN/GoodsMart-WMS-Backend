@@ -16,11 +16,13 @@ from .schemas import (
     asn_input_model,
     asn_input_base_model,
     asn_detail_input_model,
+    asn_detail_spec_input_model,
     asn_pagination_parser,
     asn_pagination_model,
     asn_monthly_stats_parser
 )
 from .services import ASNService
+from .spec_capture import SpecCaptureService
 from .stage import attach as attach_inbound_stage
 
 
@@ -42,6 +44,7 @@ class ASNList(Resource):
         Get all ASNs with optional filters & pagination.
         Each item also has `inbound_stage` (expected / in_transit / receiving / sorting / putaway / completed / closed /
         exception; same definition as GET /asn/<id>/flow); `inbound_stage=<stage>` filters by it (evaluated in SQL).
+        `spec_pending=true` lists only ASNs with lines whose specs are still to capture (`spec_pending_count` > 0).
         """
         args = asn_pagination_parser.parse_args()
         page = args.get('page')
@@ -60,6 +63,7 @@ class ASNList(Resource):
             'is_active': args.get('is_active'),
             'keyword': args.get('keyword'),
             'inbound_stage': args.get('inbound_stage'),
+            'spec_pending': args.get('spec_pending'),
         }
 
         filters = add_warehouse_filter(filters)
@@ -81,6 +85,8 @@ class ASNList(Resource):
         - `expected_arrival_date`: Can be null
         - `remark`: Can be null
         - `details`: A list of ASN details, can be empty
+        - `spec_capture`: `{fields, mode}` specs to capture on receiving; omitted parts are copied from the warehouse
+          defaults (400 17020 if invalid)
         - `status` / `is_active` and per-detail process quantities are ignored
         """
 
@@ -146,12 +152,13 @@ class ASNReceiveResource(Resource):
     Calls the ASNService.receive_asn(asn_id) method.
     """
 
-    @permission_required(["all_access","company_all_access","asn_edit"])
+    # 作业员收货：asn_receive 或 asn_edit（新建 / 修改 / 关闭 / 取消收货通知仍只认 asn_edit）
+    @permission_required(["all_access","company_all_access","asn_receive","asn_edit"])
     @warehouse_required()
     @api_ns.marshal_with(asn_model)
     def put(self, asn_id):
         """
-        Mark a specific ASN as 'received'.
+        Mark a specific ASN as 'received' (requires asn_receive or asn_edit).
         - Returns 404 if ASN not found.
         """
         updated_asn = ASNService.receive_asn(_owned_asn(asn_id))
@@ -273,6 +280,36 @@ class ASNDetailItem(Resource):
         ASNService.delete_asn_detail(asn, detail_id)
 
         return {"message": "ASNDetail deleted successfully"}, 200
+
+
+@api_ns.doc(security="jsonWebToken")
+@api_ns.route('/<int:asn_id>/details/<int:detail_id>/spec')
+class ASNDetailSpec(Resource):
+    """
+    收货时采集（或跳过）一行明细的规格（warehouse/asn/spec_capture.py）
+    """
+
+    # 与只改原产国的接口（PUT /goods/<id>/origin-country）同一组权限
+    @permission_required(["all_access","company_all_access","goods_edit","sorting_edit","packing_edit"])
+    @warehouse_required()
+    @api_ns.expect(asn_detail_spec_input_model)
+    @api_ns.marshal_with(asn_detail_model)
+    def put(self, asn_id, detail_id):
+        """
+        Capture (or skip) the specs of an ASN line while the ASN is received, or later once it is completed
+        (catching up; else 409 17023).
+        Requires any of goods_edit, sorting_edit or packing_edit (same as PUT /goods/<id>/origin-country).
+        - weight (kg), length / width / height (mm, all three together), origin_country (ISO 3166-1 alpha-2): the
+          given values are written to the goods master data (empty / null values are ignored, nothing is cleared;
+          invalid numbers 400 16100, invalid country 400 10014) and emit goods.spec_updated when they change
+          (source = spec_source, default "receiving")
+        - note: skip reason; the requested specs not given are skipped. Neither a value nor a note -> 400 17022;
+          remeasure mode without a note must give every requested spec -> else 400 17022 details {missing}
+        - The line records spec_captured_at / spec_captured_by and spec_capture_note (cleared when no note is given)
+        Returns the line with its new spec_pending.
+        """
+        asn = _owned_asn(asn_id)
+        return SpecCaptureService.capture(asn, detail_id, api_ns.payload), 200
 
 
 @api_ns.doc(security="jsonWebToken")

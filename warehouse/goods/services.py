@@ -25,9 +25,41 @@ SPEC_FIELDS = (
     ('height', 'goods_height_mm'),
     ('origin_country', 'goods_origin_country'),
 )
-# 规格变更来源（goods.spec_updated 的 source）
-SPEC_SOURCES = ('station', 'manual', 'import', 'api')
+# 规格变更来源（goods.spec_updated 的 source）：receiving = 收货通知明细上的规格采集
+# （PUT /asn/<id>/details/<detail_id>/spec 的默认来源，warehouse/asn/spec_capture.py）
+SPEC_SOURCES = ('station', 'manual', 'import', 'api', 'receiving')
 SPEC_UPDATED_EVENT = 'goods.spec_updated'
+
+# 规格采集项（weight / dimensions = 长宽高三项一起 / origin_country，warehouse/common/spec_capture.py）在商品资料里缺不缺：
+# 收货通知的待采集项与商品列表的 spec_missing 筛选用同一口径
+_DIMENSION_ATTRS = ('length', 'width', 'height')
+
+
+def _number_missing(value) -> bool:
+    return value is None or value <= 0
+
+
+def goods_spec_missing(goods) -> list:
+    """商品资料里缺的采集项（按 SPEC_CAPTURE_FIELDS 的顺序）：重量为空或 ≤ 0；长宽高任一为空或 ≤ 0；原产国为空"""
+    missing = []
+    if _number_missing(goods.weight):
+        missing.append('weight')
+    if any(_number_missing(getattr(goods, attr)) for attr in _DIMENSION_ATTRS):
+        missing.append('dimensions')
+    if not goods.origin_country:
+        missing.append('origin_country')
+    return missing
+
+
+def goods_spec_missing_condition(field):
+    """SQL 条件：商品缺这一采集项（与 goods_spec_missing 同一口径）"""
+    if field == 'weight':
+        return or_(Goods.weight.is_(None), Goods.weight <= 0)
+    if field == 'dimensions':
+        return or_(*[or_(getattr(Goods, attr).is_(None), getattr(Goods, attr) <= 0) for attr in _DIMENSION_ATTRS])
+    if field == 'origin_country':
+        return or_(Goods.origin_country.is_(None), Goods.origin_country == '')
+    raise ValueError(f"Unknown spec field: {field}")
 
 # goods.spec_updated 的排序字段 changed_at_ms（epoch 毫秒）。changed_at 只到秒（外部已在解析，格式不改），
 # 同一秒内的多次变动靠它分先后：本进程内严格递增（同一毫秒或时钟回拨时 +1）
@@ -131,7 +163,7 @@ def clean_goods_numbers(data: dict, row=None) -> dict:
 
 
 def resolve_spec_source(requested=None):
-    """规格变更来源：请求体 spec_source（station / manual / import / api）优先；
+    """规格变更来源：请求体 spec_source（station / manual / import / api / receiving）优先；
     没传或不认识的值 → API Key 调用 = api，登录用户（及其他）= manual"""
     if isinstance(requested, str) and requested.strip().lower() in SPEC_SOURCES:
         return requested.strip().lower()
@@ -286,6 +318,16 @@ class GoodsService:
             query = query.filter(or_(Goods.origin_country.is_(None), Goods.origin_country == ''))
         elif filters.get('origin_missing') is False:
             query = query.filter(Goods.origin_country.isnot(None), Goods.origin_country != '')
+
+        # 没有图片（image_url 为空）/ 有图片
+        if filters.get('image_missing') is True:
+            query = query.filter(or_(Goods.image_url.is_(None), Goods.image_url == ''))
+        elif filters.get('image_missing') is False:
+            query = query.filter(Goods.image_url.isnot(None), Goods.image_url != '')
+
+        # 缺所列采集项中的任一项（weight / dimensions / origin_country，口径同收货规格采集）
+        if filters.get('spec_missing'):
+            query = query.filter(or_(*[goods_spec_missing_condition(field) for field in filters['spec_missing']]))
 
         if filters.get('keyword'):
             keyword = filters['keyword']

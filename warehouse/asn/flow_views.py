@@ -1,6 +1,6 @@
 """入库单流程汇总接口（warehouse/asn/flow.py，doc/shipping-flow.md §7.1）。
 
-权限：读 = asn_read；刷新跟踪 = asn_edit（会写入库单上的跟踪结果、调承运商接口）。
+权限：读 = asn_read；刷新跟踪 = asn_receive 或 asn_edit（会写入库单上的跟踪结果、调承运商接口；作业员收货前查到货）。
 归属校验与其它 ASN 接口一致（跨仓库 / 跨公司 403、不存在 404），同样接受 warehouse_id / X-WAREHOUSE-ID。
 """
 from flask_restx import Resource
@@ -14,7 +14,7 @@ from .schemas import api_ns
 from .tracking import ASNTrackingService
 
 _READ = ["all_access", "company_all_access", "asn_read"]
-_EDIT = ["all_access", "company_all_access", "asn_edit"]
+_TRACK = ["all_access", "company_all_access", "asn_receive", "asn_edit"]
 
 
 def _owned_asn(asn_id: int) -> ASN:
@@ -50,6 +50,9 @@ class ASNFlow(Resource):
         - putaway is estimated from the warehouse's stock waiting for putaway (putaway records carry no ASN):
           summary {quantity, pending_quantity, put_away_quantity, goods[{goods_id, code, name, quantity, pending}],
           last_putaway_at, estimated: true}
+        - sorting summary.spec_capture: {fields, mode, enforcement: warn | block, pending_count, sorted_pending:
+          [{asn_detail_id, goods_id, goods_code, goods_name, spec_pending}]} (sorted lines still to capture: what
+          completing sorting warns about / is blocked by)
         """
         return InboundFlowService.build(_owned_asn(asn_id)), 200
 
@@ -58,7 +61,7 @@ class ASNFlow(Resource):
 @api_ns.route('/<int:asn_id>/track', '/<int:asn_id>/track/')
 class ASNTrack(Resource):
 
-    @permission_required(_EDIT)
+    @permission_required(_TRACK)
     @warehouse_required()
     def post(self, asn_id):
         """

@@ -102,6 +102,7 @@ BUILTIN_PERMISSIONS = [
     # 仓库 - 入库通知 (ASN)
     ("asn_read", "查看入库通知列表和详情"),
     ("asn_edit", "创建或编辑入库通知"),
+    ("asn_receive", "入库通知收货（收货、刷新到货跟踪；不能新建 / 修改 / 关闭 / 取消入库通知）"),
     ("asn_delete", "删除入库通知"),
 
     # 仓库 - 出库通知 (DN)
@@ -160,6 +161,7 @@ BUILTIN_PERMISSIONS = [
     # 仓库 - 盘点
     ("cycle_count_read", "查看盘点计划列表和详情"),
     ("cycle_count_edit", "创建或编辑盘点计划"),
+    ("cycle_count_execute", "执行盘点（开始盘点、录入实盘数、完成明细 / 盘点单；不能新建 / 修改盘点计划）"),
     ("cycle_count_delete", "删除盘点计划"),
 ]
 
@@ -174,23 +176,25 @@ _OPERATOR_READ = (
     'carrier_read', 'recipient_read',
     'adjustment_read',  # PDA 商品详情的调整记录页签
 )
-# 现场 / PDA 作业：收货（PUT /asn/<id>/receive/ 要 asn_edit，后端没有单独的收货权限）、分拣、上架、拣货、打包、
-# 配送（完成发货 / 签收 / 运单号 / 揽收登记都是 delivery_edit）、盘点录入（cycle_count_edit）、下架、移库
+# 现场 / PDA 作业：收货（asn_receive：PUT /asn/<id>/receive/，不能新建 / 修改收货通知）、分拣（含收货规格采集，
+# sorting_edit）、上架、拣货、打包、配送（完成发货 / 签收 / 运单号 / 揽收登记都是 delivery_edit）、
+# 盘点录入（cycle_count_execute：开始 / 录入 / 完成，不能新建盘点）、下架、移库。
+# asn_edit / cycle_count_edit 不再默认给作业员（迁移 c4e8a1f6b2d9 从内置作业员角色上移除）
 _OPERATOR_EXECUTE = (
-    'asn_edit', 'sorting_edit', 'putaway_edit', 'picking_edit', 'packing_edit', 'delivery_edit', 'cycle_count_edit',
-    'removal_edit', 'transfer_edit',
+    'asn_receive', 'sorting_edit', 'putaway_edit', 'picking_edit', 'packing_edit', 'delivery_edit',
+    'cycle_count_execute', 'removal_edit', 'transfer_edit',
 )
 # 仓库经理：仓库范围内的全部单据与作业（含新建 / 编辑 / 取消 / 删除），库存调整审批，库位管理，
 # 商品 / 承运商 / 收货方 / 供应商的查看与编辑，员工与仓库的查看
 _WAREHOUSE_ADMIN = (
-    'asn_read', 'asn_edit', 'asn_delete',
+    'asn_read', 'asn_edit', 'asn_receive', 'asn_delete',
     'sorting_read', 'sorting_edit', 'sorting_delete',
     'putaway_read', 'putaway_edit',
     'dn_read', 'dn_edit', 'dn_delete',
     'picking_read', 'picking_edit', 'picking_delete',
     'packing_read', 'packing_edit', 'packing_delete',
     'delivery_read', 'delivery_edit', 'delivery_delete',
-    'cycle_count_read', 'cycle_count_edit', 'cycle_count_delete',
+    'cycle_count_read', 'cycle_count_edit', 'cycle_count_execute', 'cycle_count_delete',
     'adjustment_read', 'adjustment_edit', 'adjustment_delete', 'adjustment_approve',
     'removal_read', 'removal_edit',
     'transfer_read', 'transfer_edit',

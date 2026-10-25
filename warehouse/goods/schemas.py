@@ -5,6 +5,8 @@ from system.user.schemas import user_simple_model as original_user_model  # 用�
 from warehouse.location.models import Location
 from warehouse.location.schemas import location_simple_model  # 位置序列化器
 from warehouse.company.schemas import comapny_simple_model as company_model  # 公司序列化器
+from warehouse.common.spec_capture import SPEC_CAPTURE_FIELDS
+from .services import SPEC_SOURCES
 
 # 初始化 Namespace
 api_ns = Namespace('goods', description='Goods operations')
@@ -76,7 +78,7 @@ input_fields = generate_input_fields(goods_base_model)
 input_fields['spec_source'] = fields.String(
     description='Source of a spec change for the goods.spec_updated webhook; '
                 'default: "api" for API Key calls, "manual" for logged-in users',
-    enum=['station', 'manual', 'import', 'api'],
+    enum=list(SPEC_SOURCES),
 )
 goods_input_model = api_ns.model('GoodsInput', input_fields)
 
@@ -157,6 +159,23 @@ goods_pagination_parser.add_argument('goods_codes', type=lambda s: [code.strip()
 goods_pagination_parser.add_argument('company_id', type=int, help='Filter by Company ID')
 goods_pagination_parser.add_argument('origin_missing', type=inputs.boolean,
                                      help='true: only goods without origin_country; false: only goods with it')
+goods_pagination_parser.add_argument('image_missing', type=inputs.boolean,
+                                     help='true: only goods without image_url; false: only goods with it')
+
+
+def _spec_missing_list(value):
+    """spec_missing=weight,dimensions：逗号分隔的采集项，不认识的 → 400"""
+    names = [name.strip() for name in str(value).split(',') if name.strip()]
+    unknown = [name for name in names if name not in SPEC_CAPTURE_FIELDS]
+    if unknown:
+        raise ValueError(f"unknown spec field(s): {', '.join(unknown)}; use {', '.join(SPEC_CAPTURE_FIELDS)}")
+    return names
+
+
+goods_pagination_parser.add_argument(
+    'spec_missing', type=_spec_missing_list,
+    help='Comma separated weight / dimensions / origin_country: only goods missing any of them (weight empty or <= 0; '
+         'any of length / width / height empty or <= 0; origin_country empty)')
 
 
 # GoodsLocation 分页解析器

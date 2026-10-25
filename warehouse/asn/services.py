@@ -17,6 +17,7 @@ from warehouse.supplier.models import Supplier
 from warehouse.warehouse.models import Warehouse
 from system.webhook.services import emit as webhook_emit
 from .models import ASN, ASNDetail
+from .spec_capture import apply_spec_capture, line_spec_pending, pending_condition
 
 
 class ASNService:
@@ -268,6 +269,11 @@ class ASNService:
             # 入库阶段：与入库流程接口的 stage 同一个 SQL 表达式（warehouse/asn/stage.py）
             from .stage import stage_expression
             query = query.filter(stage_expression() == filters['inbound_stage'])
+        # 有 / 没有待采集规格的行（与明细的 spec_pending 同一口径，warehouse/asn/spec_capture.py）
+        if filters.get('spec_pending') is True:
+            query = query.filter(pending_condition())
+        elif filters.get('spec_pending') is False:
+            query = query.filter(~pending_condition())
 
         # 如果 filters 中没有 is_active 或其值为 None，则只返回 is_active=True
         if 'is_active' not in filters or filters['is_active'] is None:
@@ -340,6 +346,8 @@ class ASNService:
             created_by=created_by_id,
             api_key_id=require_source_api_key(data.get('api_key_id'), company_id),
         )
+        # 规格采集：没传（或对象里没给的键）复制仓库的默认值（快照；不合法 400 17020）
+        apply_spec_capture(new_asn, data.get('spec_capture'), db.session.get(Warehouse, warehouse_id), creating=True)
         db.session.add(new_asn)
         db.session.flush()
 
@@ -389,6 +397,9 @@ class ASNService:
         )
         if data.get('asn_type') and data['asn_type'] not in ASN.ASN_TYPES:
             raise BadRequestException(f"Invalid asn_type: {data['asn_type']}", 14007)
+
+        # 规格采集：只改对象里给了的键（不合法 400 17020）
+        apply_spec_capture(asn, data.get('spec_capture'), asn.warehouse, creating=False)
 
         tracked_before = (asn.tracking_number or None, asn.carrier_id)
         for field in ASNService.ASN_WRITABLE_FIELDS:
@@ -685,6 +696,10 @@ class ASNService:
 
         webhook_emit('asn.completed', {
             'asn_id': asn.id, 'status': 'completed', 'order_number': asn.order_number,
+            # 完成时刻（仓库时区偏移的 ISO 8601，同其他 webhook 的时刻）与 epoch 毫秒：明细里的商品规格快照是完成的同一事务里
+            # 读的，订阅方可拿 completed_at_ms 与 goods.spec_updated 的 changed_at_ms 比新旧（商品上没有单独记规格的变更时刻）
+            'completed_at': clock.local_iso(asn.completed_at, asn),
+            'completed_at_ms': int(asn.completed_at.timestamp() * 1000) if asn.completed_at else None,
             'details': [{'goods_code': d.goods.code if d.goods else None,
                          'actual_quantity': d.actual_quantity,
                          'quantity': d.quantity,
@@ -695,7 +710,9 @@ class ASNService:
                          # 由订阅方（Wholesale）换算回填其商品主数据
                          'weight': d.weight,
                          'volume': d.volume,
-                         **ASNService._goods_spec_payload(d.goods)} for d in asn.details],
+                         **ASNService._goods_spec_payload(d.goods),
+                         # 收货时还没采集到的规格（weight / dimensions / origin_country；[] = 没有）
+                         'spec_pending': line_spec_pending(d, asn)} for d in asn.details],
         }, api_key_id=asn.api_key_id)
 
         return asn

@@ -9,6 +9,7 @@ from warehouse.common.address_format import (
 )
 from warehouse.common.export_profile import WAREHOUSE_EXPORT_FIELDS, normalize_export_profile
 from warehouse.common.references import ensure_not_referenced
+from warehouse.common.spec_capture import warehouse_spec_settings
 from .models import Warehouse
 
 
@@ -84,6 +85,7 @@ class WarehouseService:
         structured = parse_columns(data, WAREHOUSE_ADDRESS_LIMITS)
         has_postal, postal_code = postal_code_of(data)
         tz_name = normalize_timezone_input(data.get('timezone'))       # 不合法 400 14022
+        spec_settings = warehouse_spec_settings(data)                  # 规格采集默认规则，不合法 400 17020
         manager_id = data.get('manager_id')
         manager = None  # 显式初始化
         if manager_id:
@@ -109,6 +111,8 @@ class WarehouseService:
             setattr(new_warehouse, field, value)
         if new_warehouse.country_code is None and 'country_code' not in export_profile:
             new_warehouse.country_code = 'JP'          # 列默认值（生成地址时就要用到国家）
+        for field, value in spec_settings.items():
+            setattr(new_warehouse, field, value)
         _apply_address(new_warehouse, data, structured, has_postal, postal_code)
 
         db.session.add(new_warehouse)
@@ -133,6 +137,9 @@ class WarehouseService:
         has_postal, postal_code = postal_code_of(data)
         if 'timezone' in data:                                        # 只改请求里带了的；null / 空串 = 用默认时区
             warehouse.timezone = normalize_timezone_input(data['timezone'])
+        # 规格采集默认规则：只改请求里带了的（不合法 400 17020）；已建的收货通知不受影响（单据上是快照）
+        for field, value in warehouse_spec_settings(data).items():
+            setattr(warehouse, field, value)
 
         manager = None
         new_manager_id = data.get('manager_id')

@@ -27,6 +27,9 @@ from .schemas import (
 )
 from .services import CycleCountTaskService
 
+# 盘点作业（开始盘点、录入实盘数、完成明细 / 盘点单）接受 cycle_count_execute 或 cycle_count_edit；
+# 新建 / 修改盘点单、增加明细仍只认 cycle_count_edit
+
 
 def _get_owned_task(task_id: int) -> CycleCountTask:
     """按 id 取盘点任务并校验仓库归属（须在 @warehouse_required() 之后）"""
@@ -136,7 +139,7 @@ class CycleCountTaskDetailView(Resource):
 @api_ns.route('/<int:task_id>/process/')
 class CycleCountTaskProcess(Resource):
 
-    @permission_required(["all_access","company_all_access","cycle_count_edit"])
+    @permission_required(["all_access","company_all_access","cycle_count_execute","cycle_count_edit"])
     @warehouse_required()
     @api_ns.marshal_with(cycle_count_task_model)
     def put(self, task_id):
@@ -155,7 +158,7 @@ class CycleCountTaskProcess(Resource):
 @api_ns.route('/<int:task_id>/complete/')
 class CycleCountTaskComplete(Resource):
 
-    @permission_required(["all_access","company_all_access","cycle_count_edit"])
+    @permission_required(["all_access","company_all_access","cycle_count_execute","cycle_count_edit"])
     @warehouse_required()
     @api_ns.marshal_with(cycle_count_task_model)
     def put(self, task_id):
@@ -258,7 +261,7 @@ class CycleCountTaskDetailItem(Resource):
 @api_ns.doc(security="jsonWebToken")
 @api_ns.route('/<int:task_id>/details-batch-save/')
 class CycleCountTaskDetailBatchSave(Resource):
-    @permission_required(["all_access","company_all_access","cycle_count_edit"])
+    @permission_required(["all_access","company_all_access","cycle_count_execute","cycle_count_edit"])
     @warehouse_required()
     @api_ns.expect(cycle_count_task_batch_save_input_model)
     @api_ns.marshal_with(cycle_count_task_model)
@@ -286,7 +289,7 @@ class CycleCountTaskDetailBatchSave(Resource):
 @api_ns.route('/<int:task_id>/details/<int:detail_id>/complete/')
 class CycleCountTaskDetailComplete(Resource):
 
-    @permission_required(["all_access","company_all_access","cycle_count_edit"])
+    @permission_required(["all_access","company_all_access","cycle_count_execute","cycle_count_edit"])
     @warehouse_required()
     @api_ns.marshal_with(cycle_count_task_detail_model)
     def put(self, task_id, detail_id):

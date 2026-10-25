@@ -184,7 +184,7 @@ GoodsMart-WMS-Backend/
 
 ### System Management
 - **Users**: Registration, login, JWT token management
-- **Roles & Permissions**: RBAC with granular permission control (84 permissions)
+- **Roles & Permissions**: RBAC with granular permission control (91 built-in permissions)
 - **API Keys**: Third-party system integration with company-level isolation
 - **Logs**: Request logging and audit trail
 - **IP Control**: Whitelist/blacklist management
@@ -200,7 +200,70 @@ GoodsMart-WMS-Backend/
 - ASN creation and management
 - Goods receiving
 - Quality sorting (actual quantity, damage tracking)
+- Spec capture on receiving: weight, dimensions and country of origin per ASN line (see below; off by default)
 - Putaway to storage locations
+- Receiving permission: `PUT /warehouse/asn/<id>/receive/` and refreshing the tracking (`POST /warehouse/asn/<id>/track`)
+  accept `asn_receive` or `asn_edit`; creating / editing / closing / cancelling / deleting an ASN and its lines still
+  needs `asn_edit` (`asn_delete`). The built-in `warehouse_operator` role has `asn_receive` instead of `asn_edit`
+  (migration `c4e8a1f6b2d9` removes `asn_edit` from that role; grant it again by hand if operators should create ASNs).
+  Sorting (including completing the ASN through sorting) only needs `sorting_edit`.
+
+#### Spec capture on receiving
+
+A warehouse can ask for the weight, dimensions and country of origin of the goods to be captured while an ASN is
+received. It is a general feature and **off by default** (no warehouse captures anything until it is configured).
+
+- **Warehouse defaults** (`POST` / `PUT /warehouse/warehouse/<id>`, `warehouse_edit`):
+  `default_spec_capture_fields` — a subset of `weight` / `dimensions` (length, width and height together) /
+  `origin_country`, `[]` = no capture (default, `null` too); `default_spec_capture_mode` — `missing` (only what the goods
+  master data lacks, default) or `remeasure` (measure every requested spec again); `spec_capture_enforcement` — `warn`
+  (default) or `block`, used when sorting completes. Invalid values → 400 `17020` (`field` = the field name). One-off
+  setup: `python scripts/set_warehouse_spec_capture.py` (dry-run unless `--apply`; defaults to the `Kyoto#1` warehouse,
+  all three specs, `missing`, `warn`; `--warehouse-id` / `--warehouse-name` / `--company-id` / `--fields` / `--mode` /
+  `--enforcement`).
+- **Request on the ASN**: `spec_capture: {fields, mode}` on create (`POST /warehouse/asn/`) and update
+  (`PUT /warehouse/asn/<id>`, pending ASNs only). On create a missing `spec_capture` (or a missing key in it) is copied
+  from the warehouse defaults — a snapshot: changing the warehouse later does not affect existing ASNs. On update only
+  the given keys change (`null` = unchanged). Invalid → 400 `17020` (`field`: `spec_capture` / `spec_capture.fields` /
+  `spec_capture.mode`). ASNs created before the upgrade capture nothing. ASN responses (list and detail) carry
+  `spec_capture` and `spec_pending_count`.
+- **Pending specs** are computed, not stored. Every ASN line has `spec_pending` (for example
+  `["weight", "origin_country"]`; `[]` = nothing pending) and `GET /warehouse/asn/?spec_pending=true|false` filters on
+  `spec_pending_count > 0` (same rule, evaluated in SQL):
+  - `missing`: the requested specs the goods master data lacks (weight empty or ≤ 0; any of length / width / height
+    empty or ≤ 0; origin empty). Filling them anywhere (this capture, goods edit, CSV import, another ASN) clears it.
+  - `remeasure`: every requested spec until the line has been captured.
+  - Nothing is pending on a line with a skip reason, on a closed ASN, or on a line of a completed ASN where nothing
+    arrived (`actual_quantity` 0).
+- **Capture** `PUT /warehouse/asn/<id>/details/<detail_id>/spec` — any of `goods_edit` / `sorting_edit` /
+  `packing_edit` (like `PUT /warehouse/goods/<id>/origin-country`), while the ASN is `received`, or later once it is
+  `completed` to catch up what was missed (same effect; `asn.completed` is not sent again); `pending` / `closed` → 409
+  `17023` `details {asn_id, status}`:
+
+  ```json
+  { "weight": 0.235, "length": 120, "width": 80, "height": 45, "origin_country": "CN",
+    "note": null, "spec_source": "receiving" }
+  ```
+
+  Weight in kg, dimensions in mm (all three together, else 400 `17022` `field: dimensions`), origin as ISO 3166-1
+  alpha-2. The given values are written to the goods master data — empty / `null` values are ignored, a capture never
+  clears data; invalid numbers 400 `16100`, invalid country 400 `10014` — and emit `goods.spec_updated` when they
+  change, with `source` = `spec_source` (default `receiving`; a weighing station sends `station`). `note` is the skip
+  reason (text, at most 255 characters; the client offers presets such as "no country of origin on the package"): the
+  requested specs that are not given are skipped. Neither a value nor a note → 400 `17022`; in `remeasure` mode without
+  a note every requested spec must be given → 400 `17022` `details {missing}`. The line records `spec_captured_at`,
+  `spec_captured_by` (and `spec_captured_by_user {id, user_name}`) and `spec_capture_note` (cleared by a later capture
+  without a note). The response is the line with its new `spec_pending`.
+- **Completing sorting** (`PUT /warehouse/sorting/<id>/complete/`) checks the lines whose goods were sorted (good +
+  damaged > 0): `warn` completes as before and the response's `spec_pending` lists the lines still pending —
+  `[{asn_detail_id, goods_id, goods_code, goods_name, spec_pending}]`; `block` → 409 `17021`
+  `details {asn_id, enforcement: "block", lines: [same shape]}` while any of them is neither captured nor skipped with a
+  reason. `GET /warehouse/sorting/<id>` returns the same `spec_pending` (what completing now would report), and the
+  inbound flow's sorting step has `summary.spec_capture {fields, mode, enforcement, pending_count, sorted_pending}`.
+- `asn.completed` lines carry `spec_pending` (see *Webhook Integration*).
+- Goods list filters (general): `GET /warehouse/goods/?image_missing=true|false` (no `image_url`) and
+  `?spec_missing=weight,dimensions,origin_country` (goods missing any of the listed specs, same rule as above; an
+  unknown name → 400).
 
 ### Outbound (DN)
 - Delivery note creation and management
@@ -216,7 +279,11 @@ GoodsMart-WMS-Backend/
 ### Inventory Operations
 - Real-time inventory tracking (multi-stage: ASN → received → sorted → onhand → DN → picked → packed → delivered)
 - Stock adjustment (increase/decrease with reason tracking)
-- Cycle counting (with approval workflow)
+- Cycle counting (with approval workflow). Counting — starting a count (`PUT /warehouse/cyclecount/<id>/process/`),
+  entering counts (`POST .../details-batch-save/`), completing a detail (`PUT .../details/<detail_id>/complete/`) and
+  completing the count (`PUT .../complete/`) — accepts `cycle_count_execute` or `cycle_count_edit`; creating / editing a
+  count and adding / editing its details still need `cycle_count_edit`. The built-in `warehouse_operator` role has
+  `cycle_count_execute` instead of `cycle_count_edit` (migration `c4e8a1f6b2d9`)
 - Stock transfer between locations
 - Stock removal
 - Inventory snapshots (daily scheduled)
@@ -278,7 +345,7 @@ WMS pushes event notifications to external systems via Webhook with HMAC-SHA256 
 | Event | Trigger |
 |-------|---------|
 | `asn.received` | ASN marked as received |
-| `asn.completed` | ASN completed with actual quantities |
+| `asn.completed` | ASN completed with actual quantities (includes the completion time `completed_at` / `completed_at_ms`) |
 | `asn.cancelled` | A received (not yet sorted) ASN was cancelled |
 | `dn.in_progress` | DN processing started (includes the start time `started_at`) |
 | `dn.picked` | DN picking completed (includes the planned / picked quantity per goods and `picked_at`) |
@@ -289,14 +356,20 @@ WMS pushes event notifications to external systems via Webhook with HMAC-SHA256 
 | `dn.cancelled` | A DN was cancelled after processing started (`in_progress` / `picked` / `packed`; includes `previous_status` and the picked / packed quantity per goods) |
 | `goods.spec_updated` | Goods weight / dimensions / country of origin changed (company-wide, subscription required — see below) |
 
-`started_at` / `picked_at` / `packed_at` / `shipped_at` / `signed_at` are when the step actually happened (ISO 8601 with offset, e.g.
+`completed_at` (ASN) / `started_at` / `picked_at` / `packed_at` / `shipped_at` / `signed_at` are when the step actually happened (ISO 8601 with offset, e.g.
 `2026-10-23T13:03:00+09:00`), not when the webhook is sent: the time of the warehouse action for manual steps (the
 entered signed time when one is given), the carrier's pickup time for automatic shipping and the carrier's delivery time
 for automatic signing. Webhooks can arrive late (scheduled pushes, retries), so receivers should record these fields.
 
 Document events (`asn.*`, `dn.*`) are sent only to the API Key that created the document.
 `asn.completed` details also carry the goods master data: `goods_weight_kg`, `goods_length_mm`,
-`goods_width_mm`, `goods_height_mm` and `goods_origin_country` (ISO 3166-1 alpha-2, `null` = not recorded).
+`goods_width_mm`, `goods_height_mm` and `goods_origin_country` (ISO 3166-1 alpha-2, `null` = not recorded), and
+`spec_pending`: the specs requested on the ASN (*Spec capture on receiving*) that were still not captured when it
+completed (`weight` / `dimensions` / `origin_country`; `[]` = none — also when nothing was requested, the line was
+skipped with a reason or nothing arrived). The snapshot is read when the ASN completes: `completed_at` (ISO 8601 with
+the warehouse's offset, like the other event times) and `completed_at_ms` (epoch milliseconds) tell how new it is —
+compare `completed_at_ms` with the `changed_at_ms` of `goods.spec_updated` for the same goods and keep the newer one.
+The goods table keeps no separate time of its last spec change, so the lines carry no per-goods change time.
 
 ### Setup
 
@@ -358,8 +431,10 @@ weight, length, width, height or origin country. The payload is a full snapshot 
   out of order (retries, several push processes). Events queued before this field existed have no `changed_at_ms` —
   fall back to `changed_at` for them.
 
-- `source`: `spec_source` from the goods create/update request body (`station` / `manual` / `import` / `api`);
-  otherwise `api` for API Key calls and `manual` for logged-in users. CSV import uses `import`.
+- `source`: `spec_source` from the goods create/update request body (`station` / `manual` / `import` / `api` /
+  `receiving`); otherwise `api` for API Key calls and `manual` for logged-in users. CSV import uses `import`; spec
+  capture on an ASN line (`PUT /warehouse/asn/<id>/details/<detail_id>/spec`) uses `receiving` unless the request sends
+  `spec_source` (a weighing station sends `station`).
 - While an event for the same goods is still pending for a key and has not been sent yet, a newer change overwrites
   its payload instead of queueing another one (`dedupe_key = goods:<id>`; `changed_fields` becomes the union). If it
   was already attempted, a new event (new `X-Webhook-Id`) replaces it and the old one is marked `superseded`; an event
@@ -1716,10 +1791,17 @@ stdout_logfile=/var/log/wms-api.out.log
 | Validation | 14000-14999 | 400 | Data format errors |
 | Inventory | 15000-15999 | 400 | Stock-related errors |
 | State | 16000-16999 | 400 | State transition errors |
+| Inbound rules | 17000-17999 | 400 / 409 | Spec capture on receiving (and later inbound rules) |
 
 Business codes of the export-document features: `14019` export profile text too long, `14020` invalid country code, `16063` customs structure invalid, `16064` customs line goods code not in the DN / duplicated, `16065` shipped — customs data / packages / documents locked (409), `16066` invalid packages, `16067` packages cannot be edited in the current DN status (409), `16068` documents cannot be issued yet (409, `details.problems`), `16070` not an export DN (409), `16071` document not found (404), `16117` documents cannot be laid out — a text block (usually the consignee) is too long for one page; shorten it (409, `details {document, reason: LAYOUT_OVERFLOW}`). Carrier shipments (automatic): `16072` preconditions for creating / cancelling not met (409, `details.blockers`), `16073` the carrier returned an error or an unclear result (502, `details.errors` / `transaction_id` / `maybe_processed`), `16074` the carrier timed out or the time budget ran out (504, `details.budget_exhausted`), `16075` no carrier shipment to cancel / dismiss (409, `details.unresolved`), `16076` packages / customs data cannot be changed, or documents with different data cannot be issued, while a carrier shipment is pending, active, unclear or being cancelled (409, `details {reason: CARRIER_SHIPMENT_OPEN | DOCUMENT_DATA_CHANGED, status, carrier, carrier_shipment {id, status, tracking_number}}`), `16077` invalid `label_format`, or not supported by the carrier (400), `16078` tracking number / carrier differs from the active carrier shipment, or a delivery task is added / deleted while a carrier shipment exists (409), `16079` a carrier shipment request is pending or its result is unclear, or the shipment is being cancelled / the cancellation is unclear — no new shipment, tracking number or shipping (409, `details.unresolved`), `16093` the shipment / record named in a cancel / dismiss request is not the current one (409, `details {expected, actual}`), `16094` dismissing a record with a tracking number: the carrier did not confirm it is cancelled / not found (409), `16095` the carrier created the shipment but saving it in WMS failed; compensated (502, `details {error, compensation, unresolved, …}`). Carrier integrations: `16124` invalid integration settings (400, `field`: `adapter` / `enabled` / `settings.<key>` / `secrets.<key>`), `16125` the carrier has unfinished automatic shipments — its integration cannot be removed or switched to another plugin (409, `details.shipments`). Courier pickups: `16130` blockers (409, `details.blockers`), `16131` invalid pickup request (400, `field`), `16132` selected shipments cannot be scheduled (409, `details.shipments[{shipment_id, tracking_number, reason}]`), `16133` the pickup cannot be cancelled / dismissed in its current state (409, `details {pickup_id, status, reason, pickup_date}`); tracking: `16134` no active waybill that can be tracked through the API (409); carrier errors / timeouts as for shipments (`16073` / `16074`, `details.action` `pickup` / `pickup_cancel` / `pickup_availability`). No longer used: `16069` (formerly: documents missing or out of date on completion; completion no longer checks documents); the documents no longer print the tracking number or carrier: `16080` (formerly: tracking number on completion differs from the AWB printed on the CI), `16092` (formerly: carrier on completion differs from the one printed on the CI). Delivery tasks: `16090` the DN already has an unfinished delivery task (409, `details {delivery_task_id, status}`), `16091` DN with customs data or waybill records — not the current delivery task (409, `details {delivery_task_id, current_status}`), `16136` `shipped_at` in the future (400, `field: shipped_at`; an invalid one is `16050`). Shipping flow: `16135` invalid carrier method / pickup schedule / tracking page / `auto_sign_days` / file settings (`file_preset`, `file_template.<path>`, `file_account.<key>`), or a method that is not available (400, `field`); file mode: `16137` rows with problems — nothing exported (409, `details.rows[{dn_id, order_number, problems[{column, code, message}]}]`), `16138` file mode not available: invalid request / import file (400) or the carrier is not in file mode / its template is incomplete (409), with `field`; `16139` invalid shipping options (400, `field: options.<key>`); `16076` also with `details.reason: SHIPPING_OPTIONS_LOCKED` / `SHIP_TO_LOCKED`, `16075` also when there is no exported file waybill to discard (`details.waybill`); structured addresses use `14019` (not a string / too long / `zip_code` ≠ `postal_code`) and `14020` (country); `16130` also carries `PICKUP_METHOD_NOT_API`; `16131` manual pickups also use `field` `warehouse_id` / `confirmation_code`; carrier-shipment blockers `SCOPE_NOT_SUPPORTED` / `CUSTOMS_DATA_MISSING` / `CUSTOMS_NOT_SUPPORTED` / `WAYBILL_NOT_SUPPORTED` replace `NOT_EXPORT`. Warehouses: `14022` invalid time zone (not an IANA name, 400, `field: timezone`). Errors may carry a structured `details` object.
 
 Process rules (see "Process rules" above): `16110` DN has an unfinished carrier shipment — cancel it first (409), `16111` adjustment cancelled (409), `16112` adjustment cannot be cancelled in its status (409), `16113` adjustment line cannot be applied — the location no longer holds the goods / no location (409), `16114` cycle count has uncounted details (409, `details.detail_ids`), `16115` invalid numeric field (400, `field`), `16116` the ASN of a sorting task cannot be changed (409), `16120` transfer: the goods is not in the source location (404), `16121` the same `client_batch_id` was already submitted with different details (409, `details {client_batch_id, batch_id}`), `16122` the user who changed the adjustment details cannot approve it (409), `16123` invalid `client_batch_id` (400), `44009` location has history records — deactivate it instead (409). Tasks: `16088` the task is deactivated (its DN / ASN was cancelled, 409), `16089` a picking task with nothing picked cannot be completed (409). Inventory: `15017` bulk threshold items are invalid, nothing changed (400, `details.errors[{index, goods_id, goods_code, field, code, message}]`), `15018` moving stock from a damaged / return location back to a standard location needs a reason (400, `field: reason`), `15019` invalid query parameter of the stock ledger / history / analysis endpoints (400, `field`), `15020` ledger export over 50,000 lines (400, `details {total, max_rows}`); `15016` damaged goods waiting to be put away can only go to a damaged location — a standard / return location only takes the good part (`sorted_stock - sorted_damage_stock`) (400, `details {good_pending, damaged_pending}`); `16162` goods can only be picked from standard locations (400, `details {location_id, location_type}`). Inventory lists: `GET /warehouse/inventory/?pending_putaway=true` (rows with `sorted_stock > 0`, with `sorted_damage_stock` and `pending_since`) and `GET /warehouse/inventory/pending-putaway/summary` (doc/库存数值系统说明.md §8).
+
+Spec capture on receiving: `17020` invalid spec capture settings — ASN `spec_capture`, warehouse defaults (400,
+`field`), `17021` completing sorting is blocked: sorted lines still need specs captured or a skip reason (409,
+`details {asn_id, enforcement, lines}`), `17022` invalid capture request — no value and no skip reason, dimensions not
+all given, `remeasure` without every requested spec, invalid `note` (400, `field` / `details.missing`), `17023` specs can
+only be captured while the ASN is received or completed (409, `details {asn_id, status}`).
 
 Master data and permissions: `16100` invalid goods value (400), `16101` duplicate goods code in the CSV (400, with row numbers), `16102` invalid data value (400), `16103` inactive roles cannot be assigned (400), `16104` only company administrators can create / delete warehouses or change the manager (403), `16105` without company_all_access only API keys bound to yourself can be managed (403), `44004` master data referenced by documents or stock cannot be deleted — deactivate it instead (409, `details {entity, id, references}`), `44005` conflicts with existing data (409). Passwords: `10015` a new password must be 8-16 characters with an uppercase letter, a lowercase letter, a digit and a special character (`@$!%*?&`), nothing else (400, `field`, `details {min_length, max_length, special_characters}`; reset / change password, creating / editing users and staff). Built-in permissions / roles (`is_builtin`): `11011` a built-in permission cannot be renamed or deleted (409, `details {permission, reason}`), `11012` a built-in role (admin / company_admin / warehouse_admin / warehouse_operator) cannot be renamed, deactivated or deleted (409, `details {role, reason}`). Goods import: template `GET /warehouse/goods/bulk_upload/template`; errors `10004` / `10005` / `10006` / `10012` / `10014` / `16100` / `16101` carry `details {row, rows, code, columns, value}`, `10016` the file is not UTF-8 text.
 

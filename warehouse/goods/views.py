@@ -162,6 +162,8 @@ class GoodsList(Resource):
             'keyword': args.get('keyword'),
             'goods_codes': args.get('goods_codes'),
             'origin_missing': args.get('origin_missing'),
+            'image_missing': args.get('image_missing'),
+            'spec_missing': args.get('spec_missing'),
             # 商品是公司级主数据：员工 / 公司级 API Key 强制只看本公司
             'company_id': get_actor_company_id() or args.get('company_id'),
         }

@@ -221,6 +221,7 @@ class InboundFlowService:
             'damage_quantity': damage_qty,
             'quantity': sorted_qty + damage_qty,
             'expected_quantity': f['expected_quantity'],
+            'spec_capture': InboundFlowService._spec_capture(asn),
         }
         if asn.status == 'completed':
             done_at = [task.completed_at for task in tasks if task.completed_at is not None]
@@ -234,6 +235,19 @@ class InboundFlowService:
         started = [task.started_at for task in tasks if task.started_at is not None]
         return _step('sorting', 'current', min(started) if started else None, 'warehouse' if started else None,
                      summary)
+
+    @staticmethod
+    def _spec_capture(asn):
+        """规格采集（warehouse/asn/spec_capture.py）：单据的采集项与模式、仓库的提示 / 拦截、有待采集项的行数，以及本单已分拣到
+        但还没采集的行（分拣完成时提示 / 拦截的就是这些）"""
+        from warehouse.common.spec_capture import DEFAULT_SPEC_CAPTURE_ENFORCEMENT
+        from .spec_capture import asn_spec_pending_count, sorted_pending_lines, spec_capture_payload
+        return {
+            **spec_capture_payload(asn),
+            'enforcement': getattr(asn.warehouse, 'spec_capture_enforcement', None) or DEFAULT_SPEC_CAPTURE_ENFORCEMENT,
+            'pending_count': asn_spec_pending_count(asn),
+            'sorted_pending': sorted_pending_lines(asn),
+        }
 
     @staticmethod
     def _putaway(f, _steps):

@@ -1,7 +1,7 @@
 """Stock foundation (phase 1): unified stock service tables — ledger, lot stock, daily balances, metrics
 
 Revision ID: 5b8e2d7c4a91
-Revises: e7b4c2a9d1f3
+Revises: c4e8a1f6b2d9
 Create Date: 2026-10-25
 
 库存底座一期（doc/库存数值系统说明.md 第九、十节）：
@@ -25,7 +25,7 @@ import sqlalchemy as sa
 
 
 revision = '5b8e2d7c4a91'
-down_revision = 'e7b4c2a9d1f3'
+down_revision = 'c4e8a1f6b2d9'
 branch_labels = None
 depends_on = None
 

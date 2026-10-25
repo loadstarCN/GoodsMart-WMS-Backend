@@ -180,7 +180,7 @@ GoodsMart-WMS-Backend/
 
 ### 系统管理
 - **用户管理**: 注册、登录、JWT 令牌管理
-- **角色与权限**: RBAC 细粒度权限控制（84 项权限）
+- **角色与权限**: RBAC 细粒度权限控制（91 项内置权限）
 - **API Key**: 第三方系统集成，支持公司级数据隔离
 - **日志**: 请求日志与审计追踪
 - **IP 管控**: 黑白名单管理
@@ -196,7 +196,57 @@ GoodsMart-WMS-Backend/
 - ASN 创建与管理
 - 收货
 - 质量分拣（实际数量、损坏追踪）
+- 收货规格采集：按收货通知明细采集重量、尺寸、原产国（见下文；默认不开）
 - 上架至库位
+- 收货权限：`PUT /warehouse/asn/<id>/receive/` 与刷新到货跟踪（`POST /warehouse/asn/<id>/track`）接受 `asn_receive` 或
+  `asn_edit`；新建 / 修改 / 关闭 / 取消 / 删除收货通知及其明细仍要 `asn_edit`（`asn_delete`）。内置角色 `warehouse_operator`
+  用 `asn_receive` 代替 `asn_edit`（迁移 `c4e8a1f6b2d9` 从该角色上移除 `asn_edit`；要让作业员也能建单，请手工加回）。
+  分拣（含分拣完成时自动完成收货通知）只要 `sorting_edit`。
+
+#### 收货规格采集
+
+仓库可以要求在收货时采集商品的重量、尺寸、原产国。这是通用功能，**默认不开**（仓库没设置就不采集任何项）。
+
+- **仓库默认规则**（`POST` / `PUT /warehouse/warehouse/<id>`，`warehouse_edit`）：`default_spec_capture_fields` ——
+  `weight` / `dimensions`（长宽高三项一起）/ `origin_country` 的子集，`[]` = 不采集（默认，`null` 同）；
+  `default_spec_capture_mode` —— `missing`（只补商品资料里缺的，默认）或 `remeasure`（要求的项全部重新测量）；
+  `spec_capture_enforcement` —— `warn`（默认）或 `block`，分拣完成时用。取值不合法 → 400 `17020`（`field` 为字段名）。
+  一次性设置脚本：`python scripts/set_warehouse_spec_capture.py`（不加 `--apply` 只预览；默认针对 `Kyoto#1` 仓库、三项全采、
+  `missing`、`warn`；可用 `--warehouse-id` / `--warehouse-name` / `--company-id` / `--fields` / `--mode` / `--enforcement`）。
+- **收货通知上的请求**：建单（`POST /warehouse/asn/`）与修改（`PUT /warehouse/asn/<id>`，仅 pending）时可传
+  `spec_capture: {fields, mode}`。建单时没传（或对象里缺某个键）就从仓库默认值复制——是快照，之后改仓库设置不影响已建的单；
+  修改时只改给了的键（`null` = 不变）。不合法 → 400 `17020`（`field`：`spec_capture` / `spec_capture.fields` /
+  `spec_capture.mode`）。升级前建的收货通知不采集。收货通知的列表与详情都带 `spec_capture` 和 `spec_pending_count`。
+- **待采集项**按规则算出、不落库。每行明细带 `spec_pending`（如 `["weight", "origin_country"]`；`[]` = 没有待采集），
+  `GET /warehouse/asn/?spec_pending=true|false` 按 `spec_pending_count > 0` 筛选（同一规则，在 SQL 里算）：
+  - `missing`：要求的项里商品资料缺的（重量为空或 ≤ 0；长宽高任一为空或 ≤ 0；原产国为空）。不论在哪里补上（这里采集、
+    商品编辑、CSV 导入、别的收货通知），就不再待采集。
+  - `remeasure`：这一行还没采集过 → 要求的全部项。
+  - 填了跳过原因的行、已关闭的收货通知、已完成的收货通知上没到货（`actual_quantity` 为 0）的行，都没有待采集。
+- **采集** `PUT /warehouse/asn/<id>/details/<detail_id>/spec`：要 `goods_edit` / `sorting_edit` / `packing_edit` 任一（与
+  `PUT /warehouse/goods/<id>/origin-country` 相同）；收货通知为 `received` 时可以采集，`completed` 后也可以补采（效果相同，
+  不会重推 `asn.completed`）；`pending` / `closed` → 409 `17023` `details {asn_id, status}`：
+
+  ```json
+  { "weight": 0.235, "length": 120, "width": 80, "height": 45, "origin_country": "CN",
+    "note": null, "spec_source": "receiving" }
+  ```
+
+  重量 kg、尺寸 mm（长宽高要一起给，否则 400 `17022` `field: dimensions`）、原产国 ISO 3166-1 alpha-2。给了的值写回商品主数据
+  ——空值 / `null` 忽略，采集不会清空资料；数值不合法 400 `16100`、国家代码不合法 400 `10014`——规格有变化就推
+  `goods.spec_updated`，`source` = `spec_source`（默认 `receiving`；称重站传 `station`）。`note` 是跳过原因（文字，最多 255
+  个字符；前端给预设选项：包装无原产国标识 / 无法拆封测量 / 商品破损 / 其他须填写）：要求的项里没给的就算跳过。既没有值也没有
+  跳过原因 → 400 `17022`；`remeasure` 模式不填跳过原因就要给齐要求的全部项 → 400 `17022` `details {missing}`。明细记
+  `spec_captured_at`、`spec_captured_by`（及 `spec_captured_by_user {id, user_name}`）与 `spec_capture_note`（之后不带原因再
+  采集一次就清空）。响应是这一行明细（带最新的 `spec_pending`）。
+- **分拣完成**（`PUT /warehouse/sorting/<id>/complete/`）只看本单分拣到的商品（合格 + 破损 > 0）的行：`warn` 照常完成，响应的
+  `spec_pending` 列出仍待采集的行 `[{asn_detail_id, goods_id, goods_code, goods_name, spec_pending}]`；`block` 时只要还有既没
+  采集、也没填跳过原因的行 → 409 `17021` `details {asn_id, enforcement: "block", lines: [同上]}`。
+  `GET /warehouse/sorting/<id>` 也带同样的 `spec_pending`（现在完成会提示 / 拦截的行）；入库流程的分拣一步带
+  `summary.spec_capture {fields, mode, enforcement, pending_count, sorted_pending}`。
+- `asn.completed` 每行带 `spec_pending`（见「Webhook 集成」）。
+- 商品列表筛选（通用）：`GET /warehouse/goods/?image_missing=true|false`（没有 `image_url`）、
+  `?spec_missing=weight,dimensions,origin_country`（缺所列任一项，规则同上；不认识的项 → 400）。
 
 ### 出库（DN）
 - 发货单创建与管理
@@ -211,7 +261,10 @@ GoodsMart-WMS-Backend/
 ### 库存运营
 - 实时库存追踪（多阶段：ASN → 已收货 → 已分拣 → 在库 → DN → 已拣货 → 已打包 → 已发货）
 - 库存调整（增减及原因追踪）
-- 盘点（带审批流程）
+- 盘点（带审批流程）。盘点作业——开始盘点（`PUT /warehouse/cyclecount/<id>/process/`）、录入实盘数
+  （`POST .../details-batch-save/`）、完成明细（`PUT .../details/<detail_id>/complete/`）、完成盘点单（`PUT .../complete/`）——
+  接受 `cycle_count_execute` 或 `cycle_count_edit`；新建 / 修改盘点单、增加 / 修改明细仍要 `cycle_count_edit`。内置角色
+  `warehouse_operator` 用 `cycle_count_execute` 代替 `cycle_count_edit`（迁移 `c4e8a1f6b2d9`）
 - 库位间调拨
 - 库存移除
 - 库存快照（每日定时）
@@ -256,7 +309,7 @@ WMS 通过 Webhook 向外部系统推送事件通知，使用 HMAC-SHA256 签名
 | 事件 | 触发时机 |
 |------|----------|
 | `asn.received` | ASN 标记为已收货 |
-| `asn.completed` | ASN 完成（含实际数量） |
+| `asn.completed` | ASN 完成（含实际数量、完成时刻 `completed_at` / `completed_at_ms`） |
 | `asn.cancelled` | 已收货（未分拣）的 ASN 被取消 |
 | `dn.in_progress` | DN 开始处理（含开始时刻 `started_at`） |
 | `dn.picked` | DN 拣货完成（含各商品计划 / 已拣量、拣货完成时刻 `picked_at`） |
@@ -267,13 +320,17 @@ WMS 通过 Webhook 向外部系统推送事件通知，使用 HMAC-SHA256 签名
 | `dn.cancelled` | 开始处理后（`in_progress` / `picked` / `packed`）的 DN 被取消（含 `previous_status` 与各商品已拣 / 已打包量） |
 | `goods.spec_updated` | 商品重量 / 尺寸 / 原产国变更（按公司广播，需订阅，见下文） |
 
-`started_at` / `picked_at` / `packed_at` / `shipped_at` / `signed_at` 是这一步实际发生的时刻（带时区偏移的 ISO 8601，如 `2026-10-23T13:03:00+09:00`），不是推送时刻：
+`completed_at`（ASN）/ `started_at` / `picked_at` / `packed_at` / `shipped_at` / `signed_at` 是这一步实际发生的时刻（带时区偏移的 ISO 8601，如 `2026-10-23T13:03:00+09:00`），不是推送时刻：
 仓库手动操作的 = 操作时刻（签收时填了签收时间的 = 填的时间），承运商揽收后自动发货的 = 承运商的揽收时刻，送达后自动签收的 =
 承运商的送达时刻。推送可能晚到（定时推、失败重试），来源系统应按这些字段记各步的时间。
 
 单据类事件（`asn.*`、`dn.*`）只推给创建该单据的 API Key。`asn.completed` 明细另带商品主数据：
 `goods_weight_kg`、`goods_length_mm`、`goods_width_mm`、`goods_height_mm` 与
-`goods_origin_country`（ISO 3166-1 alpha-2，`null` = 未录入）。
+`goods_origin_country`（ISO 3166-1 alpha-2，`null` = 未录入），以及 `spec_pending`：收货通知要求采集（「收货规格采集」）、
+到完成时仍没采集到的项（`weight` / `dimensions` / `origin_country`；`[]` = 没有——没要求采集、这一行填了跳过原因、或没到货时
+也是 `[]`）。规格快照是完成时读的：`completed_at`（带仓库时区偏移的 ISO 8601，与其他事件时刻同格式）与 `completed_at_ms`
+（epoch 毫秒）表示它有多新——同一商品拿 `completed_at_ms` 与 `goods.spec_updated` 的 `changed_at_ms` 比，取较新的一份。
+商品表没有单独记规格的最近变更时刻，所以明细里不带每个商品的变更时刻。
 
 ### 配置
 
@@ -329,7 +386,9 @@ payload 是当前值的完整快照（`null` = 未录入）：
   在商品行写入之后取值）用来判断新旧：接收方按 `goods_id` 记住已应用的最大 `changed_at_ms`，小于或等于它的 payload 忽略。
   事件可能乱序到达（重试、多个推送进程）。加这个字段之前排队的事件没有 `changed_at_ms`，按 `changed_at` 处理。
 
-- `source`：取商品新建 / 修改请求体里的 `spec_source`（`station` / `manual` / `import` / `api`）；
+- `source`：取商品新建 / 修改请求体里的 `spec_source`（`station` / `manual` / `import` / `api` / `receiving`）；
+  收货通知明细上的规格采集（`PUT /warehouse/asn/<id>/details/<detail_id>/spec`）默认为 `receiving`（请求里传了 `spec_source`
+  就照用，称重站传 `station`）；
   没传时 API Key 调用为 `api`、登录用户为 `manual`；CSV 导入为 `import`。
 - 同一商品对同一 Key 还有没推送过的待发送事件时，新的变更覆盖它的 payload，不再新增
   （`dedupe_key = goods:<id>`；`changed_fields` 取并集）；已推送失败过的不覆盖，另建新事件（新的 `X-Webhook-Id`）接替、
@@ -1424,10 +1483,16 @@ stdout_logfile=/var/log/wms-api.out.log
 | 验证错误 | 14000-14999 | 400 | 数据格式错误 |
 | 库存错误 | 15000-15999 | 400 | 库存相关错误 |
 | 状态错误 | 16000-16999 | 400 | 状态流转错误 |
+| 入库规则 | 17000-17999 | 400 / 409 | 收货规格采集（及以后的入库规则） |
 
 出口单证相关业务码：`14019` 出口资料文本超长、`14020` 国家代码不合法、`16063` 报关结构不合法、`16064` 报关行商品编码不在 DN 明细或重复、`16065` 已发货不可改（409）、`16066` 箱子数据不合法、`16067` 当前状态不能改箱子（409）、`16068` 单证条件不全（409，`details.problems`）、`16070` 不是海外单（409）、`16071` 单证不存在（404）、`16117` 单证排不下——某块文字（通常是收件人信息）一页放不下，请缩短（409，`details {document, reason: LAYOUT_OVERFLOW}`）。承运商运单（自动建运单）：`16072` 建单 / 取消的前置条件不满足（409，`details.blockers`）、`16073` 承运商返回错误或结果不明（502，`details.errors` / `transaction_id` / `maybe_processed`）、`16074` 承运商超时或时间预算用完（504，`details.budget_exhausted`）、`16075` 没有可取消 / 可确认作废的运单记录（409，`details.unresolved`）、`16076` 有进行中 / 有效 / 结果不明 / 取消中的运单时不能改箱子或报关数据，也不能签发数据有变化的单证（409，`details {reason: CARRIER_SHIPMENT_OPEN | DOCUMENT_DATA_CHANGED, status, carrier, carrier_shipment {id, status, tracking_number}}`）、`16077` `label_format` 不合法或该承运商不支持（400）、`16078` 运单号 / 承运商与有效的自动运单不一致，或有自动运单时新建 / 删除发货任务（409）、`16079` 有结果不明 / 进行中的建单记录，或运单正在取消 / 取消结果不明——不能建单、存运单号、发货（409，`details.unresolved`）、`16093` 取消 / 确认作废请求里的目标与当前记录不符（409，`details {expected, actual}`）、`16094` 确认作废带运单号的记录时承运商没有确认已取消 / 不存在（409）、`16095` 承运商已建好运单但 WMS 写库失败，已补偿处理（502，`details {error, compensation, unresolved, …}`）。承运商在线对接：`16124` 对接设置不合法（400，`field`：`adapter` / `enabled` / `settings.<key>` / `secrets.<key>`）、`16125` 承运商还有未结束的自动运单，不能删除对接或换插件（409，`details.shipments`）。上门揽收：`16130` 前置条件不满足（409，`details.blockers`）、`16131` 预约参数不合法（400，`field`）、`16132` 所选运单不能预约（409，`details.shipments[{shipment_id, tracking_number, reason}]`）、`16133` 当前状态不能取消 / 作废（409，`details {pickup_id, status, reason, pickup_date}`）；跟踪：`16134` 没有能经 API 跟踪的有效运单（409）；承运商报错 / 超时同运单（`16073` / `16074`，`details.action` 为 `pickup` / `pickup_cancel` / `pickup_availability`）。已不再使用：`16069`（原：完成发货时单证缺失或已过期；完成发货不再查单证）；单证不再印运单号和承运商：`16080`（原：完成发货时运单号与 CI 上印的 AWB 不一致）、`16092`（原：完成发货时承运商与 CI 上印的不一致）。发货任务：`16090` DN 已有未完成的发货任务（409，`details {delivery_task_id, status}`）、`16091` 有报关快照或运单记录的 DN 不是当前发货任务（409，`details {delivery_task_id, current_status}`）、`16136` `shipped_at` 晚于现在（400，`field: shipped_at`；格式不对为 `16050`）。发货流程：`16135` 承运商对接方式 / 集荷安排 / 查询页 / `auto_sign_days` / 文件方式设置（`file_preset`、`file_template.<位置>`、`file_account.<key>`）不合法，或所选方式现在不可选（400，`field`）；文件方式：`16137` 有行有问题、整批不导出（409，`details.rows[{dn_id, order_number, problems[{column, code, message}]}]`）、`16138` 文件方式用不了：请求 / 导入文件不合法（400）或承运商不是文件方式 / 模板不全（409），带 `field`；`16139` 运单服务选项不合法（400，`field: options.<key>`）；`16076` 另有 `details.reason: SHIPPING_OPTIONS_LOCKED` / `SHIP_TO_LOCKED`，`16075` 另用于没有可作废的已导出文件运单（`details.waybill`）；结构化地址用 `14019`（不是文字 / 超长 / `zip_code` 与 `postal_code` 不同）与 `14020`（国家代码）；`16130` 另有 `PICKUP_METHOD_NOT_API`；`16131` 手工揽收另有 `field` `warehouse_id` / `confirmation_code`；建运单的 blocker `SCOPE_NOT_SUPPORTED` / `CUSTOMS_DATA_MISSING` / `CUSTOMS_NOT_SUPPORTED` / `WAYBILL_NOT_SUPPORTED` 取代 `NOT_EXPORT`。仓库：`14022` 时区不合法（不是 IANA 时区名，400，`field: timezone`）。错误响应可能带结构化的 `details`。
 
 作业流程（见上文「作业流程规则」）：`16110` DN 有未结束的承运商运单，请先取消运单（409）、`16111` 调整单已取消（409）、`16112` 调整单当前状态不能取消（409）、`16113` 调整明细无法执行：库位上已没有该商品 / 明细没有库位（409）、`16114` 盘点单有未录入的明细（409，`details.detail_ids`）、`16115` 数值字段不合法（400，`field`）、`16116` 分拣任务的 ASN 不能改（409）、`16120` 移库来源库位没有这个商品（404）、`16121` 同一个 `client_batch_id` 已提交过不同的明细（409，`details {client_batch_id, batch_id}`）、`16122` 修改过调整单明细的人不能审批（409）、`16123` `client_batch_id` 不合法（400）、`44009` 库位有历史记录，请改用停用（409）。任务：`16088` 任务已停用（所属 DN / ASN 已取消，409）、`16089` 拣货一件都没拣不能完成（409）。库存：`15017` 补货阈值批量设置有错误行、全部不改（400，`details.errors[{index, goods_id, goods_code, field, code, message}]`）、`15018` 从破损 / 退货库位移回标准库位没有填原因（400，`field: reason`）、`15019` 库存流水 / 历史 / 分析接口的查询参数不合法（400，`field`）、`15020` 流水导出超过 50,000 行（400，`details {total, max_rows}`）；`15016` 待上架里的破损品只能上到破损库位，standard / return 库位只能用良品部分（`sorted_stock − sorted_damage_stock`）（400，`details {good_pending, damaged_pending}`）；`16162` 只能从 standard 库位拣货（400，`details {location_id, location_type}`）。待上架：`GET /warehouse/inventory/?pending_putaway=true`（只返回 `sorted_stock > 0` 的行，带 `sorted_damage_stock`、`pending_since`）与 `GET /warehouse/inventory/pending-putaway/summary`（doc/库存数值系统说明.md 第八节）。
+
+收货规格采集：`17020` 采集设置不合法——收货通知的 `spec_capture`、仓库默认规则（400，`field`）、`17021` 分拣完成被拦：
+分拣到的行还没采集规格、也没填跳过原因（409，`details {asn_id, enforcement, lines}`）、`17022` 采集请求不合法——既没有值也没有
+跳过原因、长宽高没给齐、`remeasure` 没给齐要求的项、`note` 不合法（400，`field` / `details.missing`）、`17023` 只有已收货
+（received）或已完成（completed，补采）的收货通知能采集（409，`details {asn_id, status}`）。
 
 主数据与权限：`16100` 商品数值不合法（400）、`16101` CSV 内商品编码重复（400，带行号）、`16102` 数据值不合法（400）、`16103` 不能分配已停用的角色（400）、`16104` 只有公司管理员能新建 / 删除仓库或更换负责人（403）、`16105` 没有公司管理权限时只能管理绑定自己的 API Key（403）、`44004` 被单据或库存引用的主数据不能删除，请改用停用（409，`details {entity, id, references}`）、`44005` 与已有数据冲突（409）。密码：`10015` 新密码须 8–16 位，含大写字母、小写字母、数字和特殊符号（`@$!%*?&`），不能有其它字符（400，`field`，`details {min_length, max_length, special_characters}`；忘记密码重置、修改密码、新建 / 修改用户与员工都查）。内置权限 / 角色（输出 `is_builtin`）：`11011` 内置权限不能改代码、不能删（409，`details {permission, reason}`），`11012` 内置角色（admin / company_admin / warehouse_admin / warehouse_operator）不能改名、停用、删除（409，`details {role, reason}`）。商品导入：模板 `GET /warehouse/goods/bulk_upload/template`；`10004` / `10005` / `10006` / `10012` / `10014` / `16100` / `16101` 带 `details {row, rows, code, columns, value}`，`10016` 文件不是 UTF-8 文本。
 

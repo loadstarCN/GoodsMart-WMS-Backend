@@ -335,7 +335,7 @@ tracking_url_template = None              # 公开查询页，如 'https://www.f
 - `stage`（列表用，SQL 判定，`warehouse/asn/stage.py`，按顺序先命中先算）：`closed` → `putaway`（已完成、有待上架，
   口径同上）→ `completed` → `sorting`（`received`）→ 待收货里：`exception`（有运单号且跟踪异常）→ `receiving`（有运单号且
   承运商说已送达，等仓库收货）→ `in_transit`（有运单号）→ `expected`（没有运单号）。预计到货日过了不改阶段，只记问题。
-- `POST /warehouse/asn/<id>/track`（权限 `asn_edit`）：只在承运商的跟踪方式是 `api`、在线对接的插件 `supports_tracking` 且
+- `POST /warehouse/asn/<id>/track`（权限 `asn_receive` 或 `asn_edit`）：只在承运商的跟踪方式是 `api`、在线对接的插件 `supports_tracking` 且
   `tracks_any_number`、设置齐全时可用（否则 / 没有运单号 → 409 `16140`）。经插件 `track()` 查一次（约 40 秒时限，调承运商时
   不占事务），结果按插件归好的那一套存到入库单的 `tracking_status` / `tracking_detail`（`{code, status_text, picked_up_at,
   delivered_at, estimated_delivery, events[], error}`）/ `tracking_synced_at`；查询失败不是 HTTP 错误，只记 `error`、保留上次

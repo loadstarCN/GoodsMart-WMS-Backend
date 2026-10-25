@@ -3,6 +3,7 @@ from extensions import authorizations
 from system.common import generate_input_fields,pagination_parser, create_pagination_model
 from system.user.schemas import user_simple_model as original_user_model
 from warehouse.company.schemas import comapny_simple_model as company_model
+from warehouse.common.spec_capture import SPEC_CAPTURE_ENFORCEMENTS, SPEC_CAPTURE_FIELDS, SPEC_CAPTURE_MODES
 
 # -----------------------------
 # 定义 Warehouse 命名空间
@@ -69,6 +70,21 @@ warehouse_model = api_ns.model('Warehouse', {
     'timezone': warehouse_timezone_field,
     'timezone_configured': fields.String(attribute='timezone', readOnly=True,
                                          description='Time zone set on the warehouse itself; null = default'),
+    # 收货规格采集的默认规则（README「Spec capture on receiving」）
+    'default_spec_capture_fields': fields.List(
+        fields.String(enum=list(SPEC_CAPTURE_FIELDS)),
+        attribute=lambda w: (w.get('default_spec_capture_fields') if isinstance(w, dict)
+                             else w.default_spec_capture_fields) or [],
+        description='Specs captured on receiving by default (subset of weight / dimensions / origin_country), copied '
+                    'to a new ASN that does not send spec_capture; [] = no capture (default)'),
+    'default_spec_capture_mode': fields.String(
+        enum=list(SPEC_CAPTURE_MODES),
+        description='Default capture mode: missing = only what the goods master data lacks (default); '
+                    'remeasure = measure everything again'),
+    'spec_capture_enforcement': fields.String(
+        enum=list(SPEC_CAPTURE_ENFORCEMENTS),
+        description='When sorting completes with specs still pending: warn = complete and list them (default); '
+                    'block = 409 17021 until every sorted line is captured or has a skip reason'),
     'company_id': fields.Integer(required=True, description='ID of the associated company'),
     'manager_id': fields.Integer(description='Manager ID'),
     'is_active': fields.Boolean(description='Is the warehouse active?'),

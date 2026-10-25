@@ -7,7 +7,10 @@ from warehouse.goods.schemas import goods_simple_model as goods_model
 from warehouse.carrier.schemas import carrier_simple_model,carrier_model
 from warehouse.supplier.schemas import supplier_simple_model,supplier_model
 from warehouse.warehouse.schemas import warehouse_simple_model,warehouse_model
+from warehouse.common.spec_capture import SPEC_CAPTURE_FIELDS, SPEC_CAPTURE_MODES
+from warehouse.goods.services import SPEC_SOURCES
 from .models import ASN
+from .spec_capture import asn_spec_pending_count, line_spec_pending, spec_capture_payload
 from .stage import STAGES as INBOUND_STAGES, inbound_stage_of
 
 # -----------------------------
@@ -44,6 +47,17 @@ asn_detail_fields = {
     'update_time': fields.DateTime(readOnly=True, description='Last updated time'),
     'goods': fields.Nested(goods_model, readOnly=True, description='Details of the associated goods'),
     'creator': fields.Nested(user_model, readOnly=True, description='Details of the creator'),
+    # 规格采集（README「Spec capture on receiving」）：待采集项按商品当前资料与单据的采集项 / 模式算出，不落库
+    'spec_pending': fields.List(
+        fields.String(enum=list(SPEC_CAPTURE_FIELDS)), readOnly=True, attribute=line_spec_pending,
+        description='Specs still to capture for this line (weight / dimensions / origin_country); [] = nothing '
+                    'pending (no capture requested, captured, skipped with a reason, ASN closed, or nothing arrived)'),
+    'spec_captured_at': fields.DateTime(readOnly=True, description='When the specs were last captured / skipped'),
+    'spec_captured_by': fields.Integer(readOnly=True, description='User who last captured / skipped the specs'),
+    'spec_captured_by_user': fields.Nested(user_model, readOnly=True, allow_null=True, attribute='spec_capturer',
+                                           description='User who last captured / skipped the specs'),
+    'spec_capture_note': fields.String(readOnly=True,
+                                       description='Skip reason; set = the specs not captured were skipped'),
 }
 
 # 输出模型：ASNDetail
@@ -52,6 +66,31 @@ asn_detail_model = api_ns.model('ASNDetail', asn_detail_fields)
 # 生成输入模型：复制后删除不允许用户输入的字段
 asn_detail_input_fields = generate_input_fields(asn_detail_fields)
 asn_detail_input_model = api_ns.model('ASNDetailInput', asn_detail_input_fields)
+
+# 规格采集请求：PUT /asn/<id>/details/<detail_id>/spec
+asn_detail_spec_input_model = api_ns.model('ASNDetailSpecInput', {
+    'weight': fields.Float(description='Weight in kg (> 0, at most 99999.999; 3 decimals)'),
+    'length': fields.Integer(description='Length in mm (give length, width and height together)'),
+    'width': fields.Integer(description='Width in mm'),
+    'height': fields.Integer(description='Height in mm'),
+    'origin_country': fields.String(description='Country of origin, ISO 3166-1 alpha-2 (e.g. "CN")'),
+    'note': fields.String(description='Skip reason (at most 255 characters): the requested specs not given are '
+                                      'skipped; required to skip, and in remeasure mode unless every requested spec '
+                                      'is given'),
+    'spec_source': fields.String(enum=list(SPEC_SOURCES),
+                                 description='Source for goods.spec_updated; default "receiving" ("station" for a '
+                                             'weighing station)'),
+})
+
+# 单据上的采集请求 {fields, mode}
+asn_spec_capture_model = api_ns.model('ASNSpecCapture', {
+    'fields': fields.List(fields.String(enum=list(SPEC_CAPTURE_FIELDS)),
+                          description='Specs to capture on receiving: weight / dimensions (length, width, height) / '
+                                      'origin_country; [] = none'),
+    'mode': fields.String(enum=list(SPEC_CAPTURE_MODES),
+                          description='missing = only what the goods master data lacks (default); '
+                                      'remeasure = measure every requested spec again'),
+})
 
 # -----------------------------
 # ASN 模型定义
@@ -133,7 +172,14 @@ asn_fields = {
         ),  # 计算所有明细的体积总和
         description='Sum of all goods volumes in the ASN (m³)'
     ),
-
+    # 规格采集请求（建单 / 修改时可传；建单没传取仓库默认值）与待采集行数
+    'spec_capture': fields.Nested(
+        asn_spec_capture_model, attribute=spec_capture_payload,
+        description='Specs to capture on receiving {fields, mode}. On create, omitted parts are copied from the '
+                    'warehouse defaults (a snapshot); on update only the given keys change. Invalid -> 400 17020'),
+    'spec_pending_count': fields.Integer(
+        readOnly=True, attribute=asn_spec_pending_count,
+        description='Number of lines with specs still to capture (same rule as details[].spec_pending)'),
 }
 
 # 输出模型：ASNBase
@@ -184,6 +230,8 @@ asn_pagination_parser.add_argument('warehouse_id', type=int, help='Filter by War
 asn_pagination_parser.add_argument('keyword', type=str, help='Keyword search')
 asn_pagination_parser.add_argument('inbound_stage', type=str, choices=INBOUND_STAGES, location='args',
                                    help='Filter by inbound stage (same definition as GET /asn/<id>/flow stage)')
+asn_pagination_parser.add_argument('spec_pending', type=inputs.boolean, location='args',
+                                   help='true: only ASNs with lines whose specs are still to capture; false: none')
 
 # 列表行另带入库阶段（见 warehouse/asn/stage.py）：列表接口整页一条查询算好，挂在 _inbound_stage 上
 asn_list_model = api_ns.inherit('ASNListItem', asn_base_model, {
