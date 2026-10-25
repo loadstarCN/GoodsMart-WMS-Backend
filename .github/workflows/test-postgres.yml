@@ -1,0 +1,99 @@
+# PostgreSQL 上的测试（库存底座一期，doc/库存数值系统说明.md 第十三节）：SQLite 测不出 FOR UPDATE 行锁、函数唯一索引、
+# 外键与类型约束在 PostgreSQL 上的差异。两步：
+#   1. 迁移往返：空库 create_all → stamp head → downgrade 到上一修订 → upgrade head → 与模型比对（scripts/manual/migration_roundtrip.py）
+#   2. 库存与并发相关的测试子集，在 postgres:16 上跑（tests/pg_plugin.py 把测试的 sqlite 连接串换成 WMS_TEST_DATABASE_URI）
+# 不部署、不碰任何真实数据库。
+name: Tests on PostgreSQL
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    paths:
+      - 'warehouse/**'
+      - 'migrations/**'
+      - 'tests/**'
+      - 'extensions/**'
+      - 'requirements*.txt'
+      - '.github/workflows/test-postgres.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: test-postgres-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  postgres:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+          TZ: Asia/Tokyo
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      PGPASSWORD: postgres
+      # 生产配置必填的项（假值，只为能启动）
+      JWT_SECRET_KEY: ci-dummy-jwt-secret-0123456789abcdef0123
+      SETTINGS_ENCRYPTION_KEY: BkxtjInaQ4xLDw8lonASwQ3Livdsm9yIwmZyibc-xJc=
+      CORS_ORIGINS: https://admin.example
+      OSS_ACCESS_KEY_ID: dummy
+      OSS_ACCESS_KEY_SECRET: dummy
+      OSS_ENDPOINT: https://oss-ap-northeast-1.aliyuncs.com
+      OSS_BUCKET_NAME: dummy
+      OSS_HOST: https://dummy.example
+      WMS_TIMEZONE: Asia/Tokyo
+      SCHEDULER_ENABLED: 'False'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+      - name: Install dependencies
+        run: |
+          # psycopg2（非 binary）从源码编译，要 pg_config / libpq 头文件
+          sudo apt-get update -q && sudo apt-get install -y -q libpq-dev
+          pip install -r requirements-dev.txt
+      - name: Create databases
+        run: |
+          for db in wms_migration wms_test_0 wms_test_1; do
+            psql -h 127.0.0.1 -U postgres -c "CREATE DATABASE $db"
+          done
+      - name: Migration round trip (downgrade / upgrade the latest revision)
+        env:
+          FLASK_ENV: production
+          SQLALCHEMY_DATABASE_URI: postgresql://postgres:postgres@127.0.0.1:5432/wms_migration
+          PGOPTIONS: -c lock_timeout=15s
+        run: python scripts/manual/migration_roundtrip.py
+      - name: Stock and concurrency tests on PostgreSQL
+        run: |
+          set -o pipefail
+          G0="tests/test_stock_ledger_matrix.py tests/test_stock_api.py tests/test_inventory.py tests/test_putaway.py
+              tests/test_removal.py tests/test_transfer.py tests/test_adjustment.py tests/test_damaged_putaway.py"
+          G1="tests/test_picking.py tests/test_packing.py tests/test_dn.py tests/test_inventory_guards.py
+              tests/test_concurrent_transitions.py tests/test_process_followups.py tests/test_process_guards.py
+              tests/test_delivery.py"
+          WMS_TEST_DATABASE_URI=postgresql://postgres:postgres@127.0.0.1:5432/wms_test_0 PGOPTIONS="-c lock_timeout=60s" \
+            python -m pytest -p tests.pg_plugin $G0 -q -p no:cacheprovider -rfE > pg_0.log 2>&1 &
+          P0=$!
+          WMS_TEST_DATABASE_URI=postgresql://postgres:postgres@127.0.0.1:5432/wms_test_1 PGOPTIONS="-c lock_timeout=60s" \
+            python -m pytest -p tests.pg_plugin $G1 -q -p no:cacheprovider -rfE > pg_1.log 2>&1 &
+          P1=$!
+          status=0
+          wait $P0 || status=1
+          wait $P1 || status=1
+          tail -n 40 pg_0.log pg_1.log
+          exit $status

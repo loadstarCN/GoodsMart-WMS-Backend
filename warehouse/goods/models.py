@@ -222,7 +222,7 @@ class GoodsLocation(db.Model):
     )
     lot_id = db.Column(
         db.Integer,
-        db.ForeignKey('goods_lots.id', ondelete='RESTRICT'),
+        db.ForeignKey('goods_lots.id', ondelete='RESTRICT', name='fk_goods_locations_lot_id'),
         nullable=True,
         info={'description': '批次（为空 = 无批次；一期一律为空，二期启用）'}
     )

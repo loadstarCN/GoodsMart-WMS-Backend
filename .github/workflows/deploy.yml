@@ -1,5 +1,6 @@
 # 后端部署：推送到 main 后 SSH 到服务器，在 /var/www/api_wms 上
-#   工作区检查 → 探测当前服务 → fetch + reset --keep → pip install → flask db upgrade → 权限种子 → pm2 restart → 健康探测
+#   工作区检查 → 探测当前服务 → fetch + reset --keep → pip install → flask db upgrade → 权限种子 → 库存流水期初
+#   （flask stock init-ledger，已有流水就跳过）→ pm2 restart → 健康探测 → 部署窗口的库存校正（flask stock reconcile --apply）
 #
 # 失败处理（B-71）：
 #   - fetch / reset、pip install、迁移任一步失败：代码回到部署前的提交（PREV），不重启，运行中的旧进程不受影响。
@@ -230,6 +231,15 @@ jobs:
               say "!!! seed_permissions.py 失败（迁移已提交，继续用新代码重启；本次运行最后会标记失败）"
             fi
 
+            # ---- 6b. 库存流水的期初（warehouse/stock/commands.py）：流水为空时按当前库存写 opening 行，并把旧快照转成
+            #          之前各天的日终结存；已有流水直接跳过（幂等）。失败不影响重启（之后的校正会把差额写成 reconcile 行），
+            #          最后标记失败
+            STOCK_FAILED=no
+            if ! PGOPTIONS="-c lock_timeout=$LOCK_TIMEOUT" FLASK_ENV=production SCHEDULER_ENABLED=False FLASK_APP=app:create_app flask stock init-ledger; then
+              STOCK_FAILED=yes
+              say "!!! flask stock init-ledger 失败（继续重启；本次运行最后会标记失败）"
+            fi
+
             # ---- 7. 重启 + 健康探测；失败回滚代码并重启旧代码，数据库不回滚
             say "重启 $PM2_NAME"
             RESTARTED=yes
@@ -248,9 +258,27 @@ jobs:
               exit 1
             fi
 
+            # ---- 8. 部署窗口的库存校正：迁移跑完到重启之间旧进程还在接请求，它们改了库存不写流水（一期首次部署时也不改
+            #          inventory_lot_stock）。新进程通过探测后，把「当前结存 − 流水合计」写成 reconcile 行并打印出来；
+            #          部署前的版本还没有 StockService（一期首次部署）时，先从 inventory 计数器重建无批次的 inventory_lot_stock
+            SYNC_FLAG=
+            if ! git cat-file -e "$PREV:warehouse/stock/service.py" 2>/dev/null; then
+              SYNC_FLAG=--sync-legacy-counters
+              say "部署前的版本没有库存流水（一期首次部署）：校正时先从 inventory 计数器重建 inventory_lot_stock"
+            fi
+            if ! PGOPTIONS="-c lock_timeout=$LOCK_TIMEOUT" FLASK_ENV=production SCHEDULER_ENABLED=False FLASK_APP=app:create_app flask stock reconcile --apply $SYNC_FLAG; then
+              STOCK_FAILED=yes
+              say "!!! flask stock reconcile --apply 失败，请在服务器上排查后手动补跑："
+              say "    cd $APP_DIR && FLASK_ENV=production SCHEDULER_ENABLED=False FLASK_APP=app:create_app flask stock reconcile --apply $SYNC_FLAG"
+            fi
+
             if [ "$SEED_FAILED" = yes ]; then
               say "!!! 新版本 $NEW_SHORT 已上线，但权限种子失败，请在服务器上手动补跑："
               say "    cd $APP_DIR && FLASK_ENV=production SCHEDULER_ENABLED=False python seed_permissions.py"
+              exit 1
+            fi
+            if [ "$STOCK_FAILED" = yes ]; then
+              say "!!! 新版本 $NEW_SHORT 已上线，但库存期初 / 校正有失败（见上），请在服务器上处理"
               exit 1
             fi
             say "部署完成：$PREV_SHORT → $NEW_SHORT"
