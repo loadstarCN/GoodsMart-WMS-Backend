@@ -34,6 +34,9 @@ class StaffService:
         if filters.get('department_id'):
             query = query.filter(Staff.department_id == filters['department_id'])
 
+        if filters.get('role'):
+            query = query.filter(Staff.roles.any(Role.name == filters['role']))
+
         if filters.get('user_name'):
             query = query.filter(Staff.user_name.ilike(f"%{filters['user_name']}%"))
         if filters.get('email'):

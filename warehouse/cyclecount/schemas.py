@@ -214,3 +214,5 @@ cycle_count_detail_pagination_model = create_pagination_model(api_ns, cycle_coun
 cycle_count_monthly_stats_parser =  reqparse.RequestParser()
 cycle_count_monthly_stats_parser.add_argument('months', type=int, help='Number of months to look back', default=6)
 cycle_count_monthly_stats_parser.add_argument('warehouse_id', type=int, help='Filter by Warehouse ID')
+
+cycle_count_detail_pagination_parser.add_argument('order_by', type=str, choices=('id', 'completed_at'), default='id', location='args')

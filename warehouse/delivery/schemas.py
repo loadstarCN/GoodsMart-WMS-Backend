@@ -143,6 +143,7 @@ delivery_task_signed_input_model = api_ns.model('DeliveryTaskSignedInput', {
 # 6. 分页解析器: 添加 Delivery 专属过滤项
 # ------------------------------------------------------------------------------
 delivery_pagination_parser = pagination_parser.copy()
+delivery_pagination_parser.add_argument('shipping_stage', type=str, location='args', choices=STAGES, help='Shipping stage')
 delivery_pagination_parser.add_argument('dn_id', type=int, location='args', help='ID of associated DN')
 delivery_pagination_parser.add_argument('recipient_id', type=int, location='args', help='ID of recipient')
 delivery_pagination_parser.add_argument('carrier_id', type=int, location='args', help='Carrier ID')

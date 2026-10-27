@@ -23,6 +23,15 @@ from .schemas import (
     dn_monthly_stats_parser
 )
 from .services import DNService
+
+
+@api_ns.route('/report')
+class DNReport(Resource):
+    @permission_required(['all_access', 'company_all_access', 'dn_read'])
+    @warehouse_required(force_warehouse=True)
+    def get(self):
+        from warehouse.common.document_reports import document_report
+        return document_report('outbound', g.warehouse)
 from warehouse.shipping.stage import attach as attach_shipping
 
 
@@ -324,3 +333,53 @@ class DNStatusOverviewStats(Resource):
         filters = add_warehouse_filter(filters)
         stats = DNService.get_status_overview(filters=filters)
         return stats, 200
+
+
+@api_ns.route('/items/preview')
+class DocumentItemsPreview(Resource):
+    @permission_required(["all_access", "company_all_access", "dn_edit"])
+    @warehouse_required(force_warehouse=True)
+    def post(self):
+        """Read-only item preview: JSON text or multipart CSV/XLSX; code, quantity, remark columns."""
+        from warehouse.common.document_items import preview
+        return preview(g.warehouse, outbound=True), 200
+
+
+@api_ns.route('/items/template')
+class DocumentItemsTemplate(Resource):
+    @permission_required(["all_access", "company_all_access", "dn_edit"])
+    def get(self):
+        from warehouse.common.document_items import template
+        return template()
+
+
+@api_ns.route('/recipient-summary')
+class DNRecipientSummary(Resource):
+    @permission_required(["all_access", "company_all_access", "dn_read"])
+    @warehouse_required()
+    def get(self):
+        """Batch recipient dispatch statistics within the caller's warehouse scope."""
+        from flask import request
+        from sqlalchemy import func
+        raw = request.args.get('recipient_ids', '').split(',')
+        if len(raw) > 100 or any(not value.isascii() or not value.isdigit() or len(value) > 10 for value in raw):
+            raise BadRequestException('recipient_ids must contain 1 to 100 positive IDs', 14015)
+        ids = list(dict.fromkeys(int(value) for value in raw))
+        if any(value <= 0 or value > 2147483647 for value in ids):
+            raise BadRequestException('recipient_ids must contain positive IDs', 14015)
+        query = DNService.list_dns(add_warehouse_filter({})).enable_eagerloads(False).order_by(None)
+        rows = query.filter(DN.recipient_id.in_(ids)).with_entities(
+            DN.recipient_id, func.count().label('total'), func.max(DN.delivered_at).label('dispatched_at')
+        ).group_by(DN.recipient_id).all()
+        return {'items': [{'recipient_id': row.recipient_id, 'total': row.total,
+                           'dispatched_at': row.dispatched_at.isoformat() if row.dispatched_at else None}
+                          for row in rows]}, 200
+
+
+@api_ns.route('/report/export')
+class DocumentReportExport(Resource):
+    @permission_required(['all_access', 'company_all_access', 'dn_read'])
+    @warehouse_required(force_warehouse=True)
+    def get(self):
+        from warehouse.common.document_reports import export_document_report
+        return export_document_report('outbound', g.warehouse)

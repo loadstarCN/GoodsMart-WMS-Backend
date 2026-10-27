@@ -309,3 +309,21 @@ class PackingStatusOverviewStats(Resource):
         filters = add_warehouse_filter(filters)
         stats = PackingTaskService.get_status_overview(filters=filters)
         return stats, 200
+
+
+@api_ns.route('/report/operators')
+class OperatorReport(Resource):
+    @permission_required(['all_access', 'company_all_access', 'packing_read'])
+    @warehouse_required(force_warehouse=True)
+    def get(self):
+        from warehouse.common.operator_reports import operator_report
+        return operator_report('packing', g.warehouse)
+
+
+@api_ns.route('/report/operators/export')
+class OperatorReportExport(Resource):
+    @permission_required(['all_access', 'company_all_access', 'packing_read'])
+    @warehouse_required(force_warehouse=True)
+    def get(self):
+        from warehouse.common.operator_reports import export_operator_report
+        return export_operator_report('packing', g.warehouse)

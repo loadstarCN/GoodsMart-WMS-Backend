@@ -103,6 +103,14 @@ class LocationService:
 
 
     @staticmethod
+    def zone_expression():
+        """First hyphen-delimited code segment, identical for list and zone counts."""
+        from sqlalchemy import case, func
+        position = (func.instr(Location.code, '-') if db.engine.dialect.name == 'sqlite'
+                    else func.strpos(Location.code, '-'))
+        return case((position > 1, func.substr(Location.code, 1, position - 1)), else_=Location.code)
+
+    @staticmethod
     def list_locations(filters: dict):
         """
         根据过滤条件返回位置查询对象
@@ -113,6 +121,8 @@ class LocationService:
             query = query.filter(Location.location_type == filters['location_type'])
         if filters.get('code'):
             query = query.filter(Location.code.ilike(f"%{filters['code']}%"))
+        if filters.get('zone') is not None:
+            query = query.filter(LocationService.zone_expression() == filters['zone'])
 
         # 如果 filters 中没有 is_active 或其值为 None，则只返回 is_active=True
         if 'is_active' not in filters or filters['is_active'] is None:

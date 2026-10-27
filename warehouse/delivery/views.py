@@ -52,6 +52,7 @@ class DeliveryTaskList(Resource):
             'order_number': args.get('order_number'),
             'transportation_mode': args.get('transportation_mode'),
             'status': args.get('status'),
+            'shipping_stage': args.get('shipping_stage'),
             'expected_shipping_date': args.get('expected_shipping_date'),
             'actual_shipping_date': args.get('actual_shipping_date'),
             'is_active': args.get('is_active'),

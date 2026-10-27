@@ -30,6 +30,7 @@ class LocationList(Resource):
         filters = {
             'location_type': args.get('location_type'),
             'code': args.get('code'),
+            'zone': args.get('zone'),
             'is_active': args.get('is_active'),
         }
         query = add_warehouse_filter(filters)
@@ -51,6 +52,30 @@ class LocationList(Resource):
         created_by = require_actor_user_id()
         new_location = LocationService.create_location(data,created_by)
         return new_location, 201
+
+
+@api_ns.doc(security="jsonWebToken")
+@api_ns.route('/zones')
+class LocationZones(Resource):
+    @permission_required(["all_access", "company_all_access", "location_read"])
+    @warehouse_required()
+    def get(self):
+        """Code-derived zones in the current warehouse scope, before table filters."""
+        filters = {}
+        add_warehouse_filter(filters)
+        query = Location.query
+        if filters.get('warehouse_id'):
+            query = query.filter(Location.warehouse_id == filters['warehouse_id'])
+        if filters.get('warehouse_ids'):
+            query = query.filter(Location.warehouse_id.in_(filters['warehouse_ids']))
+        zone = LocationService.zone_expression().label('zone')
+        rows = query.with_entities(zone, Location.is_active, db.func.count(Location.id).label('count')) \
+            .group_by(zone, Location.is_active).order_by(zone).all()
+        groups = {}
+        for row in rows:
+            item = groups.setdefault(row.zone, {'zone': row.zone, 'active': 0, 'inactive': 0})
+            item['active' if row.is_active else 'inactive'] += row.count
+        return {'items': list(groups.values())}
 
 @api_ns.doc(security="jsonWebToken")
 @api_ns.route('/<int:location_id>')

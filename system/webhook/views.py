@@ -1,6 +1,7 @@
 """Webhook 事件推送日志 — 视图"""
 from extensions.db import utc_now
 
+from flask import request
 from flask_restx import Resource, abort
 from extensions import db
 from extensions.error import ForbiddenException
@@ -32,6 +33,52 @@ def _enforce_event_company_scope(event):
     api_key_ids = _company_api_key_ids()
     if event.api_key_id not in api_key_ids:
         raise ForbiddenException("Permission denied: cannot access webhook events of other companies", 12002)
+
+
+@api_ns.doc(security="jsonWebToken")
+@api_ns.route('/key-summary')
+class WebhookKeySummary(Resource):
+    @permission_required(["all_access", "company_all_access", "webhook_read"])
+    def get(self):
+        """Read-only summaries for up to 100 visible keys; no payload or secrets."""
+        raw_ids = request.args.get('api_key_ids', '')
+        parts = raw_ids.split(',') if raw_ids else []
+        if not parts or len(parts) > 100 or any(not p.isdecimal() or len(p) > 10 for p in parts):
+            abort(400, 'api_key_ids must contain 1 to 100 positive integer IDs')
+        ids = sorted({int(p) for p in parts})
+        if not all(0 < key_id <= 2147483647 for key_id in ids):
+            abort(400, 'Invalid API key ID')
+        keys = APIKey.query.filter(APIKey.id.in_(ids))
+        if not _is_super_admin():
+            keys = keys.filter(APIKey.company_id == _get_user_company_id())
+            if not _get_user_company_id():
+                return {'items': []}
+        allowed = [key.id for key in keys.all()]
+        if not allowed:
+            return {'items': []}
+        ranked = db.session.query(
+            WebhookEvent.api_key_id.label('key_id'),
+            WebhookEvent.status,
+            WebhookEvent.created_at,
+            WebhookEvent.sent_at,
+            db.func.row_number().over(
+                partition_by=WebhookEvent.api_key_id,
+                order_by=(WebhookEvent.created_at.desc(), WebhookEvent.id.desc()),
+            ).label('rank'),
+        ).filter(WebhookEvent.api_key_id.in_(allowed)).subquery()
+        latest = {row.key_id: row for row in db.session.query(ranked).filter(ranked.c.rank == 1).all()}
+        failures = dict(db.session.query(WebhookEvent.api_key_id, db.func.count(WebhookEvent.id))
+                        .filter(WebhookEvent.api_key_id.in_(allowed), WebhookEvent.status == 'failed')
+                        .group_by(WebhookEvent.api_key_id).all())
+        def timestamp(value):
+            return value.isoformat() if value else None
+        return {'items': [{
+            'api_key_id': key_id,
+            'failed_count': failures.get(key_id, 0),
+            'latest_event': ({'status': latest[key_id].status,
+                              'created_at': timestamp(latest[key_id].created_at),
+                              'sent_at': timestamp(latest[key_id].sent_at)} if key_id in latest else None),
+        } for key_id in allowed]}
 
 
 @api_ns.doc(security="jsonWebToken")

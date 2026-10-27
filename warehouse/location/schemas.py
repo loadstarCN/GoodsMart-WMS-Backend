@@ -72,6 +72,7 @@ location_model = api_ns.inherit('LocationModel', location_base_model, {
 # -----------------------------
 location_pagination_parser = pagination_parser.copy()
 location_pagination_parser.add_argument('code', type=str, help='Filter by Location Code', location='args')
+location_pagination_parser.add_argument('zone', type=str, help='Exact first hyphen-delimited code segment', location='args')
 location_pagination_parser.add_argument('warehouse_id', type=int, help='Filter by Warehouse ID', location='args')
 location_pagination_parser.add_argument('is_active', type=inputs.boolean, help='Filter by Active Status', location='args')
 location_pagination_parser.add_argument('location_type', type=str, help='Filter by Location Type', location='args', choices=Location.LOCATION_TYPES)

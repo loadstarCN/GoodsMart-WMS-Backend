@@ -115,7 +115,7 @@ class RecipientService:
         organization / latin）与 postal_code（= zip_code，两个名字都收）一并保存；没给单行 address 时按国家格式生成。
         字段不合法 400 14019（field）。
         """
-        structured = parse_columns(data, RECIPIENT_ADDRESS_LIMITS)
+        structured = parse_columns(data, {**RECIPIENT_ADDRESS_LIMITS, 'tax_id': 100, 'tax_id_type': 30})
         _has_postal, postal_code = postal_code_of(data)
         external_reference = data.get('external_reference')
         new_recipient = Recipient(
@@ -157,7 +157,7 @@ class RecipientService:
         更新 Recipient 信息。结构化地址字段只改请求里带了的；改了结构化地址而没给单行 address 时重新生成 address。
         """
         recipient = RecipientService.get_recipient(recipient_id, company_id)
-        structured = parse_columns(data, RECIPIENT_ADDRESS_LIMITS)
+        structured = parse_columns(data, {**RECIPIENT_ADDRESS_LIMITS, 'tax_id': 100, 'tax_id_type': 30})
         has_postal, postal_code = postal_code_of(data)
 
         external_reference = data.get('external_reference')

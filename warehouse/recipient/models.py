@@ -71,6 +71,8 @@ class Recipient(db.Model):
         info={'description': '拉丁转写 {name, organization, address_line1, address_line2, locality, admin_area}'
                              '（跨境面单用）'}
     )
+    tax_id = db.Column(db.String(100), nullable=True)
+    tax_id_type = db.Column(db.String(30), nullable=True)
     is_active = db.Column(
         db.Boolean, 
         default=True,

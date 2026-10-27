@@ -85,6 +85,7 @@ pagination_parser.add_argument('employee_number', type=str, help='Filter by Empl
 pagination_parser.add_argument('openid', type=str, help='Filter by OpenID', location='args')
 pagination_parser.add_argument('hire_date', type=inputs.date_from_iso8601, help='Filter by Hire Date', location='args')
 pagination_parser.add_argument('warehouse_id', type=int, help='Filter by Warehouse ID', location='args')
+pagination_parser.add_argument('role', type=str, help='Filter by exact role name', location='args')
 pagination_parser.add_argument('keyword', type=str, help='Search by keyword in user_name or email ,phone,position,employee_number', location='args')
 
 pagination_model = create_pagination_model(api_ns, staff_model)

@@ -76,3 +76,31 @@ def test_delete_location(client, access_token):
         # Ensure the supplier is deleted
         deleted_location = get_location_by_id(location.id)
         assert deleted_location is None
+
+
+def test_location_zone_counts_exact_filter_and_scope(client, access_company_admin_token):
+    with client.application.app_context():
+        warehouse = get_warehouse()
+        warehouse_id = warehouse.id
+        other_company = Company.query.filter_by(name='Company B').first()
+        foreign = Warehouse(name='Zone foreign', address='B Street', phone='000', zip_code='00000', company_id=other_company.id, created_by=get_admin_user().id)
+        db.session.add(foreign)
+        db.session.flush()
+        for code, active in [('A-01-1', True), ('A-02', False), ('AB-01', True), ('A%-01', True), ('-01', True)]:
+            db.session.add(Location(warehouse_id=warehouse_id, code=code, location_type='standard', is_active=active, created_by=get_admin_user().id))
+        db.session.add(Location(warehouse_id=foreign.id, code='FOREIGN-01', location_type='standard', created_by=get_admin_user().id))
+        db.session.commit()
+        foreign_id = foreign.id
+    headers = {'Authorization': f'Bearer {access_company_admin_token}', 'X-WAREHOUSE-ID': str(warehouse_id)}
+    response = client.get('/location/zones', headers=headers)
+    assert response.status_code == 200, response.json
+    zones = {r['zone']: r for r in response.json['items']}
+    assert zones['A'] == {'zone':'A', 'active':1, 'inactive':1}
+    assert 'FOREIGN' not in zones
+    assert '-01' in zones
+    for zone, code, active in [('A','A-01-1','true'),('A','A-02','false'),('A%','A%-01','true')]:
+        result = client.get('/location/', headers=headers, query_string={'zone':zone,'is_active':active})
+        assert result.status_code == 200, result.json
+        assert [r['code'] for r in result.json['items']] == [code]
+    headers['X-WAREHOUSE-ID'] = str(foreign_id)
+    assert client.get('/location/zones', headers=headers).status_code == 403

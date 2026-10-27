@@ -163,3 +163,27 @@ def test_update_delivery_with_invalid_status(client):
 
         assert 16023 == excinfo.value.biz_code
 
+
+
+@pytest.mark.parametrize('dn_status,stage',[('packed','awaiting_handover'),('delivered','in_transit'),('completed','delivered')])
+def test_delivery_list_stage_filter_matches_rows(client,access_token,dn_status,stage):
+    from warehouse.shipping.stage import STAGES
+    with client.application.app_context():
+        task=get_delivery_task()
+        task.dn.status=dn_status
+        task.tracking_number='TEST-STAGE'
+        task.carrier.pickup_method='none'
+        ident=task.id
+        wid=task.dn.warehouse_id
+        db.session.commit()
+    headers={'Authorization':f'Bearer {access_token}','X-WAREHOUSE-ID':str(wid)}
+    response=client.get('/delivery/?shipping_stage='+stage,headers=headers)
+    assert response.status_code==200,response.get_json()
+    assert ident in [row['id'] for row in response.get_json()['items']]
+    assert all(row['shipping_stage']==stage for row in response.get_json()['items'])
+    for other in STAGES:
+        if other==stage:continue
+        response=client.get('/delivery/?shipping_stage='+other,headers=headers)
+        assert response.status_code==200,response.get_json()
+        assert ident not in [row['id'] for row in response.get_json()['items']]
+    assert client.get('/delivery/?shipping_stage=invalid',headers=headers).status_code==400

@@ -44,6 +44,8 @@ recipient_fields = {
     'organization': fields.String(description='Company / organization printed on the label'),
     'latin': fields.Raw(description='Latin transliteration for international labels: {name, organization, '
                                     'address_line1, address_line2, locality, admin_area}'),
+    'tax_id': fields.String(description='Default recipient customs tax ID'),
+    'tax_id_type': fields.String(description='Default recipient customs tax ID type'),
     'is_active': fields.Boolean(description='Is the recipient active?'),
     'company_id': fields.Integer(required=True, description='ID of the associated company'),
     'company': fields.Nested(company_model, readonly=True, description='Associated company details'),

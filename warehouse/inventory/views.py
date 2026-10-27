@@ -157,3 +157,26 @@ class InventoryDetail(Resource):
     #     from .services import InventoryService
     #     InventoryService.delete_inventory(goods_id, warehouse_id)
     #     return {"message": "Inventory record deleted successfully"}, 200
+@api_ns.route('/summary')
+class InventorySummary(Resource):
+    @permission_required(['all_access', 'company_all_access', 'inventory_read'])
+    @warehouse_required()
+    @api_ns.expect(inventory_pagination_parser)
+    def get(self):
+        """Aggregate the same authorized, filtered rows as the inventory list (not just one page)."""
+        from sqlalchemy import func
+        from .models import Inventory
+        args = inventory_pagination_parser.parse_args()
+        filters = add_warehouse_filter({key: args.get(key) for key in (
+            'goods_id', 'goods_codes', 'keyword', 'pending_putaway',
+            'low_stock_threshold', 'high_stock_threshold', 'below_low_threshold', 'above_high_threshold')})
+        query = InventoryService.list_inventories(filters).order_by(None)
+        keys = ('total_stock', 'onhand_stock', 'locked_stock', 'damage_stock', 'return_stock',
+                'asn_stock', 'received_stock', 'sorted_stock', 'sorted_damage_stock',
+                'dn_stock', 'picked_stock', 'packed_stock', 'delivered_stock')
+        columns = [func.coalesce(func.sum(getattr(Inventory, key)), 0).label(key) for key in keys]
+        row = query.with_entities(*columns, func.count().label('inventory_count'),
+                                  func.count(func.distinct(Inventory.goods_id)).label('goods_count')).one()
+        result = {key: int(getattr(row, key)) for key in (*keys, 'inventory_count', 'goods_count')}
+        result['available_stock_for_sale'] = result['onhand_stock'] - result['locked_stock'] - result['dn_stock']
+        return result, 200

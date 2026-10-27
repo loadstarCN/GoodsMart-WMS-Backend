@@ -293,3 +293,30 @@ def daily_totals(warehouse_id, date_from, date_to, goods_ids=None, stock_types=N
             result.setdefault(day, {})
         day += timedelta(days=1)
     return result
+
+
+def daily_coverage(warehouse_id, date_from, date_to, goods_ids=None, per_goods=False):
+    """Coverage is independent of numeric zero; do not draw missing history as stockouts."""
+    first = ledger_start_date(warehouse_id)
+    today = clock.local_today(warehouse_id)
+    query = db.session.query(StockDailyBalance.balance_date, StockDailyBalance.goods_id, StockDailyBalance.source).filter(
+        StockDailyBalance.warehouse_id == warehouse_id,
+        StockDailyBalance.balance_date >= date_from, StockDailyBalance.balance_date <= date_to)
+    if goods_ids is not None:
+        query = query.filter(StockDailyBalance.goods_id.in_(goods_ids))
+    sources = defaultdict(set)
+    for day, goods_id, source in query.distinct():
+        sources[(goods_id if per_goods else None, day)].add(source)
+
+    def series(goods_id):
+        result = {}
+        day = date_from
+        while day <= date_to:
+            day_sources = sources[(goods_id, day)]
+            result[day] = ('full' if day >= today or (first is not None and day >= first) else
+                           'none' if not day_sources else
+                           'on_shelf_only' if day_sources == {'legacy_snapshot'} else 'full')
+            day += timedelta(days=1)
+        return result
+
+    return {gid: series(gid) for gid in goods_ids} if per_goods else series(None)

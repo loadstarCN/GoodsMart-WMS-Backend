@@ -73,7 +73,8 @@ class StaffList(Resource):
             'position': args.get('position'),
             'employee_number': args.get('employee_number'),
             'hire_date': args.get('hire_date'),
-            'keyword': args.get('keyword')
+            'keyword': args.get('keyword'),
+            'role': args.get('role')
         }
 
         company_id = get_actor_company_id()

@@ -289,6 +289,7 @@ class ASNService:
             conditions = number_conditions(keyword, {'ASN': [ASN.id]}, [ASN.id])
 
             conditions.append(ASN.tracking_number.ilike(f"%{keyword}%"))
+            conditions.append(ASN.order_number.ilike(f"%{keyword}%"))
             # conditions.append(ASN.remark.ilike(f"%{keyword}%"))
             conditions.append(ASN.details.any(ASNDetail.goods.has(code=keyword)))
             query = query.filter(db.or_(*conditions))

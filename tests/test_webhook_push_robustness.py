@@ -655,3 +655,39 @@ def test_scheduler_time_budget_fits_interval():
     # 间隔 1 分钟：预算 + 最后一次推送的总时限不超过间隔，下一轮不会因 max_instances=1 被跳过
     assert _webhook_time_budget(1) + services.SEND_DEADLINE_SECONDS < 60
     assert _webhook_time_budget(30) == 30 * 60 - services.SEND_DEADLINE_SECONDS - 15
+
+
+def test_key_summary_scoped_latest_and_failed(webhook_client, access_company_admin_token, company_ids):
+    client = webhook_client
+    headers = {'Authorization': f'Bearer {access_company_admin_token}'}
+    with client.application.app_context():
+        owned = _make_key(company_ids[0])
+        empty = _make_key(company_ids[0], active=False)
+        foreign = _make_key(company_ids[1])
+        when = datetime(2026, 10, 1, tzinfo=timezone.utc)
+        _add_event(owned, status='failed', created_at=when)
+        _add_event(owned, status='sent', created_at=when, sent_at=when)
+        _add_event(owned, status='superseded', created_at=when-timedelta(days=1))
+        _add_event(foreign, status='failed', created_at=when)
+    response = client.get(f'/wh/webhook/key-summary?api_key_ids={owned},{empty},{foreign}', headers=headers)
+    assert response.status_code == 200, response.get_json()
+    rows = {r['api_key_id']: r for r in response.json['items']}
+    assert set(rows) == {owned, empty}
+    assert rows[owned]['failed_count'] == 1
+    assert rows[owned]['latest_event']['status'] == 'sent'  # equal creation timestamps use stable ID ordering
+    assert rows[owned]['latest_event']['sent_at'] is not None
+    assert rows[empty] == {'api_key_id': empty, 'failed_count': 0, 'latest_event': None}
+    for invalid in ['', '-1', '1,no', '0', '9'*30, ','.join(['1']*101)]:
+        assert client.get('/wh/webhook/key-summary', query_string={'api_key_ids': invalid}, headers=headers).status_code == 400
+
+
+def test_key_summary_requires_webhook_permission(webhook_client, company_ids):
+    with webhook_client.application.app_context():
+        plain = 'summary-read-only-test'
+        key = APIKey(key=hash_api_key(plain), system_name='summary-no-permission', permissions=['api_keys_read'])
+        key.company_id = company_ids[0]
+        db.session.add(key)
+        db.session.commit()
+        key_id = key.id
+    response = webhook_client.get(f'/wh/webhook/key-summary?api_key_ids={key_id}', headers={'X-API-KEY': plain})
+    assert response.status_code == 403

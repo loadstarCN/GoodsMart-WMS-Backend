@@ -223,6 +223,10 @@ class DeliveryTaskService:
         """
         query = DeliveryTask.query.order_by(DeliveryTask.id.desc())
 
+        if filters.get('shipping_stage'):
+            from warehouse.shipping.stage import stage_expression
+            query = query.filter(DeliveryTask.dn.has(stage_expression() == filters['shipping_stage']))
+
         if filters.get('dn_id'):
             query = query.filter(DeliveryTask.dn_id == filters['dn_id'])
         if filters.get('recipient_id'):

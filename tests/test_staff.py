@@ -94,3 +94,19 @@ def test_delete_staff(client, access_token):
         # Ensure the staff is deleted
         deleted_staff = db.session.get(Staff, staff.id)
         assert deleted_staff is None
+
+def test_staff_exact_role_filter_preserves_company_scope(client, access_token):
+    from tests.test_platform_guards import _role, _staff
+    from tests.test_isolation_outbound import _make_company_b
+    with client.application.app_context():
+        role=_role('staff_filter_role',[])
+        who=_staff('staff_filter_member',role,[get_warehouse()])
+        ident=who.id
+    headers={'Authorization':f'Bearer {access_token}'}
+    response=client.get('/staff/?role=staff_filter_role',headers=headers)
+    assert response.status_code==200
+    assert [row['id'] for row in response.get_json()['items']]==[ident]
+    assert client.get('/staff/?role=staff_filter',headers=headers).get_json()['total']==0
+    assert client.get('/staff/?role=staff_filter_role&keyword=missing',headers=headers).get_json()['total']==0
+    other,_=_make_company_b(client,company_admin=True)
+    assert client.get('/staff/?role=staff_filter_role',headers=other).get_json()['total']==0

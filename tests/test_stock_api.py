@@ -65,6 +65,8 @@ def test_ledger_list_filters_and_export(client, access_token):
     rows = list(csv.reader(io.StringIO(response.get_data(as_text=True).lstrip('﻿'))))
     assert rows[0][:3] == ['id', 'posted_at', 'occurred_at'] and len(rows) == 4
     assert rows[1][4] == 'GRD-1'
+    assert rows[0][-2:] == ['category_balance_after', 'lot_no']
+    assert rows[1][-2] == '6'
 
 
 def test_ledger_scope_and_permission(client, access_operator_token, access_token):
@@ -212,6 +214,10 @@ def test_history_daily_balances(client, access_token, monkeypatch):
     series = _ok(client.get(f'/inventory/history/series?goods_id={g}&from={day1}&to={today.isoformat()}',
                             headers=headers))
     assert [p['total'] for p in series['series']] == [8, 8, 8, 8]
+    assert {p['coverage'] for p in series['series']} == {'full'}
+    extended = _ok(client.get(f'/inventory/history/series?goods_id={g}&from={today-timedelta(days=4)}', headers=headers))
+    assert extended['series'][0]['coverage'] == 'none'
+    assert extended['series'][1]['coverage'] == 'full'
     multi = _ok(client.get(f"/inventory/history/series?goods_ids={g},{w['g2']}&from={day1}", headers=headers))
     assert [len(item['series']) for item in multi['goods']] == [4, 4]
 
@@ -255,6 +261,13 @@ def test_history_legacy_snapshot_coverage(client, access_token):
     none = _ok(client.get(f"/inventory/history?date={(today - timedelta(days=30)).isoformat()}",
                           headers=_wh(access_token, w['wh'])))
     assert none['coverage'] == 'none' and none['items'] == []
+    series = _ok(client.get(
+        f"/inventory/history/series?goods_ids={w['g1']},{w['g2']}&from={day}&to={day}",
+        headers=_wh(access_token, w['wh'])))
+    by_goods = {item['goods_id']: item['series'][0] for item in series['goods']}
+    assert by_goods[w['g1']]['coverage'] == 'on_shelf_only'
+    assert by_goods[w['g1']]['total'] == 9
+    assert by_goods[w['g2']]['coverage'] == 'none'
 
 
 def test_history_flows(client, access_token):
@@ -313,6 +326,24 @@ def test_metrics_nightly_summary(client, access_token, monkeypatch):
     assert by_age['items'][0]['goods']['code'] == 'GRD-2'
     latest = _ok(client.get('/inventory/metrics', headers=_wh(access_token, w['wh'])))
     assert latest['metric_date'] == today.isoformat()
+    assert body['summary']['age_buckets']['age_0_30'] == 6
+    assert body['summary']['age_buckets']['age_91_180'] == 5
+    assert sum(body['summary']['age_buckets'].values()) == body['summary']['total_stock']
+    assert body['summary']['out_qty_90d'] == 4
+    assert body['summary']['abc_curve'][-1] == {'sku_share': 1, 'outbound_share': 1}
+    # Table filters and pagination must never turn the warehouse chart into a partial-page total.
+    page = _ok(client.get(f'/inventory/metrics?date={today.isoformat()}&per_page=1&status=dead',
+                          headers=_wh(access_token, w['wh'])))
+    assert page['summary'] == body['summary']
+    aged = _ok(client.get('/inventory/metrics?age_bucket=age_91_180', headers=_wh(access_token, w['wh'])))
+    assert aged['total'] == 1 and aged['items'][0]['goods_id'] == g2
+    assert aged['summary'] == body['summary']
+    unknown = _ok(client.get('/inventory/metrics?age_bucket=unknown', headers=_wh(access_token, w['wh'])))
+    assert unknown['total'] == 2 and all(row['age_buckets']['unknown'] > 0 for row in unknown['items'])
+    assert _ok(client.get('/inventory/metrics?age_bucket=unknown&keyword=GRD', headers=_wh(access_token, w['wh'])))['total'] == 0
+    _err(client.get('/inventory/metrics?age_bucket=bad', headers=_wh(access_token, w['wh'])), 400, 15019)
+
+
     _err(client.get('/inventory/metrics?status=bogus', headers=_wh(access_token, w['wh'])), 400, 15019)
 
     detail = _ok(client.get(f'/inventory/metrics/goods/{g2}', headers=_wh(access_token, w['wh'])))
@@ -559,3 +590,198 @@ def test_replay_reports_snapshot_mismatch(client):
     assert report['snapshots'][0]['samples'] == [{'goods_id': w['g1'], 'location_id': location_id,
                                                   'snapshot': 5, 'replayed': 3}]
     assert report['negative_balances'] == 1          # 上架时待上架没有货（入库单不在）
+
+
+def test_ledger_overview_shipment_boundary_and_pagination(client, access_token):
+    w = _world(client)
+    g = w['g1']
+    _inbound(client, access_token, w, [(g, 10)], [(g, w['std1'], 10)])
+    dn_id, packing_id = _picked_dn(client, access_token, w, [(g, 4)], [(g, w['std1'], 4)])
+    _inbound(client, access_token, w, [(w['g2'], 3)], [])
+    url = '/stock-ledger/overview?per_page=1&keyword=GRD-'
+    body = _ok(client.get(url, headers=_wh(access_token, w['wh'])))
+    assert body['totals'] == dict(opening=0, inbound=13, outbound=0, closing=13)
+    assert body['total'] == 2 and len(body['items']) == 1
+    assert body['series'][-1]['total'] == 13
+    assert 'picked' in body['stock_types'] and 'packed' in body['stock_types']
+    report_url='/stock-ledger/summary?per_page=1&keyword=GRD-'
+    report=_ok(client.get(report_url,headers=_wh(access_token,w['wh'])))
+    assert report['totals']['closing_by_stock_type']['picked']==4
+    assert report['totals']['closing_by_stock_type']['onhand']==6
+    assert report['totals']['closing_by_stock_type']['pending']==3
+    assert sum(report['totals']['closing_by_stock_type'].values())==13
+    assert sum(report['totals']['opening_by_stock_type'].values())==0
+
+    second = _ok(client.get(url+'&page=2&movement_types=ship&doc_no=missing', headers=_wh(access_token, w['wh'])))
+    assert second['totals'] == body['totals'] and second['series'] == body['series']
+    assert second['items'][0]['goods_id'] != body['items'][0]['goods_id']
+    scoped = _ok(client.get(f'/stock-ledger/overview?goods_id={g}', headers=_wh(access_token, w['wh'])))
+    assert scoped['totals']['closing'] == 10 and scoped['items'][0]['lot_no'] is None
+    assert scoped['totals']['opening'] + scoped['totals']['inbound'] - scoped['totals']['outbound'] == scoped['totals']['closing']
+    _err(client.get('/stock-ledger/overview?start_time=2020-01-01&end_time=2026-10-26', headers=_wh(access_token, w['wh'])),400,15019)
+
+    _ok(client.post(f'/packing/{packing_id}/batches/', json={'details':[{'goods_id':g,'packed_quantity':4}]},headers=_h(access_token)))
+    _ok(client.put(f'/packing/{packing_id}/complete/',headers=_h(access_token)))
+    packed = _ok(client.get(url,headers=_wh(access_token,w['wh'])))
+    assert packed['totals'] == body['totals']
+    report=_ok(client.get(report_url+'&group_by=brand',headers=_wh(access_token,w['wh'])))
+    assert report['totals']['closing_by_stock_type']['picked']==0
+    assert report['totals']['closing_by_stock_type']['packed']==4
+    assert report['totals']['outbound']==0
+
+    delivery_id = _task_ids(client, DeliveryTask, dn_id=dn_id)[0]
+    _ok(client.put(f'/delivery/{delivery_id}/process/',headers=_h(access_token)))
+    _ok(client.put(f'/delivery/{delivery_id}/complete/',json={},headers=_h(access_token)))
+    shipped = _ok(client.get(url,headers=_wh(access_token,w['wh'])))
+    assert shipped['totals'] == dict(opening=0,inbound=13,outbound=4,closing=9)
+    assert shipped['series'][-1]['total'] == 9
+    report=_ok(client.get(report_url,headers=_wh(access_token,w['wh'])))
+    assert report['totals']['closing_by_stock_type']['packed']==0
+    assert sum(report['totals']['closing_by_stock_type'].values())==9
+    later=quote((clock.now()+timedelta(minutes=1)).isoformat())
+    end=quote((clock.now()+timedelta(minutes=2)).isoformat())
+    report=_ok(client.get(report_url+f'&start_time={later}&end_time={end}',headers=_wh(access_token,w['wh'])))
+    assert report['totals']['opening_by_stock_type']==report['totals']['closing_by_stock_type']
+    assert sum(report['totals']['opening_by_stock_type'].values())==9
+
+
+
+def test_ledger_overview_permission_and_warehouse_scope(client, access_token, access_operator_token):
+    w = _world(client)
+    _inbound(client, access_token, w, [(w['g1'], 10)], [])
+    assert client.get('/stock-ledger/overview',headers=_wh(access_operator_token,w['wh'])).status_code == 403
+    with client.application.app_context():
+        other = Warehouse.query.filter(Warehouse.id != w['wh']).first().id
+    body = _ok(client.get('/stock-ledger/overview',headers=_wh(access_token,other)))
+    assert body['totals']['closing'] == 0 and not body['items']
+
+
+def test_ledger_category_balance_not_cut_by_location_filter_or_page(client, access_token):
+    w = _world(client)
+    g = w['g1']
+    _inbound(client, access_token, w, [(g, 10)], [(g,w['std1'],6),(g,w['std2'],4)])
+    body = _ok(client.get(f"/stock-ledger/?goods_id={g}&stock_types=onhand&location_id={w['std2']}&per_page=1",headers=_wh(access_token,w['wh'])))
+    row = body['items'][0]
+    assert row['balance_after'] == 4
+    assert row['category_balance_after'] == 10
+    assert row.get('lot_no') is None
+
+
+def test_summary_totals_cover_all_pages_and_filtered_scope(client, access_token):
+    w = _world(client)
+    _inbound(client,access_token,w,[(w['g1'],10),(w['g2'],3)],[])
+    url='/stock-ledger/summary?keyword=GRD-&per_page=1'
+    first=_ok(client.get(url,headers=_wh(access_token,w['wh'])))
+    second=_ok(client.get(url+'&page=2',headers=_wh(access_token,w['wh'])))
+    assert first['total']==2 and len(first['items'])==1
+    assert first['totals']==second['totals']
+    assert first['totals']['inbound']==13 and first['totals']['closing']==13
+    assert first['totals']['inbound_by_movement']=={'sort_in':13}
+    scoped=_ok(client.get(url+f"&goods_id={w['g2']}",headers=_wh(access_token,w['wh'])))
+    assert scoped['totals']['closing']==3
+
+
+def test_summary_dimensions_and_missing_group_drilldown(client, access_token):
+    w=_world(client)
+    with client.application.app_context():
+        first=db.session.get(Goods,w['g1']);second=db.session.get(Goods,w['g2'])
+        first.brand='Brand A';second.brand=None
+        first.category=second.category='Food'
+        db.session.commit()
+    _inbound(client,access_token,w,[(w['g1'],10),(w['g2'],3)],[])
+    url='/stock-ledger/summary?keyword=GRD-'
+    brand=_ok(client.get(url+'&group_by=brand',headers=_wh(access_token,w['wh'])))
+    assert brand['total']==2 and brand['totals']['closing']==13
+    groups={row.get('group_value'):row for row in brand['items']}
+    assert groups['Brand A']['closing']==10 and groups[None]['closing']==3
+    category=_ok(client.get(url+'&group_by=category',headers=_wh(access_token,w['wh'])))
+    assert category['total']==1 and category['items'][0]['goods_count']==2
+    assert category['items'][0]['closing']==13
+    missing=_ok(client.get(url+'&brand_missing=1',headers=_wh(access_token,w['wh'])))
+    assert missing['total']==1 and missing['items'][0]['goods_id']==w['g2']
+    named=_ok(client.get(url+'&brand=Brand%20A',headers=_wh(access_token,w['wh'])))
+    assert named['total']==1 and named['totals']['closing']==10
+
+    ledger=_ok(client.get('/stock-ledger/?keyword=GRD-&brand_missing=1',headers=_wh(access_token,w['wh'])))
+    assert ledger['total'] and all(row['goods_id']==w['g2'] for row in ledger['items'])
+    overview=_ok(client.get('/stock-ledger/overview?keyword=GRD-&brand=Brand%20A',headers=_wh(access_token,w['wh'])))
+    assert overview['totals']['closing']==10
+
+
+def test_summary_export_all_pages_totals_and_spreadsheet_text(client,access_token,access_operator_token):
+    w=_world(client)
+    with client.application.app_context():
+        db.session.get(Goods,w['g1']).name='=1+1'
+        db.session.commit()
+    _inbound(client,access_token,w,[(w['g1'],10),(w['g2'],3)],[])
+    url='/stock-ledger/summary/export?keyword=GRD-&page=2&per_page=1'
+    response=client.get(url,headers=_wh(access_token,w['wh']))
+    assert response.status_code==200
+    rows=list(csv.DictReader(io.StringIO(response.get_data(as_text=True).lstrip('\ufeff'))))
+    assert len(rows)==3 and rows[-1]['row_type']=='total' and rows[-1]['closing']=='13'
+    assert rows[0]['goods_name']=="'=1+1"
+    assert sum(int(row['inbound_sort_in']) for row in rows[:-1])==13
+    assert sum(int(row['closing_pending']) for row in rows[:-1])==13
+    assert rows[-1]['closing_pending']=='13' and rows[-1]['opening_pending']=='0'
+    assert all(row['closing_picked']=='0' and row['closing_packed']=='0' for row in rows)
+    grouped=client.get(url+'&group_by=brand',headers=_wh(access_token,w['wh']))
+    group_rows=list(csv.DictReader(io.StringIO(grouped.get_data(as_text=True).lstrip('\ufeff'))))
+    assert len(group_rows)==2
+    assert group_rows[0]['closing_pending']==group_rows[1]['closing_pending']=='13'
+    scoped=client.get(url+f"&goods_id={w['g2']}&stock_types=pending",headers=_wh(access_token,w['wh']))
+    scope_rows=list(csv.DictReader(io.StringIO(scoped.get_data(as_text=True).lstrip('\ufeff'))))
+    assert scope_rows[-1]['closing_pending']=='3' and 'closing_onhand' not in scope_rows[-1]
+
+    assert client.get(url,headers=_wh(access_operator_token,w['wh'])).status_code==403
+
+
+def test_summary_calendar_timezone_and_explicit_drilldown_instants(client, access_token):
+    from warehouse.warehouse.models import Warehouse
+    original=client.application.config.get('WMS_DEFAULT_TIMEZONE')
+    client.application.config['WMS_DEFAULT_TIMEZONE']='America/Los_Angeles'
+    try:
+        w=_world(client)
+        with client.application.app_context():
+            db.session.get(Warehouse,w['wh']).timezone='Asia/Tokyo'
+            db.session.commit()
+        dates='start_time=2026-03-08&end_time=2026-03-08'
+        all_report=_ok(client.get('/stock-ledger/summary?'+dates,headers=_h(access_token)))
+        assert all_report['timezone']=='America/Los_Angeles'
+        assert all_report['start_time'].startswith('2026-03-08T08:00:00')
+        assert all_report['end_time'].startswith('2026-03-09T06:59:59')
+        local=_ok(client.get('/stock-ledger/summary?'+dates,headers=_wh(access_token,w['wh'])))
+        assert local['timezone']=='Asia/Tokyo'
+        assert local['start_time'].startswith('2026-03-07T15:00:00')
+        explicit='start_time='+quote(all_report['start_time'])+'&end_time='+quote(all_report['end_time'])
+        child=_ok(client.get('/stock-ledger/summary?'+explicit,headers=_wh(access_token,w['wh'])))
+        assert child['start_time']==all_report['start_time']
+        assert child['end_time']==all_report['end_time']
+        overview=_ok(client.get('/stock-ledger/overview?'+explicit,headers=_wh(access_token,w['wh'])))
+        assert overview['start_time']==all_report['start_time']
+        assert overview['end_time']==all_report['end_time']
+    finally:
+        client.application.config['WMS_DEFAULT_TIMEZONE']=original
+
+
+def test_metric_age_chart_counts_skus_per_bucket_and_limits_oldest():
+    from types import SimpleNamespace
+    from warehouse.stock.views import _metric_chart_summary
+    rows=[]
+    for ident, quantity in enumerate([1, 8, 8, 3, 9], 1):
+        rows.append(SimpleNamespace(goods_id=ident, goods=SimpleNamespace(id=ident,code=str(ident),name=str(ident)),
+            age_0_30=2,age_31_90=0,age_91_180=0,age_over_180=quantity,age_unknown=1,
+            total_stock=quantity+3,out_qty_90d=0,abc_class=None,weighted_age_days=None,last_out_at=None))
+    result=_metric_chart_summary(rows)
+    assert result['age_sku_counts']==dict(age_0_30=5,age_31_90=0,age_91_180=0,age_over_180=5,unknown=5)
+    assert [row['goods_id'] for row in result['aged_top']]==[5,2,3,4]
+    assert result['aged_top'][0]['quantity']==9
+    assert result['aged_top'][0]['weighted_age_days'] is None
+    assert result['aged_top'][0]['last_out_at'] is None
+    assert _metric_chart_summary([])['aged_top']==[]
+    rows[0].out_qty_90d=10
+    rows[0].abc_class='A'
+    curve=_metric_chart_summary(rows)
+    assert curve['abc_sku_total']==5 and curve['abc_unclassified']==4
+    assert curve['abc_curve'][1]=={'sku_share':.2,'outbound_share':1}
+    assert curve['abc_curve'][-1]=={'sku_share':1,'outbound_share':1}
+    assert curve['abc_outbound']['A']==10

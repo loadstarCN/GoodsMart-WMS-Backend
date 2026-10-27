@@ -186,6 +186,8 @@ class CycleCountTaskService:
         根据过滤条件，返回 CycleCountTaskDetail 的查询对象。
         """
         query = CycleCountTaskDetail.query.order_by(CycleCountTaskDetail.id.desc())
+        if filters.get('order_by') == 'completed_at':
+            query = query.order_by(None).order_by(CycleCountTaskDetail.completed_at.desc(), CycleCountTaskDetail.id.desc())
 
 
         if filters.get('goods_id'):

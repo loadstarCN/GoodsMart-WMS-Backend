@@ -176,6 +176,7 @@ def _ledger_filters(args):
         'stock_types': args.get('stock_types'), 'movement_types': args.get('movement_types'),
         'doc_types': args.get('doc_type'), 'sources': args.get('source'),
         'time_field': args.get('time_field'), 'order': args.get('order'),
+        **{key: args.get(key) for key in ('category', 'brand', 'category_missing', 'brand_missing')},
     }
     for field in ('start_time', 'end_time'):
         value = args.get(field)
@@ -215,7 +216,10 @@ class StockLedgerList(Resource):
         from .queries import ledger_query
         args = ledger_parser.parse_args()
         query = ledger_query(_ledger_filters(args))
-        return paginate(query, args.get('page'), args.get('per_page'), args.get('all', False)), 200
+        result = paginate(query, args.get('page'), args.get('per_page'), args.get('all', False))
+        from .overview import enrich_ledger_lines
+        enrich_ledger_lines(result['items'])
+        return result, 200
 
 
 @api_ns.doc(security="jsonWebToken")
@@ -238,9 +242,13 @@ class StockLedgerExport(Resource):
                                       details={'total': total, 'max_rows': MAX_EXPORT_ROWS})
         header = ['id', 'posted_at', 'occurred_at', 'warehouse_id', 'goods_code', 'goods_name', 'lot_id',
                   'location_code', 'stock_type', 'quantity', 'balance_after', 'goods_total_after', 'movement_type',
-                  'doc_type', 'doc_id', 'doc_no', 'doc_line_id', 'reason', 'operator', 'source', 'trace_id', 'remark']
+                  'doc_type', 'doc_id', 'doc_no', 'doc_line_id', 'reason', 'operator', 'source', 'trace_id', 'remark',
+                  'category_balance_after', 'lot_no']
         rows = []
-        for line in query.all():
+        from .overview import enrich_ledger_lines
+        lines = query.all()
+        enrich_ledger_lines(lines)
+        for line in lines:
             rows.append([
                 line.id, clock.local_iso(line.posted_at, line.warehouse_id),
                 clock.local_iso(line.occurred_at, line.warehouse_id), line.warehouse_id,
@@ -248,7 +256,7 @@ class StockLedgerExport(Resource):
                 line.location.code if line.location else '', line.stock_type, line.quantity, line.balance_after,
                 line.goods_total_after, line.movement_type, line.doc_type or '', line.doc_id or '', line.doc_no or '',
                 line.doc_line_id or '', line.reason or '', line.operator.user_name if line.operator else '',
-                line.source or '', line.trace_id, line.remark or '',
+                line.source or '', line.trace_id, line.remark or '', line.category_balance_after, line.lot_no or '',
             ])
         return _csv_response(header, rows, 'stock_ledger.csv')
 
@@ -293,29 +301,64 @@ class StockLedgerSummary(Resource):
         gives one row per goods × stock type (each type is its own boundary). With `location_id` every line in or
         out of the location counts.
         """
-        from .queries import ledger_summary
-        args = summary_parser.parse_args()
-        filters = add_warehouse_filter({
-            'company_id': args.get('company_id'), 'goods_id': args.get('goods_id'),
-            'goods_code': args.get('goods_code'), 'keyword': args.get('keyword'),
-            'location_id': args.get('location_id'),
-            'goods_ids': [int(v) for v in args['goods_ids']] if args.get('goods_ids') else None,
-        })
-        stock_types = args.get('stock_types') or list(IN_WAREHOUSE_STOCK_TYPES)
-        unknown = [t for t in stock_types if t not in STOCK_TYPES]
-        if unknown:
-            raise _bad(f"unknown stock type(s): {', '.join(unknown)}", 'stock_types')
-        start, end = _summary_range(args, filters.get('warehouse_id'))
-        items = ledger_summary(filters, start, end, stock_types, args.get('group_by') or 'goods')
-        page = max(1, args.get('page') or 1)
-        per_page = min(500, max(1, args.get('per_page') or 50))
-        chunk = items[(page - 1) * per_page: page * per_page]
-        goods = _goods_map(i['goods_id'] for i in chunk)
-        for item in chunk:
+        return _stock_summary_result(summary_parser.parse_args()), 200
+
+
+def _stock_summary_result(args, export=False):
+    from .queries import ledger_summary
+    filters = add_warehouse_filter({
+        'company_id': args.get('company_id'), 'goods_id': args.get('goods_id'),
+        'goods_code': args.get('goods_code'), 'keyword': args.get('keyword'),
+        'location_id': args.get('location_id'),
+        'goods_ids': [int(v) for v in args['goods_ids']] if args.get('goods_ids') else None,
+        **{key: args.get(key) for key in ('category', 'brand', 'category_missing', 'brand_missing')},
+    })
+    stock_types = args.get('stock_types') or list(IN_WAREHOUSE_STOCK_TYPES)
+    unknown = [t for t in stock_types if t not in STOCK_TYPES]
+    if unknown:
+        raise _bad(f"unknown stock type(s): {', '.join(unknown)}", 'stock_types')
+    start, end = _summary_range(args, filters.get('warehouse_id'))
+    items = ledger_summary(filters, start, end, stock_types, args.get('group_by') or 'goods')
+    totals = {key: sum(item[key] for item in items) for key in ('opening', 'inbound', 'outbound', 'closing')}
+    for direction in ('inbound_by_movement', 'outbound_by_movement', 'opening_by_stock_type', 'closing_by_stock_type'):
+        breakdown = {}
+        for item in items:
+            for movement, quantity in item[direction].items():
+                breakdown[movement] = breakdown.get(movement, 0) + quantity
+        totals[direction] = breakdown
+    dimension = args.get('group_by') or 'goods'
+    if dimension in ('category', 'brand'):
+        goods = _goods_map(item['goods_id'] for item in items)
+        groups = {}
+        for item in items:
+            value = getattr(goods[item['goods_id']], dimension) or None
+            key = (item['warehouse_id'], value)
+            if key not in groups:
+                groups[key] = dict(warehouse_id=key[0], group_dimension=dimension, group_value=value,
+                                   goods_count=0, opening=0, inbound=0, outbound=0, closing=0,
+                                   inbound_by_movement={}, outbound_by_movement={},
+                                   opening_by_stock_type={}, closing_by_stock_type={})
+            group = groups[key]
+            group['goods_count'] += 1
+            for metric in ('opening', 'inbound', 'outbound', 'closing'):
+                group[metric] += item[metric]
+            for direction in ('inbound_by_movement', 'outbound_by_movement', 'opening_by_stock_type', 'closing_by_stock_type'):
+                for movement, quantity in item[direction].items():
+                    group[direction][movement] = group[direction].get(movement, 0) + quantity
+        items = sorted(groups.values(), key=lambda row: (row['warehouse_id'], row['group_value'] or ''))
+    page = max(1, args.get('page') or 1)
+    per_page = min(500, max(1, args.get('per_page') or 50))
+    if export and len(items) > MAX_EXPORT_ROWS:
+        raise BadRequestException('Too many summary rows to export', EXPORT_TOO_LARGE)
+    chunk = items if export else items[(page - 1) * per_page: page * per_page]
+    goods = _goods_map(i.get('goods_id') for i in chunk)
+    for item in chunk:
+        if item.get('goods_id') is not None:
             item['goods'] = _goods_ref(goods.get(item['goods_id']))
-        return {'start_time': start, 'end_time': end - timedelta(microseconds=1), 'stock_types': stock_types,
-                'group_by': args.get('group_by') or 'goods', 'total': len(items), 'page': page, 'per_page': per_page,
-                'items': chunk}, 200
+    return {'start_time': start, 'end_time': end - timedelta(microseconds=1),
+            'timezone': clock.warehouse_timezone_name(filters.get('warehouse_id')), 'stock_types': stock_types,
+            'group_by': args.get('group_by') or 'goods', 'total': len(items), 'page': page, 'per_page': per_page,
+            'items': chunk, 'totals': totals}
 
 
 # ---------------------------------------------------------------------------
@@ -609,9 +652,10 @@ class InventoryHistorySeries(Resource):
         (default the in-warehouse types).
         Response `{warehouse_id, from, to, stock_types, series: [{date, total}]}` (whole warehouse / one goods) or
         `{…, goods: [{goods_id, series: [{date, total}]}]}` with goods_ids. Days before the ledger with only old
-        snapshots count location stock only; days with no data are 0.
+        snapshots count location stock only; every point includes coverage full / on_shelf_only / none.
+        For compatibility totals remain 0 when coverage is none; charts must render these as gaps.
         """
-        from .history import daily_totals
+        from .history import daily_totals, daily_coverage
         warehouse = _single_warehouse()
         date_from, date_to = _series_range(warehouse)
         stock_types = _stock_types(default=list(IN_WAREHOUSE_STOCK_TYPES))
@@ -622,6 +666,7 @@ class InventoryHistorySeries(Resource):
             allowed = set(_goods_filter_ids(warehouse, goods_ids=ids) or [])
             ids = [i for i in ids if i in allowed]
         totals = daily_totals(warehouse.id, date_from, date_to, ids, stock_types)
+        coverage = daily_coverage(warehouse.id, date_from, date_to, ids, per_goods=goods_ids is not None)
         days = []
         day = date_from
         while day <= date_to:
@@ -631,10 +676,10 @@ class InventoryHistorySeries(Resource):
                   'stock_types': stock_types}
         if goods_ids is not None:
             result['goods'] = [{'goods_id': gid, 'series': [{'date': d.isoformat(),
-                                                             'total': totals.get(d, {}).get(gid, 0)} for d in days]}
+                                                             'total': totals.get(d, {}).get(gid, 0), 'coverage': coverage[gid][d]} for d in days]}
                                for gid in ids]
         else:
-            result['series'] = [{'date': d.isoformat(), 'total': sum(totals.get(d, {}).values())} for d in days]
+            result['series'] = [{'date': d.isoformat(), 'total': sum(totals.get(d, {}).values()), 'coverage': coverage[d]} for d in days]
         return result, 200
 
 
@@ -683,6 +728,36 @@ def _metric_row(row):
     return item
 
 
+def _metric_chart_summary(rows):
+    """Warehouse-wide chart totals; independent of table filters and pagination."""
+    from .metrics import AGE_BUCKETS
+    buckets = {column: sum(getattr(row, column) or 0 for row in rows) for _, _, column in AGE_BUCKETS}
+    buckets['unknown'] = sum(row.age_unknown or 0 for row in rows)
+    sku_counts = {column: sum(1 for row in rows if (getattr(row, column) or 0) > 0)
+                  for _, _, column in AGE_BUCKETS}
+    sku_counts['unknown'] = sum(1 for row in rows if (row.age_unknown or 0) > 0)
+    aged = sorted((row for row in rows if row.age_over_180 > 0),
+                  key=lambda row: (-row.age_over_180, row.goods_id))
+    aged_top = [dict(goods_id=row.goods_id, goods=_goods_ref(row.goods), quantity=row.age_over_180,
+                     weighted_age_days=row.weighted_age_days, last_out_at=clock.utc_iso(row.last_out_at))
+                for row in aged[:4]]
+    quantities = sorted((max(0, row.out_qty_90d or 0) for row in rows), reverse=True)
+    outbound = sum(quantities)
+    cumulative = 0
+    curve = [{'sku_share': 0, 'outbound_share': 0}]
+    for index, quantity in enumerate(quantities if outbound else [], 1):
+        cumulative += quantity
+        # At most 101 points, including the final point, for large catalogues.
+        if index == len(quantities) or index * 100 // len(quantities) > (index - 1) * 100 // len(quantities):
+            curve.append({'sku_share': round(index / len(quantities), 4),
+                          'outbound_share': round(cumulative / outbound, 4)})
+    return {'total_stock': sum(row.total_stock for row in rows), 'age_buckets': buckets, 'age_sku_counts': sku_counts, 'aged_top': aged_top,
+            'out_qty_90d': outbound, 'abc_curve': curve, 'abc_sku_total': len(rows),
+            'abc_unclassified': sum(1 for row in rows if row.abc_class not in ('A', 'B', 'C')),
+            'abc_outbound': {label: sum(row.out_qty_90d for row in rows if row.abc_class == label)
+                             for label in ('A', 'B', 'C')}}
+
+
 @inventory_ns.doc(security="jsonWebToken")
 @inventory_ns.route('/metrics')
 class InventoryMetrics(Resource):
@@ -709,9 +784,14 @@ class InventoryMetrics(Resource):
         from .queries import _keyword_goods
         warehouse = _single_warehouse()
         day = _date(request.args.get('date'), 'date') or latest_metric_date(warehouse.id)
+        age_bucket = request.args.get('age_bucket')
+        age_columns = {'age_0_30': 'age_0_30', 'age_31_90': 'age_31_90',
+                       'age_91_180': 'age_91_180', 'age_over_180': 'age_over_180', 'unknown': 'age_unknown'}
+        if age_bucket and age_bucket not in age_columns:
+            raise _bad('Invalid age bucket', 'age_bucket')
         page, per_page = _page()
         empty = {'metric_date': None if day is None else day.isoformat(), 'warehouse_id': warehouse.id,
-                 'summary': {'sku_with_stock': 0, 'moving_sku': 0, 'moving_rate': None, 'dead_sku': 0,
+                 'summary': {**_metric_chart_summary([]), 'sku_with_stock': 0, 'moving_sku': 0, 'moving_rate': None, 'dead_sku': 0,
                              'abc': {'A': 0, 'B': 0, 'C': 0}},
                  'total': 0, 'page': page, 'per_page': per_page, 'items': []}
         if day is None:
@@ -721,7 +801,7 @@ class InventoryMetrics(Resource):
         all_rows = base.all()
         with_stock = [r for r in all_rows if r.total_stock > 0]
         moving = [r for r in with_stock if r.out_qty_30d > 0]
-        summary = {'sku_with_stock': len(with_stock), 'moving_sku': len(moving),
+        summary = {**_metric_chart_summary(all_rows), 'sku_with_stock': len(with_stock), 'moving_sku': len(moving),
                    'moving_rate': round(len(moving) / len(with_stock), 4) if with_stock else None,
                    'dead_sku': sum(1 for r in all_rows if r.status == 'dead'),
                    'abc': {label: sum(1 for r in all_rows if r.abc_class == label) for label in ('A', 'B', 'C')}}
@@ -738,6 +818,8 @@ class InventoryMetrics(Resource):
             if abc not in ('A', 'B', 'C'):
                 raise _bad("abc must be A / B / C", 'abc')
             query = query.filter(InventoryMetricsDaily.abc_class == abc)
+        if age_bucket:
+            query = query.filter(getattr(InventoryMetricsDaily, age_columns[age_bucket]) > 0)
         age_min = _int('age_min', None, 0)
         if age_min is not None:
             query = query.filter(InventoryMetricsDaily.weighted_age_days >= age_min)
@@ -771,7 +853,7 @@ class InventoryMetricsGoods(Resource):
         from warehouse.goods.models import Goods
         from warehouse.inventory.models import Inventory
         from .flows import inbound_events, outbound_events
-        from .history import daily_totals
+        from .history import daily_totals, daily_coverage
         from .metrics import age_layers, latest_metric_date
         from .models import InventoryMetricsDaily
         warehouse = _single_warehouse()
@@ -921,3 +1003,61 @@ class InventoryThresholdsSuggest(Resource):
                           'available_stock_for_sale': inventory.available_stock_for_sale if inventory else 0})
         return {'warehouse_id': warehouse.id, 'params': params, 'total': len(goods), 'page': page,
                 'per_page': per_page, 'items': items}, 200
+
+
+@api_ns.route('/overview')
+class StockLedgerOverview(Resource):
+    @permission_required(READ)
+    @warehouse_required()
+    @api_ns.expect(ledger_parser)
+    def get(self):
+        """Warehouse ledger overview: include shelf/pending/picked/packed, exclude transit.
+
+        Movement/document filters apply to detail lines only. Summary and daily series
+        share warehouse/goods/lot/location/type scope and booking-time boundaries.
+        Totals and series include all matching lots, independent of row pagination.
+        """
+        from .overview import ledger_overview
+        warehouse = _single_warehouse()
+        args = ledger_parser.parse_args()
+        filters = _ledger_filters(args)
+        start, end = _summary_range(args, warehouse.id)
+        end = min(end, clock.now() + timedelta(microseconds=1))
+        if start >= end:
+            raise _bad('Overview start must not be in the future', 'start_time')
+        if (clock.local_date(end - timedelta(microseconds=1), warehouse) - clock.local_date(start, warehouse)).days >= 400:
+            raise _bad('At most 400 days', 'start_time')
+        page, per_page = _page()
+        return ledger_overview(warehouse, filters, start, end, page, per_page)
+
+
+@api_ns.route('/summary/export')
+class StockSummaryExport(Resource):
+    @permission_required(READ)
+    @warehouse_required()
+    @api_ns.expect(summary_parser)
+    def get(self):
+        """CSV for the complete selected summary dimension, independent of pagination."""
+        result = _stock_summary_result(summary_parser.parse_args(), export=True)
+        incoming = sorted(result['totals']['inbound_by_movement'])
+        outgoing = sorted(result['totals']['outbound_by_movement'])
+        header = ['row_type', 'warehouse_id', 'group_dimension', 'group_value', 'goods_code', 'goods_name',
+                  'stock_type', 'start_time_utc', 'end_time_utc', 'opening']
+        header += ['inbound_' + key for key in incoming] + ['inbound']
+        header += ['outbound_' + key for key in outgoing] + ['outbound', 'closing']
+        # Append breakdown columns so existing CSV columns retain their positions.
+        types = list(dict.fromkeys(result['stock_types']))
+        header += ['opening_' + key for key in types] + ['closing_' + key for key in types]
+        def text_cell(value):
+            text = str(value or '')
+            return "'" + text if text.lstrip().startswith(('=', '+', '-', '@')) or text.startswith(('\t','\r','\n')) else text
+        def values(item):
+            return [item['opening']] + [item['inbound_by_movement'].get(key, 0) for key in incoming] + [item['inbound']] + [item['outbound_by_movement'].get(key, 0) for key in outgoing] + [item['outbound'], item['closing']] + [item['opening_by_stock_type'].get(key, 0) for key in types] + [item['closing_by_stock_type'].get(key, 0) for key in types]
+        dates = [clock.utc_iso(result['start_time']), clock.utc_iso(result['end_time'])]
+        rows = []
+        for item in result['items']:
+            goods = item.get('goods') or {}
+            rows.append(['item', item['warehouse_id'], result['group_by'], text_cell(item.get('group_value')),
+                         text_cell(goods.get('code')), text_cell(goods.get('name')), item.get('stock_type', '')] + dates + values(item))
+        rows.append(['total', '', result['group_by'], '', '', '', ''] + dates + values(result['totals']))
+        return _csv_response(header, rows, 'stock_summary.csv')

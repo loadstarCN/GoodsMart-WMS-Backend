@@ -972,6 +972,10 @@ class CustomsService:
             'customs': customs.to_dict() if customs else None,
             'invoice_number': CustomsService._invoice_number(dn),
             'recipient_country': recipient_country,
+            'recipient_tax_defaults': {
+                'tax_id': dn.recipient.tax_id if dn.recipient else None,
+                'tax_id_type': dn.recipient.tax_id_type if dn.recipient else None,
+            },
             'consignee': consignee,
             'lines': lines,
             'packages': packages,

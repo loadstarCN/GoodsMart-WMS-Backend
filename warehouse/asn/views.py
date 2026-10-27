@@ -31,6 +31,15 @@ def _owned_asn(asn_id: int) -> ASN:
     return get_warehouse_owned(ASN, asn_id, what='ASN')
 
 
+@api_ns.route('/report')
+class ASNReport(Resource):
+    @permission_required(['all_access', 'company_all_access', 'asn_read'])
+    @warehouse_required(force_warehouse=True)
+    def get(self):
+        from warehouse.common.document_reports import document_report
+        return document_report('inbound', g.warehouse)
+
+
 @api_ns.doc(security="jsonWebToken")
 @api_ns.route('/')
 class ASNList(Resource):
@@ -361,3 +370,66 @@ class ASNStatusOverviewStats(Resource):
         filters = add_warehouse_filter(filters)
         stats = ASNService.get_status_overview(filters=filters)
         return stats, 200
+
+
+@api_ns.route('/items/preview')
+class DocumentItemsPreview(Resource):
+    @permission_required(["all_access", "company_all_access", "asn_edit"])
+    @warehouse_required(force_warehouse=True)
+    def post(self):
+        """Read-only item preview: JSON text or multipart CSV/XLSX; code, quantity, remark columns."""
+        from warehouse.common.document_items import preview
+        return preview(g.warehouse, outbound=False), 200
+
+
+@api_ns.route('/items/template')
+class DocumentItemsTemplate(Resource):
+    @permission_required(["all_access", "company_all_access", "asn_edit"])
+    def get(self):
+        from warehouse.common.document_items import template
+        return template()
+
+
+@api_ns.doc(security="jsonWebToken")
+@api_ns.route('/supplier-summary')
+class ASNSupplierSummary(Resource):
+    @permission_required(["all_access", "company_all_access", "asn_read"])
+    @warehouse_required()
+    def get(self):
+        """Batch supplier receipt counts and last received document within the caller's warehouse scope."""
+        from flask import request
+        from sqlalchemy import case, func
+        from extensions.db import db
+        from extensions.error import BadRequestException
+        from .stage import stage_expression
+        raw = request.args.get('supplier_ids', '').split(',')
+        if not raw or len(raw) > 100 or any(not value.isascii() or not value.isdigit() or len(value) > 10 for value in raw):
+            raise BadRequestException("supplier_ids must contain 1 to 100 positive IDs", 14015)
+        ids = list(dict.fromkeys(int(value) for value in raw))
+        if any(value <= 0 or value > 2147483647 for value in ids):
+            raise BadRequestException("supplier_ids must contain positive IDs", 14015)
+        query = ASNService.list_asns(add_warehouse_filter({})).enable_eagerloads(False).order_by(None)
+        rows = query.filter(ASN.supplier_id.in_(ids)).with_entities(
+            ASN.supplier_id, ASN.id, ASN.received_at,
+            stage_expression().label('stage'),
+            func.row_number().over(partition_by=ASN.supplier_id,
+                order_by=(ASN.received_at.desc().nullslast(), ASN.id.desc())).label('position'),
+        ).subquery()
+        stats = db.session.query(
+            rows.c.supplier_id, func.count().label('total'),
+            func.sum(case((rows.c.stage == 'in_transit', 1), else_=0)).label('in_transit'),
+            func.max(rows.c.received_at).label('received_at'),
+            func.max(case(((rows.c.position == 1) & rows.c.received_at.isnot(None), rows.c.id), else_=None)).label('asn_id'),
+        ).group_by(rows.c.supplier_id).all()
+        return {'items': [{'supplier_id': row.supplier_id, 'total': row.total, 'in_transit': row.in_transit,
+                           'received_at': row.received_at.isoformat() if row.received_at else None,
+                           'asn_id': row.asn_id} for row in stats]}, 200
+
+
+@api_ns.route('/report/export')
+class DocumentReportExport(Resource):
+    @permission_required(['all_access', 'company_all_access', 'asn_read'])
+    @warehouse_required(force_warehouse=True)
+    def get(self):
+        from warehouse.common.document_reports import export_document_report
+        return export_document_report('inbound', g.warehouse)

@@ -324,6 +324,7 @@ class CycleCountTaskDetailSearch(Resource):
         # 将筛选参数打包
         filters = {
             'status': args.get('status'),
+            'order_by': args.get('order_by'),
             'operator_id': args.get('operator_id'),
             'goods_id': args.get('goods_id'),
             'location_id': args.get('location_id'),
@@ -372,3 +373,12 @@ class CycleCountStatusOverviewStats(Resource):
         filters = add_warehouse_filter(filters)
         stats = CycleCountTaskService.get_status_overview(filters=filters)
         return stats, 200
+
+
+@api_ns.route('/report/accuracy')
+class CycleCountAccuracyReport(Resource):
+    @permission_required(['all_access','company_all_access','cycle_count_read'])
+    @warehouse_required(force_warehouse=True)
+    def get(self):
+        from .report import accuracy_report
+        return accuracy_report(g.warehouse)

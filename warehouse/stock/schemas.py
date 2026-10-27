@@ -36,6 +36,8 @@ ledger_model = api_ns.model('StockLedgerLine', {
         'picked / packed / in_transit (shipped, not signed; not part of total_stock)')),
     'quantity': fields.Integer(description='Signed change of this bucket'),
     'balance_after': fields.Integer(description='Balance of the same bucket after this line'),
+    'category_balance_after': fields.Integer(description='Warehouse/goods/stock-type balance at booking position, across lots and locations'),
+    'lot_no': fields.String(),
     'goods_total_after': fields.Integer(description="The goods' total_stock in the warehouse after the movement"),
     'counter_stock_type': fields.String(description='Stock type of the other side of the movement (null = outside '
                                                     'the warehouse: inbound / outbound / reconcile)'),
@@ -75,6 +77,9 @@ for name, kind, text in (
     ('end_time', str, 'To (inclusive; a date = the whole local day)'),
 ):
     ledger_parser.add_argument(name, type=kind, location='args', help=text)
+for name in ('category', 'brand'):
+    ledger_parser.add_argument(name, type=str, location='args')
+    ledger_parser.add_argument(name + '_missing', type=int, choices=(0, 1), location='args')
 ledger_parser.add_argument('stock_types', type=_csv, location='args', help='Comma separated stock types')
 ledger_parser.add_argument('movement_types', type=_csv, location='args', help='Comma separated movement types')
 ledger_parser.add_argument('doc_type', type=_csv, location='args', help='Comma separated document types')
@@ -101,10 +106,15 @@ summary_parser.add_argument('goods_ids', type=_csv, location='args', help='Comma
 summary_parser.add_argument('stock_types', type=_csv, location='args',
                             help='Stock types to count (default: in the warehouse = total_stock); only movements '
                                  'crossing the boundary of this set count as in / out')
-summary_parser.add_argument('group_by', type=str, location='args', choices=('goods', 'goods_stock_type'),
+summary_parser.add_argument('group_by', type=str, location='args', choices=('goods', 'goods_stock_type', 'category', 'brand'),
                             default='goods')
 
+for name in ('category', 'brand'):
+    summary_parser.add_argument(name, type=str, location='args')
+    summary_parser.add_argument(name + '_missing', type=int, choices=(0, 1), location='args')
+
 summary_item_model = api_ns.model('StockLedgerSummaryItem', {
+    'group_value': fields.String(), 'group_dimension': fields.String(), 'goods_count': fields.Integer(),
     'warehouse_id': fields.Integer(),
     'goods_id': fields.Integer(),
     'goods': fields.Nested(goods_ref_model, skip_none=True),
@@ -117,6 +127,8 @@ summary_item_model = api_ns.model('StockLedgerSummaryItem', {
     'outbound_by_movement': fields.Raw(description='{movement_type: quantity}'),
 })
 summary_model = api_ns.model('StockLedgerSummary', {
+    'timezone': fields.String(description='Timezone used to interpret report calendar dates'),
+    'totals': fields.Raw(description='All matching rows before pagination, with movement breakdowns'),
     'start_time': fields.DateTime(), 'end_time': fields.DateTime(),
     'stock_types': fields.List(fields.String()),
     'group_by': fields.String(),

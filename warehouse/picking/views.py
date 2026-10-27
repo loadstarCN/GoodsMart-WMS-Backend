@@ -307,3 +307,48 @@ class PickingStatusOverviewStats(Resource):
         filters = add_warehouse_filter(filters)
         stats = PickingTaskService.get_status_overview(filters=filters)
         return stats, 200
+
+
+@api_ns.route('/report/operators')
+class OperatorReport(Resource):
+    @permission_required(['all_access', 'company_all_access', 'picking_read'])
+    @warehouse_required(force_warehouse=True)
+    def get(self):
+        from warehouse.common.operator_reports import operator_report
+        return operator_report('picking', g.warehouse)
+
+
+@api_ns.route('/report/operators/export')
+class OperatorReportExport(Resource):
+    @permission_required(['all_access', 'company_all_access', 'picking_read'])
+    @warehouse_required(force_warehouse=True)
+    def get(self):
+        from warehouse.common.operator_reports import export_operator_report
+        return export_operator_report('picking', g.warehouse)
+
+
+@api_ns.route('/<int:task_id>/print-plan')
+class PickingPrintPlan(Resource):
+    @permission_required(["all_access", "company_all_access", "picking_read"])
+    @warehouse_required()
+    def get(self, task_id):
+        from .print_plan import print_plan
+        return print_plan(_owned_task(task_id)), 200
+
+
+@api_ns.route('/report/operators/overview')
+class OperatorOverview(Resource):
+    @permission_required(['all_access', 'company_all_access', 'picking_read', 'packing_read'])
+    @warehouse_required(force_warehouse=True)
+    def get(self):
+        from warehouse.common.operator_reports import operator_overview
+        return operator_overview(g.warehouse)
+
+
+@api_ns.route('/report/operators/tasks')
+class OperatorTaskDrilldown(Resource):
+    @permission_required(['all_access', 'company_all_access', 'picking_read', 'packing_read'])
+    @warehouse_required(force_warehouse=True)
+    def get(self):
+        from warehouse.common.operator_reports import operator_tasks
+        return operator_tasks(g.warehouse)

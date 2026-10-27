@@ -10,6 +10,84 @@ from .schemas import api_ns, warehouse_model, warehouse_input_model, pagination_
 from .services import WarehouseService
 
 
+@api_ns.route('/<int:warehouse_id>/zones')
+class WarehouseZones(Resource):
+    @permission_required(['all_access', 'company_all_access', 'location_read'])
+    def get(self, warehouse_id):
+        from warehouse.location.models import Location
+        from warehouse.stock.queries import location_stock, location_summary, shelf_of
+        get_company_owned(Warehouse, warehouse_id)
+        scope = _restricted_warehouse_ids()
+        if scope is not None and warehouse_id not in scope:
+            raise ForbiddenException('Warehouse is outside your scope', 12001)
+        is_super, permissions, _ = get_actor_context()
+        inventory_visible = is_super or 'company_all_access' in permissions or 'inventory_read' in permissions
+        rows = (location_stock({'warehouse_id': warehouse_id, 'include_empty': True}) if inventory_visible else
+                [(location, []) for location in Location.query.filter_by(warehouse_id=warehouse_id, is_active=True).order_by(Location.code).all()])
+        zones = {}
+        for location, stocks in rows:
+            code = shelf_of(location.code)
+            zone = zones.setdefault(code, dict(code=code, first_code=location.code, last_code=location.code,
+                location_types=set(), locations=0, empty=0, quantity=0, capacity_m3=0.,
+                used_volume_m3=0., volume_unknown_quantity=0, sized_locations=0))
+            zone['last_code'] = location.code
+            zone['location_types'].add(location.location_type)
+            zone['locations'] += 1
+            if inventory_visible:
+                summary = location_summary(location, stocks)
+                zone['empty'] += int(summary['is_empty'])
+                zone['quantity'] += summary['quantity']
+                if summary['capacity_m3']:
+                    zone['sized_locations'] += 1
+                    zone['capacity_m3'] += summary['capacity_m3']
+                    zone['used_volume_m3'] += summary['used_volume_m3'] or 0
+                    zone['volume_unknown_quantity'] += summary['volume_unknown_quantity'] or 0
+        for zone in zones.values():
+            zone['location_types'] = sorted(zone['location_types'])
+            zone['volume_utilization'] = (round(zone['used_volume_m3'] / zone['capacity_m3'], 4)
+                                          if zone['capacity_m3'] else None)
+            if not inventory_visible:
+                for key in ('empty', 'quantity', 'capacity_m3', 'used_volume_m3', 'volume_unknown_quantity', 'sized_locations'):
+                    zone[key] = None
+        return {'items': list(zones.values()), 'total': len(zones), 'locations': len(rows),
+                'inventory_visible': bool(inventory_visible)}
+
+
+@api_ns.route('/<int:warehouse_id>/overview')
+class WarehouseOverview(Resource):
+    @permission_required(['all_access', 'company_all_access', 'warehouse_read'])
+    def get(self, warehouse_id):
+        from sqlalchemy import func
+        from extensions import db
+        from warehouse.common.clock import local_today
+        from warehouse.location.models import Location
+        from warehouse.inventory.models import Inventory
+        from warehouse.asn.models import ASN
+        from warehouse.dn.models import DN
+
+        warehouse = get_company_owned(Warehouse, warehouse_id)
+        scope = _restricted_warehouse_ids()
+        if scope is not None and warehouse_id not in scope:
+            raise ForbiddenException('Permission denied: warehouse is outside your scope', 12001)
+        is_super, permissions, _ = get_actor_context()
+        allowed = lambda permission: is_super or 'company_all_access' in permissions or permission in permissions
+        today = local_today(warehouse)
+        result = {'date': today.isoformat()}
+        if allowed('location_read'):
+            result['locations'] = Location.query.filter_by(warehouse_id=warehouse_id, is_active=True).count()
+        if allowed('inventory_read'):
+            count, quantity = db.session.query(func.count(), func.coalesce(func.sum(Inventory.onhand_stock), 0)).filter(
+                Inventory.warehouse_id == warehouse_id, Inventory.onhand_stock > 0).one()
+            result['goods_count'], result['onhand'] = count, quantity
+        if allowed('dn_read'):
+            result['dispatch_today'] = DN.query.filter(DN.warehouse_id == warehouse_id, DN.is_active.is_(True),
+                DN.expected_shipping_date == today, DN.status.in_(['pending', 'in_progress', 'picked', 'packed'])).count()
+        if allowed('asn_read'):
+            result['receive_today'] = ASN.query.filter(ASN.warehouse_id == warehouse_id, ASN.is_active.is_(True),
+                ASN.expected_arrival_date == today, ASN.status == 'pending').count()
+        return result, 200
+
+
 def _restricted_warehouse_ids():
     """仓库写操作的范围（B-75）。
 

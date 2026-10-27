@@ -45,8 +45,15 @@ def ledger_query(filters: dict):
     if filters.get('lot_no'):
         from .models import GoodsLot
         query = query.join(GoodsLot, GoodsLot.id == StockLedger.lot_id).filter(GoodsLot.lot_no == filters['lot_no'])
-    if filters.get('goods_code') or filters.get('keyword'):
+    if (filters.get('goods_code') or filters.get('keyword') or any(
+            filters.get(key) is not None for key in ('category', 'brand', 'category_missing', 'brand_missing'))):
         query = query.join(Goods, Goods.id == StockLedger.goods_id)
+        for dimension in ('category', 'brand'):
+            column = getattr(Goods, dimension)
+            if filters.get(dimension + '_missing'):
+                query = query.filter(or_(column.is_(None), column == ''))
+            elif filters.get(dimension) is not None:
+                query = query.filter(column == filters[dimension])
         if filters.get('goods_code'):
             query = query.filter(Goods.code == filters['goods_code'])
         if filters.get('keyword'):
@@ -82,9 +89,12 @@ def ledger_summary(filters: dict, start, end, stock_types=None, group_by='goods'
         return (row[0], row[1], row[2]) if per_type else (row[0], row[1])
 
     result = defaultdict(lambda: {'opening': 0, 'inbound': 0, 'outbound': 0,
-                                  'inbound_by_movement': defaultdict(int), 'outbound_by_movement': defaultdict(int)})
+                                  'inbound_by_movement': defaultdict(int), 'outbound_by_movement': defaultdict(int),
+                                  'opening_by_stock_type': defaultdict(int), 'closing_by_stock_type': defaultdict(int)})
     for row in opening_rows:
         result[key(row)]['opening'] += int(row[3] or 0)
+        result[key(row)]['opening_by_stock_type'][row[2]] += int(row[3] or 0)
+        result[key(row)]['closing_by_stock_type'][row[2]] += int(row[3] or 0)
     # 期间内按行拆成入 / 出（同一组变动里可能有正有负）
     period_lines = (_scope_summary(
         db.session.query(StockLedger.warehouse_id, StockLedger.goods_id, StockLedger.stock_type,
@@ -94,6 +104,7 @@ def ledger_summary(filters: dict, start, end, stock_types=None, group_by='goods'
     for row in period_lines:
         entry = result[key(row)]
         quantity = int(row[5])
+        entry['closing_by_stock_type'][row[2]] += quantity
         # 另一侧也在统计范围里 = 仓内搬动（只筛了一个库位时，进出这个库位都算）
         inside = (row[3] is not None and filters.get('location_id') is None
                   and (row[3] == row[2] if per_type else row[3] in stock_types))
@@ -112,7 +123,9 @@ def ledger_summary(filters: dict, start, end, stock_types=None, group_by='goods'
         item = {'warehouse_id': k[0], 'goods_id': k[1], 'opening': entry['opening'], 'inbound': entry['inbound'],
                 'outbound': entry['outbound'], 'closing': closing,
                 'inbound_by_movement': dict(entry['inbound_by_movement']),
-                'outbound_by_movement': dict(entry['outbound_by_movement'])}
+                'outbound_by_movement': dict(entry['outbound_by_movement']),
+                'opening_by_stock_type': dict(entry['opening_by_stock_type']),
+                'closing_by_stock_type': dict(entry['closing_by_stock_type'])}
         if per_type:
             item['stock_type'] = k[2]
         if any((item['opening'], item['inbound'], item['outbound'], item['closing'])):
@@ -137,8 +150,15 @@ def _scope_summary(query, filters):
         query = query.filter(StockLedger.location_id == filters['location_id'])
     if filters.get('lot_id') is not None:
         query = query.filter(StockLedger.lot_id == filters['lot_id'])
-    if filters.get('keyword') or filters.get('goods_code'):
+    if (filters.get('keyword') or filters.get('goods_code') or any(
+            filters.get(key) is not None for key in ('category', 'brand', 'category_missing', 'brand_missing'))):
         query = query.join(Goods, Goods.id == StockLedger.goods_id)
+        for dimension in ('category', 'brand'):
+            column = getattr(Goods, dimension)
+            if filters.get(dimension + '_missing'):
+                query = query.filter(or_(column.is_(None), column == ''))
+            elif filters.get(dimension) is not None:
+                query = query.filter(column == filters[dimension])
         if filters.get('goods_code'):
             query = query.filter(Goods.code == filters['goods_code'])
         if filters.get('keyword'):
