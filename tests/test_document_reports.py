@@ -453,6 +453,7 @@ def test_inbound_difference_categories_do_not_cancel_each_other(client, access_t
         today = clock.local_today(warehouse)
         ASN.query.filter_by(warehouse_id=warehouse.id).update({'expected_arrival_date':today,'received_at':None})
         asn.received_at = clock.now()
+        asn.status = 'completed'
         details = ASNDetail.query.filter_by(asn_id=asn.id).order_by(ASNDetail.id).all()
         assert len(details) >= 2
         for line in details:
@@ -474,3 +475,66 @@ def test_inbound_difference_categories_do_not_cancel_each_other(client, access_t
     assert result['items'][0]['id']==ident
     assert client.get(url+'&page=99&per_page=1',headers=_h(access_token)).json['receipt_differences']==result
     assert client.get(url+'&supplier_id=999999',headers=_h(access_token)).json['receipt_differences']['received']==0
+
+
+@pytest.mark.parametrize('status', ['received', 'completed'])
+def test_inbound_difference_requires_finalized_quantities(client, access_token, status):
+    with client.application.app_context():
+        asn = get_asn()
+        warehouse = db.session.get(Warehouse, asn.warehouse_id)
+        today = clock.local_today(warehouse)
+        ASN.query.filter_by(warehouse_id=warehouse.id).update({'expected_arrival_date': today, 'received_at': None})
+        asn.received_at = clock.now()
+        asn.status = status
+        details = ASNDetail.query.filter_by(asn_id=asn.id).all()
+        expected = sum(line.quantity for line in details)
+        assert expected > 0
+        for line in details:
+            line.actual_quantity = 0
+            line.damage_quantity = 0
+        wid, ident = warehouse.id, asn.id
+        db.session.commit()
+    url = f'/asn/report?warehouse_id={wid}&start_date={today}&end_date={today}'
+    data = client.get(url, headers=_h(access_token)).get_json()
+    row = next(row for row in data['items'] if row['id'] == ident)
+    assert data['summary']['received'] == 1
+    assert row['actual_date'] == str(today)
+    assert row['on_time'] is True
+    confirmed = status == 'completed'
+    assert row['actual'] == (0 if confirmed else None)
+    assert row['difference'] == (expected if confirmed else None)
+    assert row['damage'] == (0 if confirmed else None)
+    assert data['summary']['difference_rate'] == (1 if confirmed else None)
+    assert data['receipt_differences']['types']['short']['quantity'] == (expected if confirmed else 0)
+    assert data['receipt_differences']['received'] == int(confirmed)
+    assert data['receipt_differences']['documents'] == int(confirmed)
+    assert sum(day['on_time'] for day in data['daily']) == 1
+    import csv, io
+    response = client.get(url.replace('/report?', '/report/export?'), headers=_h(access_token))
+    rows = list(csv.DictReader(io.StringIO(response.get_data(as_text=True).lstrip('\ufeff'))))
+    exported = next(item for item in rows if item['document_id'] == str(ident))
+    assert exported['actual'] == ('0' if confirmed else '')
+    assert exported['difference'] == (str(expected) if confirmed else '')
+
+
+@pytest.mark.parametrize('status', ['received', 'completed'])
+def test_spec_coverage_excludes_unconfirmed_receipt_quantities(client, access_token, status):
+    with client.application.app_context():
+        asn = get_asn()
+        warehouse = db.session.get(Warehouse, asn.warehouse_id)
+        today = clock.local_today(warehouse)
+        ASN.query.filter_by(warehouse_id=warehouse.id).update({'received_at': None})
+        asn.received_at = clock.local_midnight(today, warehouse)
+        asn.status = status
+        asn.is_active = True
+        details = ASNDetail.query.filter_by(asn_id=asn.id).all()
+        # Historical/imported values are not proof of finalized receipt.
+        for line in details:
+            line.actual_quantity = line.quantity
+        unique_goods = len({line.goods_id for line in details if line.quantity > 0})
+        assert unique_goods > 0
+        wid = warehouse.id
+        db.session.commit()
+    response = client.get(f'/asn/report?warehouse_id={wid}&start_date={today}&end_date={today}', headers=_h(access_token))
+    assert response.status_code == 200
+    assert response.json['spec_coverage']['total'] == (unique_goods if status == 'completed' else 0)

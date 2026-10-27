@@ -160,6 +160,8 @@ def document_report(kind, warehouse, export=False):
                     durations[key].append(value)
             actual_day = clock.local_date(row.actual_at, warehouse)
             received = actual_day is not None
+            # ASN actual quantities are finalized by complete_asn, not receive_asn.
+            quantity_confirmed = received and (not inbound or row.status == 'completed')
             due = (received or row.planned < today) if inbound else row.planned is not None
             on_time = received and row.planned is not None and actual_day <= row.planned
             bucket_day = row.planned if inbound else actual_day
@@ -170,7 +172,7 @@ def document_report(kind, warehouse, export=False):
                                            planned=row.planned.isoformat() if row.planned else None,
                                            timing='unscheduled' if row.planned is None else 'on_time' if on_time else 'late'))
             bucket['documents'] += 1
-            bucket['actual'] += (row.actual or 0) if received else 0
+            bucket['actual'] += (row.actual or 0) if quantity_confirmed else 0
             if received:
                 bucket['unscheduled' if row.planned is None else 'on_time' if on_time else 'late'] += 1
             summary['documents'] += 1
@@ -178,7 +180,7 @@ def document_report(kind, warehouse, export=False):
             summary['received'] += int(received)
             summary['due'] += int(due)
             summary['on_time'] += int(on_time)
-            if received:
+            if quantity_confirmed:
                 for key in ('actual', 'damage', 'difference'):
                     summary[key] += getattr(row, key) or 0
                 summary['received_expected'] += row.expected or 0
@@ -199,9 +201,9 @@ def document_report(kind, warehouse, export=False):
                 items.append(dict(id=row.id, planned=row.planned.isoformat() if row.planned else None,
                                   actual_date=actual_day.isoformat() if actual_day else None,
                                   status=row.status, expected=row.expected or 0,
-                                  actual=(row.actual or 0) if received else None,
-                                  damage=(row.damage or 0) if received else None,
-                                  difference=(row.difference or 0) if received else None,
+                                  actual=(row.actual or 0) if quantity_confirmed else None,
+                                  damage=(row.damage or 0) if quantity_confirmed else None,
+                                  difference=(row.difference or 0) if quantity_confirmed else None,
                                   on_time=bool(on_time) if received else None, lead_hours=lead))
         summary['on_time_rate'] = summary['on_time'] / summary['due'] if summary['due'] else None
         summary['difference_rate'] = ((summary['difference'] + summary['damage']) / summary['received_expected']
@@ -258,7 +260,8 @@ def document_report(kind, warehouse, export=False):
     if inbound and not export:
         from warehouse.goods.models import Goods
         # The specification card uses actual receipts in the period, not the planned-arrival cohort.
-        received_ids = base.with_entities(model.id).filter(actual >= clock.local_midnight(start, warehouse),
+        received_ids = base.with_entities(model.id).filter(model.status == 'completed',
+            actual >= clock.local_midnight(start, warehouse),
             actual < clock.local_midnight(end+timedelta(days=1), warehouse)).subquery()
         specs = db.session.query(Goods.id, Goods.code, Goods.name, Goods.weight, Goods.length, Goods.width, Goods.height,
             func.sum(ASNDetail.actual_quantity).label('quantity')).join(ASNDetail, ASNDetail.goods_id == Goods.id).filter(
