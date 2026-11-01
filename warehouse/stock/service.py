@@ -349,11 +349,20 @@ class StockService:
         # 1. 校验
         locations = {}
         for move in moves:
+            if move.src is not None and move.movement_type in ('pick', 'ship'):
+                from .lots import assert_shippable
+                assert_shippable(move.goods_id, move.src.lot_id, warehouse_id)
+            if move.src is not None and move.dst is not None and move.src.lot_id != move.dst.lot_id and move.movement_type != 'lot_relabel':
+                raise BadRequestException('Stock movement must preserve lot identity', 16173, field='lot_id')
             for leg, inbound in ((move.src, False), (move.dst, True)):
                 if leg is None:
                     continue
                 if leg.lot_id is not None:
-                    raise ValueError("lots are not enabled yet (phase 2)")
+                    from .lots import lot_for_goods
+                    lot = lot_for_goods(move.goods_id, leg.lot_id)
+                    if move.src is None and inbound and move.movement_type in ('sort_in', 'adjust_gain') and lot.first_inbound_at is None:
+                        from warehouse.common import clock
+                        lot.first_inbound_at = op.occurred_at or clock.now()
                 if leg.kind != Leg.LOCATION:
                     continue
                 location = locations.get(leg.location_id)
@@ -456,6 +465,23 @@ class StockService:
             for obj in touched + lines:
                 guard.authorize(obj)
             db.session.add_all(lines)
+            # Record future DN returns at the same transaction boundary as their stock movement.
+            # Existing balances are never attributed retrospectively to an order.
+            from warehouse.putaway.models import ReceiptPendingStock
+            for line in lines:
+                if (line.quantity > 0 and line.stock_type == STOCK_PENDING
+                        and line.movement_type in ('pack_short_return', 'dn_cancel_return')):
+                    dn_id = line.doc_id if line.doc_type == 'dn' else None
+                    if line.doc_type == 'packing_task' and line.doc_id:
+                        from warehouse.packing.models import PackingTask
+                        task = db.session.get(PackingTask, line.doc_id)
+                        dn_id = task.dn_id if task else None
+                    if not dn_id:
+                        continue
+                    db.session.add(ReceiptPendingStock(dn_id=dn_id, source_type=line.movement_type,
+                        warehouse_id=line.warehouse_id, goods_id=line.goods_id, lot_id=line.lot_id,
+                        entered_at=line.occurred_at, good_received=line.quantity, damaged_received=0,
+                        good_remaining=line.quantity, damaged_remaining=0))
         db.session.flush()
         return lines
 

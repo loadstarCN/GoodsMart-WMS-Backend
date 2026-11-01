@@ -1,3 +1,4 @@
+from warehouse.stock.lots import validated_lot_id
 from datetime import datetime
 from extensions.db import *
 from warehouse.common.search import number_conditions
@@ -69,6 +70,7 @@ class AdjustmentService:
         if filters.get('keyword'):
             from warehouse.goods.models import Goods
             from warehouse.location.models import Location
+            from warehouse.stock.models import GoodsLot
             keyword = str(filters['keyword']).strip()
             pattern = f"%{keyword}%"
             conditions = [
@@ -76,6 +78,7 @@ class AdjustmentService:
                 Adjustment.details.any(AdjustmentDetail.goods.has(
                     db.or_(Goods.code.ilike(pattern), Goods.name.ilike(pattern)))),
                 Adjustment.details.any(AdjustmentDetail.location.has(Location.code.ilike(pattern))),
+                Adjustment.details.any(AdjustmentDetail.lot.has(GoodsLot.lot_no.ilike(pattern))),
             ]
             # 单号：纯数字或 ADJ-4（调整单）、CC-2（来源盘点单）
             conditions += number_conditions(keyword, {'ADJ': [Adjustment.id], 'CC': [Adjustment.cyclecount_id]},
@@ -93,6 +96,17 @@ class AdjustmentService:
 
         if filters.get('created_by'):
             query = query.filter(Adjustment.created_by == filters['created_by'])
+        if filters.get('source') == 'cyclecount':
+            query = query.filter(Adjustment.cyclecount_id.isnot(None))
+        elif filters.get('source') == 'manual':
+            query = query.filter(Adjustment.cyclecount_id.is_(None))
+        if filters.get('awaiting_approver_id'):
+            actor_id = filters['awaiting_approver_id']
+            query = query.filter(
+                Adjustment.status == 'pending', Adjustment.is_active.is_(True),
+                Adjustment.created_by != actor_id,
+                db.or_(Adjustment.details_modified_by.is_(None), Adjustment.details_modified_by != actor_id),
+            )
         
         if filters.get('warehouse_id'):
             query = query.filter(Adjustment.warehouse_id == filters['warehouse_id'])
@@ -245,6 +259,7 @@ class AdjustmentService:
         new_detail = AdjustmentDetail(
             adjustment_id=adjustment_id,
             goods_id=data['goods_id'],
+            lot_id=validated_lot_id(data['goods_id'], data.get('lot_id')),
             location_id=data.get('location_id'),
             system_quantity=system_quantity,
             actual_quantity=actual_quantity,
@@ -292,6 +307,7 @@ class AdjustmentService:
 
         detail.goods_id = data.get('goods_id', detail.goods_id)
         detail.location_id = data.get('location_id', detail.location_id)
+        detail.lot_id = validated_lot_id(detail.goods_id, data.get('lot_id', detail.lot_id))
         detail.system_quantity = system_quantity
         detail.actual_quantity = actual_quantity
         detail.adjustment_quantity = adjustment_quantity
@@ -389,16 +405,16 @@ class AdjustmentService:
         # doc = 调整单，doc_line = 调整明细，reason = 调整原因
         stock_op = StockOp(adjustment.warehouse_id, 'adjust_gain', doc_type='adjustment', doc_id=adjustment.id,
                            operator_id=operator_id, reason=adjustment.adjustment_reason)
-        for detail in sorted(adjustment.details, key=lambda d: lock_order_key(d.goods_id, d.location_id)):
+        for detail in sorted(adjustment.details, key=lambda d: lock_order_key(d.goods_id, d.location_id, d.lot_id)):
             delta = detail.adjustment_quantity or 0
             if delta == 0:
                 continue
             AdjustmentService._lock_or_create_goods_location(adjustment, detail)
             if delta > 0:
-                stock_op.move(detail.goods_id, delta, dst=Leg.at(detail.location_id), movement_type='adjust_gain',
+                stock_op.move(detail.goods_id, delta, dst=Leg.at(detail.location_id, detail.lot_id), movement_type='adjust_gain',
                               doc_line_id=detail.id, remark=detail.remark or None)
             else:
-                stock_op.move(detail.goods_id, -delta, src=Leg.at(detail.location_id), movement_type='adjust_loss',
+                stock_op.move(detail.goods_id, -delta, src=Leg.at(detail.location_id, detail.lot_id), movement_type='adjust_loss',
                               doc_line_id=detail.id, remark=detail.remark or None,
                               errors={'insufficient': (15002, f"Insufficient stock for goods_id={detail.goods_id} "
                                                               f"in location_id={detail.location_id}")})
@@ -421,7 +437,7 @@ class AdjustmentService:
                 16113, details={'detail_id': detail.id, 'goods_id': detail.goods_id, 'location_id': None,
                                 'adjustment_quantity': delta}
             )
-        record = lock_goods_location(detail.goods_id, detail.location_id)
+        record = lock_goods_location(detail.goods_id, detail.location_id, detail.lot_id)
         if record is not None:
             return record
         if delta < 0:
@@ -437,7 +453,7 @@ class AdjustmentService:
             lock_row(get_object_or_404(Location, detail.location_id), shared=True))
         # 该商品在仓库还没有库存行时先建（savepoint 兜底并发首次创建，B-107），再在锁下取 / 建库位库存行
         InventoryService.ensure_inventory(detail.goods_id, adjustment.warehouse_id)
-        record, _ = lock_or_create_goods_location(detail.goods_id, detail.location_id)
+        record, _ = lock_or_create_goods_location(detail.goods_id, detail.location_id, detail.lot_id)
         return record
 
     @staticmethod
@@ -502,6 +518,7 @@ class AdjustmentService:
             system_quantity = detail.system_quantity or 0
             adjustment_detail = AdjustmentDetail(
                 goods_id=detail.goods_id,
+                lot_id=detail.lot_id,
                 location_id=detail.location_id,
                 system_quantity=system_quantity,
                 actual_quantity=detail.actual_quantity,

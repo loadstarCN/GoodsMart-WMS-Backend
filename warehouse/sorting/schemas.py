@@ -2,7 +2,7 @@ from flask_restx import Namespace, fields, inputs,reqparse
 from extensions import authorizations
 from system.user.schemas import user_simple_model as original_user_model
 from warehouse.asn.schemas import asn_model
-from warehouse.asn.spec_capture import sorted_pending_lines
+from warehouse.asn.spec_capture import sorted_pending_lines, asn_spec_pending_count
 from warehouse.goods.schemas import goods_simple_model as goods_model
 from system.common import pagination_parser, create_pagination_model,generate_input_fields
 from .models import SortingTask
@@ -34,9 +34,14 @@ sorting_task_status_log_model = api_ns.model('SortingTaskStatusLog', {
 # ---------------------------------------------------------------------------------
 sorting_task_detail_for_batch_model = api_ns.model('SortingTaskDetailForBatch', {
     'id': fields.Integer(readOnly=True, description='Sorting Task Detail ID'),
+    'lot_id': fields.Integer(description='Product lot ID; null means unassigned'),
+    'lot_no': fields.String(attribute='lot.lot_no', readOnly=True),
     'goods_id': fields.Integer(required=True, description='Associated Goods ID (must be part of the ASN)'),
     'sorted_quantity': fields.Integer(description='Quantity sorted in this task (non-negative integer)'),
     'damage_quantity': fields.Integer(description='Quantity damaged in this task (non-negative integer)'),
+    'rejected_quantity': fields.Integer(description='Rejected units; never added to warehouse stock'),
+    'rejection_reason': fields.String(description='Required reason when rejecting units'),
+    'concession_reason': fields.String(description='Recorded exception for a short remaining shelf life'),
     'sorting_time': fields.DateTime(readOnly=True, description='Time of sorting operation'),
     'operator_id': fields.Integer(readOnly=True, description='Operator performing the sorting'),
     'goods': fields.Nested(goods_model, readOnly=True, description='Goods details'),
@@ -79,7 +84,10 @@ sorting_task_detail_model = api_ns.inherit('SortingTaskDetail', sorting_task_det
 # ---------------------------------------------------------------------------------
 # status / is_active / started_at / completed_at 只能经 process / complete 动作端点变更，不接受客户端输入
 sorting_task_base_model = api_ns.model('SortingTaskBase', {
+    'spec_pending_count': fields.Integer(readOnly=True, attribute=lambda x: asn_spec_pending_count(x.asn) if x.asn else 0),
+    'has_variance': fields.Boolean(readOnly=True, attribute=lambda x: x.status == 'completed' and any(d.actual_quantity is not None and d.actual_quantity != d.quantity for d in x.asn.details)),
     'id': fields.Integer(readOnly=True, description='Sorting Task ID'),
+    'warehouse_id': fields.Integer(attribute='asn.warehouse_id', readOnly=True),
     'asn_id': fields.Integer(required=True, description='Associated ASN ID'),
     'status': fields.String(readOnly=True, description='Sorting Task Status', enum=SortingTask.SORTING_TASK_STATUSES),
     'is_active': fields.Boolean(readOnly=True, description='Is the task active?'),
@@ -112,6 +120,7 @@ sorting_task_base_model = api_ns.model('SortingTaskBase', {
         ), # 计算所有明细的实际数量总和
         description='Sum of all sorted goods quantities in the task'
     ),
+    'total_rejected_quantity': fields.Integer(readOnly=True, attribute=lambda x: sum(d.rejected_quantity or 0 for d in x.task_details)),
         
     'total_damage_quantity': fields.Integer(
         readOnly=True,
@@ -176,6 +185,11 @@ sorting_pagination_parser.add_argument('status',type=str,help='Sorting Task Stat
 sorting_pagination_parser.add_argument('is_active',type=inputs.boolean,help='Is the task active?',location='args')
 sorting_pagination_parser.add_argument('warehouse_id', type=int, help='Filter by Warehouse ID')
 sorting_pagination_parser.add_argument('keyword', type=str, help='Keyword search')
+sorting_pagination_parser.add_argument('has_variance', type=inputs.boolean, location='args', help='Completed tasks with confirmed quantity differences')
+sorting_pagination_parser.add_argument('has_damage', type=inputs.boolean, location='args')
+sorting_pagination_parser.add_argument('spec_pending', type=inputs.boolean, location='args')
+sorting_pagination_parser.add_argument('received_from', type=lambda value: inputs.date(value).date(), location='args')
+sorting_pagination_parser.add_argument('received_to', type=lambda value: inputs.date(value).date(), location='args')
 
 
 pagination_model = create_pagination_model(api_ns, sorting_task_base_model)

@@ -48,6 +48,7 @@ dn_detail_model = api_ns.model('DNDetail', dn_detail_fields)
 # --------------------------------------------
 
 dn_package_model = api_ns.model('DNPackage', {
+    'contents': fields.Raw(readOnly=True, description='Explicit per-carton goods and lots; null means unknown'),
     'package_no': fields.Integer(description='Package number (1..99, consecutive)'),
     'gross_weight_kg': fields.Float(description='Gross weight in kg (0.01 - 999.999, 3 decimals)'),
     'length_mm': fields.Integer(description='Length in mm (1 - 3000)'),
@@ -286,12 +287,15 @@ dn_input_model = api_ns.inherit('DNInput', dn_input_base_model, {
 
 # 7) DN 专用的分页解析器
 dn_pagination_parser = pagination_parser.copy()
+dn_pagination_parser.add_argument('warehouse_todo_date', type=lambda value: inputs.date(value).date(), location='args', help='Exact local planned date, active documents awaiting warehouse processing')
 dn_pagination_parser.add_argument('dn_type', type=str, help='Filter by DN type', choices=DN.DN_TYPES)
 dn_pagination_parser.add_argument('status', type=str, help='Filter by DN status', choices=DN.DN_STATUSES)
 dn_pagination_parser.add_argument('order_number', type=str, help='Filter by order number')
 dn_pagination_parser.add_argument('carrier_id', type=int, help='Filter by carrier ID')
 dn_pagination_parser.add_argument('recipient_id', type=int, help='Filter by recipient ID')
 dn_pagination_parser.add_argument('expected_shipping_date', type=inputs.date_from_iso8601, help='Filter by expected shipping date')
+dn_pagination_parser.add_argument('planned_start_date', type=lambda value: inputs.date(value).date(), location='args', help='Inclusive planned shipping date lower bound')
+dn_pagination_parser.add_argument('planned_end_date', type=lambda value: inputs.date(value).date(), location='args', help='Inclusive planned shipping date upper bound')
 dn_pagination_parser.add_argument('created_by', type=int, help='Filter by creator ID')
 dn_pagination_parser.add_argument('is_active', type=inputs.boolean, help='Filter by DN active status')
 dn_pagination_parser.add_argument('warehouse_id', type=int, help='Filter by warehouse ID')

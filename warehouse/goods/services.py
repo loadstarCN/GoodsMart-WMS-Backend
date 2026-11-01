@@ -551,8 +551,11 @@ class GoodsLocationService:
             query = query.filter(GoodsLocation.location_id == filters['location_id'])
 
         # 针对 Goods 相关的过滤，先统一 join 一次
-        if filters.get('goods_code') or filters.get('goods_name') or filters.get('keyword'):
+        if filters.get('goods_code') or filters.get('goods_name') or filters.get('keyword') or filters.get('goods_query'):
             query = query.join(Goods, Goods.id == GoodsLocation.goods_id)
+        if filters.get('goods_query'):
+            term = filters['goods_query']
+            query = query.filter(or_(Goods.code.contains(term, autoescape=True), Goods.name.contains(term, autoescape=True)))
         if filters.get('goods_code'):
             query = query.filter(Goods.code.ilike(f"%{filters['goods_code']}%"))
         if filters.get('goods_name'):
@@ -564,7 +567,7 @@ class GoodsLocationService:
 
         # 针对 Location 相关的过滤，先统一 join 一次
         if (filters.get('location_code') or filters.get('warehouse_id') or filters.get('warehouse_ids')
-                or filters.get('keyword') or filters.get('location_type')):
+                or filters.get('keyword') or filters.get('location_type') or filters.get('expiry_scope')):
             query = query.join(Location, GoodsLocation.location_id == Location.id)
         if filters.get('location_type'):
             query = query.filter(Location.location_type == filters['location_type'])
@@ -591,6 +594,32 @@ class GoodsLocationService:
             query = query.filter(Location.warehouse_id.in_(filters['warehouse_ids']))
 
         # 稳定排序：分页靠 LIMIT / OFFSET，不排序时 PostgreSQL 各页的行序不保证一致（会重复或漏行）
+        if filters.get('lot_no') or filters.get('expiry_scope'):
+            from warehouse.stock.models import GoodsLot
+            query = query.join(GoodsLot, GoodsLot.id == GoodsLocation.lot_id)
+            if filters.get('lot_no'):
+                query = query.filter(GoodsLot.lot_no.contains(filters['lot_no'], autoescape=True))
+            if filters.get('expiry_scope'):
+                from datetime import timedelta
+                from sqlalchemy import and_
+                from warehouse.stock.lot_policy import effective_rules
+                groups, rules, dates = defaultdict(list), {}, {}
+                for goods_id, warehouse_id in query.with_entities(GoodsLocation.goods_id, Location.warehouse_id).distinct():
+                    if goods_id not in rules:
+                        rules[goods_id] = effective_rules(db.session.get(Goods, goods_id))['values']
+                    if warehouse_id not in dates:
+                        dates[warehouse_id] = clock.local_today(warehouse_id)
+                    days = rules[goods_id]['warning_days' if filters['expiry_scope'] == 'warning' else 'ship_days']
+                    groups[(warehouse_id, dates[warehouse_id] + timedelta(days=days))].append(goods_id)
+                clauses = []
+                for (warehouse_id, cutoff), ids in groups.items():
+                    expiry = (GoodsLot.expiry_date <= cutoff if filters['expiry_scope'] == 'warning'
+                              else GoodsLot.expiry_date < cutoff)
+                    for start in range(0, len(ids), 300):
+                        clauses.append(and_(Location.warehouse_id == warehouse_id,
+                                            GoodsLocation.goods_id.in_(ids[start:start + 300]), expiry))
+                query = query.filter(or_(*clauses) if clauses else db.false())
+
         return query.order_by(GoodsLocation.id)
 
     @staticmethod
@@ -655,7 +684,7 @@ class GoodsLocationService:
     
 
     @staticmethod
-    def get_quantity(goods_id:int,location_id:int) -> int:
+    def get_quantity(goods_id:int,location_id:int,lot_id=None) -> int:
         """
         获取商品数量：根据库存记录获取指定商品在指定库位的总库存量
         """
@@ -664,7 +693,7 @@ class GoodsLocationService:
             func.sum(GoodsLocation.quantity).label('total')
         ).filter_by(
             goods_id=goods_id,
-            location_id=location_id
+            location_id=location_id, lot_id=lot_id
         ).scalar()  # scalar() 返回单个标量值
 
         # 处理查询结果为 None 的情况（当没有库存记录时返回 0）

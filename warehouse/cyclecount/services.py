@@ -1,3 +1,4 @@
+from warehouse.stock.lots import validated_lot_id
 from werkzeug.exceptions import NotFound
 from extensions.db import *
 from warehouse.common.search import number_conditions
@@ -43,7 +44,7 @@ class CycleCountTaskService:
     @staticmethod
     def _record_actual(detail: CycleCountTaskDetail, actual_quantity: int, operator_id) -> CycleCountTaskDetail:
         """录入实盘：系统数取录入此刻的库位库存，差异按此计算，记录录入人"""
-        system_quantity = GoodsLocationService.get_quantity(detail.goods_id, detail.location_id)
+        system_quantity = GoodsLocationService.get_quantity(detail.goods_id, detail.location_id, detail.lot_id)
         detail.actual_quantity = actual_quantity
         detail.system_quantity = system_quantity
         detail.difference = actual_quantity - system_quantity
@@ -72,6 +73,12 @@ class CycleCountTaskService:
             query = query.filter(CycleCountTask.task_name.ilike(f"%{filters['task_name']}%"))
         if filters.get('status'):
             query = query.filter(CycleCountTask.status == filters['status'])
+        if filters.get('has_variance') is not None:
+            differs = CycleCountTask.task_details.any(db.and_(
+                db.or_(CycleCountTaskDetail.status == 'completed', CycleCountTaskDetail.operator_id.isnot(None)),
+                CycleCountTaskDetail.difference != 0,
+            ))
+            query = query.filter(differs if filters['has_variance'] else ~differs)
 
         # 如果 filters 中没有 is_active 或其值为 None，则只返回 is_active=True
         if 'is_active' not in filters or filters['is_active'] is None:
@@ -90,12 +97,14 @@ class CycleCountTaskService:
 
         # 搜索id，task_name，在detail中的goods.code，在detail中的location.code
         if filters.get('keyword'):
+            from warehouse.stock.models import GoodsLot
             keyword = filters['keyword']
             # 单号：纯数字或 CC-2（界面显示的格式）
             conditions = number_conditions(keyword, {'CC': [CycleCountTask.id]}, [CycleCountTask.id])
             conditions.append(CycleCountTask.task_name.ilike(f"%{keyword}%"))
             conditions.append(CycleCountTask.task_details.any(CycleCountTaskDetail.goods.has(code=keyword)))
             conditions.append(CycleCountTask.task_details.any(CycleCountTaskDetail.location.has(code=keyword)))
+            conditions.append(CycleCountTask.task_details.any(CycleCountTaskDetail.lot.has(GoodsLot.lot_no.ilike(f"%{keyword}%"))))
             query = query.filter(db.or_(*conditions))
 
         if filters.get('warehouse_id'):
@@ -130,6 +139,7 @@ class CycleCountTaskService:
                 require_company_goods(detail_data.get('goods_id'), company_id)
                 new_detail = CycleCountTaskDetail(
                     goods_id=detail_data['goods_id'],
+                    lot_id=validated_lot_id(detail_data['goods_id'], detail_data.get('lot_id')),
                     location_id=detail_data['location_id'],
                     actual_quantity=0
                 )
@@ -232,6 +242,7 @@ class CycleCountTaskService:
         new_detail = CycleCountTaskDetail(
             task_id=task_id,
             goods_id=data['goods_id'],
+            lot_id=validated_lot_id(data['goods_id'], data.get('lot_id')),
             location_id=data['location_id'],
             actual_quantity=0
         )
@@ -268,13 +279,14 @@ class CycleCountTaskService:
         # status 与 operator_id 不接受客户端输入（operator_id 取当前操作人）
         if data.get('goods_id') is not None:
             require_company_goods(data['goods_id'], task.warehouse.company_id)
-        old_key = (detail.goods_id, detail.location_id)
+        old_key = (detail.goods_id, detail.location_id, detail.lot_id)
         detail.goods_id = data.get('goods_id', detail.goods_id)
         detail.location_id = data.get('location_id', detail.location_id)
+        detail.lot_id = validated_lot_id(detail.goods_id, data.get('lot_id', detail.lot_id))
         if 'actual_quantity' in data:
             actual_quantity = require_non_negative_int(data['actual_quantity'], 'actual_quantity')
             CycleCountTaskService._record_actual(detail, actual_quantity, operator_id)
-        elif (detail.goods_id, detail.location_id) != old_key:
+        elif (detail.goods_id, detail.location_id, detail.lot_id) != old_key:
             detail.system_quantity = None
             detail.difference = None
             detail.operator_id = None
@@ -322,7 +334,7 @@ class CycleCountTaskService:
             for detail in task.task_details:
                 if CycleCountTaskService.is_recorded(detail) and detail.system_quantity is not None:
                     continue
-                goods_location = GoodsLocationService.get_quantity(detail.goods_id, detail.location_id)
+                goods_location = GoodsLocationService.get_quantity(detail.goods_id, detail.location_id, detail.lot_id)
                 detail.system_quantity = goods_location
                 # 计算差异
                 detail.difference = detail.actual_quantity - goods_location
@@ -509,6 +521,7 @@ class CycleCountTaskService:
                     {
                         'goods_id': goods_id,
                         'location_id': location_id,
+                        'lot_id': storage_record.lot_id,
                         'actual_quantity': 0
                     },
                     created_by_id=created_by_id

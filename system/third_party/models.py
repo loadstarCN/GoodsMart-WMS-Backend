@@ -1,6 +1,19 @@
 from extensions import db
 from sqlalchemy.dialects.postgresql import JSON
 
+
+class APICallLog(db.Model):
+    """Authenticated key calls: metadata only, never credentials or payloads."""
+    __tablename__ = 'api_call_logs'
+    id = db.Column(db.Integer, primary_key=True)
+    api_key_id = db.Column(db.Integer, db.ForeignKey('api_keys.id', ondelete='CASCADE'), nullable=False)
+    called_at = db.Column(db.DateTime(timezone=True), nullable=False)
+    method = db.Column(db.String(16), nullable=False)
+    route = db.Column(db.String(512), nullable=False)
+    status_code = db.Column(db.Integer, nullable=False)
+    duration_ms = db.Column(db.Integer, nullable=False)
+    __table_args__ = (db.Index('ix_api_call_key_time', 'api_key_id', 'called_at', 'id'),)
+
 class APIKey(db.Model):
     """API密钥管理表
 

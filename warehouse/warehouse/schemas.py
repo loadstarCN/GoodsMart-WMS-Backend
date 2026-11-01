@@ -34,6 +34,7 @@ warehouse_timezone_field = fields.String(
 # 定义用于响应的简单 Warehouse 模型（仅包含 id 和 name）
 # -----------------------------
 warehouse_simple_model = api_ns.model('WarehouseSimple', {
+    'operations': fields.Raw(readOnly=True, description='Warehouse operation settings'),
     'id': fields.Integer(readOnly=True, description='Warehouse ID'),
     'name': fields.String(required=True, description='Warehouse Name'),
     'default_currency': fields.String(description='Default Currency Code (ISO 4217 standard)', default='JPY'),
@@ -44,6 +45,7 @@ warehouse_simple_model = api_ns.model('WarehouseSimple', {
 # 定义 Warehouse 输出模型（完整字段）
 # -----------------------------
 warehouse_model = api_ns.model('Warehouse', {
+    'operations': fields.Raw(description='Warehouse outbound and navigation settings'),
     'id': fields.Integer(readOnly=True, description='Warehouse ID'),
     'name': fields.String(required=True, description='Warehouse Name'),
     'address': fields.String(description='Warehouse address in one line; generated in the country format when only '

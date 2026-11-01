@@ -18,6 +18,8 @@ log_model = api_ns.model('Log', {
     'method': fields.String(description='Method (only write requests are logged)', enum=ActivityLog.LOGGED_METHODS),
     'request_data': fields.String(description='Request Data'),
     'response_data': fields.String(description='Response Data'),
+    'request_content_type': fields.String(description='Request Content-Type'),
+    'response_content_type': fields.String(description='Response Content-Type'),
     'status_code': fields.Integer(description='Status Code'),
     'ip_address': fields.String(description='IP Address'),
     'processing_time': fields.Integer(description='Processing time in milliseconds'),
@@ -34,7 +36,7 @@ pagination_parser.add_argument('method', type=str, location='args',
                                help='Method (POST / PUT / DELETE; GET requests are not logged)',
                                choices=ActivityLog.LOGGED_METHODS)
 pagination_parser.add_argument('status_code', type=int, location='args', help='Status Code')
-pagination_parser.add_argument('ip_address', type=inputs.ipv4, help='IP address to filter by', location='args')
+pagination_parser.add_argument('ip_address', type=inputs.ip, help='IPv4 or IPv6 address to filter by', location='args')
 pagination_parser.add_argument('created_at', type=inputs.datetime_from_iso8601, help='Filter logs created on or after this date', location='args')
 
 
@@ -51,7 +53,7 @@ _date_or_datetime.__schema__ = {'type': 'string', 'format': 'date-time'}
 pagination_parser.add_argument('created_at_end', type=_date_or_datetime, location='args',
                                help='Filter logs created on or before this time (YYYY-MM-DD = through that whole day '
                                     'in the default time zone; a time without offset is in the default time zone)')
-pagination_parser.add_argument('keyword', type=str, location='args', help='Keyword to search in actor, endpoint, request_data, response_data')
+pagination_parser.add_argument('keyword', type=str, location='args', help='Keyword to search in actor or endpoint')
 
 # -----------------------------
 # 创建分页模型（基于输出模型）

@@ -87,7 +87,7 @@ def validate_layout(value, warehouse_id):
         normalized = []
         for item in objects:
             required = {'id', 'type', 'name', 'x', 'y', 'width', 'height', 'rotation'}
-            optional = {'location_ids', 'target_id', 'travel_seconds', 'pick_face'}
+            optional = {'location_ids', 'target_id', 'travel_seconds', 'pick_face', 'code', 'columns', 'levels'}
             if not isinstance(item, dict) or not required <= set(item) or set(item) - required - optional:
                 _invalid('object')
             oid, label, kind = text(item, 'id'), text(item, 'name'), item['type']
@@ -112,6 +112,19 @@ def validate_layout(value, warehouse_id):
                 if face not in ('front', 'back', 'both'):
                     _invalid('pick_face')
                 row.update(location_ids=ids, pick_face=face)
+                if item.get('code'):
+                    code=item['code']
+                    if not isinstance(code,str) or len(code)>40 or not code.strip():
+                        _invalid('rack.code')
+                    row['code']=code.strip()
+                for key in ('columns','levels'):
+                    value=item.get(key)
+                    if value is not None:
+                        if type(value) is not int or not 1<=value<=1000:
+                            _invalid('rack.'+key)
+                        row[key]=value
+            elif any(key in item for key in ('code','columns','levels')):
+                _invalid('rack.fields')
             if item.get('target_id') is not None:
                 if kind != 'connector':
                     _invalid('target_id')
@@ -121,6 +134,9 @@ def validate_layout(value, warehouse_id):
             normalized.append(row)
         clean.append(dict(id=fid, name=name, width=width, height=height, objects=normalized))
     connectors = {item['id'] for floor in clean for item in floor['objects'] if item['type'] == 'connector'}
+    rack_codes=[obj['code'] for floor in clean for obj in floor['objects'] if obj.get('code')]
+    if len(rack_codes)!=len(set(rack_codes)):
+        _invalid('rack.code')
     for source, target in links:
         if target not in connectors or source == target:
             _invalid('target_id')
@@ -146,9 +162,11 @@ def _payload(row):
 class LayoutResource(Resource):
     @permission_required(['all_access', 'company_all_access', 'warehouse_read'])
     def get(self, warehouse_id):
-        _owned(warehouse_id)
+        warehouse = _owned(warehouse_id)
+        from .operations import settings
         row = db.session.get(WarehouseLayout, warehouse_id)
-        return _payload(row) if row else dict(revision=0, published_version=0, draft=None, updated_at=None)
+        result = _payload(row) if row else dict(revision=0, published_version=0, draft=None, updated_at=None)
+        return {**result, 'operations': settings(warehouse)}
 
     @permission_required(['all_access', 'company_all_access', 'warehouse_edit'])
     def put(self, warehouse_id):
@@ -205,4 +223,7 @@ class LayoutVersion(Resource):
     def get(self, warehouse_id, version):
         _owned(warehouse_id)
         row = db.get_or_404(WarehouseLayoutVersion, (warehouse_id, version))
-        return dict(version=row.version, layout=row.layout, published_at=clock.utc_iso(row.published_at))
+        from warehouse.location.models import Location
+        from .layout_bindings import resolve
+        bindings=resolve(row.layout,Location.query.filter_by(warehouse_id=warehouse_id).all())
+        return dict(version=row.version, layout=row.layout, bindings=bindings, published_at=clock.utc_iso(row.published_at))

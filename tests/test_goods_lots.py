@@ -6,6 +6,34 @@ from tests.test_isolation_inbound import foreign
 from warehouse.stock.models import GoodsLot
 
 
+def test_lot_date_correction_audits_and_rejects_stale_revision_without_stock_change(client, access_token):
+    from warehouse.stock.models import GoodsLotDateChange, StockLedger
+    with client.application.app_context():
+        gid = Goods.query.filter_by(code='G001').first().id
+        before_stock = [(row.id, row.quantity) for row in GoodsLocation.query.filter_by(goods_id=gid)]
+        before_ledger = StockLedger.query.count()
+    lot = client.post(f'/goods/{gid}/lots', json={'lot_no':'DATE-QA', 'expiry_date':'2027-01-01'}, headers=_h(access_token)).json
+    url = f'/goods/{gid}/lots/{lot["id"]}'
+    body = {'date_revision':0, 'production_date':'2026-10-01', 'expiry_date':'2027-02-01', 'reason':'Checked the carton'}
+    result = client.put(url, json=body, headers=_h(access_token))
+    assert result.status_code == 200, result.json
+    assert result.json['date_revision'] == 1
+    assert client.put(url, json=body, headers=_h(access_token)).status_code == 409
+    body['date_revision'] = 1
+    assert client.put(url, json=body, headers=_h(access_token)).status_code == 200
+    for invalid in ({**body,'reason':''}, {**body,'expiry_date':'2026-09-01'}, {**body,'date_revision':True}):
+        assert client.put(url, json=invalid, headers=_h(access_token)).status_code == 400
+    history = client.get(url+'/date-history', headers=_h(access_token)).json
+    assert history['total'] == 1
+    assert history['items'][0]['before_expiry_date'] == '2027-01-01'
+    assert history['items'][0]['expiry_date'] == '2027-02-01'
+    assert history['items'][0]['reason'] == 'Checked the carton'
+    with client.application.app_context():
+        assert GoodsLotDateChange.query.filter_by(lot_id=lot['id']).count() == 1
+        assert [(row.id, row.quantity) for row in GoodsLocation.query.filter_by(goods_id=gid)] == before_stock
+        assert StockLedger.query.count() == before_ledger
+
+
 def test_lot_registration_dates_normalization_and_no_stock_mutation(client, access_token):
     with client.application.app_context():
         goods = Goods.query.filter_by(code='G001').first()
@@ -53,6 +81,12 @@ def test_lots_permissions_company_isolation_and_pagination(client, access_token,
     url = f'/goods/{gid}/lots'
     assert client.get(url, headers=_h(token, wid)).status_code == 200
     assert client.post(url, json={'lot_no':'L1'}, headers=_h(token, wid)).status_code == 403
+    lot = client.post(url, json={'lot_no':'READONLY-DATES'}, headers=_h(access_token)).json
+    date_url = url+'/'+str(lot['id'])
+    assert client.put(date_url, json={'date_revision':0,'production_date':None,'expiry_date':'2027-01-01','reason':'test'}, headers=_h(token, wid)).status_code == 403
+    assert client.get(date_url+'/date-history', headers=_h(token, wid)).status_code == 200
+    assert client.put(date_url, json={}, headers=_h(foreign['token'])).status_code in (403,404)
+    assert client.get(date_url+'/date-history', headers=_h(foreign['token'])).status_code in (403,404)
     assert client.get(url, headers=_h(foreign['token'])).status_code in (403,404)
     assert client.post(url, json={'lot_no':'L1'}, headers=_h(foreign['token'])).status_code in (403,404)
     for query in ['page=0','per_page=101','page=bad']:

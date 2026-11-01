@@ -381,6 +381,19 @@ def test_types_without_read_permission_are_not_searched(client):
     _search(client, {}, status=401, q='sample')
 
 
+def test_task_search_keeps_reference_text_without_unauthorized_link(client):
+    with client.application.app_context():
+        task = get_picking_task()
+        task_id, warehouse_id = task.id, task.dn.warehouse_id
+        warehouse = db.session.get(Warehouse, warehouse_id)
+        token = _staff_token('search_picking_only', warehouse.company_id,
+                             _role('search_picking_only', ['picking_read']), [warehouse])
+    result = _search(client, _h(token, warehouse_id), q=f'PICK-{task_id}', types='picking')
+    row = _item(result, 'picking', task_id)
+    assert row['columns']['related_code'].startswith('DN-')
+    assert row['columns']['related_url_hint'] is None
+
+
 def test_company_isolation(client):
     with client.application.app_context():
         company_b = Company.query.filter_by(name='Company B').first()

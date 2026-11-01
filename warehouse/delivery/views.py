@@ -63,6 +63,8 @@ class DeliveryTaskList(Resource):
         result = paginate(query, page, per_page)
         # 每行的 shipping_stage（DN 的发货阶段）整页一条查询算好
         result['items'] = attach_shipping(result['items'], dn_id_of=lambda task: task.dn_id)
+        from .list_summary import attach_pickups
+        result['items'] = attach_pickups(result['items'])
         return result
 
 

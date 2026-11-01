@@ -13,6 +13,7 @@ class ASN(db.Model):
         asn_type: 单据类型 (inbound/return_from_customer/transfer)
     """
     __tablename__ = 'asn'
+    putaway_tracked = db.Column(db.Boolean, nullable=False, default=False, server_default=db.false())
     
     __table_args__ = (
         db.Index('idx_asn_warehouse_status', 'warehouse_id', 'status'),  # 高频查询组合索引
@@ -227,6 +228,8 @@ class ASNDetail(db.Model):
         actual_quantity: 实际到货数量 (必须≥0)
     """
     __tablename__ = 'asn_details'
+    announced_lots = db.Column(db.JSON, nullable=True)
+    rejected_quantity = db.Column(db.Integer, nullable=True)
     
     __table_args__ = (
         db.Index('idx_detail_goods_asn', 'goods_id', 'asn_id'),  # 高频查询组合索引

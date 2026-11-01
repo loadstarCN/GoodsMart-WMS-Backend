@@ -197,6 +197,8 @@ def setup_app(db_connection=None):
     # 注册 JWT 回调（与生产 app.py 共用同一套：含停用用户拒绝、token 吊销）
     register_jwt_callbacks(jwt)
     # 注册 JWT and API Key 验证逻辑
+    from system.third_party.call_history import register_call_history
+    register_call_history(app)
     app.before_request(validate_jwt_and_api_key)
 
 

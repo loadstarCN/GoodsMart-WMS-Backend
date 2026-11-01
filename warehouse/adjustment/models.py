@@ -153,6 +153,9 @@ class AdjustmentDetail(db.Model):
                          name='chk_adjustment_qty')
     )
 
+    lot_id = db.Column(db.Integer, db.ForeignKey('goods_lots.id', ondelete='RESTRICT'), nullable=True)
+    lot = db.relationship('GoodsLot', lazy='joined')
+
     id = db.Column(db.Integer, primary_key=True)
     adjustment_id = db.Column(
         db.Integer,

@@ -27,6 +27,107 @@ MAX_SERIES_DAYS = 400
 MAX_SERIES_GOODS = 100
 
 
+@inventory_ns.route('/expiry')
+class InventoryExpiry(Resource):
+    @permission_required(READ)
+    @warehouse_required(force_warehouse=True)
+    def get(self):
+        from .expiry import expiry_balances
+        status = request.args.get('status') or None
+        if status not in (None, 'normal', 'warning', 'blocked', 'unknown'):
+            raise _bad('Invalid expiry status', 'status')
+        page, per_page = _page()
+        return expiry_balances(_single_warehouse(), page, per_page, request.args.get('keyword', '').strip(), status, filters=request.args, has_lot=_bool('has_lot', None))
+
+
+@inventory_ns.route('/location-health')
+class LocationStockHealth(Resource):
+    @permission_required(READ)
+    @warehouse_required(force_warehouse=True)
+    def get(self):
+        from warehouse.goods.models import GoodsLocation, Goods
+        from warehouse.location.models import Location
+        from .lot_policy import effective_rules
+        warehouse = _single_warehouse()
+        today = clock.local_today(warehouse)
+        result, rules = {}, {}
+        rows = (db.session.query(GoodsLocation).join(Location, Location.id == GoodsLocation.location_id)
+                .filter(Location.warehouse_id == warehouse.id, GoodsLocation.quantity > 0))
+        for stock in rows:
+            row = result.setdefault(stock.location_id, dict(location_id=stock.location_id, quantity=0,
+                expired=0, expiring=0, held=0, unknown_expiry=0))
+            row['quantity'] += stock.quantity
+            lot = stock.lot
+            if lot is None or lot.expiry_date is None:
+                row['unknown_expiry'] += stock.quantity
+            else:
+                if stock.goods_id not in rules:
+                    rules[stock.goods_id] = effective_rules(db.session.get(Goods, stock.goods_id))['values']
+                remaining = (lot.expiry_date - today).days
+                if remaining < 0:
+                    row['expired'] += stock.quantity
+                elif remaining <= rules[stock.goods_id]['warning_days']:
+                    row['expiring'] += stock.quantity
+            if lot and lot.status != 'active':
+                row['held'] += stock.quantity
+        return dict(warehouse_id=warehouse.id, as_of=today.isoformat(), items=list(result.values()))
+
+
+@inventory_ns.route('/lot-relabel')
+class LotRelabel(Resource):
+    @permission_required(EDIT)
+    @warehouse_required(force_warehouse=True)
+    def post(self):
+        from .relabel import relabel
+        return relabel(_single_warehouse().id, request.get_json(silent=True))
+
+
+@inventory_ns.route('/lot-balances')
+class LotBalances(Resource):
+    @permission_required(READ)
+    @warehouse_required()
+    def get(self):
+        from sqlalchemy import func, case
+        from warehouse.common import get_company_owned
+        from warehouse.goods.models import Goods, GoodsLocation
+        from warehouse.location.models import Location
+        from warehouse.warehouse.models import Warehouse
+        from .models import InventoryLotStock
+        goods_id = _int('goods_id', low=1)
+        if goods_id is None:
+            raise _bad('goods_id is required', 'goods_id')
+        get_company_owned(Goods, goods_id)
+        ids = _int_list('lot_ids', limit=100) or []
+        if any(value <= 0 for value in ids):
+            raise _bad('Lot IDs must be positive', 'lot_ids')
+        filters = add_warehouse_filter({})
+        scope = db.session.query(Warehouse.id)
+        for field in ('warehouse_id', 'company_id'):
+            if filters.get(field):
+                scope = scope.filter(getattr(Warehouse, 'id' if field == 'warehouse_id' else field) == filters[field])
+        if filters.get('warehouse_ids'):
+            scope = scope.filter(Warehouse.id.in_(filters['warehouse_ids']))
+        keys = ('onhand_stock', 'damage_stock', 'return_stock', 'sorted_stock', 'sorted_damage_stock', 'picked_stock', 'packed_stock', 'delivered_stock')
+        result = {lot_id: dict(lot_id=lot_id, **{key: 0 for key in keys}) for lot_id in [None, *ids]}
+        location_rows = (db.session.query(GoodsLocation.lot_id, Location.location_type, func.sum(GoodsLocation.quantity))
+            .join(Location, Location.id == GoodsLocation.location_id)
+            .filter(GoodsLocation.goods_id == goods_id, Location.warehouse_id.in_(scope),
+                    func.coalesce(GoodsLocation.lot_id, 0).in_([0, *ids]))
+            .group_by(GoodsLocation.lot_id, Location.location_type))
+        for lot_id, kind, quantity in location_rows:
+            key = {'standard': 'onhand_stock', 'damaged': 'damage_stock', 'return': 'return_stock'}[kind]
+            result[lot_id][key] += int(quantity or 0)
+        pending = (db.session.query(InventoryLotStock.lot_id, *[func.sum(getattr(InventoryLotStock, key)) for key in keys[3:]])
+            .filter(InventoryLotStock.goods_id == goods_id, InventoryLotStock.warehouse_id.in_(scope),
+                    func.coalesce(InventoryLotStock.lot_id, 0).in_([0, *ids])).group_by(InventoryLotStock.lot_id))
+        for row in pending:
+            for key, quantity in zip(keys[3:], row[1:]):
+                result[row[0]][key] += int(quantity or 0)
+        for row in result.values():
+            row['total_stock'] = sum(row[key] for key in ('onhand_stock', 'damage_stock', 'return_stock', 'sorted_stock', 'picked_stock', 'packed_stock'))
+        return dict(items=list(result.values()))
+
+
 # ---------------------------------------------------------------------------
 # 参数
 # ---------------------------------------------------------------------------
@@ -115,9 +216,10 @@ def _goods_filter_ids(warehouse, keyword=None, goods_id=None, goods_ids=None):
     """商品筛选 → 商品 id 列表（None = 不筛）；商品必须属于仓库所在公司"""
     from warehouse.goods.models import Goods
     from .queries import _keyword_goods
-    if not keyword and goods_id is None and goods_ids is None:
+    from warehouse.inventory.analysis_scope import has_scope, goods_query
+    if not keyword and goods_id is None and goods_ids is None and not has_scope(request.args):
         return None
-    query = db.session.query(Goods.id).filter(Goods.company_id == warehouse.company_id)
+    query = goods_query(request.args).filter(Goods.company_id == warehouse.company_id)
     if goods_id is not None:
         query = query.filter(Goods.id == goods_id)
     if goods_ids is not None:
@@ -365,7 +467,10 @@ def _stock_summary_result(args, export=False):
 # 按库位查看库存
 # ---------------------------------------------------------------------------
 def _item_row(stock, goods):
-    return {'goods': _goods_ref(goods), 'goods_id': goods.id, 'lot_id': stock.lot_id, 'lot': None,
+    lot = stock.lot
+    return {'goods': _goods_ref(goods), 'goods_id': goods.id, 'lot_id': stock.lot_id,
+            'lot': {'id': lot.id, 'lot_no': lot.lot_no,
+                    'expiry_date': lot.expiry_date.isoformat() if lot.expiry_date else None} if lot else None,
             'quantity': int(stock.quantity)}
 
 
@@ -390,9 +495,13 @@ def _location_filters():
     if location_type and location_type not in Location.LOCATION_TYPES:
         raise _bad("location_type must be standard / damaged / return", 'location_type')
     return add_warehouse_filter({
-        'location_id': _int('location_id'), 'location_type': location_type,
+        'location_id': _int('location_id'), 'location_type': location_type, 'zone': request.args.get('zone'),
         'keyword': request.args.get('keyword'), 'include_empty': _bool('include_empty', True),
+        'shelf': request.args.get('shelf'), 'shelf_separator': request.args.get('shelf_separator', '-'),
+        'shelf_levels': _int('shelf_levels', 1, 1, 10),
+        'shelf_prefix_length': _int('shelf_prefix_length', None, 1, 50),
         'include_inactive': _bool('include_inactive', False),
+        **{key:request.args.get(key) for key in ('category','brand','category_missing','brand_missing')},
     })
 
 
@@ -442,6 +551,8 @@ class InventoryByLocation(Resource):
                               'occupied_count': stats['occupied_count'], 'occupancy_rate': stats['occupancy_rate'],
                               'quantity': stats['quantity'],
                               'goods_count': len({g.id for s in group for _st, g in s['items']}),
+                              'sized_location_count': stats['sized_location_count'],
+                              'volume_unknown_quantity': stats['volume_unknown_quantity'],
                               'capacity_m3': stats['capacity_m3'], 'used_volume_m3': stats['used_volume_m3'],
                               'volume_utilization': stats['volume_utilization']})
         else:
@@ -662,6 +773,9 @@ class InventoryHistorySeries(Resource):
         goods_id = _int('goods_id')
         goods_ids = _int_list('goods_ids', MAX_SERIES_GOODS)
         ids = goods_ids if goods_ids is not None else ([goods_id] if goods_id is not None else None)
+        from warehouse.inventory.analysis_scope import has_scope
+        if ids is None and has_scope(request.args):
+            ids = _goods_filter_ids(warehouse)
         if ids is not None:
             allowed = set(_goods_filter_ids(warehouse, goods_ids=ids) or [])
             ids = [i for i in ids if i in allowed]
@@ -778,63 +892,99 @@ class InventoryMetrics(Resource):
         Response `{metric_date, warehouse_id, summary {sku_with_stock, moving_sku (outbound in 30 days),
         moving_rate, dead_sku, abc {A, B, C}}, total, page, per_page, items}`.
         """
-        from warehouse.goods.models import Goods
-        from .metrics import latest_metric_date
-        from .models import InventoryMetricsDaily
-        from .queries import _keyword_goods
-        warehouse = _single_warehouse()
-        day = _date(request.args.get('date'), 'date') or latest_metric_date(warehouse.id)
-        age_bucket = request.args.get('age_bucket')
-        age_columns = {'age_0_30': 'age_0_30', 'age_31_90': 'age_31_90',
-                       'age_91_180': 'age_91_180', 'age_over_180': 'age_over_180', 'unknown': 'age_unknown'}
-        if age_bucket and age_bucket not in age_columns:
-            raise _bad('Invalid age bucket', 'age_bucket')
-        page, per_page = _page()
-        empty = {'metric_date': None if day is None else day.isoformat(), 'warehouse_id': warehouse.id,
-                 'summary': {**_metric_chart_summary([]), 'sku_with_stock': 0, 'moving_sku': 0, 'moving_rate': None, 'dead_sku': 0,
-                             'abc': {'A': 0, 'B': 0, 'C': 0}},
-                 'total': 0, 'page': page, 'per_page': per_page, 'items': []}
-        if day is None:
-            return empty, 200
-        base = InventoryMetricsDaily.query.filter(InventoryMetricsDaily.warehouse_id == warehouse.id,
-                                                  InventoryMetricsDaily.metric_date == day)
-        all_rows = base.all()
-        with_stock = [r for r in all_rows if r.total_stock > 0]
-        moving = [r for r in with_stock if r.out_qty_30d > 0]
-        summary = {**_metric_chart_summary(all_rows), 'sku_with_stock': len(with_stock), 'moving_sku': len(moving),
-                   'moving_rate': round(len(moving) / len(with_stock), 4) if with_stock else None,
-                   'dead_sku': sum(1 for r in all_rows if r.status == 'dead'),
-                   'abc': {label: sum(1 for r in all_rows if r.abc_class == label) for label in ('A', 'B', 'C')}}
-        query = base.join(Goods, Goods.id == InventoryMetricsDaily.goods_id)
-        if request.args.get('keyword'):
-            query = _keyword_goods(query, request.args['keyword'])
-        status = request.args.get('status')
-        if status:
-            if status not in ('normal', 'dead', 'empty'):
-                raise _bad("status must be normal / dead / empty", 'status')
-            query = query.filter(InventoryMetricsDaily.status == status)
-        abc = request.args.get('abc')
-        if abc:
-            if abc not in ('A', 'B', 'C'):
-                raise _bad("abc must be A / B / C", 'abc')
-            query = query.filter(InventoryMetricsDaily.abc_class == abc)
-        if age_bucket:
-            query = query.filter(getattr(InventoryMetricsDaily, age_columns[age_bucket]) > 0)
-        age_min = _int('age_min', None, 0)
-        if age_min is not None:
-            query = query.filter(InventoryMetricsDaily.weighted_age_days >= age_min)
-        sort = request.args.get('sort')
-        order = request.args.get('order') or 'desc'
-        if sort:
-            if sort not in METRIC_SORTS:
-                raise _bad(f"sort must be one of {', '.join(METRIC_SORTS)}", 'sort')
-            column = getattr(InventoryMetricsDaily, sort)
-            query = query.order_by(column.is_(None), column.asc() if order == 'asc' else column.desc(), Goods.code)
-        else:
-            query = query.order_by(Goods.code)
-        total = query.count()
-        rows = query.offset((page - 1) * per_page).limit(per_page).all()
-        return {**empty, 'summary': summary, 'total': total, 'items': [_metric_row(r) for r in rows]}, 200
+        return _inventory_metrics_result()
+
+
+def _inventory_metrics_result(export=False):
+    from .queries import MAX_EXPORT_ROWS, EXPORT_TOO_LARGE
+    from extensions.error import BadRequestException
+    from warehouse.goods.models import Goods
+    from .metrics import latest_metric_date
+    from .models import InventoryMetricsDaily
+    from .queries import _keyword_goods
+    warehouse = _single_warehouse()
+    day = _date(request.args.get('date'), 'date') or latest_metric_date(warehouse.id)
+    age_bucket = request.args.get('age_bucket')
+    age_columns = {'age_0_30': 'age_0_30', 'age_31_90': 'age_31_90',
+                   'age_91_180': 'age_91_180', 'age_over_180': 'age_over_180', 'unknown': 'age_unknown'}
+    if age_bucket and age_bucket not in age_columns:
+        raise _bad('Invalid age bucket', 'age_bucket')
+    page, per_page = _page()
+    empty = {'metric_date': None if day is None else day.isoformat(), 'warehouse_id': warehouse.id,
+             'summary': {**_metric_chart_summary([]), 'sku_with_stock': 0, 'moving_sku': 0, 'moving_rate': None, 'dead_sku': 0,
+                         'abc': {'A': 0, 'B': 0, 'C': 0}},
+             'total': 0, 'page': page, 'per_page': per_page, 'items': []}
+    if day is None:
+        return empty, 200
+    base = InventoryMetricsDaily.query.filter(InventoryMetricsDaily.warehouse_id == warehouse.id,
+                                              InventoryMetricsDaily.metric_date == day)
+    from warehouse.inventory.analysis_scope import has_scope, goods_query
+    if has_scope(request.args):
+        base = base.filter(InventoryMetricsDaily.goods_id.in_(goods_query(request.args)))
+    all_rows = base.all()
+    with_stock = [r for r in all_rows if r.total_stock > 0]
+    moving = [r for r in with_stock if r.out_qty_30d > 0]
+    summary = {**_metric_chart_summary(all_rows), 'sku_with_stock': len(with_stock), 'moving_sku': len(moving),
+               'moving_rate': round(len(moving) / len(with_stock), 4) if with_stock else None,
+               'dead_sku': sum(1 for r in all_rows if r.status == 'dead'),
+               'abc': {label: sum(1 for r in all_rows if r.abc_class == label) for label in ('A', 'B', 'C')}}
+    query = base.join(Goods, Goods.id == InventoryMetricsDaily.goods_id)
+    if request.args.get('keyword'):
+        query = _keyword_goods(query, request.args['keyword'])
+    status = request.args.get('status')
+    if status:
+        if status not in ('normal', 'dead', 'empty'):
+            raise _bad("status must be normal / dead / empty", 'status')
+        query = query.filter(InventoryMetricsDaily.status == status)
+    abc = request.args.get('abc')
+    if abc:
+        if abc not in ('A', 'B', 'C'):
+            raise _bad("abc must be A / B / C", 'abc')
+        query = query.filter(InventoryMetricsDaily.abc_class == abc)
+    if age_bucket:
+        query = query.filter(getattr(InventoryMetricsDaily, age_columns[age_bucket]) > 0)
+    age_min = _int('age_min', None, 0)
+    if age_min is not None:
+        query = query.filter(InventoryMetricsDaily.weighted_age_days >= age_min)
+    sort = request.args.get('sort')
+    order = request.args.get('order') or 'desc'
+    if sort:
+        if sort not in METRIC_SORTS:
+            raise _bad(f"sort must be one of {', '.join(METRIC_SORTS)}", 'sort')
+        column = getattr(InventoryMetricsDaily, sort)
+        query = query.order_by(column.is_(None), column.asc() if order == 'asc' else column.desc(), Goods.code)
+    else:
+        query = query.order_by(Goods.code)
+    total = query.count()
+    if export and total > MAX_EXPORT_ROWS:
+        raise BadRequestException('Too many metric rows to export', EXPORT_TOO_LARGE)
+    rows = query.all() if export else query.offset((page - 1) * per_page).limit(per_page).all()
+    return {**empty, 'summary': summary, 'total': total, 'items': [_metric_row(r) for r in rows]}, 200
+
+@inventory_ns.route('/metrics/export')
+class InventoryMetricsExport(Resource):
+    @permission_required(READ)
+    @warehouse_required()
+    def get(self):
+        from flask import Response
+        from warehouse.goods.tabular import write_csv, write_xlsx, content_type
+        fmt = request.args.get('format', 'csv')
+        if fmt not in ('csv', 'xlsx'):
+            raise _bad('format must be csv / xlsx', 'format')
+        result, _ = _inventory_metrics_result(export=True)
+        fields = ['total_stock', 'out_qty_30d', 'out_qty_90d', 'weighted_age_days',
+                  'turnover_days_30d', 'days_of_supply', 'last_out_at', 'abc_class', 'status']
+        header = ['warehouse_id', 'metric_date', 'goods_id', 'goods_code', 'goods_name', *fields]
+        def safe(value):
+            if isinstance(value, str) and (value.lstrip().startswith(('=', '+', '-', '@')) or value.startswith(('\t','\r','\n'))):
+                return "'" + value
+            return value
+        rows = [[result['warehouse_id'], result['metric_date'], item['goods_id'],
+                 safe(item['goods']['code']), safe(item['goods']['name']),
+                 *[item.get(field) for field in fields]] for item in result['items']]
+        body = write_csv(header, rows, 'utf-8') if fmt == 'csv' else write_xlsx('Inventory metrics', header, rows)
+        return Response(body, content_type=content_type(fmt), headers={
+            'Content-Disposition': f'attachment; filename="inventory-metrics.{fmt}"'})
 
 
 @inventory_ns.doc(security="jsonWebToken")
@@ -856,6 +1006,7 @@ class InventoryMetricsGoods(Resource):
         from .history import daily_totals, daily_coverage
         from .metrics import age_layers, latest_metric_date
         from .models import InventoryMetricsDaily
+        from .goods_analysis import current_distribution, flow_distribution, current_age_layers
         warehouse = _single_warehouse()
         goods = db.session.get(Goods, goods_id)
         if goods is None or goods.company_id != warehouse.company_id:
@@ -867,29 +1018,35 @@ class InventoryMetricsGoods(Resource):
         used, unknown = age_layers(total, [(at, quantity) for _g, at, quantity, _m in events])
         today = clock.local_today(warehouse)
         date_from = today - timedelta(days=89)
-        out_by_day = {}
-        for _g, at, quantity, _dn in outbound_events(warehouse.id, clock.local_midnight(date_from, warehouse),
-                                                     clock.now(), [goods_id]):
-            day = clock.local_date(at, warehouse)
-            out_by_day[day] = out_by_day.get(day, 0) + quantity
         stock = daily_totals(warehouse.id, date_from, today, [goods_id])
+        coverage = daily_coverage(warehouse.id, date_from, today, [goods_id], per_goods=True)[goods_id]
+        from .queries import daily_flows
+        flows = {row['date']: row for row in daily_flows(warehouse.id, date_from, today, [goods_id])}
         daily = []
         day = date_from
         while day <= today:
-            daily.append({'date': day.isoformat(), 'outbound': out_by_day.get(day, 0),
-                          'stock': stock.get(day, {}).get(goods_id, 0)})
+            flow = flows.get(day.isoformat(), {})
+            daily.append({'date': day.isoformat(), 'outbound': flow.get('outbound', 0),
+                          'inbound': flow.get('inbound', 0), 'adjust_loss': flow.get('adjust_loss', 0),
+                          'coverage': coverage[day], 'stock': stock.get(day, {}).get(goods_id, 0)})
             day += timedelta(days=1)
         latest_day = latest_metric_date(warehouse.id)
         latest = None
         if latest_day is not None:
             row = db.session.get(InventoryMetricsDaily, (latest_day, warehouse.id, goods_id))
             latest = {'metric_date': latest_day.isoformat(), **_metric_row(row)} if row is not None else None
+        distribution = current_distribution(warehouse.id, goods_id)
+        from .lot_policy import effective_rules
         return {
             'goods': _goods_ref(goods), 'warehouse_id': warehouse.id, 'total_stock': total,
             'layers': [{'in_at': clock.utc_iso(at), 'quantity': quantity,
                         'age_days': (today - clock.local_date(at, warehouse)).days,
                         'movement_type': movements.get((at, quantity))} for at, quantity in used],
             'age_unknown': unknown, 'daily': daily, 'latest_metrics': latest,
+            'distribution': distribution,
+            'lot_age_layers': current_age_layers(warehouse, goods_id, distribution),
+            'lot_rules': effective_rules(goods, warehouse_id=warehouse.id),
+            'flow_distribution': flow_distribution(warehouse, goods_id, clock.local_midnight(date_from, warehouse), clock.now()),
         }, 200
 
 
@@ -997,10 +1154,18 @@ class InventoryThresholdsSuggest(Resource):
         items = []
         for goods_row in chunk:
             inventory = inventories.get(goods_row.id)
-            items.append({'goods': _goods_ref(goods_row), **suggestions.get(goods_row.id, {}),
+            suggestion = suggestions.get(goods_row.id, {})
+            available = inventory.available_stock_for_sale if inventory else 0
+            incoming = inventory.asn_stock if inventory else 0
+            from math import ceil
+            replenish = (max(0, ceil(suggestion['out_qty_window'] / params['window_days'] *
+                                     params['cover_days'] - available - incoming))
+                         if suggestion.get('suggested_low') is not None else None)
+            items.append({'goods': _goods_ref(goods_row), **suggestion,
                           'current_low': inventory.low_stock_threshold if inventory else -1,
                           'current_high': inventory.high_stock_threshold if inventory else -1,
-                          'available_stock_for_sale': inventory.available_stock_for_sale if inventory else 0})
+                          'available_stock_for_sale': available, 'incoming_stock': incoming,
+                          'suggested_replenishment': replenish})
         return {'warehouse_id': warehouse.id, 'params': params, 'total': len(goods), 'page': page,
                 'per_page': per_page, 'items': items}, 200
 
@@ -1061,3 +1226,30 @@ class StockSummaryExport(Resource):
                          text_cell(goods.get('code')), text_cell(goods.get('name')), item.get('stock_type', '')] + dates + values(item))
         rows.append(['total', '', result['group_by'], '', '', '', ''] + dates + values(result['totals']))
         return _csv_response(header, rows, 'stock_summary.csv')
+
+
+@inventory_ns.route('/analysis-options')
+class InventoryAnalysisOptions(Resource):
+    @permission_required(READ)
+    @warehouse_required()
+    def get(self):
+        from warehouse.goods.models import Goods
+        from warehouse.inventory.models import Inventory
+        warehouse = _single_warehouse()
+        dimension = request.args.get('dimension')
+        if dimension == 'zone':
+            from warehouse.location.models import Location
+            from warehouse.location.services import LocationService
+            column = LocationService.zone_expression()
+            query = db.session.query(column).filter(Location.warehouse_id==warehouse.id, Location.is_active.is_(True)).distinct().order_by(column)
+            page, per_page = _page()
+            return dict(items=[row[0] for row in query.offset((page-1)*per_page).limit(per_page)],total=query.count(),page=page,per_page=per_page)
+        if dimension not in ('brand','category'):
+            raise _bad('dimension must be brand / category', 'dimension')
+        column = getattr(Goods, dimension)
+        query = db.session.query(column).join(Inventory,Inventory.goods_id==Goods.id).filter(
+            Inventory.warehouse_id==warehouse.id,Goods.company_id==warehouse.company_id).distinct().order_by(column)
+        page, per_page = _page()
+        total = query.count()
+        rows = query.offset((page-1)*per_page).limit(per_page).all()
+        return dict(items=[row[0] or None for row in rows],total=total,page=page,per_page=per_page)

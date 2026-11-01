@@ -71,7 +71,12 @@ packing_task_detail_model = api_ns.inherit('PackingTaskDetail',packing_task_deta
 # 5. Packing Task 基础信息模型（输出）
 # ---------------------------------------------------------------------------------
 packing_task_base_model = api_ns.model('PackingTaskBase', {
+    'has_variance': fields.Boolean(readOnly=True, attribute=lambda x: x.status == 'completed' and any(d.picked_quantity is not None and d.packed_quantity is not None and d.picked_quantity != d.packed_quantity for d in x.dn.details)),
+    'package_count': fields.Integer(readOnly=True, attribute=lambda x: len(x.dn.packages)),
+    'expected_goods_count': fields.Integer(readOnly=True, attribute=lambda x: len({d.goods_id for d in x.dn.details if (d.picked_quantity or 0) > 0})),
+    'packed_goods_count': fields.Integer(readOnly=True, attribute=lambda x: len({d.goods_id for d in x.task_details if (d.packed_quantity or 0) > 0})),
     'id': fields.Integer(readOnly=True, description='Packing Task ID'),
+    'warehouse_id': fields.Integer(attribute='dn.warehouse_id', readOnly=True),
     'dn_id': fields.Integer(required=True, description='Associated delivery notice ID'),
     'status': fields.String(
         enum=PackingTask.PACKING_TASK_STATUSES,
@@ -152,6 +157,7 @@ packing_pagination_parser.add_argument('status',type=str,choices=PackingTask.PAC
 packing_pagination_parser.add_argument('is_active',type=inputs.boolean,help='Is the task active?',location='args')
 packing_pagination_parser.add_argument('warehouse_id', type=int, help='Filter by Warehouse ID')
 packing_pagination_parser.add_argument('keyword', type=str, help='Keyword search')
+packing_pagination_parser.add_argument('has_variance', type=inputs.boolean, location='args', help='Completed tasks with confirmed quantity differences')
 
 pagination_model = create_pagination_model(api_ns, packing_task_base_model)
 

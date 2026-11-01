@@ -273,7 +273,7 @@ class InboundFlowService:
                       for r in rows],
             'last_putaway_at': _at(last_at),
             # 上架记录不带入库单：按待上架库存估算（见 stage.py）
-            'estimated': True,
+            'estimated': not asn.putaway_tracked,
         }
         if f['stage'] == STAGE_PUTAWAY:
             return _step('putaway', 'current', None, None, summary)
@@ -281,15 +281,13 @@ class InboundFlowService:
 
     @staticmethod
     def _last_putaway_at(asn, goods_ids):
-        """本单商品在本仓库最近一次上架的时刻（没有为 None）。待上架清零之前一定有分拣完成后的上架，所以不再按完成时刻
-        过滤（上架时刻是数据库的 now()，与 WMS 应用写的完成时刻不是同一个时钟）"""
-        if not goods_ids:
+        """Only explicitly recorded receipt associations establish the ASN's putaway time."""
+        if not asn.putaway_tracked:
             return None
-        from warehouse.location.models import Location
-        from warehouse.putaway.models import PutawayRecord
+        from warehouse.putaway.models import PutawayRecord, ReceiptPendingStock
         return db.session.query(func.max(PutawayRecord.putaway_time)).join(
-            Location, PutawayRecord.location_id == Location.id).filter(
-            PutawayRecord.goods_id.in_(goods_ids), Location.warehouse_id == asn.warehouse_id).scalar()
+            ReceiptPendingStock, PutawayRecord.receipt_source_id == ReceiptPendingStock.id).filter(
+            ReceiptPendingStock.asn_id == asn.id).scalar()
 
     @staticmethod
     def _completed(f, _steps):

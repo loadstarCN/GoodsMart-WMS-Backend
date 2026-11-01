@@ -20,6 +20,16 @@ class PickingTask(db.Model):
     PICKING_TASK_STATUSES = ('pending', 'in_progress', 'completed')
 
     id = db.Column(db.Integer, primary_key=True)
+    print_requests = db.relationship('PickingPrintRequest', lazy='selectin', order_by='PickingPrintRequest.requested_at', cascade='all, delete-orphan')
+
+    @property
+    def print_count(self):
+        return len(self.print_requests)
+
+    @property
+    def last_print_requested_at(self):
+        return self.print_requests[-1].requested_at if self.print_requests else None
+
     dn_id = db.Column(
         db.Integer, 
         db.ForeignKey('dn.id', ondelete='RESTRICT'),
@@ -103,6 +113,19 @@ class PickingTask(db.Model):
         info={'description': '状态变更记录'}
     )
 
+class PickingPrintRequest(db.Model):
+    """Browser print intent; never evidence that a physical page was printed."""
+    __tablename__ = 'picking_print_requests'
+    __table_args__ = (db.UniqueConstraint('task_id', 'request_id', name='uq_picking_print_request'),)
+    id = db.Column(db.Integer, primary_key=True)
+    task_id = db.Column(db.Integer, db.ForeignKey('picking_tasks.id', ondelete='CASCADE'), nullable=False, index=True)
+    request_id = db.Column(db.String(36), nullable=False)
+    operator_id = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='RESTRICT'), nullable=False)
+    language = db.Column(db.String(2), nullable=False)
+    requested_at = db.Column(UTCDateTime, nullable=False)
+    operator = db.relationship('User', lazy='joined')
+
+
 class PickingTaskDetail(db.Model):
     """拣货任务明细表
     
@@ -116,6 +139,9 @@ class PickingTaskDetail(db.Model):
         db.Index('idx_picking_detail_goods_location', 'goods_id', 'location_id'),  # 商品库位组合索引
         db.CheckConstraint('picked_quantity >= 0', name='chk_picked_qty')
     )
+
+    lot_id = db.Column(db.Integer, db.ForeignKey('goods_lots.id', ondelete='RESTRICT'), nullable=True)
+    lot = db.relationship('GoodsLot', lazy='joined')
 
     id = db.Column(db.Integer, primary_key=True)
     picking_task_id = db.Column(

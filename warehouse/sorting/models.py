@@ -110,12 +110,19 @@ class SortingTaskDetail(db.Model):
         damage_quantity: 损坏数量 (必须≥0)
     """
     __tablename__ = 'sorting_task_details'
+    rejected_quantity = db.Column(db.Integer, nullable=False, default=0, server_default='0')
+    rejection_reason = db.Column(db.String(500), nullable=True)
+    concession_reason = db.Column(db.String(500), nullable=True)
     
     __table_args__ = (
         db.Index('idx_detail_goods_batch', 'goods_id', 'batch_id'),  # 商品批次组合索引
         db.CheckConstraint('sorted_quantity >= 0', name='chk_sorted_qty'),
+        db.CheckConstraint('rejected_quantity >= 0', name='chk_rejected_qty'),
         db.CheckConstraint('damage_quantity >= 0', name='chk_damage_qty')
     )
+
+    lot_id = db.Column(db.Integer, db.ForeignKey('goods_lots.id', ondelete='RESTRICT'), nullable=True)
+    lot = db.relationship('GoodsLot', lazy='joined')
 
     id = db.Column(db.Integer, primary_key=True)
     sorting_task_id = db.Column(

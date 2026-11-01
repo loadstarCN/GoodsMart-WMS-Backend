@@ -1,4 +1,4 @@
-from flask import g
+from flask import g, request
 from flask_restx import Resource
 from warehouse.common import warehouse_required,add_warehouse_filter,get_warehouse_owned, require_actor_user_id
 from .models import PackingTask
@@ -45,7 +45,8 @@ class PackingTaskList(Resource):
             'dn_id': args.get('dn_id'),
             'status': args.get('status'),
             'is_active': args.get('is_active'),
-            'keyword': args.get('keyword')
+            'keyword': args.get('keyword'),
+            'has_variance': args.get('has_variance')
         }
         filters = add_warehouse_filter(filters)
 
@@ -122,8 +123,21 @@ class PackingTaskComplete(Resource):
         """
         operator_id = require_actor_user_id()
         task = _owned_task(task_id)
-        updated_task = PackingTaskService.complete_task(task, operator_id)
+        from extensions.error import BadRequestException
+        body=request.get_json(silent=True)
+        if body is not None and not isinstance(body,dict):
+            raise BadRequestException('Expected an object')
+        updated_task = PackingTaskService.complete_task(task, operator_id, lot_allocations=(body or {}).get('lot_allocations'))
         return updated_task
+
+
+@api_ns.route('/<int:task_id>/lot-allocations')
+class PackingLotAllocations(Resource):
+    @permission_required(["all_access","company_all_access","packing_read","packing_edit"])
+    @warehouse_required()
+    def get(self,task_id):
+        from .lot_choices import options
+        return options(_owned_task(task_id))
 
 
 @api_ns.doc(security="jsonWebToken")

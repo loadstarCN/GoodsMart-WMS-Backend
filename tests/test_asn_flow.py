@@ -149,7 +149,7 @@ def test_flow_without_tracking(client, access_token):
     putaway = steps['putaway']['summary']
     assert (putaway['quantity'], putaway['pending_quantity'], putaway['put_away_quantity']) == (8, 8, 0)
     assert {g['goods_id']: g['pending'] for g in putaway['goods']} == {1: 5, 2: 3}
-    assert putaway['estimated'] is True and putaway['goods'][0]['code']
+    assert putaway['estimated'] is False and putaway['goods'][0]['code']
 
     # 上架一部分：还是 putaway。商品 1 的 1 件破损只能上到破损库位（普通库位只收 4 件良品，5 件 → 400 15016）
     with client.application.app_context():

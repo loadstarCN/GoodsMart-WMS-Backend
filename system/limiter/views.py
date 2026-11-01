@@ -3,6 +3,16 @@ from extensions import limiter  # 导入 Limiter 扩展
 from system.common import paginate, permission_required
 from .schemas import api_ns, whitelist_model, blacklist_model, whitelist_input_model, blacklist_input_model, pagination_parser, whitelist_pagination_model, blacklist_pagination_model
 from .services import LimiterService
+from flask import current_app, request
+
+
+@api_ns.route('/status')
+class ListStatus(Resource):
+    @permission_required(['all_access', 'limiter_read'])
+    def get(self):
+        return dict(blacklist=bool(current_app.config.get('CHECK_BLACKLIST')),
+                    whitelist=bool(current_app.config.get('CHECK_WHITELIST')),
+                    client_ip=request.remote_addr)
 
 @api_ns.route('/test')
 class LimiterResource(Resource):

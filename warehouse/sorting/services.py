@@ -11,9 +11,10 @@ from warehouse.common.locks import lock_row
 from warehouse.common.batch_idempotency import parse_client_batch_id, find_batch, replay_or_conflict, insert_batch
 from warehouse.common.validation import require_active_task
 from warehouse.common import clock
-from warehouse.asn.models import ASN
+from warehouse.asn.models import ASN, ASNDetail
 from warehouse.asn.services import ASNService
-from warehouse.asn.spec_capture import assert_capturable_on_complete
+from warehouse.asn.spec_capture import assert_capturable_on_complete, pending_condition
+from warehouse.stock.lots import assert_receivable
 from .models import SortingTask, SortingTaskDetail, SortingTaskStatusLog, SortingBatch
 
 class SortingTaskService:
@@ -66,7 +67,18 @@ class SortingTaskService:
         goods_id = item['goods_id']
         sorted_quantity = require_non_negative_int(item.get('sorted_quantity'), 'sorted_quantity')
         damage_quantity = require_non_negative_int(item.get('damage_quantity'), 'damage_quantity')
-        return goods_id, sorted_quantity, damage_quantity
+        rejected_quantity = require_non_negative_int(item.get('rejected_quantity', 0), 'rejected_quantity')
+        reasons = []
+        for field in ('rejection_reason','concession_reason'):
+            value = item.get(field) or ''
+            if not isinstance(value, str) or len(value.strip()) > 500:
+                raise BadRequestException('Reason must be text of at most 500 characters', field=field)
+            reasons.append(value.strip())
+        if rejected_quantity and not reasons[0]:
+            raise BadRequestException('Rejection reason is required', field='rejection_reason')
+        from warehouse.stock.lots import lot_for_goods
+        lot = lot_for_goods(goods_id, item.get('lot_id'))
+        return goods_id, sorted_quantity, damage_quantity, lot.id if lot else 0, rejected_quantity, *reasons
 
     @staticmethod
     def _assert_batch_in_task(task: SortingTask, batch_id) -> SortingBatch:
@@ -100,7 +112,7 @@ class SortingTaskService:
         query = (
             db.session.query(
                 SortingTaskDetail.goods_id,
-                func.coalesce(func.sum(SortingTaskDetail.sorted_quantity + SortingTaskDetail.damage_quantity), 0),
+                func.coalesce(func.sum(SortingTaskDetail.sorted_quantity + SortingTaskDetail.damage_quantity + SortingTaskDetail.rejected_quantity), 0),
             )
             .join(SortingTask, SortingTaskDetail.sorting_task_id == SortingTask.id)
             .filter(SortingTask.asn_id == asn.id, SortingTask.is_active == True)
@@ -194,11 +206,24 @@ class SortingTaskService:
             conditions = number_conditions(keyword, {'SORT': [SortingTask.id], 'ASN': [SortingTask.asn_id]},
                                            [SortingTask.id, SortingTask.asn_id])
 
-            conditions.append(SortingTask.task_details.any(SortingTaskDetail.goods.has(code=keyword)))
+            conditions.append(SortingTask.asn.has(ASN.details.any(ASNDetail.goods.has(code=keyword))))
             query = query.filter(db.or_(*conditions))
 
-        if filters.get('warehouse_id') or filters.get('warehouse_ids'):
-            query = query.join(ASN, SortingTask.asn_id == ASN.id)
+        query = query.join(ASN, SortingTask.asn_id == ASN.id)
+        start, end = filters.get('received_from'), filters.get('received_to')
+        if start and end and start > end:
+            raise BadRequestException('received_from must not be after received_to', 10022)
+        query = clock.filter_time_range(query, ASN.received_at, start, end, filters.get('warehouse_id'))
+        conditions = {
+            'has_damage': SortingTask.task_details.any(SortingTaskDetail.damage_quantity > 0),
+            'has_variance': and_(SortingTask.status == 'completed', ASN.details.any(and_(
+                ASNDetail.actual_quantity.isnot(None), ASNDetail.actual_quantity != ASNDetail.quantity))),
+            'spec_pending': pending_condition(),
+        }
+        for key, condition in conditions.items():
+            if filters.get(key) is not None:
+                query = query.filter(condition if filters[key] else ~condition)
+
 
         if filters.get('warehouse_id'):
             query = query.filter(ASN.warehouse_id == filters['warehouse_id'])
@@ -302,15 +327,19 @@ class SortingTaskService:
             raise BadRequestException("Cannot create Sorting Task Detail in a non-in-progress Sorting Task", 16009)
 
         batch = SortingTaskService._assert_batch_in_task(task, data.get('batch_id'))
-        goods_id, sorted_quantity, damage_quantity = SortingTaskService._detail_quantities(data)
-        SortingTaskService._assert_within_planned(task, {goods_id: sorted_quantity + damage_quantity})
+        goods_id, sorted_quantity, damage_quantity, lot_id, rejected_quantity, rejection_reason, concession_reason = SortingTaskService._detail_quantities(data)
+        if sorted_quantity+damage_quantity > 0:
+            assert_receivable(goods_id, lot_id or None, task.asn.warehouse_id, concession_reason)
+        SortingTaskService._assert_within_planned(task, {goods_id: sorted_quantity + damage_quantity + rejected_quantity})
 
         new_detail = SortingTaskDetail(
             sorting_task_id=task.id,
             batch_id=batch.id,               # 必填字段，关联分拣批次
             goods_id=goods_id,
+            lot_id=lot_id or None,
             sorted_quantity=sorted_quantity,
             damage_quantity=damage_quantity,
+            rejected_quantity=rejected_quantity, rejection_reason=rejection_reason or None, concession_reason=concession_reason or None,
             operator_id=created_by_id
         )
         db.session.add(new_detail)
@@ -337,17 +366,26 @@ class SortingTaskService:
 
         merged = {
             'goods_id': data.get('goods_id', detail.goods_id),
+            'lot_id': data.get('lot_id', detail.lot_id),
             'sorted_quantity': data.get('sorted_quantity', detail.sorted_quantity),
             'damage_quantity': data.get('damage_quantity', detail.damage_quantity),
+            'rejected_quantity': data.get('rejected_quantity', detail.rejected_quantity),
+            'rejection_reason': data.get('rejection_reason', detail.rejection_reason),
+            'concession_reason': data.get('concession_reason', detail.concession_reason),
         }
-        goods_id, sorted_quantity, damage_quantity = SortingTaskService._detail_quantities(merged)
+        goods_id, sorted_quantity, damage_quantity, lot_id, rejected_quantity, rejection_reason, concession_reason = SortingTaskService._detail_quantities(merged)
+        if sorted_quantity+damage_quantity > 0:
+            assert_receivable(goods_id, lot_id or None, task.asn.warehouse_id, concession_reason)
         SortingTaskService._assert_within_planned(
-            task, {goods_id: sorted_quantity + damage_quantity}, exclude_detail_id=detail.id
+            task, {goods_id: sorted_quantity + damage_quantity + rejected_quantity}, exclude_detail_id=detail.id
         )
 
         detail.goods_id = goods_id
+        detail.lot_id = lot_id or None
         detail.sorted_quantity = sorted_quantity
         detail.damage_quantity = damage_quantity
+        detail.rejected_quantity = rejected_quantity
+        detail.rejection_reason, detail.concession_reason = rejection_reason or None, concession_reason or None
         db.session.add(detail)
         db.session.flush()
 
@@ -392,7 +430,7 @@ class SortingTaskService:
     @staticmethod
     def _batch_rows(batch: SortingBatch) -> list:
         """批次明细的比较内容（client_batch_id 重放判断用）：(goods_id, sorted_quantity, damage_quantity)"""
-        return [(d.goods_id, d.sorted_quantity or 0, d.damage_quantity or 0) for d in batch.details]
+        return [(d.goods_id, d.sorted_quantity or 0, d.damage_quantity or 0, d.lot_id or 0, d.rejected_quantity or 0, d.rejection_reason or '', d.concession_reason or '') for d in batch.details]
 
     @staticmethod
     def _parse_batch_details(data: dict) -> list:
@@ -454,8 +492,10 @@ class SortingTaskService:
         # 先做权威校验：累计分拣量（现有 + 本次）不得超过 ASN 计划量，阻止重复 / 超量提交
         parsed_details = SortingTaskService._parse_batch_details(data)
         incoming_by_goods = {}
-        for goods_id, sorted_quantity, damage_quantity in parsed_details:
-            incoming_by_goods[goods_id] = incoming_by_goods.get(goods_id, 0) + sorted_quantity + damage_quantity
+        for goods_id, sorted_quantity, damage_quantity, lot_id, rejected_quantity, rejection_reason, concession_reason in parsed_details:
+            if sorted_quantity+damage_quantity > 0:
+                assert_receivable(goods_id, lot_id or None, task.asn.warehouse_id, concession_reason)
+            incoming_by_goods[goods_id] = incoming_by_goods.get(goods_id, 0) + sorted_quantity + damage_quantity + rejected_quantity
         SortingTaskService._assert_within_planned(task, incoming_by_goods)
 
         # 1) 创建批次
@@ -476,13 +516,15 @@ class SortingTaskService:
             return new_batch, False
 
         # 2) 如果有 details，就批量创建 detail
-        for goods_id, sorted_quantity, damage_quantity in parsed_details:
+        for goods_id, sorted_quantity, damage_quantity, lot_id, rejected_quantity, rejection_reason, concession_reason in parsed_details:
             detail_obj = SortingTaskDetail(
                 sorting_task_id=task.id,
                 batch_id=new_batch.id,
                 goods_id=goods_id,
+                lot_id=lot_id or None,
                 sorted_quantity=sorted_quantity,
                 damage_quantity=damage_quantity,
+            rejected_quantity=rejected_quantity, rejection_reason=rejection_reason or None, concession_reason=concession_reason or None,
                 operator_id=operator_id
             )
             db.session.add(detail_obj)

@@ -408,8 +408,13 @@ def _assert_cancelled_back_to_sorted(client, token, w, dn_id, before):
         for model in (PickingTask, PackingTask, DeliveryTask):
             assert all(t.is_active is False for t in model.query.filter_by(dn_id=dn_id).all()), model
     # 退回的货可以上架放回库位
-    _ok(client.post('/putaway/', json={'goods_id': g, 'location_id': w['std1'], 'quantity': after['sorted_stock']},
-                    headers=_h(token)))
+    sources = _ok(client.get(f'/inventory/goods/{g}/warehouse/{w["wh"]}/pending-lots',
+                             headers=_h(token)))['items']
+    assert sum(row['sorted_stock'] for row in sources) == after['sorted_stock']
+    for source in sources:
+        _ok(client.post('/putaway/', json={'goods_id': g, 'location_id': w['std1'],
+            'quantity': source['sorted_stock'], 'lot_id': source['lot_id'],
+            'receipt_source_id': source['receipt_source_id']}, headers=_h(token)))
     final = _inv(client, g, w['wh'])
     assert (final['onhand_stock'], final['sorted_stock'], final['total_stock']) == (10, 0, 10)
     _assert_consistent(final)

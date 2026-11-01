@@ -28,6 +28,11 @@ def load_blacklist_from_db():
 
 def check_ip():
     ip = request.remote_addr
+    from ipaddress import ip_address
+    try:
+        ip = str(ip_address(ip))
+    except ValueError:
+        pass
     
     # 检查黑名单
     if current_app.config['CHECK_BLACKLIST']:

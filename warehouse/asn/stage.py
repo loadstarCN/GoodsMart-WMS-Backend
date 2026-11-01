@@ -74,13 +74,17 @@ def newer_actual_expression(asn_model, goods_id, exclude_id=None):
 def putaway_pending_expression():
     """本单（外层的 ASN）还有待上架的货：某个实收 > 0 的商品，仓库的 sorted_stock 大于比本单晚完成的入库单的实收合计"""
     ASN, ASNDetail, Inventory = _models()
-    return exists().where(
+    from warehouse.putaway.models import ReceiptPendingStock
+    legacy = exists().where(
         ASNDetail.asn_id == ASN.id,
         ASNDetail.actual_quantity > 0,
         Inventory.goods_id == ASNDetail.goods_id,
         Inventory.warehouse_id == ASN.warehouse_id,
         Inventory.sorted_stock > newer_actual_expression(ASN, ASNDetail.goods_id),
     ).correlate(ASN)
+    tracked = exists().where(ReceiptPendingStock.asn_id == ASN.id,
+        ReceiptPendingStock.good_remaining+ReceiptPendingStock.damaged_remaining > 0).correlate(ASN)
+    return or_(and_(ASN.putaway_tracked.is_(True), tracked), and_(ASN.putaway_tracked.is_not(True), legacy))
 
 
 def stage_expression():
@@ -148,6 +152,14 @@ def putaway_pending(asn) -> list:
         Inventory.warehouse_id == asn.warehouse_id, Inventory.goods_id.in_(list(quantities))).all()
     stocks = {goods_id: stock for goods_id, stock, _damaged in rows}
     damaged_stocks = {goods_id: damaged for goods_id, _stock, damaged in rows}
+    if asn.putaway_tracked:
+        from warehouse.putaway.models import ReceiptPendingStock
+        remaining = {}
+        for source in ReceiptPendingStock.query.filter_by(asn_id=asn.id):
+            remaining[source.goods_id] = remaining.get(source.goods_id, 0)+source.good_remaining+source.damaged_remaining
+        return [dict(goods_id=goods_id, quantity=quantity, sorted_stock=stocks.get(goods_id) or 0,
+            sorted_damage_stock=damaged_stocks.get(goods_id) or 0, newer=0, pending=remaining.get(goods_id, 0))
+            for goods_id, quantity in sorted(quantities.items())]
     outer = aliased(ASN)
     result = []
     for goods_id in sorted(quantities):

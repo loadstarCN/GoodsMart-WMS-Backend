@@ -8,6 +8,46 @@ from .services import SettingsService
 logger = logging.getLogger(__name__)
 
 
+@api_ns.route('/presentation/image')
+class PresentationImage(Resource):
+    @permission_required(['all_access'])
+    def post(self):
+        from system.common.permissions import get_actor_company_id
+        from extensions.error import ForbiddenException
+        if get_actor_company_id() is not None:
+            raise ForbiddenException('Only platform administrators can manage presentation.', 12001)
+        from .presentation import upload_image
+        return upload_image()
+
+
+@api_ns.route('/presentation/public')
+class PublicPresentation(Resource):
+    def get(self):
+        from .presentation import public
+        return public()
+
+
+@api_ns.route('/presentation')
+class Presentation(Resource):
+    @permission_required(['all_access'])
+    def get(self):
+        from system.common.permissions import get_actor_company_id
+        from extensions.error import ForbiddenException
+        if get_actor_company_id() is not None:
+            raise ForbiddenException('Only platform administrators can manage presentation.', 12001)
+        from .presentation import read
+        return read()
+
+    @permission_required(['all_access'])
+    def put(self):
+        from system.common.permissions import get_actor_company_id
+        from extensions.error import ForbiddenException
+        if get_actor_company_id() is not None:
+            raise ForbiddenException('Only platform administrators can manage presentation.', 12001)
+        from .presentation import save
+        return save(api_ns.payload)
+
+
 @api_ns.doc(security="jsonWebToken")
 @api_ns.route('/smtp')
 class SmtpConfigResource(Resource):

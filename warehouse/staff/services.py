@@ -141,7 +141,7 @@ class StaffService:
 
         # 分配角色（只允许授予调用方有资格授予的角色）
         if 'roles' in data:
-            new_staff.roles = RoleService.resolve_assignable_roles(data['roles'])
+            new_staff.roles = RoleService.resolve_assignable_roles(data['roles'], company_id=company_id)
 
         # 处理与 Warehouse 的多对多关联（仓库必须属于本公司）
         if 'warehouse_ids' in data:
@@ -186,7 +186,7 @@ class StaffService:
             revoke = True
 
         if 'roles' in data:
-            staff.roles = RoleService.resolve_assignable_roles(data['roles'], current_roles=staff.roles)
+            staff.roles = RoleService.resolve_assignable_roles(data['roles'], current_roles=staff.roles, company_id=staff.company_id)
 
         # 更新与 Warehouse 的多对多关联
         if 'warehouse_ids' in data:

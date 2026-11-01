@@ -18,6 +18,7 @@ from warehouse.common import clock
 from warehouse.dn.services import DNService, pick_fields, parse_datetime_value
 from dateutil.relativedelta import relativedelta
 from sqlalchemy import and_, func, case, extract
+from sqlalchemy.orm import joinedload, selectinload
 from datetime import datetime, timedelta
 
 class PackingTaskService:
@@ -54,7 +55,16 @@ class PackingTaskService:
         """
         根据过滤条件，返回 PackingTask 的查询对象。
         """
-        query = PackingTask.query.order_by(PackingTask.id.desc())
+        query = PackingTask.query.options(
+            selectinload(PackingTask.task_details),
+            joinedload(PackingTask.dn).selectinload(DN.details),
+            joinedload(PackingTask.dn).selectinload(DN.packages),
+        ).order_by(PackingTask.id.desc())
+        if filters.get('has_variance') is not None:
+            variance = and_(PackingTask.status == 'completed', PackingTask.dn.has(DN.details.any(and_(
+                DNDetail.picked_quantity.isnot(None), DNDetail.packed_quantity.isnot(None),
+                DNDetail.picked_quantity != DNDetail.packed_quantity))))
+            query = query.filter(variance if filters['has_variance'] else ~variance)
 
         if filters.get('dn_id'):
             query = query.filter(PackingTask.dn_id == filters['dn_id'])
@@ -454,7 +464,7 @@ class PackingTaskService:
 
     @staticmethod
     @transactional
-    def complete_task(task_or_id: int | PackingTask, operator_id: int) -> PackingTask:
+    def complete_task(task_or_id: int | PackingTask, operator_id: int, lot_allocations=None) -> PackingTask:
         """
         将 PackingTask 从 in_progress 切换为 completed，并更新库存
         """
@@ -472,10 +482,12 @@ class PackingTaskService:
         if sum(d.packed_quantity or 0 for d in task.task_details) <= 0:
             raise BadRequestException("Cannot complete a Packing Task with nothing packed", 16082)
 
+        from .lot_choices import validate
+        selected_lots = validate(task, lot_allocations)
         task = PackingTaskService._update_task_status(task, 'completed', operator_id)
 
         # 更新DN状态
-        DNService.packing_dn(task.dn, packing_task=task)
+        DNService.packing_dn(task.dn, packing_task=task, packed_lots=selected_lots)
 
         return task
 

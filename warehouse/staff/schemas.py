@@ -33,6 +33,7 @@ staff_simple_model = api_ns.model('StaffSimple', {
 # 定义 Staff 输出模型
 # -----------------------------
 staff_model = api_ns.model('Staff', {
+    'role_labels': fields.Raw(readOnly=True, attribute=lambda staff: {role.name:role.display_name for role in staff.roles if role.display_name}),
     'id': fields.Integer(readOnly=True, description='Staff ID'),
     'user_name': fields.String(required=True, description='Staff Name'),
     'email': fields.String(required=True, description='User Email'),

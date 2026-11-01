@@ -4,6 +4,21 @@ from extensions.redis import redis_client
 from extensions.transaction import transactional
 from .models import IPBlacklist, IPWhitelist
 from extensions.db import utc_now
+from ipaddress import ip_address as parse_ip
+from extensions.error import BadRequestException, ConflictException
+
+
+def validated_entry(data, model):
+    try:
+        address = str(parse_ip(str(data.get('ip_address', '')).strip()))
+    except ValueError:
+        raise BadRequestException('A single IPv4 or IPv6 address is required.', 14017)
+    reason = str(data.get('reason') or '').strip()
+    if len(reason) > 255:
+        raise BadRequestException('Reason must not exceed 255 characters.', 14017)
+    if model.query.filter_by(ip_address=address).first():
+        raise ConflictException('This IP address is already listed.', 14017)
+    return address, reason
 
 
 def _sync_redis(set_name: str, ip_address: str, add: bool):
@@ -45,8 +60,7 @@ class LimiterService:
         """
         创建一个新的黑名单条目
         """
-        ip_address = data['ip_address']
-        reason = data.get('reason')
+        ip_address, reason = validated_entry(data, IPBlacklist)
 
         new_blacklist_item = IPBlacklist(ip_address=ip_address, reason=reason, timestamp=utc_now())
         db.session.add(new_blacklist_item)
@@ -90,8 +104,7 @@ class LimiterService:
         """
         创建一个新的白名单条目
         """
-        ip_address = data['ip_address']
-        reason = data.get('reason')
+        ip_address, reason = validated_entry(data, IPWhitelist)
 
         new_whitelist_item = IPWhitelist(ip_address=ip_address, reason=reason, timestamp=utc_now())
         db.session.add(new_whitelist_item)

@@ -1,4 +1,5 @@
 """Webhook 事件 — API 模型与请求解析器"""
+from datetime import datetime, timezone
 from flask_restx import Namespace, fields
 from extensions import authorizations
 from system.common import pagination_parser, create_pagination_model
@@ -53,6 +54,21 @@ webhook_event_model = api_ns.model('WebhookEvent', {
 # 请求参数解析器
 # -----------------------------
 pagination_parser = pagination_parser.copy()
+
+
+def event_timestamp(value):
+    """Require an explicit offset so browser and server zones cannot shift filters."""
+    try:
+        parsed = datetime.fromisoformat(value.replace('Z', '+00:00'))
+        if parsed.tzinfo is None:
+            raise ValueError()
+        return parsed.astimezone(timezone.utc)
+    except (ValueError, OverflowError):
+        raise ValueError('Use an ISO 8601 timestamp with a timezone offset')
+
+
+pagination_parser.add_argument('created_from', type=event_timestamp, location='args')
+pagination_parser.add_argument('created_before', type=event_timestamp, location='args')
 pagination_parser.add_argument(
     'event_type', type=str, location='args',
     help='事件类型筛选', choices=EVENT_TYPES,

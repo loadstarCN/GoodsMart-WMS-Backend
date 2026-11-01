@@ -215,7 +215,7 @@ class GoodsOriginCountry(Resource):
 @api_ns.route('/locations/')
 class GoodsLocationList(Resource):
 
-    @permission_required(["all_access","company_all_access","goods_read"])
+    @permission_required(["all_access","company_all_access","goods_read","picking_read","picking_edit","adjustment_edit","cycle_count_edit"])
     @warehouse_required()
     @api_ns.expect(goods_location_pagination_parser)
     @api_ns.marshal_with(goods_location_pagination_model)
@@ -230,6 +230,9 @@ class GoodsLocationList(Resource):
             'goods_ids': args.get('goods_ids'),
             'location_id': args.get('location_id'),
             'goods_code': args.get('goods_code'),
+            'goods_query': args.get('goods_query'),
+            'lot_no': args.get('lot_no'),
+            'expiry_scope': args.get('expiry_scope'),
             'goods_name': args.get('goods_name'),
             'location_code': args.get('location_code'),
             'quantity_min': args.get('quantity_min'),

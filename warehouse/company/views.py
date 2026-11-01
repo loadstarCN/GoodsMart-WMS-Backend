@@ -1,4 +1,4 @@
-from flask import g
+from flask import g, request
 from flask_restx import Resource, abort
 from extensions.error import ForbiddenException
 from system.common import paginate, permission_required
@@ -9,6 +9,36 @@ from .services import CompanyService
 
 # 租户（公司）的生命周期字段只有平台管理员能改：员工即使是 company_admin 也不能给自己续期 / 启停
 _PLATFORM_ONLY_FIELDS = ('expired_at', 'is_active', 'created_by')
+
+
+@api_ns.route('/platform-overview')
+class PlatformOverview(Resource):
+    @permission_required(['all_access'])
+    def get(self):
+        if get_actor_company_id() is not None:
+            raise ForbiddenException('Only platform administrators can view this overview.', 12001)
+        from .platform_overview import overview
+        return overview(), 200
+
+
+@api_ns.route('/platform-tenants')
+class PlatformTenants(Resource):
+    @permission_required(['all_access'])
+    def get(self):
+        if get_actor_company_id() is not None:
+            raise ForbiddenException('Only platform administrators can view tenants.', 12001)
+        from .platform_overview import tenant_list
+        return tenant_list(request.args), 200
+
+
+@api_ns.route('/<int:company_id>/platform-summary')
+class PlatformTenantSummary(Resource):
+    @permission_required(['all_access'])
+    def get(self, company_id):
+        if get_actor_company_id() is not None:
+            raise ForbiddenException('Only platform administrators can view this summary.', 12001)
+        from .platform_overview import tenant_summary
+        return tenant_summary(company_id), 200
 
 
 def _enforce_company_scope(company_id: int, action: str):

@@ -31,6 +31,7 @@ user_model = api_ns.model('User', original_user_model)
 # asn_id / created_by 由路径与登录身份决定；actual / sorted / damage_quantity 是分拣完成时
 # 聚合出的过程量，都不接受客户端输入（readOnly 会被 generate_input_fields 剔除）。
 asn_detail_fields = {
+    'announced_lots': fields.Raw(description='Supplier-announced lots [{lot_code, expiry_date, quantity}]; not received stock'),
     'id': fields.Integer(readOnly=True, description='ASN Detail ID'),
     'asn_id': fields.Integer(readOnly=True, description='Associated ASN ID'),
     'goods_id': fields.Integer(description='Associated Goods ID (or provide goods_code)'),
@@ -39,6 +40,7 @@ asn_detail_fields = {
     'actual_quantity': fields.Integer(readOnly=True, description='Actual quantity received'),
     'sorted_quantity': fields.Integer(readOnly=True, description='Quantity sorted'),
     'damage_quantity': fields.Integer(readOnly=True, description='Quantity damaged'),
+    'rejected_quantity': fields.Integer(readOnly=True, description='Rejected quantity; null for historical records without capture'),
     'weight': fields.Float(description='Weight of goods (kg)'),
     'volume': fields.Float(description='Volume of goods (m³)'),
     'remark': fields.String(description='Remark for the ASN detail'),
@@ -156,6 +158,12 @@ asn_fields = {
         ), # 计算所有明细的实际数量总和
         description='Sum of all damaged goods quantities in the ASN'
     ),
+    'total_rejected_quantity': fields.Integer(
+        readOnly=True,
+        attribute=lambda x: None if any(d.rejected_quantity is None for d in x.details)
+        else sum(d.rejected_quantity for d in x.details),
+        description='Sum of rejected quantities; null if any historical line lacks rejection capture'
+    ),
     'total_weight': fields.Float(
         readOnly=True,
         attribute=lambda x: sum(
@@ -217,6 +225,7 @@ asn_input_model = api_ns.inherit('ASNInput', asn_input_base_model, {
 # 分页解析器 & 分页模型
 # -----------------------------
 asn_pagination_parser = pagination_parser.copy()
+asn_pagination_parser.add_argument('warehouse_todo_date', type=lambda value: inputs.date(value).date(), location='args', help='Exact local planned date, active documents awaiting warehouse processing')
 asn_pagination_parser.add_argument('asn_type', type=str, help='Filter by ASN type', choices=ASN.ASN_TYPES)
 asn_pagination_parser.add_argument('status', type=str, help='Filter by ASN status', choices=ASN.ASN_STATUSES)
 asn_pagination_parser.add_argument('tracking_number', type=str, help='Filter by Tracking number')

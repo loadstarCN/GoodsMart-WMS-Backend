@@ -25,6 +25,16 @@ def _owned_task(task_id: int) -> PickingTask:
     return get_warehouse_owned(PickingTask, task_id, warehouse_attr='dn.warehouse_id', what='Picking Task')
 
 
+@api_ns.route('/print-requests')
+class PickingPrintRequests(Resource):
+    @permission_required(['all_access', 'company_all_access', 'picking_read'])
+    @warehouse_required()
+    def post(self):
+        from .printing import record_print_request
+        result = record_print_request(api_ns.payload, require_actor_user_id())
+        return result, 201 if result['created'] else 200
+
+
 @api_ns.doc(security="jsonWebToken")
 @api_ns.route('/')
 class PickingTaskList(Resource):
@@ -48,6 +58,8 @@ class PickingTaskList(Resource):
             'is_active': args.get('is_active'),
             'keyword': args.get('keyword')
         }
+        filters['print_requested'] = args.get('print_requested')
+        filters['created_today'] = args.get('created_today')
 
         filters = add_warehouse_filter(filters)
         query = PickingTaskService.list_tasks(filters)
@@ -334,6 +346,15 @@ class PickingPrintPlan(Resource):
     def get(self, task_id):
         from .print_plan import print_plan
         return print_plan(_owned_task(task_id)), 200
+
+
+@api_ns.route('/<int:task_id>/route-plan')
+class PickingRoutePlan(Resource):
+    @permission_required(["all_access", "company_all_access", "picking_read"])
+    @warehouse_required()
+    def get(self, task_id):
+        from .route_plan import route_plan
+        return route_plan(_owned_task(task_id)), 200
 
 
 @api_ns.route('/report/operators/overview')

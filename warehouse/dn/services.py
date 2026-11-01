@@ -12,6 +12,7 @@ from warehouse.common import require_positive_int, require_bulk_list, require_fi
 from warehouse.common import clock
 from warehouse.inventory.services import InventoryService
 from warehouse.stock.service import StockOp
+from warehouse.stock.lots import allocated_moves
 from warehouse.common.locks import lock_row, lock_inventory_rows, lock_order_key
 
 from warehouse.goods.services import GoodsService
@@ -145,9 +146,7 @@ class DNService:
         for goods_id, quantity in sorted(requested_by_goods.items(), key=lambda item: lock_order_key(item[0])):
             inventory = InventoryService._get_for_update(goods_id, warehouse_id)
             available = (
-                inventory.onhand_stock
-                - inventory.locked_stock
-                - inventory.dn_stock
+                inventory.available_stock_for_sale
                 + own.get(goods_id, 0)
             )
             if quantity > available:
@@ -469,8 +468,18 @@ class DNService:
             query = query.filter(DN.carrier_id == filters['carrier_id'])
         if filters.get('recipient_id'):
             query = query.filter(DN.recipient_id == filters['recipient_id'])
+        if filters.get('warehouse_todo_date'):
+            query = query.filter(DN.expected_shipping_date == filters['warehouse_todo_date'],
+                                 DN.is_active.is_(True), DN.status.in_(['pending', 'in_progress', 'picked', 'packed']))
         if filters.get('expected_shipping_date'):
             query = query.filter(DN.expected_shipping_date >= filters['expected_shipping_date'])
+        planned_start, planned_end = filters.get('planned_start_date'), filters.get('planned_end_date')
+        if planned_start and planned_end and planned_start > planned_end:
+            raise BadRequestException('Planned shipping start must not follow end', 14021, field='planned_end_date')
+        if planned_start:
+            query = query.filter(DN.expected_shipping_date >= planned_start)
+        if planned_end:
+            query = query.filter(DN.expected_shipping_date <= planned_end)
         if filters.get('created_by'):
             query = query.filter(DN.created_by == filters['created_by'])
         if filters.get('shipping_stage'):
@@ -970,7 +979,8 @@ class DNService:
             inventory = InventoryService._get_for_update(
                 detail.goods_id, dn.warehouse_id
             )
-            physical_available = inventory.onhand_stock - inventory.locked_stock
+            from warehouse.stock.lot_policy import blocked_onhand
+            physical_available = inventory.onhand_stock - inventory.locked_stock - blocked_onhand(detail.goods_id, dn.warehouse_id)
             if detail.quantity > physical_available:
                 raise BadRequestException(
                     f"Insufficient physical stock for goods {detail.goods_id}: "
@@ -1036,7 +1046,7 @@ class DNService:
 
     @staticmethod
     @transactional
-    def packing_dn(dn_or_id:int | DN, packing_task=None) -> DN:
+    def packing_dn(dn_or_id:int | DN, packing_task=None, packed_lots=None) -> DN:
         """
         Mark a DN as 'packed' (例如打包操作)，仅当 DN 状态为 picked 时可变更为 packed
         - packing_task：被完成的打包任务（打包完成时由调用方传入），记进库存流水的单据；没传取最新一条已完成的
@@ -1061,6 +1071,8 @@ class DNService:
                            doc_id=packing_task.id if packing_task is not None else None, doc_no=dn.order_number)
         for detail in dn.details:
             # 按实际打包量记 packed_stock（之后按此发货）；已拣未打包的差额由 dn_packed 退回 sorted_stock 待上架
+            if allocated_moves(dn, detail, stock_op, 'pack', packed_lots=packed_lots):
+                continue
             InventoryService.dn_packed(
                 detail.goods_id, dn.warehouse_id, detail.packed_quantity or 0, detail.picked_quantity or 0,
                 op=stock_op, doc_line_id=detail.id,
@@ -1111,6 +1123,8 @@ class DNService:
         stock_op = StockOp(dn.warehouse_id, 'ship', doc_type='dn', doc_id=dn.id, doc_no=dn.order_number,
                            occurred_at=dn.delivered_at)
         for detail in dn.details:
+            if allocated_moves(dn, detail, stock_op, 'ship'):
+                continue
             InventoryService.dn_delivered(detail.goods_id, dn.warehouse_id, detail.delivered_quantity,
                                           op=stock_op, doc_line_id=detail.id)
         stock_op.commit()
@@ -1171,6 +1185,8 @@ class DNService:
         # 记账：sign 在途 →（仓外）；自动视为签收、承运商跟踪没有操作人（source = system）
         stock_op = StockOp(dn.warehouse_id, 'sign', doc_type='dn', doc_id=dn.id, doc_no=dn.order_number)
         for detail in dn.details:
+            if allocated_moves(dn, detail, stock_op, 'sign'):
+                continue
             InventoryService.dn_completed(detail.goods_id, dn.warehouse_id, detail.delivered_quantity,
                                           op=stock_op, doc_line_id=detail.id)
 
@@ -1350,6 +1366,8 @@ class DNService:
         # 记账：dn_cancel_return 已拣 / 已打包 → 待上架（按良品）
         stock_op = StockOp(dn.warehouse_id, 'dn_cancel_return', doc_type='dn', doc_id=dn.id, doc_no=dn.order_number)
         for detail in dn.details:
+            if allocated_moves(dn, detail, stock_op, 'cancel_picked' if dn.status == 'picked' else 'cancel_packed'):
+                continue
             if dn.status == 'picked':
                 InventoryService.dn_cancelled_after_picking(
                     detail.goods_id, dn.warehouse_id, picked_quantity=detail.picked_quantity or 0,

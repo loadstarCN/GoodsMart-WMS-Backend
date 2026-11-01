@@ -86,23 +86,48 @@ class InventoryService:
         """
         query = Inventory.query.order_by(Inventory.goods_id.desc())
         query = InventoryService._scoped(query.join(Warehouse), filters)
+        from .analysis_scope import has_scope, goods_query
+        if has_scope(filters):
+            query = query.filter(Inventory.goods_id.in_(goods_query(filters)))
 
         if filters.get('goods_id'):
             query = query.filter(Inventory.goods_id == filters['goods_id'])
         # 只看还有待上架的（sorted_stock > 0；其中 sorted_damage_stock 只能上到 damaged 库位）
         if filters.get('pending_putaway'):
             query = query.filter(Inventory.sorted_stock > 0)
+        bucket = filters.get('stock_bucket')
+        if bucket in ('onhand_stock', 'dn_stock', 'locked_stock', 'return_stock', 'damage_stock',
+                      'sorted_stock', 'asn_stock', 'total_stock'):
+            query = query.filter(getattr(Inventory, bucket) > 0)
+        elif bucket == 'working':
+            query = query.filter(Inventory.picked_stock + Inventory.packed_stock > 0)
+        elif bucket == 'damage_or_return':
+            query = query.filter(Inventory.damage_stock + Inventory.return_stock > 0)
 
         if filters.get('low_stock_threshold'):
             query = query.filter(Inventory.low_stock_threshold <= filters['low_stock_threshold'])
         if filters.get('high_stock_threshold'):
             query = query.filter(Inventory.high_stock_threshold >= filters['high_stock_threshold'])
         # 低于补货阈值（可售 < low）/ 高于积压阈值（可售 > high）；阈值为 -1（不启用）的不算
-        sale = Inventory.onhand_stock - Inventory.locked_stock - Inventory.dn_stock
-        if filters.get('below_low_threshold'):
-            query = query.filter(Inventory.low_stock_threshold != -1, sale < Inventory.low_stock_threshold)
-        if filters.get('above_high_threshold'):
-            query = query.filter(Inventory.high_stock_threshold != -1, sale > Inventory.high_stock_threshold)
+        if filters.get('below_low_threshold') or filters.get('above_high_threshold') or bucket in ('available_stock_for_sale', 'unshippable_stock'):
+            from warehouse.stock.lot_policy import blocked_stock_map
+            from sqlalchemy import tuple_
+            rows = query.with_entities(Inventory.goods_id, Inventory.warehouse_id, Inventory.onhand_stock,
+                Inventory.locked_stock, Inventory.dn_stock, Inventory.low_stock_threshold, Inventory.high_stock_threshold).all()
+            blocked = blocked_stock_map([(row[0], row[1]) for row in rows])
+            matching = []
+            for gid, wid, onhand, locked, demand, low, high in rows:
+                sale = onhand - locked - demand - blocked.get((gid, wid), 0)
+                if bucket == 'available_stock_for_sale' and sale <= 0:
+                    continue
+                if bucket == 'unshippable_stock' and blocked.get((gid, wid), 0) <= 0:
+                    continue
+                if filters.get('below_low_threshold') and (low == -1 or sale >= low):
+                    continue
+                if filters.get('above_high_threshold') and (high == -1 or sale <= high):
+                    continue
+                matching.append((gid, wid))
+            query = query.filter(tuple_(Inventory.goods_id, Inventory.warehouse_id).in_(matching))
 
         if 'goods_codes' in filters or 'keyword' in filters:
             query = query.join(Goods)
@@ -110,7 +135,19 @@ class InventoryService:
             query = query.filter(Goods.code.in_(filters['goods_codes']))
 
         # Search by keyword in goods name, code, manufacturer, category, tags, brand
-        return InventoryService._keyword(query, filters.get('keyword'))
+        query = InventoryService._keyword(query, filters.get('keyword'))
+        if filters.get('pending_damaged'):
+            query = query.filter(Inventory.sorted_stock > 0, Inventory.sorted_damage_stock > 0)
+        if filters.get('pending_overdue_days') is not None:
+            from sqlalchemy import tuple_
+            from warehouse.common import clock
+            from .pending import pending_age_rows
+            rows = query.filter(Inventory.sorted_stock > 0).with_entities(
+                Inventory.goods_id, Inventory.warehouse_id, Inventory.sorted_stock).all()
+            ages = pending_age_rows(rows, filters['pending_overdue_days'], clock.now())
+            matches = [key for key, age in ages.items() if age['overdue_quantity'] > 0]
+            query = query.filter(tuple_(Inventory.goods_id, Inventory.warehouse_id).in_(matches))
+        return query
 
     @staticmethod
     def _keyword(query, keyword):
@@ -160,6 +197,8 @@ class InventoryService:
         damaged = sum(min(int(row.sorted_damage_stock or 0), int(row.sorted_stock or 0)) for row in rows)
         overdue = overdue_summary([(row.goods_id, row.warehouse_id, int(row.sorted_stock)) for row in rows],
                                   overdue_days, clock.now())
+        seven_days = overdue_summary([(row.goods_id, row.warehouse_id, int(row.sorted_stock)) for row in rows],
+                                     7, clock.now())
         return {
             'warehouse_id': filters.get('warehouse_id'),
             'company_id': filters.get('company_id'),
@@ -167,6 +206,9 @@ class InventoryService:
             'goods_count': len({row.goods_id for row in rows}),
             'total_quantity': total,
             'damaged_quantity': damaged,
+            'damaged_goods_count': len({row.goods_id for row in rows if row.sorted_damage_stock > 0}),
+            'overdue_seven_quantity': seven_days['overdue_quantity'],
+            'overdue_seven_inventory_count': seven_days['overdue_inventory_count'],
             'good_quantity': total - damaged,
             'overdue_days': overdue_days,
             **overdue,
@@ -264,7 +306,7 @@ class InventoryService:
     @staticmethod
     @transactional
     def asn_completed(goods_id: int, warehouse_id: int, quantity: int, actual_quantity: int,
-                      damage_quantity: int = 0, *, op=None, doc_line_id: int | None = None):
+                      damage_quantity: int = 0, *, op=None, doc_line_id: int | None = None, lot_quantities=None):
         """
         分拣完成：签收库存减少，分拣库存增加
         :param goods_id: 关联的商品 ID
@@ -289,8 +331,12 @@ class InventoryService:
         own = op is None
         if own:
             op = StockOp(warehouse_id, 'sort_in')
-        op.move(goods_id, actual_quantity - damaged, dst=Leg.pending(), doc_line_id=doc_line_id)
-        op.move(goods_id, damaged, dst=Leg.pending(damaged=True), doc_line_id=doc_line_id)
+        quantities = lot_quantities if lot_quantities is not None else [(None, actual_quantity - damaged, damaged)]
+        if sum(good + bad for _, good, bad in quantities) != actual_quantity or sum(bad for _, _, bad in quantities) != damaged:
+            raise BadRequestException('Lot quantities do not match receipt quantities', 16172)
+        for lot_id, good, bad in quantities:
+            op.move(goods_id, good, dst=Leg.pending(lot_id), doc_line_id=doc_line_id)
+            op.move(goods_id, bad, dst=Leg.pending(lot_id, damaged=True), doc_line_id=doc_line_id)
         if own:
             op.commit()
 

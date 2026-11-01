@@ -64,7 +64,7 @@ for name, kind, text in (
     ('goods_id', int, 'Goods ID'),
     ('goods_code', str, 'Goods code (exact)'),
     ('keyword', str, 'Goods code / name / manufacturer / category / tags / brand contains'),
-    ('lot_id', int, 'Lot ID'),
+    ('lot_id', int, 'Lot ID (0 selects unassigned stock)'),
     ('lot_no', str, 'Lot number (exact)'),
     ('location_id', int, 'Location ID'),
     ('location_code', str, 'Location code contains'),

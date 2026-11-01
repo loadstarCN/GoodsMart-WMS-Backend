@@ -121,11 +121,14 @@ class CompanyService:
         from warehouse.staff.models import Staff
         from warehouse.supplier.models import Supplier
         from warehouse.warehouse.models import Warehouse
+        from system.user.models import Role
+        from warehouse.carrier.freight_models import CarrierInvoice
 
         counts = {}
         for label, model in (
             ('staff', Staff), ('warehouses', Warehouse), ('departments', Department), ('goods', Goods),
             ('suppliers', Supplier), ('carriers', Carrier), ('recipients', Recipient),
+            ('roles', Role), ('invoices', CarrierInvoice),
         ):
             count = model.query.filter_by(company_id=company_id).count()
             if count:

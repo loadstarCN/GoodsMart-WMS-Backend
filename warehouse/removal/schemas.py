@@ -22,6 +22,8 @@ user_model = api_ns.model('User', original_user_model)
 # -----------------------------
 removal_record_base_model = api_ns.model('RemovalRecordBase', {
     'id': fields.Integer(readOnly=True, description='Removal Record ID'),
+    'lot_id': fields.Integer(description='Product lot ID; null means unassigned'),
+    'lot_no': fields.String(attribute='lot.lot_no', readOnly=True),
     'goods_id': fields.Integer(required=True, description='ID of the removed goods'),
     'goods_code': fields.String(attribute='goods.code', readOnly=True, description='Code of the removed goods'),
     'location_id': fields.Integer(required=True, description='ID of the location where goods were removed'),

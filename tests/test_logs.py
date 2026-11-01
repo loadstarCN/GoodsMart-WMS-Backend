@@ -1,5 +1,39 @@
 from .helpers import *
 
+
+def test_log_detail_content_types_and_list_body_exclusion(client, access_token):
+    from system.logs.models import ActivityLog
+    with client.application.app_context():
+        log = ActivityLog(actor='content-type-test', endpoint='/content-type-test', method='PUT',
+                          status_code=200, request_content_type='application/json',
+                          response_content_type='text/plain', request_data='[redacted]', response_data='ok')
+        db.session.add(log)
+        db.session.commit()
+        log_id = log.id
+    headers = {'Authorization': f'Bearer {access_token}'}
+    detail = client.get(f'/logs/{log_id}', headers=headers)
+    assert detail.status_code == 200
+    assert detail.json['request_content_type'] == 'application/json'
+    assert detail.json['response_content_type'] == 'text/plain'
+    assert detail.json['request_data'] == '[redacted]'
+    row = client.get('/logs/?actor=content-type-test', headers=headers).json['items'][0]
+    assert 'request_data' not in row and 'response_data' not in row
+    assert 'request_content_type' not in row and 'response_content_type' not in row
+
+def test_log_ipv6_filter(client, access_token):
+    from system.logs.models import ActivityLog
+    with client.application.app_context():
+        db.session.add(ActivityLog(actor='ipv6-filter', endpoint='/ipv6-filter', method='PUT',
+                                   status_code=200, ip_address='2001:db8::1', processing_time=0))
+        db.session.commit()
+    headers = {'Authorization': f'Bearer {access_token}'}
+    response = client.get('/logs/', query_string={'ip_address': '2001:db8::1'}, headers=headers)
+    assert response.status_code == 200
+    assert [item['actor'] for item in response.get_json()['items']] == ['ipv6-filter']
+    assert response.get_json()['items'][0]['processing_time'] == 0
+    assert client.get('/logs/?ip_address=invalid', headers=headers).status_code == 400
+
+
 def test_get_user_logs(client, access_token):
     response = client.get('/logs/', headers={
         'Authorization': f'Bearer {access_token}'

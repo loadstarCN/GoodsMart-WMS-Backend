@@ -86,6 +86,8 @@ class WarehouseService:
         has_postal, postal_code = postal_code_of(data)
         tz_name = normalize_timezone_input(data.get('timezone'))       # 不合法 400 14022
         spec_settings = warehouse_spec_settings(data)                  # 规格采集默认规则，不合法 400 17020
+        from .operations import validate
+        operations = validate(data['operations']) if 'operations' in data else None
         manager_id = data.get('manager_id')
         manager = None  # 显式初始化
         if manager_id:
@@ -95,6 +97,7 @@ class WarehouseService:
                 raise BadRequestException("Manager does not belong to the same company", 16027)
         
         new_warehouse = Warehouse(
+            operations=operations,
             name=data['name'],
             address=data.get('address'),
             phone=data.get('phone'),
@@ -132,6 +135,9 @@ class WarehouseService:
         更新 Warehouse 信息（company_id 不可变；manager 归属按仓库自己的公司校验）
         """
         warehouse = WarehouseService.get_warehouse(warehouse_id)
+        if 'operations' in data:
+            from .operations import validate
+            warehouse.operations = validate(data['operations'], warehouse)
         export_profile = normalize_export_profile(data, WAREHOUSE_EXPORT_FIELDS)
         structured = parse_columns(data, WAREHOUSE_ADDRESS_LIMITS)
         has_postal, postal_code = postal_code_of(data)

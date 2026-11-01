@@ -152,3 +152,67 @@ class APIKeyDetail(Resource):
 
         APIKeyService.delete_api_key(api_key_id)
         return {"message": "API key deleted successfully"}, 200
+
+
+@api_ns.route('/api-keys/<int:api_key_id>/calls')
+class APIKeyCalls(Resource):
+    @permission_required(["all_access", "company_all_access", "api_keys_read"])
+    def get(self, api_key_id):
+        from datetime import datetime, timezone
+        from flask import request
+        from flask_restx import abort
+        from .models import APICallLog
+        key = APIKeyService.get_api_key(api_key_id)
+        _enforce_company_scope(key)
+        query = APICallLog.query.filter_by(api_key_id=api_key_id)
+        try:
+            page = int(request.args.get('page', '1'))
+            size = int(request.args.get('per_page', '20'))
+            if page < 1 or page > 1000000 or not 1 <= size <= 100:
+                raise ValueError()
+            dates = {}
+            for name in ('from', 'before'):
+                raw = request.args.get(name)
+                if raw:
+                    value = datetime.fromisoformat(raw.replace('Z', '+00:00'))
+                    dates[name] = value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
+            if 'from' in dates and 'before' in dates and dates['from'] >= dates['before']:
+                raise ValueError()
+            if 'from' in dates:
+                query = query.filter(APICallLog.called_at >= dates['from'])
+            if 'before' in dates:
+                query = query.filter(APICallLog.called_at < dates['before'])
+            status = request.args.get('status')
+            if status:
+                if status not in ('2xx', '3xx', '4xx', '5xx'):
+                    raise ValueError()
+                lower = int(status[0]) * 100
+                query = query.filter(APICallLog.status_code >= lower, APICallLog.status_code < lower + 100)
+        except (ValueError, TypeError, OverflowError):
+            abort(400, 'Invalid pagination, date range or status filter')
+        total = query.count()
+        rows = query.order_by(APICallLog.called_at.desc(), APICallLog.id.desc()).offset((page-1)*size).limit(size).all()
+        return {'items': [dict(id=row.id, called_at=row.called_at.isoformat(), method=row.method,
+                              route=row.route, status_code=row.status_code, duration_ms=row.duration_ms) for row in rows],
+                'total': total, 'page': page, 'per_page': size}
+
+
+@api_ns.route('/api-keys/call-summary')
+class APIKeyCallSummary(Resource):
+    @permission_required(["all_access", "company_all_access", "api_keys_read"])
+    def get(self):
+        from flask import request
+        from flask_restx import abort
+        from extensions import db
+        from .models import APIKey, APICallLog
+        parts = request.args.get('api_key_ids', '').split(',')
+        if not 1 <= len(parts) <= 100 or any(not p.isdecimal() or len(p)>10 or not 0<int(p)<=2147483647 for p in parts):
+            abort(400, 'Invalid API key IDs')
+        keys = APIKey.query.filter(APIKey.id.in_([int(p) for p in parts]))
+        company_id = _require_company_scope()
+        if company_id is not None:
+            keys = keys.filter_by(company_id=company_id)
+        ids = [key.id for key in keys.all()]
+        latest = dict(db.session.query(APICallLog.api_key_id, db.func.max(APICallLog.called_at))
+                      .filter(APICallLog.api_key_id.in_(ids)).group_by(APICallLog.api_key_id).all())
+        return {'items': [{'api_key_id': key_id, 'last_called_at': latest[key_id].isoformat() if key_id in latest else None} for key_id in ids]}

@@ -40,6 +40,23 @@ def _owned_dn(dn_id: int) -> DN:
     return get_warehouse_owned(DN, dn_id, what='DN')
 
 
+@api_ns.route('/<int:dn_id>/print-requests')
+class DNPrintRequests(Resource):
+    @permission_required(['all_access', 'company_all_access', 'dn_read'])
+    @warehouse_required()
+    def post(self, dn_id):
+        from .printing import record_print_request
+        result = record_print_request(dn_id, api_ns.payload, require_actor_user_id())
+        return result, 201 if result['created'] else 200
+
+    @permission_required(['all_access', 'company_all_access', 'dn_read'])
+    @warehouse_required()
+    def get(self, dn_id):
+        from .printing import print_history, print_metadata
+        dn = _owned_dn(dn_id)
+        return {'shipping': print_metadata(dn), 'print_requests': print_history(dn)}, 200
+
+
 @api_ns.doc(security="jsonWebToken")
 @api_ns.route('/')
 class DNList(Resource):
@@ -69,6 +86,9 @@ class DNList(Resource):
             'created_by': args.get('created_by'),
             'is_active': args.get('is_active'),
             'keyword': args.get('keyword'),
+            'warehouse_todo_date': args.get('warehouse_todo_date'),
+            'planned_start_date': args.get('planned_start_date'),
+            'planned_end_date': args.get('planned_end_date'),
             'shipping_stage': args.get('shipping_stage'),
         }
 

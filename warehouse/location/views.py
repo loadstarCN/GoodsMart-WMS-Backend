@@ -11,6 +11,11 @@ from .models import Location
 from .schemas import api_ns, location_model, location_input_model, location_pagination_parser, pagination_model
 from .services import LocationService
 
+
+@permission_required(['all_access', 'company_all_access', 'inventory_read'])
+def _require_inventory_read():
+    pass
+
 @api_ns.doc(security="jsonWebToken")
 @api_ns.route('/')
 class LocationList(Resource):
@@ -22,6 +27,8 @@ class LocationList(Resource):
     def get(self):
         """Get a paginated list of locations"""
         args = location_pagination_parser.parse_args()
+        if args.get('occupancy'):
+            _require_inventory_read()
         page = args.get('page')
         per_page = args.get('per_page')
         get_all = args.get('all', False)  # 获取是否返回全部数据的标志
@@ -31,6 +38,7 @@ class LocationList(Resource):
             'location_type': args.get('location_type'),
             'code': args.get('code'),
             'zone': args.get('zone'),
+            'occupancy': args.get('occupancy'),
             'is_active': args.get('is_active'),
         }
         query = add_warehouse_filter(filters)
@@ -55,6 +63,39 @@ class LocationList(Resource):
 
 
 @api_ns.doc(security="jsonWebToken")
+@api_ns.route('/generate')
+class LocationGenerate(Resource):
+    @permission_required(['all_access','company_all_access','location_edit'])
+    @warehouse_required()
+    def post(self):
+        from extensions.error import BadRequestException
+        from .generation import generate
+        data=api_ns.payload
+        if not isinstance(data,dict):
+            raise BadRequestException('Expected a location generation object')
+        require_fields(data,'warehouse_id')
+        require_warehouse_scope(data['warehouse_id'],'location')
+        result=generate(data['warehouse_id'],data,require_actor_user_id())
+        return result,201 if result['created'] else 200
+
+
+@api_ns.route('/map-options/<int:warehouse_id>')
+class LocationMapOptions(Resource):
+    @permission_required(['all_access','company_all_access','location_read','location_edit'])
+    @warehouse_required()
+    def get(self,warehouse_id):
+        from warehouse.warehouse.models import Warehouse
+        from warehouse.warehouse.operations import settings
+        from warehouse.warehouse.layout_bindings import published,racks
+        require_warehouse_scope(warehouse_id,'location')
+        warehouse=db.session.get(Warehouse,warehouse_id)
+        snapshot=published(warehouse_id)
+        return {'enabled':settings(warehouse)['map_enabled'],'version':snapshot.version if snapshot else None,
+                'racks':[dict(id=obj['id'],name=obj['name'],code=obj.get('code') or obj['name'],
+                    floor_name=floor['name'],columns=obj.get('columns'),levels=obj.get('levels'),location_ids=obj.get('location_ids',[]))
+                    for floor,obj in racks(snapshot.layout)] if snapshot else []}
+
+
 @api_ns.route('/zones')
 class LocationZones(Resource):
     @permission_required(["all_access", "company_all_access", "location_read"])

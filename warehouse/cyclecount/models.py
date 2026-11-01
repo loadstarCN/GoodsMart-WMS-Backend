@@ -113,6 +113,11 @@ class CycleCountTaskDetail(db.Model):
 
     CYCLE_COUNT_TASK_DETAIL_STATUSES = ('pending', 'completed')
 
+    is_supplemental = db.Column(db.Boolean, nullable=False, default=False, server_default=db.false())
+
+    lot_id = db.Column(db.Integer, db.ForeignKey('goods_lots.id', ondelete='RESTRICT'), nullable=True)
+    lot = db.relationship('GoodsLot', lazy='joined')
+
     id = db.Column(db.Integer, primary_key=True)
     task_id = db.Column(
         db.Integer,

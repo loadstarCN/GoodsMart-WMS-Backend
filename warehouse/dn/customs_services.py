@@ -619,6 +619,12 @@ class CustomsService:
             )
         packages = parse_packages(raw)
 
+        # Legacy package clients do not send contents. Preserve explicit assignments
+        # for the same carton numbers; never silently discard them when removing boxes.
+        recorded = {row.package_no: row.contents for row in dn.packages if row.contents is not None}
+        if recorded and len(packages) != len(dn.packages):
+            raise ConflictException('Clear carton contents before changing the carton count.', 16067)
+
         if _package_signature(dn.packages) == _package_signature(packages):
             return {'packages': CustomsService.packages_payload(dn), 'voided_documents': []}
 
@@ -632,7 +638,7 @@ class CustomsService:
             db.session.delete(old)
         db.session.flush()
         for item in packages:
-            db.session.add(DNPackage(dn_id=dn.id, created_by=user_id, **item))
+            db.session.add(DNPackage(dn_id=dn.id, created_by=user_id, contents=recorded.get(item['package_no']), **item))
         db.session.flush()
         db.session.expire(dn, ['packages'])
 

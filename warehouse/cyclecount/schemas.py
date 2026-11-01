@@ -47,8 +47,12 @@ cycle_count_task_status_log_model = api_ns.model('CycleCountTaskStatusLog', {
 # 2. Cycle Count Task Detail 模型（输出模型）
 # ------------------------------------------------------------------------------
 cycle_count_task_detail_fields = {
+    'is_supplemental': fields.Boolean(readOnly=True),
     'id': fields.Integer(readOnly=True, description='Cycle Count Task Detail ID'),
     'task_id': fields.Integer(required=True, description='Associated cycle count task ID'),
+    'lot_id': fields.Integer(description='Product lot ID'),
+    'lot_no': fields.String(attribute='lot.lot_no', readOnly=True),
+    'expiry_date': fields.Date(attribute='lot.expiry_date', readOnly=True),
     'goods_id': fields.Integer(required=True, description='Associated goods ID'),
     'location_id': fields.Integer(required=True, description='Associated location ID'),
     'system_quantity': fields.Integer(description='System recorded quantity'),
@@ -99,6 +103,13 @@ cycle_count_task_base_fields = {
         attribute=lambda x: len(x.task_details),  # 直接计算关联的 details 数量
         description='Number of ASN detail items'
     ),
+    'recorded_count': fields.Integer(readOnly=True, attribute=lambda x: sum(
+        d.status == 'completed' or d.operator_id is not None for d in x.task_details)),
+    'variance_count': fields.Integer(readOnly=True, attribute=lambda x: sum(
+        (d.status == 'completed' or d.operator_id is not None) and bool(d.difference) for d in x.task_details)),
+    'goods_count': fields.Integer(readOnly=True, attribute=lambda x: len({d.goods_id for d in x.task_details})),
+    'location_count': fields.Integer(readOnly=True, attribute=lambda x: len({d.location_id for d in x.task_details if d.location_id is not None})),
+    'lot_numbers': fields.List(fields.String, readOnly=True, attribute=lambda x: sorted({d.lot.lot_no for d in x.task_details if d.lot is not None})),
     'total_system_quantity': fields.Integer(
         readOnly=True,
         attribute=lambda x: sum(
@@ -189,6 +200,7 @@ cycle_count_pagination_parser = pagination_parser.copy()
 cycle_count_pagination_parser.add_argument('task_name', type=str, location='args', help='Task name filter')
 cycle_count_pagination_parser.add_argument('status', type=str, location='args',choices=CycleCountTask.CYCLE_COUNT_TASK_STATUSES,help='Cycle Count Task Status')
 cycle_count_pagination_parser.add_argument('is_active', type=inputs.boolean, location='args',help='Is the task active?')
+cycle_count_pagination_parser.add_argument('has_variance', type=inputs.boolean, location='args', help='Has recorded lines with nonzero difference')
 cycle_count_pagination_parser.add_argument('scheduled_start_date', type=_date_or_datetime, location='args',
                                            help='Scheduled from (YYYY-MM-DD = from that local day, or an ISO 8601 time)')
 cycle_count_pagination_parser.add_argument('scheduled_end_date', type=_date_or_datetime, location='args',

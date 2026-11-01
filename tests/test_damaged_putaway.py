@@ -153,7 +153,13 @@ def test_goods_returned_to_putaway_are_good(client, access_token):
     # 良品 4 件能上普通库位，第 5 件就超了
     body = _err(_putaway(client, access_token, g, w['std1'], 5), 400, 15016)
     assert (body['details']['good_pending'], body['details']['damaged_pending']) == (4, 2)
-    _ok(_putaway(client, access_token, g, w['std1'], 4))
+    # Distinct DN returns require an explicit source; do not consume another source silently.
+    assert _putaway(client, access_token, g, w['std1'], 4).status_code == 400
+    sources = _ok(client.get(f'/inventory/goods/{g}/warehouse/{w["wh"]}/pending-lots',headers=_h(access_token)))['items']
+    for source in sources:
+        if source.get('dn_id'):
+            _ok(client.post('/putaway/',json=dict(goods_id=g,location_id=w['std1'],quantity=source['sorted_stock'],
+                receipt_source_id=source['receipt_source_id']),headers=_h(access_token)))
     _ok(_putaway(client, access_token, g, w['dmg'], 2))
     stock = _inv(client, g, w['wh'])
     assert (stock['sorted_stock'], stock['sorted_damage_stock'], stock['damage_stock']) == (0, 0, 2)
@@ -229,7 +235,8 @@ def test_inventory_service_keeps_sorted_damage_invariant(client):
 # 待上架列表（GET /inventory/?pending_putaway=true）与汇总（GET /inventory/pending-putaway/summary）
 # ---------------------------------------------------------------------------
 
-OVERDUE_KEYS = ('overdue_days', 'overdue_quantity', 'overdue_inventory_count', 'oldest_pending_since')
+OVERDUE_KEYS = ('overdue_days', 'overdue_quantity', 'overdue_inventory_count', 'oldest_pending_since',
+                'unknown_age_quantity', 'overdue_seven_quantity', 'overdue_seven_inventory_count', 'damaged_goods_count')
 
 
 def _summary(client, token, full=False, **params):
@@ -263,6 +270,9 @@ def test_pending_putaway_list_and_summary(client, access_token):
     expected = {'inventory_count': 2, 'goods_count': 2, 'total_quantity': 14, 'damaged_quantity': 3,
                 'good_quantity': 11}
     assert _summary(client, access_token) == {'warehouse_id': None, 'company_id': None, **expected}
+    metrics = _summary(client, access_token, full=True)
+    assert metrics['damaged_goods_count'] == 1
+    assert metrics['unknown_age_quantity'] == metrics['overdue_seven_quantity'] == 0
     assert _summary(client, access_token, warehouse=w['wh']) == {'warehouse_id': w['wh'], 'company_id': None,
                                                                  **expected}
     assert _summary(client, access_token, warehouse_id=w['wh'])['total_quantity'] == 14
@@ -360,6 +370,24 @@ def test_pending_since_moves_forward_as_goods_are_put_away(client, access_token)
     _set_completed_at(client, _sort_in(client, access_token, w, g, good=3, damaged=0), t_mid)
     _set_completed_at(client, _sort_in(client, access_token, w, g, good=2, damaged=0), t_new)
 
+    def putaway_selected(quantity):
+        # Explicitly choose the oldest receipt; the service no longer guesses between receipts.
+        items = _ok(client.get(f'/inventory/goods/{g}/warehouse/{w["wh"]}/pending-lots', headers=_h(access_token)))['items']
+        remaining = quantity
+        response = None
+        for source in sorted(items, key=lambda row: (row['receipt_source_id'] == 0, row['receipt_source_id'])):
+            take = min(remaining, source['sorted_stock']-source['sorted_damage_stock'])
+            if not take:
+                continue
+            response = client.post('/putaway/', json=dict(goods_id=g, location_id=w['std1'], quantity=take,
+                receipt_source_id=source['receipt_source_id']), headers=_h(access_token))
+            _ok(response)
+            remaining -= take
+            if not remaining:
+                break
+        assert remaining == 0
+        return response
+
     row = _pending_row(client, access_token, g, w['wh'])
     assert row['sorted_stock'] == 9 and _parse(row['pending_since']) == t_old
     detail = _ok(client.get(f"/inventory/goods/{g}/warehouse/{w['wh']}", headers=_h(access_token)))
@@ -374,14 +402,14 @@ def test_pending_since_moves_forward_as_goods_are_put_away(client, access_token)
     assert response.status_code == 400
 
     # 先进先上：上架 4 件后剩下的是 2 天前和 1 小时前的，pending_since 前移
-    _ok(_putaway(client, access_token, g, w['std1'], 4))
+    _ok(putaway_selected(4))
     row = _pending_row(client, access_token, g, w['wh'])
     assert row['sorted_stock'] == 5 and _parse(row['pending_since']) == t_mid
     summary = _summary(client, access_token, full=True, warehouse=w['wh'])
     assert (summary['overdue_quantity'], summary['overdue_inventory_count']) == (0, 0)
     assert _parse(summary['oldest_pending_since']) == t_mid
 
-    _ok(_putaway(client, access_token, g, w['std1'], 4))
+    _ok(putaway_selected(4))
     assert _parse(_pending_row(client, access_token, g, w['wh'])['pending_since']) == t_new
 
     # 少打包退回（打包完成时刻）、已拣 DN 取消退回（取消时刻）也是入账
@@ -390,29 +418,33 @@ def test_pending_since_moves_forward_as_goods_are_put_away(client, access_token)
                     headers=_h(access_token)))
     _ok(client.put(f'/packing/{packing_id}/complete/', headers=_h(access_token)))
     with client.application.app_context():
+        from warehouse.putaway.models import ReceiptPendingStock
+        from extensions.db import as_utc
+        recorded_return = as_utc(ReceiptPendingStock.query.filter_by(dn_id=dn_id,source_type='pack_short_return').one().entered_at)
+        # Editing a legacy document timestamp must not rewrite recorded return provenance.
         db.session.get(DN, dn_id).packed_at = now - timedelta(minutes=30)
         db.session.commit()
-    _ok(_putaway(client, access_token, g, w['std1'], 1))         # 1 小时前那 1 件上架 → 只剩少打包退回的 2 件
+    _ok(putaway_selected(1))         # 1 小时前那 1 件上架 → 只剩少打包退回的 2 件
     row = _pending_row(client, access_token, g, w['wh'])
-    assert row['sorted_stock'] == 2 and _parse(row['pending_since']) == now - timedelta(minutes=30)
+    assert row['sorted_stock'] == 2 and _parse(row['pending_since']) == recorded_return
 
     dn2, _packing2 = _picked_dn(client, access_token, w, [(g, 1)], [(g, w['std1'], 1)])
     _ok(client.put(f'/dn/{dn2}/cancel/', headers=_h(access_token)))
     with client.application.app_context():
-        closed_at = db.session.get(DN, dn2).closed_at
-    _ok(_putaway(client, access_token, g, w['std1'], 2))         # 先进的 2 件上架 → 只剩取消退回的 1 件
+        closed_at = as_utc(ReceiptPendingStock.query.filter_by(dn_id=dn2,source_type='dn_cancel_return').one().entered_at)
+    _ok(putaway_selected(2))         # 先进的 2 件上架 → 只剩取消退回的 1 件
     row = _pending_row(client, access_token, g, w['wh'])
     assert row['sorted_stock'] == 1 and _parse(row['pending_since']) == closed_at
 
     # 全部上架：列表里没有这一行，详情的 pending_since 为空
-    _ok(_putaway(client, access_token, g, w['std1'], 1))
+    _ok(putaway_selected(1))
     assert _pending_row(client, access_token, g, w['wh']) is None
     detail = _ok(client.get(f"/inventory/goods/{g}/warehouse/{w['wh']}", headers=_h(access_token)))
     assert detail['sorted_stock'] == 0 and detail['pending_since'] is None
 
 
 def test_pending_since_counts_removals_and_unknown_history(client, access_token):
-    """下架（拣货下架除外）也是入账；入账不够当前待上架（旧数据）时按最早一笔；完全没有入账为 null（全算超期）"""
+    """下架也是入账；历史不足时停留时间未知，未知时间库存不计入超期。"""
     from datetime import timedelta
     from warehouse.common import clock
     w = _locations(client, _world(client))
@@ -432,7 +464,7 @@ def test_pending_since_counts_removals_and_unknown_history(client, access_token)
 
     row = _pending_row(client, access_token, g1, w['wh'])
     # 下架 2 件 + 10 天前分拣的 5 件里凑 2 件 → 最早一笔是 10 天前
-    assert _parse(row['pending_since']) == now - timedelta(days=10)
+    assert row.get('pending_since') is None  # unknown additions must not reuse an already-consumed receipt timestamp
     with client.application.app_context():
         add_stock(g1, w['wh'], pending=-2)
     assert _parse(_pending_row(client, access_token, g1, w['wh'])['pending_since']).replace(microsecond=0) \
@@ -441,5 +473,6 @@ def test_pending_since_counts_removals_and_unknown_history(client, access_token)
     assert _pending_row(client, access_token, g2, w["wh"]).get("pending_since") is None
 
     summary = _summary(client, access_token, full=True, warehouse=w['wh'])
-    # 商品 1 的 2 件是刚下架的（没超期）；商品 2 的 3 件来历不明，算超期
-    assert (summary['total_quantity'], summary['overdue_quantity'], summary['overdue_inventory_count']) == (5, 3, 1)
+    # 商品 1 刚下架，商品 2 时间未知；未知时间不算超期。
+    assert (summary['total_quantity'], summary['overdue_quantity'], summary['overdue_inventory_count']) == (5, 0, 0)
+    assert summary['unknown_age_quantity'] == 3

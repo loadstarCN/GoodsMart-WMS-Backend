@@ -15,7 +15,8 @@ def extract_warehouse_id():
     - 如果 warehouse_id 无效，则返回 400 错误
     - 如果 warehouse_id 为空，则不做处理（除非后续强制要求）
     """
-    warehouse_id = request.args.get("warehouse_id") or request.headers.get("X-WAREHOUSE-ID")
+    # The selected warehouse sent by the UI takes precedence over legacy URL filters.
+    warehouse_id = request.headers.get("X-WAREHOUSE-ID") or request.args.get("warehouse_id")
     # print("Extracted warehouse_id:", warehouse_id)
 
     if not warehouse_id:

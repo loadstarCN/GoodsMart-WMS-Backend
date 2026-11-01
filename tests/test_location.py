@@ -11,6 +11,34 @@ def test_get_locations(client, access_token):
     assert len(data['items']) > 0
 
 
+def test_location_occupancy_filters_before_pagination(client, access_company_admin_token):
+    headers = {'Authorization': f'Bearer {access_company_admin_token}', 'X-WAREHOUSE-ID': '1'}
+    occupied = client.get('/location/?occupancy=occupied&per_page=1', headers=headers)
+    empty = client.get('/location/?occupancy=empty', headers=headers)
+    all_rows = client.get('/location/', headers=headers)
+    assert occupied.status_code == empty.status_code == 200
+    assert occupied.json['total'] > 0
+    assert len(occupied.json['items']) == 1
+    assert occupied.json['total'] + empty.json['total'] == all_rows.json['total']
+    with client.application.app_context():
+        occupied_ids = {row.location_id for row in GoodsLocation.query.filter(GoodsLocation.quantity > 0).all()}
+        assert all(row['id'] in occupied_ids for row in occupied.json['items'])
+        assert all(row['id'] not in occupied_ids for row in empty.json['items'])
+    assert client.get('/location/?occupancy=bogus', headers=headers).status_code == 400
+
+
+def test_location_occupancy_requires_inventory_permission(client):
+    from tests.test_platform_guards import _role, _staff
+    with client.application.app_context():
+        warehouse = get_warehouse()
+        user = _staff('location_only', _role('location_only', ['location_read']), [warehouse])
+        token = create_access_token(identity=user)
+        headers = {'Authorization': f'Bearer {token}', 'X-WAREHOUSE-ID': str(warehouse.id)}
+    assert client.get('/location/', headers=headers).status_code == 200
+    assert client.get('/location/?occupancy=occupied', headers=headers).status_code == 403
+    assert client.get('/location/?occupancy=empty', headers=headers).status_code == 403
+
+
 def test_create_location(client, access_token):
     with client.application.app_context():
         warehouse = get_warehouse()

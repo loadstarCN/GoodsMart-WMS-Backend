@@ -23,6 +23,9 @@ class RemovalRecord(db.Model):
         db.CheckConstraint('quantity > 0', name='chk_removal_quantity')     # 数据库层校验
     )
 
+    lot_id = db.Column(db.Integer, db.ForeignKey('goods_lots.id', ondelete='RESTRICT'), nullable=True)
+    lot = db.relationship('GoodsLot', lazy='joined')
+
     id = db.Column(db.Integer, primary_key=True)
     goods_id = db.Column(
         db.Integer, 

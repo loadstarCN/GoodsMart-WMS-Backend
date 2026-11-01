@@ -29,6 +29,9 @@ class TransferRecord(db.Model):
         db.CheckConstraint('quantity > 0', name='chk_transfer_quantity')
     )
 
+    lot_id = db.Column(db.Integer, db.ForeignKey('goods_lots.id', ondelete='RESTRICT'), nullable=True)
+    lot = db.relationship('GoodsLot', lazy='joined')
+
     id = db.Column(db.Integer, primary_key=True)
     goods_id = db.Column(
         db.Integer, 

@@ -50,21 +50,25 @@ def _entries(pairs) -> dict:
     asn_at = func.coalesce(ASN.completed_at, ASN.created_at)
     add(db.session.query(ASNDetail.goods_id, ASN.warehouse_id, asn_at, func.sum(ASNDetail.actual_quantity))
         .join(ASN, ASN.id == ASNDetail.asn_id)
-        .filter(ASN.status == 'completed', ASN.is_active.is_(True), ASNDetail.actual_quantity > 0,
+        .filter(ASN.status == 'completed', ASN.is_active.is_(True), ASN.putaway_tracked.is_not(True), ASNDetail.actual_quantity > 0,
                 ASNDetail.goods_id.in_(goods_ids), ASN.warehouse_id.in_(warehouse_ids))
         .group_by(ASNDetail.goods_id, ASN.warehouse_id, asn_at).all())
 
-    dn_rows = (db.session.query(DNDetail.goods_id, DN.warehouse_id, DN.status, DN.packed_at, DN.closed_at,
+    dn_rows = (db.session.query(DNDetail.goods_id, DN.warehouse_id, DN.id, DN.status, DN.packed_at, DN.closed_at,
                                 func.coalesce(func.sum(DNDetail.picked_quantity), 0),
                                 func.coalesce(func.sum(DNDetail.packed_quantity), 0))
                .join(DN, DN.id == DNDetail.dn_id)
                .filter(DN.picked_at.isnot(None), DNDetail.goods_id.in_(goods_ids), DN.warehouse_id.in_(warehouse_ids))
                .group_by(DNDetail.goods_id, DN.warehouse_id, DN.id, DN.status, DN.packed_at, DN.closed_at).all())
-    for goods_id, warehouse_id, status, packed_at, closed_at, picked, packed in dn_rows:
-        if packed_at is not None:
+    from warehouse.putaway.models import ReceiptPendingStock
+    tracked_returns = {(row.dn_id,row.goods_id,row.source_type) for row in ReceiptPendingStock.query.filter(
+        ReceiptPendingStock.dn_id.isnot(None), ReceiptPendingStock.goods_id.in_(goods_ids),
+        ReceiptPendingStock.warehouse_id.in_(warehouse_ids)).all()}
+    for goods_id, warehouse_id, dn_id, status, packed_at, closed_at, picked, packed in dn_rows:
+        if packed_at is not None and (dn_id,goods_id,'pack_short_return') not in tracked_returns:
             # 少打包退回：打包完成时 已拣 − 已打包
             add([(goods_id, warehouse_id, packed_at, picked - packed)])
-        if status == 'closed':
+        if status == 'closed' and (dn_id,goods_id,'dn_cancel_return') not in tracked_returns:
             # 取消退回：打包后取消退已打包量，打包前取消退已拣量
             add([(goods_id, warehouse_id, closed_at, packed if packed_at is not None else picked)])
 
@@ -99,7 +103,8 @@ def _overdue_quantity(entries, sorted_stock, cutoff) -> int:
     if not sorted_stock or sorted_stock <= 0:
         return 0
     recent = sum(quantity for at, quantity in entries if at >= cutoff)
-    return max(0, sorted_stock - min(recent, sorted_stock))
+    dated_stock = min(sorted_stock, sum(quantity for _at, quantity in entries))
+    return max(0, dated_stock - min(recent, dated_stock))
 
 
 def attach_pending_since(inventories):
@@ -107,28 +112,67 @@ def attach_pending_since(inventories):
     inventories = [inv for inv in (inventories or []) if inv is not None]
     pending = [inv for inv in inventories if (inv.sorted_stock or 0) > 0]
     entries = _entries((inv.goods_id, inv.warehouse_id) for inv in pending)
+    tracked = _tracked_entries((inv.goods_id, inv.warehouse_id) for inv in pending)
     for inv in inventories:
-        inv._pending_since = (_pending_since(entries.get((inv.goods_id, inv.warehouse_id), []), inv.sorted_stock)
-                              if (inv.sorted_stock or 0) > 0 else None)
+        key = (inv.goods_id, inv.warehouse_id)
+        inv._pending_since = _source_since(entries.get(key, []), tracked.get(key, []), inv.sorted_stock)
     return inventories
 
 
-def overdue_summary(rows, overdue_days: int, now) -> dict:
-    """rows：[(goods_id, warehouse_id, sorted_stock)]（sorted_stock > 0 的行）→
-    {overdue_quantity, overdue_inventory_count, oldest_pending_since}"""
+def pending_age_rows(rows, overdue_days: int, now) -> dict:
+    """Per-inventory known age metrics, shared by queue filters and summaries."""
     rows = list(rows)
-    entries = _entries((goods_id, warehouse_id) for goods_id, warehouse_id, _stock in rows)
+    pairs = [(goods_id, warehouse_id) for goods_id, warehouse_id, _stock in rows]
+    entries, tracked = _entries(pairs), _tracked_entries(pairs)
     cutoff = as_utc(now) - timedelta(days=overdue_days)
-    overdue_quantity = 0
-    overdue_rows = 0
-    oldest = None
+    result = {}
     for goods_id, warehouse_id, stock in rows:
-        row_entries = entries.get((goods_id, warehouse_id), [])
-        overdue = _overdue_quantity(row_entries, stock, cutoff)
-        overdue_quantity += overdue
-        overdue_rows += 1 if overdue > 0 else 0
-        since = _pending_since(row_entries, stock)
-        if since is not None and (oldest is None or since < oldest):
-            oldest = since
-    return {'overdue_quantity': overdue_quantity, 'overdue_inventory_count': overdue_rows,
-            'oldest_pending_since': oldest}
+        key = (goods_id, warehouse_id)
+        row_entries, known = entries.get(key, []), tracked.get(key, [])
+        unknown_stock = max(0, stock-sum(quantity for _at, quantity in known))
+        unknown_age = sum(quantity for at, quantity in known if at is None)
+        unknown_age += max(0, unknown_stock-sum(quantity for _at, quantity in row_entries))
+        overdue = sum(quantity for at, quantity in known if at is not None and at < cutoff)
+        overdue += _overdue_quantity(row_entries, unknown_stock, cutoff)
+        result[key] = {'overdue_quantity': overdue, 'unknown_age_quantity': unknown_age,
+                       'pending_since': _source_since(row_entries, known, stock)}
+    return result
+
+
+def overdue_summary(rows, overdue_days: int, now) -> dict:
+    metrics = list(pending_age_rows(rows, overdue_days, now).values())
+    dates = [row['pending_since'] for row in metrics if row['pending_since'] is not None]
+    return {'overdue_quantity': sum(row['overdue_quantity'] for row in metrics),
+            'overdue_inventory_count': sum(row['overdue_quantity'] > 0 for row in metrics),
+            'oldest_pending_since': min(dates) if dates else None,
+            'unknown_age_quantity': sum(row['unknown_age_quantity'] for row in metrics)}
+
+
+def _tracked_entries(pairs):
+    from warehouse.putaway.models import ReceiptPendingStock as Source
+    from warehouse.asn.models import ASN
+    pairs = set(pairs)
+    if not pairs:
+        return {}
+    result = {}
+    rows = db.session.query(Source.goods_id, Source.warehouse_id, func.coalesce(Source.entered_at, ASN.completed_at),
+        Source.good_remaining+Source.damaged_remaining).outerjoin(ASN, ASN.id == Source.asn_id).filter(
+        Source.goods_id.in_({g for g,w in pairs}), Source.warehouse_id.in_({w for g,w in pairs}),
+        Source.good_remaining+Source.damaged_remaining > 0)
+    for goods_id, warehouse_id, at, quantity in rows:
+        if (goods_id, warehouse_id) in pairs:
+            result.setdefault((goods_id, warehouse_id), []).append((as_utc(at) if at else None, quantity))
+    return result
+
+
+def _source_since(legacy, known, stock):
+    if not stock:
+        return None
+    unknown_stock = max(0, stock-sum(quantity for _at,quantity in known))
+    if unknown_stock > sum(quantity for _at,quantity in legacy) or any(at is None for at,quantity in known if quantity > 0):
+        return None
+    candidates = [at for at,quantity in known if at is not None and quantity > 0]
+    legacy_at = _pending_since(legacy, unknown_stock)
+    if legacy_at:
+        candidates.append(legacy_at)
+    return min(candidates) if candidates else None

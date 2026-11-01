@@ -104,6 +104,9 @@ class TransferService:
         """
         require_fields(data, 'goods_id', 'from_location_id', 'to_location_id', 'quantity')
         goods_id = data['goods_id']
+        from warehouse.stock.lots import lot_for_goods
+        lot = lot_for_goods(goods_id, data.get('lot_id'))
+        lot_id = lot.id if lot else None
         from_location_id = data['from_location_id']
         to_location_id = data['to_location_id']
         quantity = require_positive_int(data['quantity'], 'quantity')
@@ -122,7 +125,7 @@ class TransferService:
         lock_inventory_rows([goods_id], from_location.warehouse_id)
         locked = {}
         for location_id in sorted({from_location_id, to_location_id}):
-            locked[location_id] = lock_goods_location(goods_id, location_id)
+            locked[location_id] = lock_goods_location(goods_id, location_id, lot_id)
         from_goods_location_record = locked[from_location_id]
 
         if from_goods_location_record is None:
@@ -135,6 +138,7 @@ class TransferService:
 
         new_record = TransferRecord(
             goods_id=goods_id,
+            lot_id=lot_id,
             from_location_id=from_location_id,
             to_location_id=to_location_id,
             quantity=quantity,
@@ -147,7 +151,7 @@ class TransferService:
         # 记账：库位 → 库位（目标库位库存行没有就新建，savepoint 兜底并发首次移入同一库位，B-107）
         StockOp(to_location.warehouse_id, 'transfer', doc_type='transfer', doc_id=new_record.id,
                 operator_id=created_by_id, remark=reason or data.get('remark') or None).move(
-            goods_id, quantity, src=Leg.at(from_location_id), dst=Leg.at(to_location_id),
+            goods_id, quantity, src=Leg.at(from_location_id, lot_id), dst=Leg.at(to_location_id, lot_id),
             errors={'insufficient': (15001, "Insufficient inventory in the specified location")}).commit()
         # db.session.commit()
         return new_record

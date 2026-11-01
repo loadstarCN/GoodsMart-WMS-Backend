@@ -19,6 +19,21 @@ def _service_name(adapter_code, service_type):
     from warehouse.carrier.integrations.base import CarrierAdapter
     return (adapter_class(adapter_code) or CarrierAdapter).service_name(service_type)
 
+class DNPrintRequest(db.Model):
+    __tablename__ = 'dn_print_requests'
+    __table_args__ = (db.UniqueConstraint('dn_id', 'request_id', name='uq_dn_print_request'),)
+    id = db.Column(db.Integer, primary_key=True)
+    dn_id = db.Column(db.Integer, db.ForeignKey('dn.id', ondelete='CASCADE'), nullable=False)
+    request_id = db.Column(db.String(36), nullable=False)
+    operator_id = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='RESTRICT'), nullable=False)
+    language = db.Column(db.String(2), nullable=False)
+    requested_at = db.Column(UTCDateTime, nullable=False)
+
+    def to_dict(self):
+        return {'id': self.id, 'request_id': self.request_id, 'operator': _user_ref(self.operator_id),
+                'language': self.language, 'requested_at': self.requested_at.isoformat()}
+
+
 class DN(db.Model):
     """发货单主表
     
@@ -373,6 +388,7 @@ class DNPackage(db.Model):
     )
 
     id = db.Column(db.Integer, primary_key=True)
+    contents = db.Column(db.JSON(none_as_null=True), nullable=True)
     dn_id = db.Column(
         db.Integer,
         db.ForeignKey('dn.id', ondelete='CASCADE'),
@@ -405,6 +421,7 @@ class DNPackage(db.Model):
 
     def to_dict(self) -> dict:
         return {
+            'contents': self.contents,
             'package_no': self.package_no,
             'gross_weight_kg': float(self.gross_weight_kg) if self.gross_weight_kg is not None else None,
             'length_mm': self.length_mm,

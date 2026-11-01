@@ -95,7 +95,14 @@ class WebhookEventList(Resource):
         page = args.get('page')
         per_page = args.get('per_page')
 
-        query = WebhookEvent.query.order_by(WebhookEvent.created_at.desc())
+        start, end = args.get('created_from'), args.get('created_before')
+        if start and end and start >= end:
+            abort(400, 'created_from must be earlier than created_before')
+        query = WebhookEvent.query.order_by(WebhookEvent.created_at.desc(), WebhookEvent.id.desc())
+        if start:
+            query = query.filter(WebhookEvent.created_at >= start)
+        if end:
+            query = query.filter(WebhookEvent.created_at < end)
 
         # 非超管用户强制只查自己公司的数据
         if not _is_super_admin():

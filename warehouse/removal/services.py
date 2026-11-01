@@ -115,6 +115,9 @@ class RemovalService:
                     16083, field='reason'
                 )
         goods_id = data['goods_id']
+        from warehouse.stock.lots import lot_for_goods
+        lot = lot_for_goods(goods_id, data.get('lot_id'))
+        lot_id = lot.id if lot else None
         location_id = data['location_id']
         quantity = require_positive_int(data['quantity'], 'quantity')
         location = get_object_or_404(Location, location_id)
@@ -122,7 +125,7 @@ class RemovalService:
         # 加锁顺序（B-103）：库存行先于库位库存行
         lock_inventory_rows([goods_id], location.warehouse_id)
         # 持锁读取商品库位记录：找不到 404，库存不足 400，读改写期间其它事务不能插进来
-        goods_location_record = lock_goods_location(goods_id, location_id)
+        goods_location_record = lock_goods_location(goods_id, location_id, lot_id)
         if goods_location_record is None:
             raise NotFoundException("GoodsLocation not found", 13004)
         if goods_location_record.quantity < quantity:
@@ -130,6 +133,7 @@ class RemovalService:
 
         new_record = RemovalRecord(
             goods_id=goods_id,
+            lot_id=lot_id,
             location_id=location_id,
             quantity=quantity,
             reason=reason,
@@ -142,13 +146,13 @@ class RemovalService:
         # 记账：拣货下架的货走已拣（并进拣货完成的那一笔 pick），其它原因的下架进入待上架区。
         # 从 damaged 库位下架、或因破损（damage / damaged）下架的是破损品：记进待上架·破损，之后只能上到 damaged 库位
         if from_picking:
-            stock_op.move(goods_id, quantity, src=Leg.at(location_id), dst=Leg.picked(), doc_line_id=doc_line_id)
+            stock_op.move(goods_id, quantity, src=Leg.at(location_id, lot_id), dst=Leg.picked(lot_id), doc_line_id=doc_line_id)
         else:
             damaged = (location.location_type == 'damaged'
                        or reason in InventoryService.DAMAGED_REMOVAL_REASONS)
             StockOp(location.warehouse_id, 'removal', doc_type='removal', doc_id=new_record.id,
                     operator_id=created_by_id, reason=reason, remark=data.get('remark') or None).move(
-                goods_id, quantity, src=Leg.at(location_id), dst=Leg.pending(damaged=damaged)).commit()
+                goods_id, quantity, src=Leg.at(location_id, lot_id), dst=Leg.pending(lot_id, damaged=damaged)).commit()
 
         # db.session.commit()
         return new_record

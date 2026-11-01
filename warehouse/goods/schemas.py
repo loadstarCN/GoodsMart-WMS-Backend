@@ -106,11 +106,16 @@ goods_origin_country_model = api_ns.model('GoodsOriginCountry', {
 goods_location_base_model = api_ns.model('GoodsLocationBase', {
     'id': fields.Integer(readOnly=True, description='Goods Location ID'),
     'quantity': fields.Integer(description='Quantity in the location'),
+    'pickable': fields.Boolean(readOnly=True),
     'created_at': fields.DateTime(readOnly=True, description='Creation timestamp'),
     'updated_at': fields.DateTime(readOnly=True, description='Last update timestamp'),
     'creator': fields.Nested(user_model, readonly=True,  description='User name of the creator'),
     'goods_id': fields.Integer(description='Goods ID'),
     'goods_code': fields.String(attribute='goods.code', readOnly=True, description='Goods Code'),
+    'lot_id': fields.Integer(),
+    'lot_no': fields.String(attribute='lot.lot_no'),
+    'expiry_date': fields.Date(attribute='lot.expiry_date'),
+    'lot_status': fields.String(attribute='lot.status'),
     'location_id': fields.Integer(description='Location ID'),
     'location_code': fields.String(attribute='location.code', readOnly=True, description='Location Code'),
     'warehouse_id': fields.Integer(attribute='location.warehouse.id', readOnly=True, description='Warehouse ID'),
@@ -193,6 +198,9 @@ goods_location_pagination_parser.add_argument(
     type=lambda s: [int(v) for v in s.split(',') if v.strip()],
     help='Goods IDs (comma separated)',
 )
+goods_location_pagination_parser.add_argument('goods_query', type=str)
+goods_location_pagination_parser.add_argument('lot_no', type=str)
+goods_location_pagination_parser.add_argument('expiry_scope', type=str, choices=('warning', 'below_shipping'))
 goods_location_pagination_parser.add_argument('goods_code', type=str, help='Filter by Goods Code')
 goods_location_pagination_parser.add_argument('goods_name', type=str, help='Filter by Goods Name')
 goods_location_pagination_parser.add_argument('location_id', type=int, help='Filter by Location ID')

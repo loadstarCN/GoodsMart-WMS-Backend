@@ -48,6 +48,17 @@ def test_report_cohort_pagination_and_timezone(client, access_token, kind):
     rows=list(csv.DictReader(io.StringIO(exported.get_data(as_text=True).lstrip('\ufeff'))))
     assert len(rows)==data['total']
     assert sum(int(row['actual'] or 0) for row in rows)==data['summary']['actual']
+    from openpyxl import load_workbook
+    excel = client.get(url.replace('/report?', '/report/export?')+'&format=xlsx&page=99&per_page=1', headers=_h(access_token))
+    assert excel.status_code == 200
+    assert 'spreadsheetml' in excel.content_type
+    workbook = load_workbook(io.BytesIO(excel.data), read_only=True)
+    values = list(workbook.active.values)
+    workbook.close()
+    assert len(values)-1 == data['total']
+    assert sum(row[5] or 0 for row in values[1:]) == data['summary']['actual']
+    assert all(row[9:] == ('Asia/Tokyo', str(today), str(today)) for row in values[1:])
+    assert client.get(url.replace('/report?', '/report/export?')+'&format=exe', headers=_h(access_token)).status_code == 400
 
 
 
@@ -140,6 +151,15 @@ def test_operator_report_completed_task_quantity_and_elapsed_time(client,access_
     assert exported.status_code==200
     rows=list(csv.DictReader(io.StringIO(exported.get_data(as_text=True).lstrip('\ufeff'))))
     assert len(rows)==1 and rows[0]['quantity']=='4' and float(rows[0]['per_hour'])==2
+    from openpyxl import load_workbook
+    excel = client.get(url.replace('/operators?', '/operators/export?')+'&format=xlsx&page=99&per_page=1', headers=_h(access_token))
+    assert excel.status_code == 200 and 'spreadsheetml' in excel.content_type
+    workbook = load_workbook(io.BytesIO(excel.data), read_only=True)
+    values = list(workbook.active.values)
+    workbook.close()
+    assert len(values) == 2 and values[1][2] == 4 and values[1][6] == 2
+    assert values[1][8] == kind
+    assert client.get(url.replace('/operators?', '/operators/export?')+'&format=exe', headers=_h(access_token)).status_code == 400
 
     assert _ok(client.get(url+'&page=2&per_page=1',headers=_h(access_token)))['summary']==report['summary']
     with client.application.app_context():
@@ -347,6 +367,34 @@ def test_operator_task_chart_combines_people_without_multiplying_elapsed_time(cl
     drill=_ok(client.get(f'/picking/report/operators/tasks?warehouse_id={w["wh"]}&start_date={day}&end_date={day}&operator_id={overview["items"][0]["operator_id"]}&per_page=1',headers=_h(access_token)))
     assert drill['total']==2 and len(drill['items'])==1
     assert drill['items'][0]['quantity']==4
+    with client.application.app_context():
+        from warehouse.dn.models import DN
+        dn = db.session.get(DN, dn_id)
+        dn.ship_to = {'country': 'JP'}
+        db.session.commit()
+    base = f'/picking/report/operators/overview?warehouse_id={w["wh"]}&start_date={day}&end_date={day}'
+    jp = _ok(client.get(base+'&destination_country=jp', headers=_h(access_token)))
+    assert jp['phases'][kind]['summary']['quantity'] == 7
+    us = _ok(client.get(base+'&destination_country=US', headers=_h(access_token)))
+    assert us['total'] == 0 and us['phases'][kind]['summary']['quantity'] == 0
+    task_url = f'/picking/report/operators/tasks?warehouse_id={w["wh"]}&start_date={day}&end_date={day}&operator_id={overview["items"][0]["operator_id"]}'
+    assert _ok(client.get(task_url+'&destination_country=US', headers=_h(access_token)))['total'] == 0
+    exported = client.get(f'/{kind}/report/operators/export?warehouse_id={w["wh"]}&start_date={day}&end_date={day}&destination_country=US', headers=_h(access_token))
+    assert len(exported.data.decode('utf-8-sig').splitlines()) == 1
+    assert client.get(base+'&destination_country=JAPAN', headers=_h(access_token)).status_code == 400
+    with client.application.app_context():
+        from warehouse.common.operator_reports import _previous_month
+        warehouse = db.session.get(Warehouse, w['wh'])
+        task = (PickingTask if kind == 'picking' else PackingTask).query.filter_by(dn_id=dn_id).one()
+        previous_day = _previous_month(day)
+        task.completed_at = clock.local_midnight(previous_day, warehouse)+timedelta(minutes=30)
+        task.started_at = task.completed_at-timedelta(hours=2)
+        db.session.commit()
+    previous = _ok(client.get(base+'&destination_country=JP', headers=_h(access_token)))
+    assert previous['previous_start'] == previous['previous_end'] == previous_day.isoformat()
+    assert previous['phases'][kind]['summary']['quantity'] == 0
+    assert previous['phases'][kind]['previous']['quantity'] == 7
+    assert previous['phases'][kind]['previous']['seconds'] == 7200
 
 
 @pytest.mark.parametrize('kind',['picking','packing'])

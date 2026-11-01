@@ -1,6 +1,77 @@
 import pytest
 from .helpers import *
 
+
+def test_count_scope_filters_use_lot_dates_rules_and_positive_stock(client, access_company_admin_token):
+    from datetime import timedelta
+    from warehouse.common import clock
+    from warehouse.stock.models import GoodsLot, GoodsLotRules
+    from warehouse.stock.service import StockOp, Leg
+    with client.application.app_context():
+        original = get_goods_location()
+        goods, location = original.goods, original.location
+        today = clock.local_today(location.warehouse_id)
+        db.session.add(GoodsLotRules(goods_id=goods.id, overrides={'warning_days': 30, 'ship_days': 10}))
+        ids = []
+        for index, (days, quantity) in enumerate(((9, 2), (10, 3), (30, 4), (31, 5), (None, 6), (5, 0))):
+            lot = GoodsLot(goods_id=goods.id, lot_no=f'COUNT-{index}',
+                           expiry_date=today + timedelta(days=days) if days is not None else None)
+            db.session.add(lot)
+            db.session.flush()
+            if quantity:
+                op = StockOp(location.warehouse_id, 'opening')
+                op.move(goods.id, quantity, dst=Leg.at(location.id, lot_id=lot.id))
+                op.commit()
+                row = GoodsLocation.query.filter_by(goods_id=goods.id, location_id=location.id, lot_id=lot.id).one()
+            else:
+                row = GoodsLocation(goods_id=goods.id, location_id=location.id, lot_id=lot.id, quantity=0)
+                db.session.add(row)
+                db.session.flush()
+            ids.append(row.id)
+        db.session.commit()
+        warehouse_id, code, name = location.warehouse_id, location.code, goods.name
+    headers = {'Authorization': f'Bearer {access_company_admin_token}', 'X-Warehouse-ID': str(warehouse_id)}
+    def selected(**query):
+        response = client.get('/goods/locations/', headers=headers,
+                              query_string={'per_page': 100, 'quantity_min': 1, **query})
+        assert response.status_code == 200
+        return {row['id'] for row in response.json['items']}
+    assert selected(lot_no='COUNT-', expiry_scope='warning') == set(ids[:3])
+    assert selected(lot_no='COUNT-', expiry_scope='below_shipping') == {ids[0]}
+    assert selected(lot_no='COUNT-4') == {ids[4]}
+    assert selected(lot_no='COUNT-%') == set()
+    assert selected(lot_no='COUNT-', goods_query=name, location_code=code) == set(ids[:5])
+    assert selected(goods_query='NO-SUCH-GOODS') == set()
+    assert client.get('/goods/locations/?expiry_scope=invalid', headers=headers).status_code == 400
+
+
+@pytest.mark.parametrize("permission", ["adjustment_edit", "cycle_count_edit"])
+def test_inventory_editor_can_search_stock_only_in_assigned_warehouse(client, permission):
+    from .test_global_search import _role, _staff_token
+    with client.application.app_context():
+        location = get_goods_location()
+        warehouse = db.session.get(Warehouse, location.location.warehouse_id)
+        expected_id = location.id
+        warehouse_id = warehouse.id
+        foreign = Warehouse(name='Adjustment inaccessible', company_id=warehouse.company_id,
+                            created_by=get_admin_user().id)
+        db.session.add(foreign)
+        db.session.commit()
+        foreign_id = foreign.id
+        token = _staff_token('adjustment_only', warehouse.company_id,
+                             _role('adjustment_only', [permission]), [warehouse])
+    headers = {'Authorization': f'Bearer {token}', 'X-Warehouse-ID': str(warehouse_id)}
+    response = client.get('/goods/locations/?per_page=100', headers=headers)
+    assert response.status_code == 200
+    allowed_ids = {row['id'] for row in response.json['items']}
+    assert expected_id in allowed_ids
+    assert client.get('/goods/', headers=headers).status_code == 403
+    assert client.get('/goods/locations/', headers={**headers, 'X-Warehouse-ID': str(foreign_id)}).status_code == 403
+    response = client.get(f'/goods/locations/?warehouse_id={foreign_id}', headers=headers)
+    # The selected warehouse header is authoritative over a stale URL parameter.
+    assert response.status_code == 200
+    assert {row['id'] for row in response.json['items']} == allowed_ids
+
 def test_get_goods(client, access_token):
     response = client.get('/goods/?page=1&per_page=10', headers={
         'Authorization': f'Bearer {access_token}'

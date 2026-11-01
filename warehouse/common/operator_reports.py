@@ -1,6 +1,7 @@
 """Completed-task quantities and elapsed task time, attributed to recorded operators."""
 from collections import defaultdict
-from datetime import timedelta
+from datetime import date, timedelta
+from calendar import monthrange
 from statistics import median
 
 from sqlalchemy import func
@@ -9,7 +10,23 @@ from warehouse.common import clock, require_warehouse_scope
 from warehouse.common.document_reports import report_period
 
 
-def operator_report(kind, warehouse, export=False, all_operators=False):
+def _destination(query, dn):
+    from flask import request
+    from extensions.error import BadRequestException
+    country = (request.args.get('destination_country') or '').strip().upper()
+    if country:
+        if len(country) != 2 or not country.isascii() or not country.isalpha():
+            raise BadRequestException('Invalid destination country code', 14009)
+        query = query.filter(func.upper(func.trim(dn.ship_to['country'].as_string())) == country)
+    return query
+
+
+def _previous_month(value):
+    year, month = (value.year-1, 12) if value.month == 1 else (value.year, value.month-1)
+    return date(year, month, min(value.day, monthrange(year, month)[1]))
+
+
+def operator_report(kind, warehouse, export=False, all_operators=False, period=None):
     from warehouse.dn.models import DN
     from warehouse.picking.models import PickingTask, PickingTaskDetail
     from warehouse.packing.models import PackingTask, PackingTaskDetail
@@ -19,6 +36,8 @@ def operator_report(kind, warehouse, export=False, all_operators=False):
     task_key = detail.picking_task_id if kind == 'picking' else detail.packing_task_id
     quantity = detail.picked_quantity if kind == 'picking' else detail.packed_quantity
     start, end, page, per_page = report_period(warehouse)
+    if period:
+        start, end = period
     # One row per operator/task: multiple batches do not multiply elapsed time.
     query = (db.session.query(task.id, task.started_at, task.completed_at, detail.operator_id,
                               User.user_name, func.sum(quantity))
@@ -28,6 +47,7 @@ def operator_report(kind, warehouse, export=False, all_operators=False):
                      task.completed_at >= clock.local_midnight(start, warehouse),
                      task.completed_at < clock.local_midnight(end + timedelta(days=1), warehouse))
              .group_by(task.id, task.started_at, task.completed_at, detail.operator_id, User.user_name))
+    query = _destination(query, DN)
     operators = {}
     daily = defaultdict(int)
     tasks = set()
@@ -73,14 +93,22 @@ def operator_report(kind, warehouse, export=False, all_operators=False):
 
 def export_operator_report(kind, warehouse):
     import csv, io
-    from flask import Response
+    from flask import Response, request
     from extensions.error import BadRequestException
+    from warehouse.goods.tabular import write_xlsx, content_type
+    fmt = request.args.get('format', 'csv')
+    if fmt not in ('csv', 'xlsx'):
+        raise BadRequestException('Unsupported report format', 14009, field='format')
     data=operator_report(kind,warehouse,export=True)
     if len(data['items'])>50000:
         raise BadRequestException('Too many operators to export',14009)
     stream=io.StringIO(newline='')
     writer=csv.writer(stream)
     keys=['operator_id','name','quantity','tasks','timed_quantity','seconds','per_hour','untimed_tasks']
+    if fmt == 'xlsx':
+        rows = ([item[key] for key in keys]+[kind,data['start_date'],data['end_date'],data['timezone']] for item in data['items'])
+        return Response(write_xlsx(kind, keys+['kind','start_date','end_date','timezone'], rows),
+                        mimetype=content_type('xlsx'), headers={'Content-Disposition':f'attachment; filename="{kind}_operators.xlsx"'})
     writer.writerow(keys+['kind','start_date','end_date','timezone'])
     for item in data['items']:
         row=dict(item)
@@ -96,10 +124,12 @@ def operator_overview(warehouse):
     _, permissions, _ = get_actor_context()
     kinds = [kind for kind in ('picking', 'packing') if permissions.intersection({'all_access', 'company_all_access', kind+'_read'})]
     start, end, page, per_page = report_period(warehouse)
+    previous_start, previous_end = _previous_month(start), _previous_month(end)
     people, phases = {}, {}
     for kind in kinds:
         report = operator_report(kind, warehouse, all_operators=True)
-        phases[kind] = dict(summary=report['summary'], task_chart=report['task_chart'])
+        previous = operator_report(kind, warehouse, all_operators=True, period=(previous_start, previous_end))
+        phases[kind] = dict(summary=report['summary'], task_chart=report['task_chart'], previous=previous['summary'])
         for item in report['items']:
             person = people.setdefault(item['operator_id'], dict(operator_id=item['operator_id'], name=item['name'], phases={}, quantity=0, days=defaultdict(int)))
             person['phases'][kind] = item
@@ -110,6 +140,7 @@ def operator_overview(warehouse):
     for row in rows:
         row['daily'] = [dict(date=day, quantity=qty) for day, qty in sorted(row.pop('days').items())]
     return dict(start_date=start.isoformat(), end_date=end.isoformat(), timezone=clock.warehouse_timezone_name(warehouse),
+                previous_start=previous_start.isoformat(), previous_end=previous_end.isoformat(),
                 phases=phases, scales=dict(quantity=max([1]+[phase['quantity'] for row in rows for phase in row['phases'].values()]),
                                          rate=max([1]+[phase['per_hour'] or 0 for row in rows for phase in row['phases'].values()]+[p['task_chart']['median_per_hour'] or 0 for p in phases.values()])),
                 items=rows[(page-1)*per_page:page*per_page], total=len(rows), page=page, per_page=per_page)
@@ -143,12 +174,13 @@ def operator_tasks(warehouse):
         task, detail = (PickingTask, PickingTaskDetail) if kind=='picking' else (PackingTask, PackingTaskDetail)
         task_key=detail.picking_task_id if kind=='picking' else detail.packing_task_id
         quantity=detail.picked_quantity if kind=='picking' else detail.packed_quantity
-        queries.append(db.session.query(literal(kind).label('kind'),task.id,task.dn_id,task.started_at,task.completed_at,
+        query = db.session.query(literal(kind).label('kind'),task.id,task.dn_id,task.started_at,task.completed_at,
                                         func.sum(quantity).label('quantity')).join(DN,DN.id==task.dn_id).join(detail,task_key==task.id).filter(
             DN.warehouse_id==warehouse.id,task.is_active.is_(True),task.status=='completed',detail.operator_id==operator_id,
             task.completed_at>=clock.local_midnight(start,warehouse),
             task.completed_at<clock.local_midnight(end+timedelta(days=1),warehouse)).group_by(
-            task.id,task.dn_id,task.started_at,task.completed_at).statement)
+            task.id,task.dn_id,task.started_at,task.completed_at)
+        queries.append(_destination(query, DN).statement)
     combined=union_all(*queries).subquery()
     total=db.session.scalar(select(func.count()).select_from(combined))
     records=db.session.execute(select(combined).order_by(combined.c.completed_at.desc(),combined.c.kind,combined.c.id).offset((page-1)*per_page).limit(per_page)).mappings()

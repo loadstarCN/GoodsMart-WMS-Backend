@@ -51,6 +51,7 @@ delivery_task_status_log_model = api_ns.model('DeliveryTaskStatusLog', {
 # ------------------------------------------------------------------------------
 delivery_task_base_fields = {
     'id': fields.Integer(readOnly=True, description='Delivery Task ID'),
+    'warehouse_id': fields.Integer(attribute='dn.warehouse_id', readOnly=True),
     'dn_id': fields.Integer(required=True, description='ID of the associated Delivery Note'),
     'recipient_id': fields.Integer(required=True, description='ID of the associated recipient'),
     'recipient_name': fields.String(attribute='recipient.name', readOnly=True, description='Recipient name'),
@@ -162,6 +163,8 @@ delivery_pagination_parser.add_argument('keyword', type=str, help='Keyword searc
 # 7. 分页模型: 使用基础模型构建（列表行另带 DN 的发货阶段，见 warehouse/shipping/stage.py）
 # ------------------------------------------------------------------------------
 delivery_task_list_model = api_ns.inherit('DeliveryTaskListItem', delivery_task_base_model, {
+    'pickup_summary': fields.Raw(attribute='_pickup_summary', readOnly=True,
+                                description='Effective carrier pickup method and latest live waybill booking'),
     'shipping_stage': fields.String(
         readOnly=True, enum=list(STAGES), attribute=lambda x: _list_stage(x),
         description='Shipping stage of the DN (same definition as GET /warehouse/dn/<id>/shipping-flow stage)'),

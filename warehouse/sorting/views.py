@@ -53,7 +53,12 @@ class SortingTaskList(Resource):
             'asn_id': args.get('asn_id'),
             'status': args.get('status'),
             'is_active': args.get('is_active'),
-            'keyword': args.get('keyword')
+            'keyword': args.get('keyword'),
+            'has_variance': args.get('has_variance') ,
+            'has_damage': args.get('has_damage'),
+            'spec_pending': args.get('spec_pending'),
+            'received_from': args.get('received_from'),
+            'received_to': args.get('received_to')
         }
 
         filters = add_warehouse_filter(filters)

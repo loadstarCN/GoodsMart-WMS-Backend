@@ -10,6 +10,35 @@ from .schemas import api_ns, warehouse_model, warehouse_input_model, pagination_
 from .services import WarehouseService
 
 
+@api_ns.route('/<int:warehouse_id>/daily')
+class WarehouseDaily(Resource):
+    @permission_required(['all_access', 'company_all_access', 'dn_read', 'inventory_read', 'putaway_read'])
+    def get(self, warehouse_id):
+        from .daily import daily_work
+        warehouse = get_company_owned(Warehouse, warehouse_id)
+        scope = _restricted_warehouse_ids()
+        if scope is not None and warehouse_id not in scope:
+            raise ForbiddenException('Warehouse is outside your scope', 12001)
+        is_super, permissions, _ = get_actor_context()
+        allowed = lambda key: is_super or 'company_all_access' in permissions or key in permissions
+        return daily_work(warehouse, allowed)
+
+
+@api_ns.route('/<int:warehouse_id>/schedule')
+class WarehouseSchedule(Resource):
+    @permission_required(['all_access', 'company_all_access', 'asn_read', 'cycle_count_read',
+                          'dn_read', 'packing_read', 'delivery_read'])
+    def get(self, warehouse_id):
+        from .schedule import upcoming_schedule
+        warehouse = get_company_owned(Warehouse, warehouse_id)
+        scope = _restricted_warehouse_ids()
+        if scope is not None and warehouse_id not in scope:
+            raise ForbiddenException('Warehouse is outside your scope', 12001)
+        is_super, permissions, _ = get_actor_context()
+        allowed = lambda key: is_super or 'company_all_access' in permissions or key in permissions
+        return upcoming_schedule(warehouse, allowed)
+
+
 @api_ns.route('/<int:warehouse_id>/zones')
 class WarehouseZones(Resource):
     @permission_required(['all_access', 'company_all_access', 'location_read'])
@@ -62,8 +91,9 @@ class WarehouseOverview(Resource):
         from warehouse.common.clock import local_today
         from warehouse.location.models import Location
         from warehouse.inventory.models import Inventory
-        from warehouse.asn.models import ASN
+        from warehouse.asn.models import ASN, ASNDetail
         from warehouse.dn.models import DN
+        from warehouse.delivery.models import DeliveryTask
 
         warehouse = get_company_owned(Warehouse, warehouse_id)
         scope = _restricted_warehouse_ids()
@@ -75,16 +105,40 @@ class WarehouseOverview(Resource):
         result = {'date': today.isoformat()}
         if allowed('location_read'):
             result['locations'] = Location.query.filter_by(warehouse_id=warehouse_id, is_active=True).count()
+            from warehouse.stock.queries import shelf_of, location_stock, location_summary
+            codes = db.session.query(Location.code).filter_by(warehouse_id=warehouse_id, is_active=True).all()
+            result['zones'] = len({shelf_of(row.code) for row in codes})
+            result['location_records'] = Location.query.filter_by(warehouse_id=warehouse_id).count()
+            if allowed('inventory_read'):
+                result['empty_locations'] = sum(int(location_summary(location, stocks)['is_empty'])
+                    for location, stocks in location_stock({'warehouse_id': warehouse_id, 'include_empty': True}))
         if allowed('inventory_read'):
+            # Picking and packing move stock inside the warehouse; only dispatch
+            # removes it. Keep shelf quantity separate from physical total.
+            physical = (Inventory.onhand_stock + Inventory.damage_stock + Inventory.return_stock +
+                        Inventory.sorted_stock + Inventory.picked_stock + Inventory.packed_stock)
             count, quantity = db.session.query(func.count(), func.coalesce(func.sum(Inventory.onhand_stock), 0)).filter(
                 Inventory.warehouse_id == warehouse_id, Inventory.onhand_stock > 0).one()
             result['goods_count'], result['onhand'] = count, quantity
+            total_count, total = db.session.query(func.count(), func.coalesce(func.sum(physical), 0)).filter(
+                Inventory.warehouse_id == warehouse_id, physical > 0).one()
+            result['total_goods_count'], result['total_stock'] = total_count, total
+            damage, returned = db.session.query(func.coalesce(func.sum(Inventory.damage_stock), 0),
+                func.coalesce(func.sum(Inventory.return_stock), 0)).filter(Inventory.warehouse_id == warehouse_id).one()
+            result['damage_stock'], result['return_stock'] = damage, returned
         if allowed('dn_read'):
-            result['dispatch_today'] = DN.query.filter(DN.warehouse_id == warehouse_id, DN.is_active.is_(True),
-                DN.expected_shipping_date == today, DN.status.in_(['pending', 'in_progress', 'picked', 'packed'])).count()
+            dispatch = DN.query.filter(DN.warehouse_id == warehouse_id, DN.is_active.is_(True),
+                DN.expected_shipping_date == today, DN.status.in_(['pending', 'in_progress', 'picked', 'packed']))
+            result['dispatch_today'] = dispatch.count()
+            tracked = db.session.query(DeliveryTask.id).filter(DeliveryTask.dn_id == DN.id,
+                DeliveryTask.is_active.is_(True), func.trim(func.coalesce(DeliveryTask.tracking_number, '')) != '').exists()
+            result['dispatch_without_tracking'] = dispatch.filter(~tracked).count()
         if allowed('asn_read'):
-            result['receive_today'] = ASN.query.filter(ASN.warehouse_id == warehouse_id, ASN.is_active.is_(True),
-                ASN.expected_arrival_date == today, ASN.status == 'pending').count()
+            receiving = ASN.query.filter(ASN.warehouse_id == warehouse_id, ASN.is_active.is_(True),
+                ASN.expected_arrival_date == today, ASN.status == 'pending')
+            result['receive_today'] = receiving.count()
+            result['receive_today_quantity'] = db.session.query(func.coalesce(func.sum(ASNDetail.quantity), 0)).filter(
+                ASNDetail.asn_id.in_(receiving.with_entities(ASN.id))).scalar()
         return result, 200
 
 

@@ -55,14 +55,17 @@ def outbound_events(warehouse_id, start=None, end=None, goods_ids=None) -> list:
     return events
 
 
-def inbound_events(warehouse_id, end=None, goods_ids=None, start=None) -> list:
+def inbound_events(warehouse_id, end=None, goods_ids=None, start=None, *, include_lot=False) -> list:
     """入库层（end 之前）：[(goods_id, 时刻, 数量, movement_type)]，movement_type 为 sort_in / adjust_gain"""
     from warehouse.adjustment.models import Adjustment, AdjustmentDetail
     from warehouse.asn.models import ASN, ASNDetail
     cutover = _cutover(warehouse_id)
     events = []
+    def event(goods_id, at, quantity, movement, lot_id=None):
+        base = (goods_id, as_utc(at), int(quantity), movement)
+        return base + (lot_id,) if include_lot else base
     query = (db.session.query(StockLedger.goods_id, StockLedger.occurred_at, StockLedger.quantity,
-                              StockLedger.movement_type)
+                              StockLedger.movement_type, StockLedger.lot_id)
              .filter(StockLedger.warehouse_id == warehouse_id, StockLedger.movement_type.in_(INBOUND_MOVEMENTS),
                      StockLedger.quantity > 0))
     if start is not None:
@@ -71,7 +74,7 @@ def inbound_events(warehouse_id, end=None, goods_ids=None, start=None) -> list:
         query = query.filter(StockLedger.occurred_at < end)
     if goods_ids is not None:
         query = query.filter(StockLedger.goods_id.in_(list(goods_ids)))
-    events.extend((g, as_utc(at), int(q), m) for g, at, q, m in query.all())
+    events.extend(event(g, at, q, m, lot) for g, at, q, m, lot in query.all())
     if cutover is None or start is None or start < cutover:
         upper = cutover if end is None or (cutover is not None and cutover < end) else end
         asn_at = func.coalesce(ASN.completed_at, ASN.created_at)
@@ -94,9 +97,9 @@ def inbound_events(warehouse_id, end=None, goods_ids=None, start=None) -> list:
         if goods_ids is not None:
             query = query.filter(ASNDetail.goods_id.in_(list(goods_ids)))
             adj_query = adj_query.filter(AdjustmentDetail.goods_id.in_(list(goods_ids)))
-        events.extend((g, as_utc(at), int(q), 'sort_in')
+        events.extend(event(g, at, q, 'sort_in')
                       for g, at, q in query.group_by(ASNDetail.goods_id, ASN.id, asn_at).all() if at is not None)
-        events.extend((g, as_utc(at), int(q), 'adjust_gain')
+        events.extend(event(g, at, q, 'adjust_gain')
                       for g, at, q in adj_query.group_by(AdjustmentDetail.goods_id, Adjustment.id,
                                                          Adjustment.completed_at).all())
     return events

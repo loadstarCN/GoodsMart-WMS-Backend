@@ -16,6 +16,17 @@ from system.user.builtin import BUILTIN_PERMISSION_NAMES, BUILTIN_ROLE_NAMES
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 
 
+def test_role_user_counts_are_scoped_to_the_calling_tenant(client, access_token, access_company_admin_token):
+    from tests.test_inventory_guards import _h, _ok
+    platform = _ok(client.get('/user/roles?all=true', headers=_h(access_token)))
+    tenant = _ok(client.get('/user/roles?all=true', headers=_h(access_company_admin_token)))
+    admin = next(row for row in platform['items'] if row['name'] == 'admin')
+    assert admin['user_count'] >= 1
+    assert next(row for row in tenant['items'] if row['id'] == admin['id'])['user_count'] == 0
+    detail = _ok(client.get(f"/user/roles/{admin['id']}", headers=_h(access_token)))
+    assert detail['user_count'] == admin['user_count']
+
+
 def _h(token):
     return {'Authorization': f'Bearer {token}'}
 

@@ -1,6 +1,6 @@
-from extensions import db  
+from extensions import db
 from werkzeug.security import generate_password_hash, check_password_hash
-from extensions.db import UTCDateTime
+from extensions.db import UTCDateTime, utc_now
 from .builtin import is_builtin_permission, is_builtin_role
 
 
@@ -15,7 +15,7 @@ role_permissions = db.Table(
 class Permission(db.Model):
     """系统权限表（原子操作权限）"""
     __tablename__ = 'permissions'
-    
+
     __table_args__ = (
         db.UniqueConstraint('name', name='uq_permission_name'),  # 权限名称全局唯一
         db.Index('idx_perm_name', 'name'),  # 权限名称查询加速
@@ -23,7 +23,7 @@ class Permission(db.Model):
 
     id = db.Column(db.Integer, primary_key=True)
     name = db.Column(
-        db.String(100), 
+        db.String(100),
         nullable=False,
         info={'description': '权限标识符（如 manage_users）'}
     )
@@ -48,7 +48,10 @@ user_roles = db.Table(
 class Role(db.Model):
     """系统角色表（权限集合）"""
     __tablename__ = 'roles'
-    
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id', ondelete='RESTRICT'), nullable=True, index=True)
+    display_name = db.Column(db.String(80), nullable=True)
+    revision = db.Column(db.Integer, nullable=False, default=1, server_default='1')
+
     __table_args__ = (
         db.UniqueConstraint('name', name='uq_role_name'),  # 角色名称全局唯一
         db.Index('idx_role_active', 'is_active'),  # 状态过滤优化
@@ -56,7 +59,7 @@ class Role(db.Model):
 
     id = db.Column(db.Integer, primary_key=True)
     name = db.Column(
-        db.String(80), 
+        db.String(80),
         nullable=False,
         info={'description': '角色名称（如 admin）'}
     )
@@ -64,19 +67,19 @@ class Role(db.Model):
         db.String(255),
         info={'description': '角色描述'}
     )
-    
+
     is_active = db.Column(
-        db.Boolean, 
+        db.Boolean,
         default=True,
         info={'description': '是否启用（默认激活）'}
     )
     created_at = db.Column(
-        UTCDateTime, 
+        UTCDateTime,
         default=db.func.now(),
         info={'description': '创建时间（自动记录）'}
     )
     updated_at = db.Column(
-        UTCDateTime, 
+        UTCDateTime,
         default=db.func.now(),
         onupdate=db.func.now(),
         info={'description': '最后更新时间（自动更新）'}
@@ -98,7 +101,7 @@ class Role(db.Model):
 class User(db.Model):
     """系统用户表（支持多态继承）"""
     __tablename__ = 'users'
-    
+
     __table_args__ = (
         db.Index('idx_user_active', 'is_active'),  # 状态过滤优化
         db.Index('idx_user_type', 'type'),  # 多态类型查询优化
@@ -106,7 +109,7 @@ class User(db.Model):
 
     id = db.Column(db.Integer, primary_key=True)
     user_name = db.Column(
-        db.String(255), 
+        db.String(255),
         unique=True,
         nullable=False,
         info={'description': '用户名（唯一标识）'}
@@ -118,7 +121,7 @@ class User(db.Model):
         info={'description': '已验证邮箱地址'}
     )
     password_hash = db.Column(
-        db.String(255), 
+        db.String(255),
         nullable=True,
         info={'description': '加密后的密码'}
     )
@@ -129,21 +132,22 @@ class User(db.Model):
         info={'description': '角色头像'}
     )
     is_active = db.Column(
-        db.Boolean, 
+        db.Boolean,
         default=True,
         info={'description': '账户激活状态'}
     )
     created_at = db.Column(
-        UTCDateTime, 
+        UTCDateTime,
         default=db.func.now(),
         info={'description': '注册时间（自动记录）'}
     )
     updated_at = db.Column(
-        UTCDateTime, 
+        UTCDateTime,
         default=db.func.now(),
         onupdate=db.func.now(),
         info={'description': '最后更新时间（自动更新）'}
     )
+    last_login_at = db.Column(UTCDateTime, nullable=True)
     refresh_token_expires_at = db.Column(
         UTCDateTime,
         nullable=True,
@@ -167,7 +171,7 @@ class User(db.Model):
         'polymorphic_on': type
     }
 
-    
+
     @property
     def active_roles(self):
         """生效中的角色：停用（is_active=False）的角色既不授予权限，也不算持有该角色。
@@ -213,6 +217,17 @@ class User(db.Model):
             return self.company.name
         return None
 
+    @property
+    def company_status(self):
+        company = getattr(self, 'company', None)
+        if company is None:
+            return None
+        if not company.is_active:
+            return 'inactive'
+        if company.expired_at and company.expired_at <= utc_now():
+            return 'expired'
+        return 'active'
+
     def set_password(self, password):
         """设置用户密码"""
         self.password_hash = generate_password_hash(password)
@@ -223,5 +238,5 @@ class User(db.Model):
             return False
         return check_password_hash(self.password_hash, password)
 
-    
-   
+
+

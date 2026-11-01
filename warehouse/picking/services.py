@@ -62,6 +62,17 @@ class PickingTaskService:
 
         if filters.get('dn_id'):
             query = query.filter(PickingTask.dn_id == filters['dn_id'])
+        if filters.get('print_requested') is not None:
+            requested = PickingTask.print_requests.any()
+            query = query.filter(requested if filters['print_requested'] else ~requested)
+        if filters.get('created_today'):
+            from warehouse.warehouse.models import Warehouse
+            windows = []
+            for warehouse in Warehouse.query.all():
+                start, end = clock.local_day_range(clock.local_today(warehouse), warehouse)
+                windows.append(and_(PickingTask.dn.has(warehouse_id=warehouse.id),
+                                    PickingTask.created_at >= start, PickingTask.created_at < end))
+            query = query.filter(db.or_(*windows) if windows else db.false())
         if filters.get('status'):
             query = query.filter(PickingTask.status == filters['status'])
         
@@ -171,7 +182,7 @@ class PickingTaskService:
         if not isinstance(data, dict):
             raise BadRequestException("Request body must be a JSON object", 16015)
 
-        for field in ('location_id', 'goods_id', 'batch_id'):
+        for field in ('location_id', 'goods_id', 'batch_id', 'lot_id'):
             if field in data and data[field] != getattr(detail, field):
                 raise BadRequestException(
                     f"{field} of a picking detail cannot be changed; delete it and pick again.", 16049
@@ -188,6 +199,7 @@ class PickingTaskService:
             PickingTaskService._assert_location_stock(task, [{
                 'goods_id': detail.goods_id,
                 'location_id': detail.location_id,
+                'lot_id': detail.lot_id,
                 'picked_quantity': delta,
             }])
         detail.picked_quantity = new_quantity
@@ -316,14 +328,16 @@ class PickingTaskService:
                 raise BadRequestException(
                     "goods_id and location_id are required for picked items", 16034
                 )
-            key = (goods_id, location_id)
+            key = (goods_id, location_id, item.get('lot_id'))
             requested[key] = requested.get(key, 0) + quantity
 
-        PickingTaskService._assert_locations_in_warehouse(task, [lid for _, lid in requested])
+        PickingTaskService._assert_locations_in_warehouse(task, [lid for _, lid, _ in requested])
 
         # 按 (goods_id, location_id) 升序逐行加锁（B-103）：两个请求库位顺序相反时不再互相等待
-        for (goods_id, location_id), quantity in sorted(requested.items(), key=lambda item: lock_order_key(*item[0])):
-            stock = lock_goods_location(goods_id, location_id)
+        for (goods_id, location_id, lot_id), quantity in sorted(requested.items(), key=lambda item: lock_order_key(*item[0])):
+            from warehouse.stock.lots import assert_shippable
+            assert_shippable(goods_id, lot_id, task.dn.warehouse_id)
+            stock = lock_goods_location(goods_id, location_id, lot_id)
             if stock is None:
                 raise BadRequestException(
                     f"Goods {goods_id} has no stock in location {location_id}.", 16035
@@ -335,6 +349,7 @@ class PickingTaskService:
                 .filter(
                     PickingTaskDetail.goods_id == goods_id,
                     PickingTaskDetail.location_id == location_id,
+                    PickingTaskDetail.lot_id == lot_id,
                     PickingTask.status == 'in_progress',
                     PickingTask.is_active.is_(True),
                 )
@@ -353,7 +368,7 @@ class PickingTaskService:
     @staticmethod
     def _batch_rows(batch: PickingBatch) -> list:
         """批次明细的比较内容（client_batch_id 重放判断用）：(goods_id, location_id, picked_quantity)"""
-        return [(d.goods_id, d.location_id, d.picked_quantity or 0) for d in batch.details]
+        return [(d.goods_id, d.location_id, d.picked_quantity or 0, d.lot_id or 0) for d in batch.details]
 
     @staticmethod
     def _parse_batch_details(data) -> list:
@@ -364,12 +379,13 @@ class PickingTaskService:
                 'goods_id': require_positive_int(raw.get('goods_id'), 'goods_id', 16034),
                 'location_id': require_positive_int(raw.get('location_id'), 'location_id', 16034),
                 'picked_quantity': require_positive_int(raw.get('picked_quantity'), 'picked_quantity'),
+                'lot_id': require_positive_int(raw['lot_id'], 'lot_id') if raw.get('lot_id') is not None else None,
             })
         return details_data
 
     @staticmethod
     def _incoming_rows(details_data: list) -> list:
-        return [(d['goods_id'], d['location_id'], d['picked_quantity']) for d in details_data]
+        return [(d['goods_id'], d['location_id'], d['picked_quantity'], d.get('lot_id') or 0) for d in details_data]
 
     @staticmethod
     @transactional
@@ -453,6 +469,7 @@ class PickingTaskService:
                 picking_task_id=task.id,
                 batch_id=new_batch.id,
                 location_id=item['location_id'],
+                lot_id=item.get('lot_id'),
                 goods_id=item['goods_id'],
                 picked_quantity=item['picked_quantity'],
                 operator_id=operator_id
@@ -592,6 +609,7 @@ class PickingTaskService:
             {
                 'goods_id': d.goods_id,
                 'location_id': d.location_id,
+                'lot_id': d.lot_id,
                 'picked_quantity': d.picked_quantity or 0,
             }
             for d in task.task_details
@@ -615,12 +633,15 @@ class PickingTaskService:
             RemovalService.create_removal_record({
                 'goods_id': detail.goods_id,
                 'location_id': detail.location_id,
+                'lot_id': detail.lot_id,
                 'quantity': detail.picked_quantity,
                 'remark': f'DN Picking: {task.dn.order_number}',
             }, operator_id, from_picking=True, stock_op=stock_op, doc_line_id=detail.id)
         stock_op.commit()
 
         # 更新DN状态
+        from warehouse.stock.lots import record_picking
+        record_picking(task.dn, task.task_details)
         DNService.picking_dn(task.dn)
         
         return task

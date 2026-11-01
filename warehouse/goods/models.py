@@ -220,6 +220,7 @@ class GoodsLocation(db.Model):
         index=True,
         info={'description': '关联库位ID（禁止删除有库存的库位）'}
     )
+    lot = db.relationship('GoodsLot', lazy='joined')
     lot_id = db.Column(
         db.Integer,
         db.ForeignKey('goods_lots.id', ondelete='RESTRICT', name='fk_goods_locations_lot_id'),
@@ -251,6 +252,19 @@ class GoodsLocation(db.Model):
         lazy='joined',
         info={'description': '关联库位对象'}
     )
+
+
+    @property
+    def pickable(self):
+        from extensions.error import BadRequestException
+        from warehouse.stock.lots import assert_shippable
+        if self.quantity <= 0 or not self.location.is_active or self.location.location_type != 'standard':
+            return False
+        try:
+            assert_shippable(self.goods_id, self.lot_id, self.location.warehouse_id)
+            return True
+        except BadRequestException:
+            return False
 
 
 def _user_ref(user_id):

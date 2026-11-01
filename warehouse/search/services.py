@@ -515,10 +515,13 @@ class _TaskSearch(_SearchType):
         title, subtitle = self.describe(task, term, related_code, related_spans, ctx)
         goods, quantity = _matched_goods(term, self.goods_of(task))
         _add_goods(subtitle, term, goods).add(_name(warehouse))
+        _, permissions, _ = get_actor_context()
+        related_permission = {'dn': 'dn_read', 'asn': 'asn_read', 'cyclecount': 'cycle_count_read'}.get(self.related_page)
+        can_open_related = bool(permissions & SUPER_PERMISSIONS or related_permission in permissions)
         columns = {
             'task_type': self.name,
             'related_code': related_code,
-            'related_url_hint': _hint(self.related_page, related_id) if self.related_page else None,
+            'related_url_hint': _hint(self.related_page, related_id) if self.related_page and can_open_related else None,
             'status': task.status,
             'warehouse_name': _name(warehouse),
         } if with_columns else None

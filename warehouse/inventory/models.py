@@ -180,7 +180,12 @@ class Inventory(db.Model):
     @property
     def available_stock_for_sale(self):
         """计算可售卖库存（可用库存 - 锁定库存- DN库存）"""
-        return self.onhand_stock - self.locked_stock- self.dn_stock
+        return self.onhand_stock - self.locked_stock - self.dn_stock - self.unshippable_stock
+
+    @property
+    def unshippable_stock(self):
+        from warehouse.stock.lot_policy import blocked_onhand
+        return blocked_onhand(self.goods_id, self.warehouse_id)
     
     # 计算可用库存
     @property

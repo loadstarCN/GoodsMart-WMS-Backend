@@ -12,6 +12,10 @@ class Location(db.Model):
         is_active: 启用状态 (默认True)
     """
     __tablename__ = 'locations'
+    picking_order = db.Column(db.Integer, nullable=True)
+    rack_column = db.Column(db.Integer, nullable=True)
+    rack_level = db.Column(db.Integer, nullable=True)
+    map_rack_id = db.Column(db.String(100), nullable=True)
 
     __table_args__ = (
         # 核心业务索引

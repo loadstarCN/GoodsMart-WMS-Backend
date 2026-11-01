@@ -76,6 +76,7 @@ class UserService:
 
         # 更新用户模型的refresh_token及有效期（需持久化存储）
         user.refresh_token_expires_at = utc_now() + refresh_expires_in
+        user.last_login_at = utc_now()
         db.session.add(user)
         db.session.commit()
 
@@ -147,6 +148,10 @@ class UserService:
             query = query.filter(User.is_active == filters['is_active'])
         if filters.get('type'):
             query = query.filter(User.type == filters['type'])
+        if filters.get('company_id') is not None:
+            from warehouse.staff.models import Staff
+            query = query.filter(User.id.in_(db.session.query(Staff.id).filter(
+                Staff.company_id == filters['company_id'])))
 
         return query
 
@@ -208,7 +213,8 @@ class UserService:
             user.is_active = is_active
 
         if 'roles' in data:
-            user.roles = RoleService.resolve_assignable_roles(data['roles'], current_roles=user.roles)
+            user.roles = RoleService.resolve_assignable_roles(data['roles'], current_roles=user.roles,
+                                                             company_id=getattr(user, 'company_id', None))
 
         if data.get('password'):
             user.set_password(data.get('password'))
@@ -348,6 +354,9 @@ class RoleService:
         根据过滤条件返回 Role 查询对象
         """
         query = Role.query.order_by(Role.id.desc())
+        actor_company = get_actor_context()[2]
+        if actor_company is not None:
+            query = query.filter(db.or_(Role.company_id.is_(None),Role.company_id==actor_company))
 
         name = filters.get('name') or filters.get('keyword')
         if name:
@@ -358,15 +367,35 @@ class RoleService:
         return query
 
     @staticmethod
+    def attach_user_counts(roles):
+        """Count assigned accounts in one query, scoped to a tenant actor."""
+        from .models import user_roles
+        from warehouse.staff.models import Staff
+        ids = [role.id for role in roles]
+        if not ids:
+            return
+        query = db.session.query(user_roles.c.role_id, db.func.count(user_roles.c.user_id)).filter(
+            user_roles.c.role_id.in_(ids))
+        company_id = get_actor_context()[2]
+        if company_id is not None:
+            query = query.join(Staff, Staff.id == user_roles.c.user_id).filter(Staff.company_id == company_id)
+        counts = dict(query.group_by(user_roles.c.role_id).all())
+        for role in roles:
+            role.user_count = counts.get(role.id, 0)
+
+    @staticmethod
     def get_role(role_id: int) -> Role:
         """
         根据 ID 获取单个 Role，不存在时抛出 404
         """
         role = get_object_or_404(Role, role_id)
+        actor_company = get_actor_context()[2]
+        if actor_company is not None and role.company_id is not None and role.company_id != actor_company:
+            raise ForbiddenException('Role belongs to another company',12001)
         return role
 
     @staticmethod
-    def resolve_assignable_roles(role_names, actor=None, current_roles=None):
+    def resolve_assignable_roles(role_names, actor=None, current_roles=None, company_id=None):
         """按名字解析角色，并校验调用方有资格授予这些角色。
 
         规则与 API Key 权限一致：超管随意；其他人不得授予含平台专属权限的角色，
@@ -391,7 +420,10 @@ class RoleService:
                                       'roles', details={'roles': inactive})
 
         actor = actor or get_actor_context()
+        target_company = company_id if company_id is not None else actor[2]
         for role in roles:
+            if role.company_id is not None and role.company_id != target_company:
+                raise ForbiddenException('Role belongs to another company', 12007)
             try:
                 assert_grantable_permissions({p.name for p in role.permissions}, actor)
             except ForbiddenException:
@@ -433,6 +465,8 @@ class RoleService:
         更新 Role 信息
         """
         role = RoleService.get_role(role_id)
+        if role.company_id is not None:
+            raise ConflictException('Manage company-owned roles through the company role editor with revision checks.', 44002)
         if role.is_builtin:
             # 内置角色（代码里按名字判断）：不能改名、不能停用；描述、权限照常改（Web 编辑页整表提交原值不算改）
             if 'name' in data and data['name'] != role.name:
@@ -457,6 +491,8 @@ class RoleService:
         删除 Role（仍有用户使用时拒绝）
         """
         role = RoleService.get_role(role_id)
+        if role.company_id is not None:
+            raise ConflictException('Manage company-owned roles through the company role editor with revision checks.', 44002)
         if role.is_builtin:
             RoleService._builtin_conflict(role, 'DELETE', "deleted")
         in_use = role.users.count()

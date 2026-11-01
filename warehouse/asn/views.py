@@ -71,6 +71,7 @@ class ASNList(Resource):
             'created_by': args.get('created_by'),
             'is_active': args.get('is_active'),
             'keyword': args.get('keyword'),
+            'warehouse_todo_date': args.get('warehouse_todo_date'),
             'inbound_stage': args.get('inbound_stage'),
             'spec_pending': args.get('spec_pending'),
         }

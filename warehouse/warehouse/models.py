@@ -13,6 +13,7 @@ class Warehouse(db.Model):
         updated_at: 更新时间 (自动更新)
     """
     __tablename__ = 'warehouses'
+    operations = db.Column(db.JSON, nullable=True)
 
     __table_args__ = (
         # 核心业务索引

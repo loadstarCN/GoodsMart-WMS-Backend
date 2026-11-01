@@ -17,6 +17,10 @@ user_model = api_ns.model('User', original_user_model)
 # -----------------------------
 putaway_record_base_model = api_ns.model('PutawayRecordBase', {
     'id': fields.Integer(readOnly=True, description='Putaway Record ID'),
+    'lot_id': fields.Integer(description='Product lot ID; null means unassigned'),
+    'receipt_source_id': fields.Integer(description='Explicit pending receipt source; 0 selects legacy/removal stock'),
+    'source_asn_id': fields.Integer(attribute='receipt_source.asn_id', readOnly=True),
+    'lot_no': fields.String(attribute='lot.lot_no', readOnly=True),
     'goods_id': fields.Integer(required=True, description='ID of the Goods being put away'),
     'goods_code': fields.String(attribute = 'goods.code',readOnly=True, description='Code of the Goods being put away'),
     'location_id': fields.Integer(required=True, description='ID of the Location where goods are put away'),

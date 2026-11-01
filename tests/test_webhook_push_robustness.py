@@ -691,3 +691,38 @@ def test_key_summary_requires_webhook_permission(webhook_client, company_ids):
         key_id = key.id
     response = webhook_client.get(f'/wh/webhook/key-summary?api_key_ids={key_id}', headers={'X-API-KEY': plain})
     assert response.status_code == 403
+
+
+def test_log_time_range_scoping_and_stable_pagination(webhook_client, access_company_admin_token, company_ids):
+    headers = {'Authorization': f'Bearer {access_company_admin_token}'}
+    when = datetime(2026, 10, 1, tzinfo=timezone.utc)
+    with webhook_client.application.app_context():
+        owned, foreign = [_make_key(company) for company in company_ids]
+        _add_event(owned, created_at=when-timedelta(microseconds=1))
+        first = _add_event(owned, created_at=when, status='failed')
+        second = _add_event(owned, created_at=when, status='failed')
+        _add_event(owned, created_at=when+timedelta(days=1))
+        _add_event(foreign, created_at=when, status='failed')
+    filters = {'created_from': '2026-10-01T09:00:00+09:00',
+               'created_before': '2026-10-02T00:00:00Z', 'per_page': 1, 'status': 'failed'}
+    response = webhook_client.get('/wh/webhook/', query_string=filters, headers=headers)
+    assert response.status_code == 200, response.json
+    assert response.json['total'] == 2
+    assert [r['id'] for r in response.json['items']] == [second]
+    response = webhook_client.get('/wh/webhook/', query_string={**filters, 'page': 2}, headers=headers)
+    assert [r['id'] for r in response.json['items']] == [first]
+    response = webhook_client.get('/wh/webhook/', query_string={**filters, 'api_key_id': foreign}, headers=headers)
+    assert response.json['total'] == 0
+
+
+@pytest.mark.parametrize('filters', [
+    {'created_from': '2026-10-01'},
+    {'created_before': 'not-a-time'},
+    {'created_from': '2026-10-01T00:00:00'},
+    {'created_from': '2026-10-02T00:00:00Z', 'created_before': '2026-10-01T00:00:00Z'},
+    {'created_from': '2026-10-01T09:00:00+09:00', 'created_before': '2026-10-01T00:00:00Z'},
+])
+def test_log_invalid_time_range(webhook_client, access_company_admin_token, filters):
+    response = webhook_client.get('/wh/webhook/', query_string=filters,
+                                  headers={'Authorization': f'Bearer {access_company_admin_token}'})
+    assert response.status_code == 400, response.json

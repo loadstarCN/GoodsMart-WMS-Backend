@@ -19,6 +19,10 @@ user_model = api_ns.model('User', original_user_model)
 # 定义 Location 的完整字段字典
 # -----------------------------
 location_simple_fields = {
+    'map_rack_id': fields.String(description='Published rack ID override; null resolves from map or location code'),
+    'picking_order': fields.Integer(description='Manual picking sequence; null sorts last'),
+    'rack_column': fields.Integer(description='Rack column, one-based'),
+    'rack_level': fields.Integer(description='Rack level, one-based'),
     'id': fields.Integer(readOnly=True, description='Location ID'),    
     'code': fields.String(required=True, description='Location Code'),
     'location_type': fields.String(
@@ -73,6 +77,7 @@ location_model = api_ns.inherit('LocationModel', location_base_model, {
 location_pagination_parser = pagination_parser.copy()
 location_pagination_parser.add_argument('code', type=str, help='Filter by Location Code', location='args')
 location_pagination_parser.add_argument('zone', type=str, help='Exact first hyphen-delimited code segment', location='args')
+location_pagination_parser.add_argument('occupancy', type=str, choices=['occupied', 'empty'], location='args', help='Positive location stock; requires inventory_read')
 location_pagination_parser.add_argument('warehouse_id', type=int, help='Filter by Warehouse ID', location='args')
 location_pagination_parser.add_argument('is_active', type=inputs.boolean, help='Filter by Active Status', location='args')
 location_pagination_parser.add_argument('location_type', type=str, help='Filter by Location Type', location='args', choices=Location.LOCATION_TYPES)

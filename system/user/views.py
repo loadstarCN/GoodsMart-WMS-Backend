@@ -146,6 +146,7 @@ class UserList(Resource):
             'keyword': args.get('keyword'),
             'is_active': args.get('is_active'),
             'type': args.get('type'),
+            'company_id': args.get('company_id'),
         }
 
         query = UserService.list_users(filters)
@@ -214,7 +215,9 @@ class RoleList(Resource):
         }
 
         query = RoleService.list_roles(filters)
-        return paginate(query, page, per_page)
+        result = paginate(query, page, per_page)
+        RoleService.attach_user_counts(result['items'])
+        return result
 
     @permission_required(["all_access", "role_edit"])
     @api_ns.expect(role_input_model)
@@ -235,6 +238,7 @@ class RoleDetail(Resource):
     def get(self, role_id):
         """获取角色详情"""
         role = RoleService.get_role(role_id)
+        RoleService.attach_user_counts([role])
         return role
 
     @permission_required(["all_access", "role_edit"])
@@ -256,6 +260,25 @@ class RoleDetail(Resource):
 # ------------------------
 # 权限路由
 # ------------------------
+
+@api_ns.doc(security="jsonWebToken")
+@api_ns.route('/permissions/catalog')
+class PermissionCatalog(Resource):
+    @permission_required(["all_access"])
+    def get(self):
+        """Platform-only catalog with actual role usage, not endpoint-reference claims."""
+        from extensions import db
+        from .models import Permission, role_permissions
+        from system.common.permissions import PLATFORM_ONLY_PERMISSIONS
+        counts = dict(db.session.query(role_permissions.c.permission_id,
+                      db.func.count(role_permissions.c.role_id))
+                      .group_by(role_permissions.c.permission_id).all())
+        return {'items': [dict(id=p.id, name=p.name, description=p.description,
+                              is_builtin=p.is_builtin,
+                              is_platform_only=p.name in PLATFORM_ONLY_PERMISSIONS,
+                              role_count=counts.get(p.id, 0))
+                          for p in Permission.query.order_by(Permission.name).all()]}
+
 
 @api_ns.doc(security="jsonWebToken")
 @api_ns.route('/permissions')

@@ -1,6 +1,6 @@
 from tests.helpers import *
 from tests.test_picking_location_type import _setup, _batch
-from tests.test_inventory_guards import _h, _ok
+from tests.test_inventory_guards import _h, _ok, _inbound
 from tests.test_isolation_outbound import _make_company_b
 
 
@@ -36,3 +36,18 @@ def test_print_plan_rejects_foreign_warehouse(client,access_token):
     _,_,task_id=_setup(client,access_token)
     headers,_=_make_company_b(client,company_admin=True)
     assert client.get(f'/picking/{task_id}/print-plan',headers=headers).status_code in (403,404)
+
+
+def test_print_plan_ignores_legacy_details_outside_current_order(client, access_token):
+    w, _, task_id = _setup(client, access_token)
+    _inbound(client, access_token, w, [(w['g2'], 3)], [(w['g2'], w['std1'], 3)])
+    _ok(_batch(client, access_token, task_id, w['g1'], w['std1'], 2))
+    with client.application.app_context():
+        # Older imports can leave a task line whose product is no longer on the DN.
+        detail = PickingTaskDetail.query.filter_by(picking_task_id=task_id).one()
+        detail.goods_id = w['g2']
+        db.session.commit()
+    plan = _ok(client.get(f'/picking/{task_id}/print-plan', headers=_h(access_token)))
+    assert plan['shortages'] == []
+    assert sum(row['quantity'] for row in plan['rows']) == 5
+    assert {row['goods_id'] for row in plan['rows']} == {w['g1']}

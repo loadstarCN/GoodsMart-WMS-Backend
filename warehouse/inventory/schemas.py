@@ -9,6 +9,7 @@ api_ns = Namespace('inventory', description='Inventory related operations')
 
 # Inventory 序列化器
 inventory_base_model = api_ns.model('InventoryBase', {
+    'metrics': fields.Raw(readOnly=True, description='Latest warehouse daily metrics with metric_date; null if unavailable'),
     'goods_id': fields.Integer(readOnly=True, description='Associated Goods ID (Primary Key)'),
     'warehouse_id': fields.Integer(readOnly=True, description='Associated Warehouse ID (Primary Key)'),
     'total_stock': fields.Integer(default=0, description='Total stock quantity'),
@@ -18,6 +19,7 @@ inventory_base_model = api_ns.model('InventoryBase', {
     'return_stock': fields.Integer(default=0, description='Backorder stock quantity'),
     'available_stock': fields.Integer(readOnly=True, description='Available stock quantity (calculated)'),
     'available_stock_for_sale': fields.Integer(readOnly=True, description='Available stock for sale (calculated)'),
+    'unshippable_stock': fields.Integer(readOnly=True, description='Stock blocked by lot and shelf-life rules'),
     'low_stock_threshold': fields.Integer(description='Low Stock Warning Threshold (-1 to disable)'),
     'high_stock_threshold': fields.Integer(description='High Stock Warning Threshold (-1 to disable)'),
 
@@ -78,6 +80,10 @@ inventory_input_model = api_ns.model('InventoryInput', {
 
 # Inventory 列表分页模型
 inventory_pagination_parser = pagination_parser.copy()
+inventory_pagination_parser.add_argument('stock_bucket', type=str, location='args', choices=(
+    'onhand_stock', 'available_stock_for_sale', 'dn_stock', 'locked_stock', 'unshippable_stock',
+    'return_stock', 'damage_stock', 'sorted_stock', 'asn_stock', 'total_stock', 'working', 'damage_or_return'),
+    help='Only inventory rows with a positive quantity in this stock category')
 inventory_pagination_parser.add_argument('goods_id', type=int, help='Associated Goods ID', location='args')
 inventory_pagination_parser.add_argument('warehouse_id', type=int, help='Associated Warehouse ID', location='args')
 inventory_pagination_parser.add_argument('goods_codes', type=lambda s: [code.strip() for code in s.split(',')], help='Goods Codes (comma separated)', location='args')
@@ -96,6 +102,10 @@ inventory_pagination_parser.add_argument(
          'sorted_damage_stock of it can only go to damaged locations)')
 
 # 待上架汇总（首页 / 侧栏的数字）：范围与库存列表相同（X-WAREHOUSE-ID / warehouse_id → 该仓库；否则调用方可访问的仓库）
+inventory_pagination_parser.add_argument('pending_damaged', type=inputs.boolean, location='args',
+                                        help='Only inventory rows with damaged stock awaiting putaway')
+inventory_pagination_parser.add_argument('pending_overdue_days', type=inputs.int_range(0, MAX_OVERDUE_DAYS),
+                                        location='args', help='Only rows with known pending stock older than this many days')
 def _optional_warehouse_id(value):
     """warehouse_id：空串（界面选「全部仓库」时带上的 warehouse_id=）= 没给仓库，按可访问的全部仓库汇总，不再 400"""
     if value is None or not str(value).strip():
@@ -124,6 +134,9 @@ pending_putaway_summary_model = api_ns.model('PendingPutawaySummary', {
     'inventory_count': fields.Integer(description='Inventory rows with stock waiting to be put away '
                                                   '(= total of GET /inventory/?pending_putaway=true)'),
     'goods_count': fields.Integer(description='Distinct goods with stock waiting to be put away'),
+    'damaged_goods_count': fields.Integer(description='Distinct goods with damaged pending stock'),
+    'overdue_seven_quantity': fields.Integer(description='Known pending stock older than seven days'),
+    'overdue_seven_inventory_count': fields.Integer(description='Inventory rows with known pending stock older than seven days'),
     'total_quantity': fields.Integer(description='Items waiting to be put away (sum of sorted_stock)'),
     'damaged_quantity': fields.Integer(description='Of which damaged (sum of sorted_damage_stock; '
                                                    'damaged locations only)'),
@@ -131,9 +144,14 @@ pending_putaway_summary_model = api_ns.model('PendingPutawaySummary', {
     'overdue_days': fields.Integer(description='Overdue threshold used, in days'),
     'overdue_quantity': fields.Integer(description='Items waiting longer than overdue_days (first-in-first-out)'),
     'overdue_inventory_count': fields.Integer(description='Inventory rows with at least one overdue item'),
+    'unknown_age_quantity': fields.Integer(description='Pending items without a known entry time; excluded from overdue quantities'),
     'oldest_pending_since': fields.DateTime(description='Earliest pending_since of the rows (UTC, +00:00; '
                                                         'null = nothing waiting / unknown)'),
 })
 
 # 创建分页模型
 pagination_model = create_pagination_model(api_ns, inventory_base_model)
+
+# Analysis metadata filters also apply to inventory drilldown and summary.
+for _field in ('category','brand','category_missing','brand_missing'):
+    inventory_pagination_parser.add_argument(_field, type=str, location='args')

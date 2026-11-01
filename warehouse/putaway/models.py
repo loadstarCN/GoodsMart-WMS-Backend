@@ -1,6 +1,34 @@
 from extensions import db
 from extensions.db import UTCDateTime
 
+
+class ReceiptPendingStock(db.Model):
+    """Prospectively recorded receipt source; never backfilled from current stock."""
+    __tablename__ = 'receipt_pending_stock'
+    __table_args__ = (
+        db.CheckConstraint('good_remaining >= 0 AND damaged_remaining >= 0', name='chk_receipt_pending_nonnegative'),
+        db.CheckConstraint('good_remaining <= good_received AND damaged_remaining <= damaged_received', name='chk_receipt_pending_received'),
+        db.CheckConstraint("(source_type = 'asn' AND asn_id IS NOT NULL AND dn_id IS NULL) OR "
+                           "(source_type IN ('pack_short_return','dn_cancel_return') AND asn_id IS NULL AND dn_id IS NOT NULL AND entered_at IS NOT NULL)",
+                           name='chk_pending_source_document'),
+        db.Index('idx_receipt_pending_scope', 'warehouse_id', 'goods_id', 'lot_id'),
+    )
+    id = db.Column(db.Integer, primary_key=True)
+    asn_id = db.Column(db.Integer, db.ForeignKey('asn.id', ondelete='RESTRICT'), nullable=True, index=True)
+    dn_id = db.Column(db.Integer, db.ForeignKey('dn.id', ondelete='RESTRICT'), nullable=True, index=True)
+    source_type = db.Column(db.String(32), nullable=False, default='asn', server_default='asn')
+    entered_at = db.Column(db.DateTime(timezone=True), nullable=True)
+    warehouse_id = db.Column(db.Integer, db.ForeignKey('warehouses.id', ondelete='RESTRICT'), nullable=False)
+    goods_id = db.Column(db.Integer, db.ForeignKey('goods.id', ondelete='RESTRICT'), nullable=False)
+    lot_id = db.Column(db.Integer, db.ForeignKey('goods_lots.id', ondelete='RESTRICT'), nullable=True)
+    good_received = db.Column(db.Integer, nullable=False)
+    damaged_received = db.Column(db.Integer, nullable=False)
+    good_remaining = db.Column(db.Integer, nullable=False)
+    damaged_remaining = db.Column(db.Integer, nullable=False)
+    asn = db.relationship('ASN')
+    dn = db.relationship('DN')
+
+
 class PutawayRecord(db.Model):
     """货品上架记录表
     
@@ -21,6 +49,11 @@ class PutawayRecord(db.Model):
         db.Index('idx_putaway_operator_time', 'operator_id', 'putaway_time'),  # 操作员效率分析
         db.CheckConstraint('quantity > 0', name='chk_removal_quantity')     # 数据库层校验
     )
+
+    lot_id = db.Column(db.Integer, db.ForeignKey('goods_lots.id', ondelete='RESTRICT'), nullable=True)
+    receipt_source_id = db.Column(db.Integer, db.ForeignKey('receipt_pending_stock.id', ondelete='RESTRICT'), nullable=True, index=True)
+    receipt_source = db.relationship('ReceiptPendingStock')
+    lot = db.relationship('GoodsLot', lazy='joined')
 
     id = db.Column(db.Integer, primary_key=True)
     goods_id = db.Column(

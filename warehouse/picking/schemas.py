@@ -36,6 +36,8 @@ picking_task_status_log_model = api_ns.model('PickingTaskStatusLog', {
 picking_task_detail_for_batch_model = api_ns.model('PickingTaskDetailForBatch', {
     'id': fields.Integer(readOnly=True, description='Picking detail ID'),
     'location_id': fields.Integer(description='Location ID'),
+    'lot_id': fields.Integer(description='Product lot ID; null means unassigned'),
+    'lot_no': fields.String(attribute='lot.lot_no', readOnly=True),
     'goods_id': fields.Integer(description='Goods ID'),
     'picked_quantity': fields.Integer(description='Picked quantity'),
     'picking_time': fields.DateTime(description='Picking time'),
@@ -75,7 +77,10 @@ picking_task_detail_model = api_ns.inherit('PickingTaskDetail', picking_task_det
 # 5. Picking Task 基础信息输出模型
 # ---------------------------------------------------------------------------------
 picking_task_base_model = api_ns.model('PickingTaskBase', {
+    'print_count': fields.Integer(readOnly=True, description='Browser print requests, not completed prints'),
+    'last_print_requested_at': fields.DateTime(readOnly=True),
     'id': fields.Integer(readOnly=True, description='Picking task ID'),
+    'warehouse_id': fields.Integer(attribute='dn.warehouse_id', readOnly=True),
     'dn_id': fields.Integer(required=True, description='Associated delivery notice ID'),
     'status': fields.String(
         enum=PickingTask.PICKING_TASK_STATUSES,
@@ -118,7 +123,13 @@ picking_task_base_model = api_ns.model('PickingTaskBase', {
 # ---------------------------------------------------------------------------------
 # 6. Picking Task 主输出模型（继承基础模型，添加关联）
 # ---------------------------------------------------------------------------------
+picking_print_request_model = api_ns.model('PickingPrintRequest', {
+    'requested_at': fields.DateTime(readOnly=True),
+    'language': fields.String(readOnly=True),
+    'operator': fields.Nested(user_model, readOnly=True),
+})
 picking_task_model = api_ns.inherit('PickingTask', picking_task_base_model, {
+    'print_requests': fields.List(fields.Nested(picking_print_request_model), readOnly=True),
     'dn': fields.Nested(dn_model, readOnly=True, description='Associated delivery notice details'),
     'task_details': fields.List(fields.Nested(picking_task_detail_model), readOnly=True,description='List of picking details'),
     'batches': fields.List(fields.Nested(picking_batch_model), readOnly=True,description='List of associated picking batches'),
@@ -152,6 +163,8 @@ picking_batch_input_model = api_ns.model('PickingBatchInput', picking_batch_inpu
 # 分页解析器 & 分页模型
 # ---------------------------------------------------------------------------------
 picking_pagination_parser = pagination_parser.copy()
+picking_pagination_parser.add_argument('created_today', type=inputs.boolean, location='args', help='Created today in each task warehouse timezone')
+picking_pagination_parser.add_argument('print_requested', type=inputs.boolean, location='args', help='Whether a browser print request has been recorded')
 picking_pagination_parser.add_argument('dn_id',type=int,help='Filter by delivery notice ID',location='args')
 picking_pagination_parser.add_argument('status',type=str,choices=PickingTask.PICKING_TASK_STATUSES,help='Filter by status',location='args')
 picking_pagination_parser.add_argument('is_active',type=inputs.boolean,help='Is the task active?',location='args')

@@ -37,6 +37,8 @@ adjustment_summary_model = api_ns.model('AdjustmentSummary', {
 adjustment_detail_fields = {
     'id': fields.Integer(readOnly=True, description='Adjustment Detail ID'),
     'adjustment_id': fields.Integer(required=True, description='ID of the associated adjustment task'),
+    'lot_id': fields.Integer(description='Product lot ID'),
+    'lot_no': fields.String(attribute='lot.lot_no', readOnly=True),
     'goods_id': fields.Integer(required=True, description='ID of the goods being adjusted'),
     'location_id': fields.Integer(description='Location ID (if applicable)'),
     'system_quantity': fields.Integer(description='System recorded quantity'),
@@ -97,6 +99,10 @@ adjustment_fields = {
         attribute=lambda x: len(x.details),  # 直接计算关联的 details 数量
         description='Number of ASN detail items'
     ),
+    'goods_count': fields.Integer(readOnly=True, attribute=lambda x: len({d.goods_id for d in x.details})),
+    'lot_numbers': fields.List(fields.String, readOnly=True, attribute=lambda x: sorted({d.lot.lot_no for d in x.details if d.lot is not None})),
+    'increase_quantity': fields.Integer(readOnly=True, attribute=lambda x: sum(max(d.adjustment_quantity or 0, 0) for d in x.details)),
+    'decrease_quantity': fields.Integer(readOnly=True, attribute=lambda x: sum(max(-(d.adjustment_quantity or 0), 0) for d in x.details)),
     'total_actual_quantity': fields.Integer(
         readOnly=True,
         attribute=lambda x: sum(
@@ -146,6 +152,8 @@ adjustment_pagination_parser.add_argument('created_by', type=int, location='args
 adjustment_pagination_parser.add_argument('warehouse_id', type=int, location='args', help='Filter by warehouse ID')
 adjustment_pagination_parser.add_argument('adjustment_reason', type=str, location='args', help='Filter by adjustment reason')
 adjustment_pagination_parser.add_argument('keyword', type=str, location='args', help='Search by adjustment id, reason, goods code / name or location code in its details')
+adjustment_pagination_parser.add_argument('awaiting_my_approval', type=inputs.boolean, location='args', help='Active pending adjustments eligible for approval by the current actor')
+adjustment_pagination_parser.add_argument('source', type=str, choices=('manual', 'cyclecount'), location='args', help='Adjustment origin')
 
 # 根据 goods 和 location 查询 Adjustment Detail 列表
 adjustment_detail_pagination_parser = pagination_parser.copy()

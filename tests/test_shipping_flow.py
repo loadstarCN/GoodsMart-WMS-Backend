@@ -127,6 +127,11 @@ def test_export_flow_through_fedex(client, access_token, fedex):
     assert _actions(steps['pickup'])['cancel_pickup']['enabled'] is True
     assert _actions(steps['pickup'])['record_pickup']['reason_code'] == 'PICKUP_EXISTS'
     assert steps['handover']['state'] == 'current'
+    deliveries = client.get('/delivery/?page=1&per_page=50', headers=_h(access_token)).get_json()['items']
+    pickup = next(row for row in deliveries if row['id'] == task_id)['pickup_summary']
+    assert pickup['method'] == 'api'
+    assert pickup['booking'] == dict(id=steps['pickup']['summary']['pickup']['id'], status='scheduled', reason=None,
+                                     date=_tomorrow(), ready_time='13:00', close_time='17:00')
 
     # 完成发货 → 运输中
     # 一小时前，但不早于仓库当地今天 0 点（实际发货日不能早于计划发货日 = 今天，否则当地凌晨跑会 400 16061）
@@ -277,6 +282,7 @@ def test_domestic_manual_flow(client, access_token):
     # 发货任务列表也带 DN 的阶段
     items = client.get('/delivery/?page=1&per_page=50', headers=_h(access_token)).get_json()['items']
     assert next(i for i in items if i['id'] == task_id)['shipping_stage'] == 'in_transit'
+    assert next(i for i in items if i['id'] == task_id)['pickup_summary'] == {'method': 'manual', 'booking': None}
 
 
 def test_packages_missing_only_when_packages_are_needed(client, access_token):

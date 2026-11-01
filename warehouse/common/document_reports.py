@@ -53,18 +53,21 @@ def document_report(kind, warehouse, export=False):
     planned = model.expected_arrival_date if inbound else model.expected_shipping_date
     actual = model.received_at if inbound else model.delivered_at
     quantity = detail.actual_quantity if inbound else detail.delivered_quantity
+    arrived_quantity = func.coalesce(quantity, 0)+(func.coalesce(detail.rejected_quantity,0) if inbound else 0)
     sums = db.session.query(
         foreign_key.label('document_id'), func.sum(detail.quantity).label('expected'),
         func.sum(quantity).label('actual'),
         func.sum(func.abs(func.coalesce(quantity, 0) - detail.quantity)).label('difference'),
-        func.sum(case((detail.quantity > func.coalesce(quantity, 0), detail.quantity-func.coalesce(quantity, 0)), else_=0)).label('short'),
-        func.sum(case((func.coalesce(quantity, 0) > detail.quantity, func.coalesce(quantity, 0)-detail.quantity), else_=0)).label('over'),
+        func.sum(case((detail.quantity > arrived_quantity, detail.quantity-arrived_quantity), else_=0)).label('short'),
+        func.sum(case((arrived_quantity > detail.quantity, arrived_quantity-detail.quantity), else_=0)).label('over'),
+        (func.sum(detail.rejected_quantity) if inbound else func.sum(literal(0))).label('rejected'),
+        (func.sum(case((detail.rejected_quantity.is_(None),1),else_=0)) if inbound else func.sum(literal(0))).label('rejection_unknown_lines'),
         (func.sum(detail.damage_quantity) if inbound else func.sum(literal(0))).label('damage'),
     ).group_by(foreign_key).subquery()
     base = db.session.query(model.id, planned.label('planned'), actual.label('actual_at'),
                             model.status, sums.c.expected, sums.c.actual,
-                            sums.c.difference, sums.c.damage, sums.c.short, sums.c.over).outerjoin(sums, sums.c.document_id == model.id).filter(
-        model.warehouse_id == warehouse.id, model.is_active.is_(True), model.status != 'closed')
+                            sums.c.difference, sums.c.damage, sums.c.short, sums.c.over, sums.c.rejected, sums.c.rejection_unknown_lines).outerjoin(sums, sums.c.document_id == model.id).filter(
+        model.warehouse_id == warehouse.id, model.is_active.is_(True))
     dimension = request.args.get('distribution_dimension')
     dimension_value = request.args.get('distribution_value')
     if dimension is not None and (inbound or dimension not in ('carrier', 'country', 'source') or dimension_value is None):
@@ -88,6 +91,11 @@ def document_report(kind, warehouse, export=False):
             Carrier, Carrier.id == CarrierShipment.carrier_id).filter(CarrierShipment.status == 'active').subquery()
         base = base.add_columns(charges.c.net_charge, charges.c.charge_currency,
             charges.c.charge_carrier_id, charges.c.charge_carrier_name).outerjoin(charges, charges.c.charge_dn_id == model.id)
+        from warehouse.dn.models import DNPackage
+        weights = db.session.query(DNPackage.dn_id.label('weighted_dn_id'),
+            func.sum(DNPackage.gross_weight_kg).label('gross_weight_kg')).group_by(DNPackage.dn_id).having(
+                func.min(DNPackage.gross_weight_kg) > 0).subquery()
+        base = base.add_columns(weights.c.gross_weight_kg).outerjoin(weights, weights.c.weighted_dn_id == model.id)
         base = base.add_columns(model.carrier_id, Carrier.name.label('carrier_name'), model.ship_to,
                                 model.api_key_id, APIKey.system_name.label('source_name')).outerjoin(
             Carrier, Carrier.id == model.carrier_id).outerjoin(APIKey, APIKey.id == model.api_key_id)
@@ -106,6 +114,8 @@ def document_report(kind, warehouse, export=False):
         if request.args[type_key] not in allowed:
             raise BadRequestException('Invalid document type', 14009)
         base = base.filter(getattr(model, type_key) == request.args[type_key])
+    issues_base = base
+    base = base.filter(model.status != 'closed')
     start, end, page, per_page = report_period(warehouse)
     today = clock.local_today(warehouse)
 
@@ -116,7 +126,7 @@ def document_report(kind, warehouse, export=False):
         slowest = None
         freight = {}
         receipt_differences = dict(documents=0, received=0, expected=0,
-            types={key:dict(quantity=0, documents=0) for key in ('short','over','damage')}, items=[], rejected=None)
+            types={key:dict(quantity=0, documents=0) for key in ('short','over','damage')}, items=[], rejected=None, rejection_unknown_documents=0)
         missing_freight = 0
         durations = {key: [] for key in ('pick', 'pack', 'handover', 'total')}
         distribution = {key: {} for key in ('carrier', 'country', 'source')}
@@ -136,9 +146,14 @@ def document_report(kind, warehouse, export=False):
                 if row.net_charge is not None and row.charge_currency:
                     freight_key = (row.charge_carrier_id, row.charge_currency.upper())
                     charge = freight.setdefault(freight_key, dict(carrier_id=row.charge_carrier_id,
-                        carrier=row.charge_carrier_name, currency=row.charge_currency.upper(), count=0, total=0))
+                        carrier=row.charge_carrier_name, currency=row.charge_currency.upper(), count=0, total=0,
+                        weighted_count=0, weighted_amount=0, gross_weight_kg=0))
                     charge['count'] += 1
                     charge['total'] += row.net_charge
+                    if row.gross_weight_kg is not None and row.gross_weight_kg > 0:
+                        charge['weighted_count'] += 1
+                        charge['weighted_amount'] += row.net_charge
+                        charge['gross_weight_kg'] += row.gross_weight_kg
                 else:
                     missing_freight += 1
                 for key, (value, label) in groups.items():
@@ -188,6 +203,12 @@ def document_report(kind, warehouse, export=False):
                     receipt_differences['received'] += 1
                     receipt_differences['expected'] += row.expected or 0
                     values = {key: getattr(row,key) or 0 for key in ('short','over','damage')}
+                    if row.rejection_unknown_lines:
+                        receipt_differences['rejection_unknown_documents'] += 1
+                    if row.rejected is not None:
+                        receipt_differences['rejected'] = (receipt_differences['rejected'] or 0)+row.rejected
+                        receipt_differences['types'].setdefault('rejected', dict(quantity=0,documents=0))
+                        values['rejected'] = row.rejected
                     if any(values.values()):
                         receipt_differences['documents'] += 1
                         if len(receipt_differences['items']) < 20:
@@ -208,7 +229,11 @@ def document_report(kind, warehouse, export=False):
         summary['on_time_rate'] = summary['on_time'] / summary['due'] if summary['due'] else None
         summary['difference_rate'] = ((summary['difference'] + summary['damage']) / summary['received_expected']
                                       if summary['received_expected'] else None)
-        return summary, items, [dict(date=key, **value) for key,value in sorted(daily.items())], distribution, {key: duration_summary(values) for key, values in durations.items()}, slowest, dict(items=[{**row, 'total':float(row['total']), 'average':float(row['total']/row['count'])} for row in freight.values()], missing=missing_freight), receipt_differences
+        freight_rows = [{**row, 'total':float(row['total']), 'average':float(row['total']/row['count']),
+                         'weighted_amount':float(row['weighted_amount']), 'gross_weight_kg':float(row['gross_weight_kg']),
+                         'per_kg':float(row['weighted_amount']/row['gross_weight_kg']) if row['gross_weight_kg'] else None}
+                        for row in freight.values()]
+        return summary, items, [dict(date=key, **value) for key,value in sorted(daily.items())], distribution, {key: duration_summary(values) for key, values in durations.items()}, slowest, dict(items=freight_rows, missing=missing_freight), receipt_differences
 
     summary, items, daily, distribution, lead_time, slowest, freight, receipt_differences = cohort(start, end)
     # Match the design's previous-month corresponding calendar dates (10/1–25 -> 9/1–25).
@@ -218,6 +243,30 @@ def document_report(kind, warehouse, export=False):
         return date(year, month, min(value.day, monthrange(year, month)[1]))
     previous_start, previous_end = previous_month(start), previous_month(end)
     previous, _, _, prior_distribution, previous_lead_time, _, previous_freight, previous_receipt_differences = cohort(previous_start, previous_end)
+    outbound_issues = previous_outbound_issues = None
+    if not inbound and not export:
+        from warehouse.shipping.stage import stage_expression
+        def issue_cohort(first, last):
+            result = dict(documents=0, exception=0, closed=0, items=[])
+            query = issues_base.add_columns(stage_expression(now=clock.now(), today=today).label('shipping_stage')).filter(
+                planned >= first, planned <= last)
+            for row in query.order_by(planned.desc(), model.id.desc()).yield_per(500):
+                country = str((row.ship_to or {}).get('country') or '').strip().upper()
+                groups = dict(carrier=str(row.carrier_id) if row.carrier_id else 'none',
+                              country=country or 'none', source=row.source_name or 'none')
+                if dimension and groups[dimension] != dimension_value:
+                    continue
+                result['documents'] += 1
+                if row.shipping_stage in ('exception', 'closed'):
+                    result[row.shipping_stage] += 1
+                    if len(result['items']) < 20:
+                        result['items'].append(dict(id=row.id, planned=row.planned.isoformat(),
+                            stage=row.shipping_stage, status=row.status, carrier=row.carrier_name))
+            for key in ('exception', 'closed'):
+                result[key+'_rate'] = result[key]/result['documents'] if result['documents'] else None
+            return result
+        outbound_issues = issue_cohort(start, end)
+        previous_outbound_issues = issue_cohort(previous_start, previous_end)
     distributions = {}
     if not inbound:
         for key in distribution:
@@ -281,7 +330,14 @@ def document_report(kind, warehouse, export=False):
                                     missing=[key for key,available in [('weight',weight),('dimensions',dimensions)] if not available]))
         spec_coverage['missing_total'] = len(missing)
         spec_coverage['missing'] = sorted(missing,key=lambda row:(-row['quantity'],row['id']))[:10]
+    putaway, previous_putaway = None, None
+    if inbound and not export:
+        from warehouse.putaway.report import putaway_timing
+        putaway = putaway_timing(warehouse, start, end, request.args.get('supplier_id'), request.args.get('asn_type'))
+        previous_putaway = putaway_timing(warehouse, previous_start, previous_end, request.args.get('supplier_id'), request.args.get('asn_type'))
     return dict(start_date=start.isoformat(), end_date=end.isoformat(), today=today.isoformat(),
+                outbound_issues=outbound_issues, previous_outbound_issues=previous_outbound_issues,
+                putaway_timing=putaway, previous_putaway_timing=previous_putaway,
                 timezone=clock.warehouse_timezone_name(warehouse), summary=summary, previous=previous,
                 previous_start=previous_start.isoformat(), previous_end=previous_end.isoformat(),
                 receipt_differences=receipt_differences if inbound else None,
@@ -292,11 +348,19 @@ def document_report(kind, warehouse, export=False):
 def export_document_report(kind, warehouse):
     import csv
     import io
-    from flask import Response
+    from flask import Response, request
+    from warehouse.goods.tabular import write_xlsx, content_type
+    fmt = request.args.get('format', 'csv')
+    if fmt not in ('csv', 'xlsx'):
+        raise BadRequestException('Unsupported report format', 14009, field='format')
     data=document_report(kind, warehouse, export=True)
+    header = ['document_id','planned_date','actual_date','status','expected','actual','damage','difference','on_time','timezone','period_start','period_end']
+    rows = ([row[key] for key in ('id','planned','actual_date','status','expected','actual','damage','difference','on_time')]+[data['timezone'],data['start_date'],data['end_date']] for row in data['items'])
+    if fmt == 'xlsx':
+        return Response(write_xlsx(kind, header, rows), mimetype=content_type('xlsx'),
+                        headers={'Content-Disposition':f'attachment; filename="{kind}_report.xlsx"'})
     output=io.StringIO(newline='')
     writer=csv.writer(output)
-    writer.writerow(['document_id','planned_date','actual_date','status','expected','actual','damage','difference','on_time','timezone','period_start','period_end'])
-    for row in data['items']:
-        writer.writerow([row[key] for key in ('id','planned','actual_date','status','expected','actual','damage','difference','on_time')]+[data['timezone'],data['start_date'],data['end_date']])
+    writer.writerow(header)
+    writer.writerows(rows)
     return Response('\ufeff'+output.getvalue(),mimetype='text/csv',headers={'Content-Disposition':f'attachment; filename="{kind}_report.csv"'})

@@ -37,6 +37,11 @@ def test_ledger_list_filters_and_export(client, access_token):
     _inbound(client, access_token, w, [(g, 10)], [(g, w['std1'], 6)])
     body = _ok(client.get(f'/stock-ledger/?goods_id={g}', headers=_wh(access_token, w['wh'])))
     assert [i['movement_type'] for i in body['items']] == ['putaway', 'putaway', 'sort_in']
+    unassigned = _ok(client.get(f'/stock-ledger/?goods_id={g}&lot_id=0&location_id={w["std1"]}', headers=_wh(access_token, w['wh'])))
+    assert unassigned['total'] == 1 and unassigned['items'][0]['quantity'] == 6
+    assert _ok(client.get(f'/stock-ledger/?goods_id={g}&lot_id=999999', headers=_wh(access_token, w['wh'])))['total'] == 0
+    overview = _ok(client.get(f'/stock-ledger/overview?goods_id={g}&lot_id=0&location_id={w["std1"]}', headers=_wh(access_token, w['wh'])))
+    assert overview['totals']['closing'] == 6
     first = body['items'][-1]
     assert first['goods'] == {'id': g, 'code': 'GRD-1', 'name': 'guard-1'} and first['stock_type'] == 'pending'
     assert first['balance_after'] == 10 and first['source'] == 'web' and first['operator']['user_name'] == 'admin'
@@ -142,6 +147,14 @@ def test_inventory_by_location(client, access_token):
     shelves = _ok(client.get('/inventory/by-location?group_by=shelf', headers=_wh(access_token, w['wh'])))['items']
     grd = next(s for s in shelves if s['shelf'] == 'GRD')
     assert (grd['location_count'], grd['occupied_count'], grd['quantity']) == (2, 1, 13)
+    assert grd['sized_location_count'] == 1 and grd['volume_unknown_quantity'] == 3
+    assert summary['volume_unknown_quantity'] == 3
+    exact = _ok(client.get('/inventory/by-location?shelf=GRD', headers=_wh(access_token, w['wh'])))
+    assert exact['total'] == 2 and exact['summary']['quantity'] == 13
+    exact_items = _ok(client.get('/inventory/by-location/items?shelf=GRD', headers=_wh(access_token, w['wh'])))
+    assert sum(row['quantity'] for row in exact_items['items']) == 13
+    assert _ok(client.get('/inventory/by-location?shelf=GR', headers=_wh(access_token, w['wh'])))['total'] == 0
+    assert _ok(client.get('/inventory/by-location?shelf=GRD-STD2&shelf_levels=2', headers=_wh(access_token, w['wh'])))['total'] == 1
     prefix = _ok(client.get('/inventory/by-location?group_by=shelf&shelf_prefix_length=3',
                             headers=_wh(access_token, w['wh'])))['items']
     assert {s['shelf'] for s in prefix} >= {'GRD', 'LOC'}
@@ -268,6 +281,12 @@ def test_history_legacy_snapshot_coverage(client, access_token):
     assert by_goods[w['g1']]['coverage'] == 'on_shelf_only'
     assert by_goods[w['g1']]['total'] == 9
     assert by_goods[w['g2']]['coverage'] == 'none'
+    detail = _ok(client.get(f"/inventory/metrics/goods/{w['g1']}", headers=_wh(access_token, w['wh'])))
+    detail_days = {row['date']: row for row in detail['daily']}
+    assert detail_days[day]['coverage'] == 'on_shelf_only' and detail_days[day]['stock'] == 9
+    assert detail_days[(today-timedelta(days=30)).isoformat()]['coverage'] == 'none'
+    assert detail_days[today.isoformat()]['coverage'] == 'full'
+    assert all({'inbound', 'outbound', 'adjust_loss'} <= set(row) for row in detail['daily'])
 
 
 def test_history_flows(client, access_token):
@@ -280,6 +299,32 @@ def test_history_flows(client, access_token):
     today = body['items'][-1]
     assert (today['date'], today['inbound'], today['sort_in'], today['outbound']) == \
         (clock.local_today(w['wh']).isoformat(), 10, 10, 4)
+    detail = _ok(client.get(f'/inventory/metrics/goods/{g}', headers=_wh(access_token, w['wh'])))
+    distribution = detail['flow_distribution']
+    assert distribution['outbound'] == sum(row['outbound'] for row in detail['daily']) == 4
+    assert distribution['inbound'] == sum(row['inbound'] for row in detail['daily']) == 10
+    for key in ('recipient', 'country', 'source'):
+        assert sum(row['quantity'] for row in distribution[key]) == 4
+    assert sum(row['quantity'] for row in distribution['supplier']) == 10
+    assert sum(row['documents'] for row in distribution['supplier']) == 1
+    assert sum(row['dated_documents'] for row in distribution['supplier']) == 0
+    assert distribution['supplier'][0]['on_time_rate'] is None
+    for key in ('recipient', 'country', 'source', 'supplier'):
+        for row in distribution[key]:
+            assert sum(entry['quantity'] for entry in row['entries']) == row['quantity']
+            assert all(entry['id'] for entry in row['entries'])
+            path = 'asn' if key == 'supplier' else 'dn'
+            for entry in row['entries']:
+                document = _ok(client.get(f'/{path}/{entry["id"]}', headers=_wh(access_token, w['wh'])))
+                assert document['order_number'] == entry['order_number']
+    with client.application.app_context():
+        from warehouse.asn.models import ASN, ASNDetail
+        receipt = ASN.query.join(ASNDetail).filter(ASN.warehouse_id == w['wh'], ASNDetail.goods_id == g).one()
+        receipt.expected_arrival_date = clock.local_today(w['wh'])
+        receipt.received_at = clock.local_midnight(receipt.expected_arrival_date, w['wh'])
+        db.session.commit()
+    dated = _ok(client.get(f'/inventory/metrics/goods/{g}', headers=_wh(access_token, w['wh'])))['flow_distribution']['supplier'][0]
+    assert dated['dated_documents'] == dated['on_time'] == 1 and dated['on_time_rate'] == 1
 
 
 # ---------------------------------------------------------------------------
@@ -423,6 +468,14 @@ def test_thresholds_by_filter_and_suggest(client, access_token):
     assert (rows['GRD-1']['avg_daily_out'], rows['GRD-1']['suggested_low'], rows['GRD-1']['suggested_high']) == \
         (1.0, 14, 90)
     assert rows['GRD-1']['current_low'] == 7
+    assert rows['GRD-1']['suggested_replenishment'] == 0
+    assert rows['GRD-2']['suggested_replenishment'] is None
+    from tests.test_inventory_guards import _create_asn
+    _create_asn(client, access_token, w, [(g1, 7)])
+    replenishment = _ok(client.get(f'/inventory/thresholds/suggest?goods_ids={g1}&cover_days=60', headers=headers))['items'][0]
+    assert replenishment['incoming_stock'] == 7
+    assert replenishment['available_stock_for_sale'] == 30
+    assert replenishment['suggested_replenishment'] == 23
     assert rows['GRD-2']['suggested_low'] is None                 # 近 90 天没有出库不给建议
     assert suggest['params'] == {'window_days': 30, 'cover_days': 14, 'overstock_days': 90, 'min_quantity': 1}
 

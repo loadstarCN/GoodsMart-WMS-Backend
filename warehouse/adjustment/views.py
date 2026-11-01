@@ -62,8 +62,11 @@ class AdjustmentList(Resource):
             'created_by': args.get('created_by'),
             'warehouse_id': args.get('warehouse_id'),
             'keyword': args.get('keyword'),
+            'source': args.get('source'),
         }
         filters = add_warehouse_filter(filters)
+        if args.get('awaiting_my_approval'):
+            filters['awaiting_approver_id'] = require_actor_user_id()
 
         query = AdjustmentService.list_adjustments(filters)
         return paginate(query, page, per_page)

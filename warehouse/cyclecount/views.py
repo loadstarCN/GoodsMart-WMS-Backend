@@ -69,7 +69,8 @@ class CycleCountTaskList(Resource):
             'scheduled_start_date': args.get('scheduled_start_date'),
             'scheduled_end_date': args.get('scheduled_end_date'),
             'warehouse_id': args.get('warehouse_id'),
-            'keyword': args.get('keyword')
+            'keyword': args.get('keyword'),
+            'has_variance': args.get('has_variance'),
         }
 
         filters = add_warehouse_filter(filters)
@@ -382,3 +383,34 @@ class CycleCountAccuracyReport(Resource):
     def get(self):
         from .report import accuracy_report
         return accuracy_report(g.warehouse)
+
+
+@api_ns.route('/<int:task_id>/supplements/')
+class CycleCountSupplement(Resource):
+    @permission_required(['all_access', 'company_all_access', 'cycle_count_edit'])
+    @warehouse_required()
+    @api_ns.marshal_with(cycle_count_task_detail_model)
+    def post(self, task_id):
+        from .supplement import add_supplement
+        _get_owned_task(task_id)
+        return add_supplement(task_id, api_ns.payload, require_actor_user_id()), 201
+
+
+@api_ns.route('/<int:task_id>/supplements/<int:detail_id>')
+class CycleCountSupplementItem(Resource):
+    @permission_required(['all_access', 'company_all_access', 'cycle_count_edit'])
+    @warehouse_required()
+    def delete(self, task_id, detail_id):
+        from .supplement import remove_supplement
+        _get_owned_task(task_id)
+        remove_supplement(task_id, detail_id)
+        return {'message': 'Supplement removed'}, 200
+
+
+@api_ns.route('/<int:task_id>/route-plan')
+class CycleCountRoutePlan(Resource):
+    @permission_required(["all_access", "company_all_access", "cycle_count_read"])
+    @warehouse_required()
+    def get(self, task_id):
+        from .route_plan import route_plan
+        return route_plan(_get_owned_task(task_id))

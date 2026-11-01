@@ -59,6 +59,10 @@ user_model = api_ns.model('User', {
     'refresh_token_expires_at': fields.DateTime(description='Refresh Token Expires Time'),
     'type': fields.String(description='User Type'),
     'company_name': fields.String(readOnly=True, description='Company Name'),
+    'company_id': fields.Integer(readOnly=True),
+    'company_status': fields.String(readOnly=True),
+    'last_login_at': fields.DateTime(readOnly=True),
+    'role_labels': fields.Raw(readOnly=True, attribute=lambda user: {role.name: role.display_name for role in user.roles if role.display_name}),
 })
 
 # -----------------------------
@@ -73,6 +77,10 @@ user_input_model = api_ns.model('UserInput', user_input_fields)
 # 定义用于输入的 Role 模型：从 Role 输出模型复制后删除只读字段
 # -----------------------------
 role_model = api_ns.model('Role', {
+    'user_count': fields.Integer(readOnly=True, description='Assigned accounts, limited to the tenant for tenant actors'),
+    'company_id': fields.Integer(readOnly=True),
+    'display_name': fields.String(readOnly=True),
+    'revision': fields.Integer(readOnly=True),
     'id': fields.Integer(readOnly=True, description='Role ID'),
     'name': fields.String(required=True, description='Role Name'),
     'permissions': fields.List(
@@ -120,6 +128,7 @@ pagination_parser.add_argument('username', type=str, location='args', help='Filt
 pagination_parser.add_argument('email', type=str, location='args', help='Filter users by email')
 pagination_parser.add_argument('name', type=str, location='args', help='Filter roles / permissions by name')
 pagination_parser.add_argument('type', type=str, location='args', help='Filter users by type (user / staff)')
+pagination_parser.add_argument('company_id', type=int, location='args', help='Filter users by company')
 
 # 创建分页模型
 user_pagination_model = create_pagination_model(api_ns, user_model)

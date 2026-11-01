@@ -33,7 +33,8 @@ def ledger_query(filters: dict):
         query = query.filter(StockLedger.company_id == filters['company_id'])
     for field in ('goods_id', 'lot_id', 'location_id', 'doc_id', 'operator_id', 'doc_line_id'):
         if filters.get(field) is not None:
-            query = query.filter(getattr(StockLedger, field) == filters[field])
+            column = getattr(StockLedger, field)
+            query = query.filter(column.is_(None) if field == 'lot_id' and filters[field] == 0 else column == filters[field])
     for field, column in (('stock_types', StockLedger.stock_type), ('movement_types', StockLedger.movement_type),
                           ('doc_types', StockLedger.doc_type), ('sources', StockLedger.source)):
         if filters.get(field):
@@ -149,7 +150,7 @@ def _scope_summary(query, filters):
     if filters.get('location_id') is not None:
         query = query.filter(StockLedger.location_id == filters['location_id'])
     if filters.get('lot_id') is not None:
-        query = query.filter(StockLedger.lot_id == filters['lot_id'])
+        query = query.filter(StockLedger.lot_id.is_(None) if filters['lot_id'] == 0 else StockLedger.lot_id == filters['lot_id'])
     if (filters.get('keyword') or filters.get('goods_code') or any(
             filters.get(key) is not None for key in ('category', 'brand', 'category_missing', 'brand_missing'))):
         query = query.join(Goods, Goods.id == StockLedger.goods_id)
@@ -217,8 +218,12 @@ def location_stock(filters: dict):
     """库位与其库存：[(Location, [(GoodsLocation, Goods)])]；filters：warehouse_id / warehouse_ids / location_id /
     location_type / keyword（库位编码、商品编码 / 名称）/ include_empty / include_inactive"""
     from warehouse.goods.models import Goods, GoodsLocation
+    from sqlalchemy.orm import joinedload
     from warehouse.location.models import Location
     query = Location.query
+    if filters.get('zone') is not None:
+        from warehouse.location.services import LocationService
+        query = query.filter(LocationService.zone_expression()==filters['zone'])
     if filters.get('warehouse_id'):
         query = query.filter(Location.warehouse_id == filters['warehouse_id'])
     if filters.get('warehouse_ids'):
@@ -230,9 +235,16 @@ def location_stock(filters: dict):
     if not filters.get('include_inactive'):
         query = query.filter(Location.is_active == True)
     locations = query.order_by(Location.code, Location.id).all()
+    if filters.get('shelf') is not None:
+        locations = [location for location in locations if shelf_of(location.code,
+            filters.get('shelf_separator', '-'), filters.get('shelf_levels', 1),
+            filters.get('shelf_prefix_length')) == filters['shelf']]
     if not locations:
         return []
-    rows = (db.session.query(GoodsLocation, Goods).join(Goods, Goods.id == GoodsLocation.goods_id)
+    from warehouse.inventory.analysis_scope import has_scope, goods_query
+    scoped_goods = goods_query(filters) if has_scope(filters) else None
+    rows = (db.session.query(GoodsLocation, Goods).options(joinedload(GoodsLocation.lot)).join(Goods, Goods.id == GoodsLocation.goods_id)
+            .filter(Goods.id.in_(scoped_goods) if scoped_goods is not None else True)
             .filter(GoodsLocation.location_id.in_([l.id for l in locations]), GoodsLocation.quantity > 0)
             .order_by(Goods.code, GoodsLocation.id).all())
     by_location = defaultdict(list)
@@ -308,6 +320,7 @@ def occupancy(summaries) -> dict:
         'occupancy_rate': round(occupied / total, 4) if total else None,
         'quantity': sum(s['quantity'] for s in summaries),
         'sized_location_count': len(sized),
+        'volume_unknown_quantity': sum(s['volume_unknown_quantity'] or 0 for s in sized) if sized else None,
         'capacity_m3': round(capacity, 6) if sized else None,
         'used_volume_m3': round(used, 6) if sized else None,
         'volume_utilization': round(used / capacity, 4) if capacity else None,

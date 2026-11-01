@@ -92,6 +92,21 @@ class DNPackagesResource(Resource):
         return CustomsService.replace_packages(dn, api_ns.payload, require_actor_user_id()), 200
 
 
+@api_ns.route('/<int:dn_id>/package-contents')
+class PackageContents(Resource):
+    @permission_required(_READ)
+    @warehouse_required()
+    def get(self, dn_id):
+        from .package_contents import options
+        return options(_owned_dn(dn_id))
+
+    @permission_required(_PACKING_EDIT)
+    @warehouse_required()
+    def put(self, dn_id):
+        from .package_contents import save
+        return save(_owned_dn(dn_id), api_ns.payload)
+
+
 @api_ns.doc(security="jsonWebToken")
 @api_ns.route('/<int:dn_id>/customs-documents/issue')
 class DNCustomsDocumentIssue(Resource):

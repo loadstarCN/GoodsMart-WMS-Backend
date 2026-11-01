@@ -67,6 +67,10 @@ BUILTIN_PERMISSIONS = [
     ("carrier_read", "查看承运商列表和详情"),
     ("carrier_edit", "创建或编辑承运商"),
     ("carrier_delete", "删除承运商"),
+    ("freight_read", "查看运费账单和对账"),
+    ("company_roles_read", "查看公司角色"),
+    ("company_roles_edit", "管理公司角色"),
+    ("freight_edit", "导入、核对和确认运费账单"),
 
     # 仓库 - 收货人
     ("recipient_read", "查看收货人列表和详情"),

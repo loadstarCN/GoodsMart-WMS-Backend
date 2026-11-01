@@ -89,6 +89,54 @@ class GoodsLot(db.Model):
     created_by = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
     created_at = db.Column(UTCDateTime, default=db.func.now())
     updated_at = db.Column(UTCDateTime, default=db.func.now(), onupdate=db.func.now())
+    date_revision = db.Column(db.Integer, nullable=False, default=0, server_default='0')
+
+
+class GoodsLotDateChange(db.Model):
+    """Append-only metadata audit; never a physical stock movement."""
+    __tablename__ = 'goods_lot_date_changes'
+    id = _bigint_pk()
+    lot_id = db.Column(db.Integer, db.ForeignKey('goods_lots.id', ondelete='RESTRICT'), nullable=False, index=True)
+    revision = db.Column(db.Integer, nullable=False)
+    before_production_date = db.Column(db.Date)
+    before_expiry_date = db.Column(db.Date)
+    production_date = db.Column(db.Date)
+    expiry_date = db.Column(db.Date)
+    reason = db.Column(db.String(255), nullable=False)
+    operator_id = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='SET NULL'))
+    created_at = db.Column(UTCDateTime, nullable=False, default=db.func.now())
+    operator = db.relationship('User', lazy='joined')
+    __table_args__ = (db.UniqueConstraint('lot_id', 'revision', name='uq_lot_date_revision'),)
+
+
+class CompanyLotRules(db.Model):
+    __tablename__ = 'company_lot_rules'
+    company_id = db.Column(db.Integer, db.ForeignKey('companies.id', ondelete='CASCADE'), primary_key=True)
+    revision = db.Column(db.Integer, nullable=False, default=0)
+    defaults = db.Column(db.JSON, nullable=False, default=dict)
+    categories = db.Column(db.JSON, nullable=False, default=dict)
+
+
+class GoodsLotRules(db.Model):
+    __tablename__ = 'goods_lot_rules'
+    goods_id = db.Column(db.Integer, db.ForeignKey('goods.id', ondelete='CASCADE'), primary_key=True)
+    revision = db.Column(db.Integer, nullable=False, default=0)
+    overrides = db.Column(db.JSON, nullable=False, default=dict)
+
+
+class DNStockAllocation(db.Model):
+    """Immutable picked lot provenance, with the packed portion retained through shipment/signing."""
+    __tablename__ = 'dn_stock_allocations'
+    __table_args__ = (
+        db.Index('uix_dn_stock_allocation', 'dn_id', 'goods_id', db.text('coalesce(lot_id, 0)'), unique=True),
+        db.CheckConstraint('picked_quantity >= 0 AND packed_quantity >= 0 AND packed_quantity <= picked_quantity', name='chk_dn_lot_quantities'),
+    )
+    id = db.Column(db.Integer, primary_key=True)
+    dn_id = db.Column(db.Integer, db.ForeignKey('dn.id', ondelete='RESTRICT'), nullable=False)
+    goods_id = db.Column(db.Integer, db.ForeignKey('goods.id', ondelete='RESTRICT'), nullable=False)
+    lot_id = db.Column(db.Integer, db.ForeignKey('goods_lots.id', ondelete='RESTRICT'), nullable=True)
+    picked_quantity = db.Column(db.Integer, nullable=False, default=0)
+    packed_quantity = db.Column(db.Integer, nullable=False, default=0)
 
 
 class InventoryLotStock(db.Model):

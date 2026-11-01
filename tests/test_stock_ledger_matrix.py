@@ -166,17 +166,26 @@ def test_entry_pack_and_short_return(client, access_token):
     assert {l['doc_line_id'] for l in lines} == {detail_id}
 
 
-def test_entry_ship_and_sign(client, access_token):
+@pytest.mark.parametrize('hours_ago', [1, 3, 25])
+def test_entry_ship_and_sign(client, access_token, hours_ago):
     from datetime import timedelta
     from warehouse.common import clock
     w = _world(client)
     g = w['g1']
     _inbound(client, access_token, w, [(g, 10)], [(g, w['std1'], 10)])
     dn_id, packing_id = _picked_dn(client, access_token, w, [(g, 4)], [(g, w['std1'], 4)])
+    shipped_at = (clock.now() - timedelta(hours=hours_ago)).replace(microsecond=0)
+    # This test intentionally backdates shipment. Its planned date must also
+    # permit that date, including runs just after midnight; production validation
+    # rejecting shipment before its planned date remains unchanged.
+    with client.application.app_context():
+        dn = db.session.get(DN, dn_id)
+        dn.expected_shipping_date = clock.local_date(shipped_at, dn)
+        db.session.commit()
+    # Packing copies the planned date into the delivery task.
     _pack(client, access_token, packing_id, g, 4)
     delivery_id = _task_ids(client, DeliveryTask, dn_id=dn_id)[0]
     _ok(client.put(f'/delivery/{delivery_id}/process/', headers=_h(access_token)))
-    shipped_at = (clock.now() - timedelta(hours=3)).replace(microsecond=0)
     _ok(client.put(f'/delivery/{delivery_id}/complete/', json={'shipped_at': shipped_at.isoformat()},
                    headers=_h(access_token)))
     ship = _lines(client, doc_type='dn', doc_id=dn_id, movement_type='ship')

@@ -18,6 +18,7 @@ from warehouse.warehouse.models import Warehouse
 from system.webhook.services import emit as webhook_emit
 from .models import ASN, ASNDetail
 from .spec_capture import apply_spec_capture, line_spec_pending, pending_condition
+from .announced_lots import validate_announced_lots
 
 
 class ASNService:
@@ -33,7 +34,7 @@ class ASNService:
         'expected_arrival_date', 'order_number', 'remark',
     )
     # 明细允许写入的字段。actual / sorted / damage_quantity 是分拣完成时聚合得出的过程量。
-    DETAIL_WRITABLE_FIELDS = ('quantity', 'weight', 'volume', 'remark')
+    DETAIL_WRITABLE_FIELDS = ('quantity', 'weight', 'volume', 'remark', 'announced_lots')
 
     # --------------------------------------
     # ASNService私有方法
@@ -125,6 +126,8 @@ class ASNService:
                 payload[field] = optional_number(item[field], field)
         if 'remark' in item:
             payload['remark'] = item['remark']
+        if 'announced_lots' in item:
+            payload['announced_lots'] = validate_announced_lots(item['announced_lots'], payload.get('quantity'))
         return payload
 
     @staticmethod
@@ -196,6 +199,7 @@ class ASNService:
                 SortingTaskDetail.goods_id,
                 func.coalesce(func.sum(SortingTaskDetail.sorted_quantity), 0),
                 func.coalesce(func.sum(SortingTaskDetail.damage_quantity), 0),
+                func.coalesce(func.sum(SortingTaskDetail.rejected_quantity), 0),
             )
             .join(SortingTask, SortingTaskDetail.sorting_task_id == SortingTask.id)
             .filter(
@@ -206,19 +210,20 @@ class ASNService:
             .group_by(SortingTaskDetail.goods_id)
             .all()
         )
-        totals = {goods_id: (sorted_qty, damage_qty) for goods_id, sorted_qty, damage_qty in rows}
+        totals = {goods_id: (sorted_qty, damage_qty, rejected_qty) for goods_id, sorted_qty, damage_qty, rejected_qty in rows}
 
         # 分拣量按商品汇总，只记到该商品的第一行明细上：新单据已禁止同一商品多行（16025），
         # 存量单据若有重复行，其余行记 0，避免 asn_completed 逐行累加时重复入账。
         seen_goods = set()
         for asn_detail in sorted(asn.details, key=lambda d: d.id):
             if asn_detail.goods_id in seen_goods:
-                sorted_quantity, damage_quantity = 0, 0
+                sorted_quantity, damage_quantity, rejected_quantity = 0, 0, 0
             else:
                 seen_goods.add(asn_detail.goods_id)
-                sorted_quantity, damage_quantity = totals.get(asn_detail.goods_id, (0, 0))
+                sorted_quantity, damage_quantity, rejected_quantity = totals.get(asn_detail.goods_id, (0, 0, 0))
             asn_detail.sorted_quantity = sorted_quantity
             asn_detail.damage_quantity = damage_quantity
+            asn_detail.rejected_quantity = rejected_quantity
             asn_detail.actual_quantity = sorted_quantity + damage_quantity
 
         db.session.add_all(asn.details)
@@ -261,6 +266,9 @@ class ASNService:
             query = query.filter(ASN.supplier_id == filters['supplier_id'])
         if filters.get('carrier_id'):
             query = query.filter(ASN.carrier_id == filters['carrier_id'])
+        if filters.get('warehouse_todo_date'):
+            query = query.filter(ASN.expected_arrival_date == filters['warehouse_todo_date'],
+                                 ASN.is_active.is_(True), ASN.status.in_(['pending']))
         if filters.get('expected_arrival_date'):
             query = query.filter(ASN.expected_arrival_date >= filters['expected_arrival_date'])
         if filters.get('created_by'):
@@ -522,6 +530,8 @@ class ASNService:
         for field, value in payload.items():
             setattr(detail, field, value)
 
+        validate_announced_lots(detail.announced_lots, detail.quantity)
+
         db.session.add(detail)
         db.session.flush()
         ASNService._assert_no_duplicate_goods(asn.id)
@@ -570,6 +580,10 @@ class ASNService:
                         setattr(detail, field, optional_number(item[field], field))
                 if 'remark' in item:
                     detail.remark = item['remark']
+                if 'announced_lots' in item:
+                    detail.announced_lots = validate_announced_lots(item['announced_lots'], detail.quantity)
+                else:
+                    validate_announced_lots(detail.announced_lots, detail.quantity)
                 db.session.add(detail)
                 new_detail_ids.add(detail_id)
             else:
@@ -689,11 +703,29 @@ class ASNService:
         # 更新库存信息：实收按 sort_in 记账（库存流水，warehouse/stock/service.py），一张 ASN 一笔
         from warehouse.stock.service import StockOp
         stock_op = StockOp(asn.warehouse_id, 'sort_in', doc_type='asn', doc_id=asn.id, doc_no=asn.order_number)
+        from warehouse.sorting.models import SortingTask, SortingTaskDetail
+        lot_rows = (db.session.query(SortingTaskDetail.goods_id, SortingTaskDetail.lot_id,
+                    func.sum(SortingTaskDetail.sorted_quantity), func.sum(SortingTaskDetail.damage_quantity))
+                    .join(SortingTask).filter(SortingTask.asn_id == asn.id, SortingTask.is_active.is_(True),
+                                               SortingTask.status == 'completed')
+                    .group_by(SortingTaskDetail.goods_id, SortingTaskDetail.lot_id).all())
+        by_goods = {}
+        for gid, lot_id, good, bad in lot_rows:
+            by_goods.setdefault(gid, []).append((lot_id, good or 0, bad or 0))
         for detail in asn.details:
             # 实收 = 良品 + 破损；破损部分同时记进待上架·破损（sorted_damage_stock），之后只能上到 damaged 库位
             InventoryService.asn_completed(detail.goods_id, asn.warehouse_id, detail.quantity, detail.actual_quantity,
-                                           detail.damage_quantity or 0, op=stock_op, doc_line_id=detail.id)
+                                           detail.damage_quantity or 0, op=stock_op, doc_line_id=detail.id,
+                                           lot_quantities=by_goods.pop(detail.goods_id, []) if detail.actual_quantity else [])
         stock_op.commit()
+
+        from warehouse.putaway.models import ReceiptPendingStock
+        asn.putaway_tracked = True
+        for gid, lot_id, good, bad in lot_rows:
+            if (good or 0)+(bad or 0) > 0:
+                db.session.add(ReceiptPendingStock(asn_id=asn.id, warehouse_id=asn.warehouse_id,
+                    goods_id=gid, lot_id=lot_id, good_received=good or 0, damaged_received=bad or 0,
+                    good_remaining=good or 0, damaged_remaining=bad or 0))
 
         webhook_emit('asn.completed', {
             'asn_id': asn.id, 'status': 'completed', 'order_number': asn.order_number,

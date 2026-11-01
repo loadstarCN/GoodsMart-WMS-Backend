@@ -340,9 +340,18 @@ def _stock_rows(goods_ids, scope) -> dict:
     ).filter(Inventory.goods_id.in_(goods_ids))
     if scope is not None:
         query = query.filter(Inventory.warehouse_id.in_(scope))
-    return {row[0]: {'stock_on_hand': int(row[1] or 0), 'stock_available': int(row[2] or 0),
+    result = {row[0]: {'stock_on_hand': int(row[1] or 0), 'stock_available': int(row[2] or 0),
                      'stock_pending_putaway': int(row[3] or 0), 'stock_damaged': int(row[4] or 0)}
             for row in query.group_by(Inventory.goods_id).all()}
+    from warehouse.stock.lot_policy import blocked_stock_map
+    pairs = db.session.query(Inventory.goods_id, Inventory.warehouse_id).filter(Inventory.goods_id.in_(goods_ids))
+    if scope is not None:
+        pairs = pairs.filter(Inventory.warehouse_id.in_(scope))
+    for (gid, _), blocked in blocked_stock_map(pairs.all()).items():
+        if gid in result:
+            result[gid]['stock_available'] -= blocked
+    return result
+
 
 
 def _user_names(user_ids) -> dict:

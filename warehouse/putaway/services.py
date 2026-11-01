@@ -84,6 +84,9 @@ class PutawayService:
         """
         require_fields(data, 'goods_id', 'location_id', 'quantity')
         goods_id = data['goods_id']
+        from warehouse.stock.lots import lot_for_goods
+        lot = lot_for_goods(goods_id, data.get('lot_id'))
+        lot_id = lot.id if lot else None
         location_id = data['location_id']
         quantity = require_positive_int(data['quantity'], 'quantity')
         get_object_or_404(Goods, goods_id)
@@ -92,8 +95,13 @@ class PutawayService:
         location = LocationService.require_active_location(
             lock_row(get_object_or_404(Location, location_id), shared=True))
 
+        from .provenance import consume
+        source, good, damaged = consume(goods_id, location, lot_id, quantity, data.get('receipt_source_id'))
         new_record = PutawayRecord(
             goods_id=goods_id,
+            lot_id=lot_id,
+            receipt_source_id=source.id if source else None,
+            putaway_time=clock.now(),
             location_id=location_id,
             quantity=quantity,
             remark=data.get('remark', ''),
@@ -104,9 +112,11 @@ class PutawayService:
 
         # 记账（StockService：库存行 → 库位库存行 → 待上架行依次加锁，库位库存行没有就新建）：待上架 → 库位。
         # 破损品只能上到 damaged 库位（standard / return 库位只能用待上架的良品部分，超出 400 15016；不足 15007）
-        StockOp(location.warehouse_id, 'putaway', doc_type='putaway', doc_id=new_record.id,
-                operator_id=created_by_id, remark=data.get('remark') or None).move(
-            goods_id, quantity, src=Leg.pending_for(location.location_type), dst=Leg.at(location_id)).commit()
+        op = StockOp(location.warehouse_id, 'putaway', doc_type='putaway', doc_id=new_record.id,
+                operator_id=created_by_id, remark=data.get('remark') or None)
+        op.move(goods_id, good, src=Leg.pending(lot_id), dst=Leg.at(location_id, lot_id))
+        op.move(goods_id, damaged, src=Leg.pending(lot_id, damaged=True), dst=Leg.at(location_id, lot_id))
+        op.commit()
 
         # db.session.commit()
         return new_record

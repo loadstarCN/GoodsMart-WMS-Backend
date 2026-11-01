@@ -22,6 +22,8 @@ location_model = api_ns.model('Location', location_model)
 # -----------------------------
 transfer_record_base_model = api_ns.model('TransferRecordBase', {
     'id': fields.Integer(readOnly=True, description='Transfer Record ID'),
+    'lot_id': fields.Integer(description='Product lot ID; null means unassigned'),
+    'lot_no': fields.String(attribute='lot.lot_no', readOnly=True),
     'goods_id': fields.Integer(required=True, description='ID of the Goods being transferred'),
     'goods_code': fields.String(attribute = 'goods.code',readOnly=True, description='Code of the Goods being put away'),
     'from_location_id': fields.Integer(required=True, description='ID of the source Location'),

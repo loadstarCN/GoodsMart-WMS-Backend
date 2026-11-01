@@ -123,6 +123,11 @@ class LocationService:
             query = query.filter(Location.code.ilike(f"%{filters['code']}%"))
         if filters.get('zone') is not None:
             query = query.filter(LocationService.zone_expression() == filters['zone'])
+        if filters.get('occupancy'):
+            from warehouse.goods.models import GoodsLocation
+            occupied = db.session.query(GoodsLocation.id).filter(
+                GoodsLocation.location_id == Location.id, GoodsLocation.quantity > 0).exists()
+            query = query.filter(occupied if filters['occupancy'] == 'occupied' else ~occupied)
 
         # 如果 filters 中没有 is_active 或其值为 None，则只返回 is_active=True
         if 'is_active' not in filters or filters['is_active'] is None:
@@ -153,7 +158,10 @@ class LocationService:
         创建新库位（尺寸 / 容量：空串 → null，必须 > 0，否则 400 16115）
         """
         numbers = LocationService._clean_numbers(data)
+        from .ordering import position_fields
+        position = position_fields(data,data['warehouse_id'])
         new_location = Location(
+            **position,
             warehouse_id=data['warehouse_id'],
             code=data['code'],
             description=data.get('description'),
@@ -178,6 +186,9 @@ class LocationService:
         """
         # 先锁库位行并重读：与并发的上架 / 移库入（同样先锁目标库位）串行，存量判断看到的是已提交的数量
         location = lock_row(LocationService.get_location(location_id))
+        from .ordering import position_fields
+        for key, value in position_fields(data,location.warehouse_id,location).items():
+            setattr(location, key, value)
         numbers = LocationService._clean_numbers(data)
 
         deactivating = bool(location.is_active) and not data.get('is_active', location.is_active)

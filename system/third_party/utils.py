@@ -60,6 +60,7 @@ def _apply_api_key(key_entry):
         _check_api_key_company(key_entry.company_id)
 
     g.current_system = {"api_key": key_entry}
+    g.authenticated_api_key_id = key_entry.id
     # 设置 API Key 关联的 company_id（数据隔离）
     if key_entry.company_id:
         g.api_key_company_id = key_entry.company_id
