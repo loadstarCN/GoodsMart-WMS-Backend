@@ -1,4 +1,5 @@
 from datetime import timedelta
+from sqlalchemy import text
 
 from tests.helpers import *
 from tests.test_inventory_guards import _world, _ok, _h, _create_asn, _task_ids
@@ -20,6 +21,14 @@ def receive_lots(client, token, w):
                 if db.session.get(batch_model, detail.batch_id) is None:
                     db.session.add(batch_model(id=detail.batch_id, **{task_key: getattr(detail, task_key)}, operator_id=w['admin']))
                     db.session.flush()
+            # PostgreSQL 的 SERIAL 序列不会随显式插入的 id 前移；补齐历史夹具后同步序列，
+            # 避免下一次真实批次 INSERT 与这些父记录冲突（SQLite 会自动前移）。
+            if db.engine.dialect.name == 'postgresql':
+                table = batch_model.__tablename__
+                db.session.execute(text(
+                    f"SELECT setval(pg_get_serial_sequence(:table, 'id'), "
+                    f"COALESCE(MAX(id), 1), MAX(id) IS NOT NULL) FROM {table}"
+                ), {'table': table})
         today = clock.local_today(w['wh'])
         a = GoodsLot(goods_id=w['g1'], lot_no='LOT-A', expiry_date=today + timedelta(days=30))
         b = GoodsLot(goods_id=w['g1'], lot_no='LOT-B', expiry_date=today + timedelta(days=90))

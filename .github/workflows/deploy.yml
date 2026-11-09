@@ -21,7 +21,7 @@ on:
   push:
     branches: [main]
   # 应急用：服务已经挂了（部署前探测不到）但需要靠部署修复时，在 Actions 页面手动运行并勾选 skip_precheck。
-  # 无论从哪个分支触发，服务器上部署的都是 origin/main；下面的 if 只允许在 main 上手动运行
+  # 只允许在 main 上手动运行；部署触发本次运行且已通过测试的提交
   workflow_dispatch:
     inputs:
       skip_precheck:
@@ -45,7 +45,12 @@ env:
   LOCK_TIMEOUT: 15s
 
 jobs:
+  validate:
+    if: github.ref == 'refs/heads/main'
+    uses: ./.github/workflows/test-postgres.yml
+
   deploy:
+    needs: validate
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 40
@@ -189,16 +194,18 @@ jobs:
               return 0
             }
 
-            # ---- 3. 跟上远端 main：用 fetch + reset --keep 而不是 pull（2026-09-30 改写过历史，pull 会因分叉失败）
+            # ---- 3. 获取 main 历史，只部署本次已验证提交；排队期间的新提交由自己的运行验证后部署
             if ! git fetch origin main; then
               say "!!! git fetch 失败，中止（什么都没改）"
               exit 1
             fi
-            NEW=$(git rev-parse FETCH_HEAD)
-            say "目标提交 NEW=$NEW（origin/main 最新）"
-            if [ "$NEW" != "$DEPLOY_SHA" ]; then
-              say "注意：origin/main 最新提交与触发本次运行的提交不同（期间又有推送），部署的是 origin/main 最新"
+            LATEST=$(git rev-parse FETCH_HEAD) || exit 1
+            if ! git merge-base --is-ancestor "$DEPLOY_SHA" "$LATEST"; then
+              say "!!! 已验证提交不在 origin/main 历史中，中止部署"
+              exit 1
             fi
+            NEW=$(git rev-parse "$DEPLOY_SHA^{commit}") || exit 1
+            say "目标提交 NEW=$NEW（本次测试通过的提交）"
             git diff --quiet "$PREV" "$NEW" -- requirements.txt || REQ_CHANGED=yes
             if ! git reset --keep "$NEW"; then
               say "!!! git reset --keep 失败"

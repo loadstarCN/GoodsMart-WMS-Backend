@@ -1,28 +1,20 @@
 # PostgreSQL 上的测试（库存底座一期，doc/库存数值系统说明.md 第十三节）：SQLite 测不出 FOR UPDATE 行锁、函数唯一索引、
 # 外键与类型约束在 PostgreSQL 上的差异。两步：
-#   1. 迁移往返：空库 create_all → stamp head → downgrade 到上一修订 → upgrade head → 与模型比对（scripts/manual/migration_roundtrip.py）
+#   1. 改版前的真实模型建库并写入样本 → 完整升级 → 与当前模型比对；另验证最新迁移往返
 #   2. 库存与并发相关的测试子集，在 postgres:16 上跑（tests/pg_plugin.py 把测试的 sqlite 连接串换成 WMS_TEST_DATABASE_URI）
 # 不部署、不碰任何真实数据库。
 name: Tests on PostgreSQL
 
 on:
   pull_request:
-  push:
-    branches: [main]
-    paths:
-      - 'warehouse/**'
-      - 'migrations/**'
-      - 'tests/**'
-      - 'extensions/**'
-      - 'requirements*.txt'
-      - '.github/workflows/test-postgres.yml'
+  workflow_call:
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: test-postgres-${{ github.ref }}
+  group: test-postgres-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -57,6 +49,8 @@ jobs:
       SCHEDULER_ENABLED: 'False'
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # 完整升级检查需要改版前的固定提交
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
@@ -69,9 +63,17 @@ jobs:
           pip install -r requirements-dev.txt
       - name: Create databases
         run: |
-          for db in wms_migration wms_test_0 wms_test_1; do
+          for db in wms_migration wms_migration_upgrade wms_test_0 wms_test_1; do
             psql -h 127.0.0.1 -U postgres -c "CREATE DATABASE $db"
           done
+      - name: Full regression suite
+        run: python -m pytest tests -q -n 2 --dist worksteal -rfE
+      - name: Upgrade from the pre-refactor schema with existing data
+        env:
+          FLASK_ENV: production
+          SQLALCHEMY_DATABASE_URI: postgresql://postgres:postgres@127.0.0.1:5432/wms_migration_upgrade
+          PGOPTIONS: -c lock_timeout=15s
+        run: python scripts/manual/migration_upgrade.py
       - name: Migration round trip (downgrade / upgrade the latest revision)
         env:
           FLASK_ENV: production
@@ -85,7 +87,9 @@ jobs:
               tests/test_removal.py tests/test_transfer.py tests/test_adjustment.py tests/test_damaged_putaway.py"
           G1="tests/test_picking.py tests/test_packing.py tests/test_dn.py tests/test_inventory_guards.py
               tests/test_concurrent_transitions.py tests/test_process_followups.py tests/test_process_guards.py
-              tests/test_delivery.py"
+              tests/test_delivery.py
+              tests/test_lot_operations.py::test_lots_survive_short_pack_ship_sign_without_cross_order_stock
+              tests/test_lot_operations.py::test_partial_mixed_lot_pack_requires_actual_selection_and_returns_the_correct_lot"
           WMS_TEST_DATABASE_URI=postgresql://postgres:postgres@127.0.0.1:5432/wms_test_0 PGOPTIONS="-c lock_timeout=60s" \
             python -m pytest -p tests.pg_plugin $G0 -q -p no:cacheprovider -rfE > pg_0.log 2>&1 &
           P0=$!
