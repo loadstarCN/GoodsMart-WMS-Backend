@@ -4,7 +4,7 @@ from extensions.db import *
 from warehouse.common.search import number_conditions
 from extensions.error import BadRequestException, ConflictException, NotFoundException
 from extensions.transaction import transactional
-from warehouse.common import require_bulk_list, require_fields, require_non_negative_int, require_company_goods
+from warehouse.common import require_bulk_list, require_fields, require_non_negative_int, require_positive_int, require_company_goods
 from warehouse.common.locks import lock_row
 from warehouse.common import clock
 from warehouse.goods.models import Goods
@@ -28,6 +28,23 @@ def _scheduled_date(value, warehouse_id):
 
 
 class CycleCountTaskService:
+
+    @staticmethod
+    def require_unique_details(task, candidate=None, exclude_id=None):
+        """One physical count per goods/location/lot; callers hold the task lock."""
+        def canonical(key):
+            return (require_positive_int(key[0], 'goods_id'),
+                    require_positive_int(key[1], 'location_id'), key[2])
+        keys = set()
+        for detail in task.task_details:
+            if exclude_id is not None and detail.id == exclude_id:
+                continue
+            key = canonical((detail.goods_id, detail.location_id, detail.lot_id))
+            if key in keys:
+                raise ConflictException('Duplicate goods, location and lot in cycle count', field='task_details')
+            keys.add(key)
+        if candidate is not None and canonical(candidate) in keys:
+            raise ConflictException('This goods, location and lot already exists in the count', field='task_details')
 
     # -------------------------------------------------------------------------
     # 实盘录入（B-79 / B-80）
@@ -143,6 +160,8 @@ class CycleCountTaskService:
                     location_id=detail_data['location_id'],
                     actual_quantity=0
                 )
+                CycleCountTaskService.require_unique_details(new_task,
+                    (new_detail.goods_id, new_detail.location_id, new_detail.lot_id))
                 new_task.task_details.append(new_detail)
 
         db.session.add(new_task)
@@ -246,6 +265,8 @@ class CycleCountTaskService:
             location_id=data['location_id'],
             actual_quantity=0
         )
+        CycleCountTaskService.require_unique_details(task,
+            (new_detail.goods_id, new_detail.location_id, new_detail.lot_id))
         db.session.add(new_detail)
         return new_detail
 
@@ -280,9 +301,13 @@ class CycleCountTaskService:
         if data.get('goods_id') is not None:
             require_company_goods(data['goods_id'], task.warehouse.company_id)
         old_key = (detail.goods_id, detail.location_id, detail.lot_id)
-        detail.goods_id = data.get('goods_id', detail.goods_id)
-        detail.location_id = data.get('location_id', detail.location_id)
-        detail.lot_id = validated_lot_id(detail.goods_id, data.get('lot_id', detail.lot_id))
+        goods_id = data.get('goods_id', detail.goods_id)
+        location_id = data.get('location_id', detail.location_id)
+        lot_id = validated_lot_id(goods_id, data.get('lot_id', detail.lot_id))
+        CycleCountTaskService.require_unique_details(task, (goods_id, location_id, lot_id), exclude_id=detail.id)
+        detail.goods_id = goods_id
+        detail.location_id = location_id
+        detail.lot_id = lot_id
         if 'actual_quantity' in data:
             actual_quantity = require_non_negative_int(data['actual_quantity'], 'actual_quantity')
             CycleCountTaskService._record_actual(detail, actual_quantity, operator_id)
@@ -367,6 +392,8 @@ class CycleCountTaskService:
         if task.status != 'pending':
             raise BadRequestException("Cannot process a non-pending CycleCountTask", 16007)
 
+        CycleCountTaskService.require_unique_details(task)
+
         return CycleCountTaskService._update_task_status(task, 'in_progress', operator_id)
 
     @staticmethod
@@ -379,6 +406,8 @@ class CycleCountTaskService:
         task = lock_row(CycleCountTaskService._get_instance(task_or_id))
         if task.status != 'in_progress':
             raise BadRequestException("Cannot complete a non-in_progress CycleCountTask", 16008)
+
+        CycleCountTaskService.require_unique_details(task)
 
         # 每条明细都必须已录入：未录入的实盘默认 0，生成的调整单会把库位清零（B-80）
         unrecorded = sorted(d.id for d in task.task_details if not CycleCountTaskService.is_recorded(d))

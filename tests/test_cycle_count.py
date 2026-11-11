@@ -124,17 +124,19 @@ def test_create_cyclecount_detail(client, access_token):
     测试创建 CycleCountDetail (POST /cyclecount/<cycle_id>/details/)
     """
     with client.application.app_context():
-        cycle = get_cyclecount_task()
+        # Use an empty task: the shared task already contains goods 1/location 1.
+        cycle = CycleCountTaskService.create_task({'warehouse_id': get_warehouse().id}, get_admin_user().id)
+        cycle_id, created_by = cycle.id, cycle.created_by
 
     response = client.post(
-        f'/cyclecount/{cycle.id}/details/',
+        f'/cyclecount/{cycle_id}/details/',
         headers={'Authorization': f'Bearer {access_token}'},
         json={
             "goods_id": 1,
             "warehouse_id": 1,
             "location_id": 1,
             "status": "pending",
-            "operator_id": cycle.created_by
+            "operator_id": created_by
         }
     )
     assert response.status_code == 201

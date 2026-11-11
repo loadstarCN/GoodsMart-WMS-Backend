@@ -395,6 +395,12 @@ class AdjustmentService:
         if adjustment.status != 'approved':
             raise BadRequestException("Cannot complete an Adjustment that is not approved", 16019)
 
+        # Also protect adjustments generated from duplicate count rows before this fix.
+        if adjustment.cyclecount_id is not None:
+            keys = [(d.goods_id, d.location_id, d.lot_id) for d in adjustment.details]
+            if len(keys) != len(set(keys)):
+                raise ConflictException('Duplicate counted stock in adjustment; cancel and correct the count', field='details')
+
         adjustment = AdjustmentService._update_adjustment_status(adjustment, 'completed',operator_id)
 
         # 加锁顺序（B-103，见 common/locks.py）：先按 goods_id 升序锁齐要动的库存行，
@@ -487,6 +493,7 @@ class AdjustmentService:
         """
         # 先锁盘点单行并重读：并发的重复生成在这里串行，后到的一个能看到前一个已提交的调整单
         cyclecount = lock_row(CycleCountTaskService.get_task(cyclecount_id))
+        CycleCountTaskService.require_unique_details(cyclecount)
 
         # 只有盘点完成后 system_quantity / difference 才是最终值，未完成不能据此生成调整单
         if cyclecount.status != 'completed':

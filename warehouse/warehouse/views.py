@@ -191,6 +191,9 @@ class WarehouseList(Resource):
 
         # Get the filtered query using WarehouseService
         query = WarehouseService.list_warehouses(filters)
+        scope = _restricted_warehouse_ids()
+        if scope is not None:
+            query = query.filter(Warehouse.id.in_(scope))
 
         return paginate(query, page, per_page, get_all)
 
@@ -222,7 +225,11 @@ class WarehouseDetail(Resource):
     @api_ns.marshal_with(warehouse_model)
     def get(self, warehouse_id):
         """Get warehouse details"""
-        return get_company_owned(Warehouse, warehouse_id)
+        warehouse = get_company_owned(Warehouse, warehouse_id)
+        scope = _restricted_warehouse_ids()
+        if scope is not None and warehouse_id not in scope:
+            raise ForbiddenException('Warehouse is outside your scope', 12001)
+        return warehouse
 
     @permission_required(["all_access", "company_all_access", "warehouse_edit"])
     @api_ns.expect(warehouse_input_model)
