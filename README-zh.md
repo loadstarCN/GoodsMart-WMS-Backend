@@ -463,7 +463,7 @@ WMS 通过 Webhook 向外部系统推送事件通知，使用 HMAC-SHA256 签名
 |------|----------|
 | `asn.received` | ASN 标记为已收货 |
 | `asn.completed` | ASN 完成（含实际数量、完成时刻 `completed_at` / `completed_at_ms`） |
-| `asn.cancelled` | 已收货（未分拣）的 ASN 被取消 |
+| `asn.cancelled` | 待收货 ASN 关闭或已收货（未分拣）的 ASN 被取消；带 `closed_at` / `closed_at_ms` |
 | `dn.in_progress` | DN 开始处理（含开始时刻 `started_at`） |
 | `dn.picked` | DN 拣货完成（含各商品计划 / 已拣量、拣货完成时刻 `picked_at`） |
 | `dn.packed` | DN 打包完成（含各商品计划 / 已拣 / 已打包量、打包完成时刻 `packed_at`） |
@@ -1512,8 +1512,10 @@ Track API，FedEx 开发者项目里要开通 Track API）。实现在 `warehous
   `status` 是归一化的 `label_created` / `in_transit` / `out_for_delivery` / `delivered` / `exception` / `unknown`
   （`code` 是承运商自己的码，如 FedEx `OC` / `PU` / `DL`；认不出的码一律 `unknown`，不会触发自动发货 / 签收）。
   查询失败只记 `error`，保留上一次的结果。
-- 状态 / 扫描记录有变化时推 `dn.tracking_updated`（`{dn_id, order_number, carrier, tracking_number, tracking{…}}`，
+- 状态 / 扫描记录 / `error` / `problem` 有变化（含异常解除）时推 `dn.tracking_updated`（`{dn_id, order_number, carrier, tracking_number, tracking{…}}`，
   `dedupe_key = dn:<id>`：没送出去的旧更新被新的取代，只送最新一条）。先自动发货 / 签收、后推跟踪。
+  `tracking` 与查询响应是同一完整快照，包含 `synced_at`（UTC ISO 8601，保留微秒、同运单严格递增）。
+  接收方应按此来源时刻拒绝迟到的旧快照；发送前去重不能撤回已经在途的旧请求。首次查询失败可能没有 `status`，但有 `error`。
 - 手动刷新与定时任务撞上时，这一轮开始后别人已存了更新结果的不覆盖；运单已取消 / 换号的不写。
 - `POST /warehouse/dn/<id>/carrier-shipment/track`（`delivery_edit`：可能当场完成发货 / 签收）立即查一次（约 40 秒时限）
   并照样处理，回运单状态 + `tracking_sync {tracked, updated, shipped, signed, problems, errors, skipped}`；

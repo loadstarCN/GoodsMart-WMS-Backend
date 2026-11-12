@@ -110,10 +110,9 @@ class AutoActionError(Exception):
     """自动发货 / 签收的前提不满足（不是接口校验错误），message 记进 tracking_problem"""
 
 
-def _fingerprint(status, code, detail: dict) -> tuple:
-    events = detail.get('events') or []
-    return (status, code, detail.get('estimated_delivery'), detail.get('delivered_at'), detail.get('picked_up_at'),
-            len(events), events[0].get('time') if events else None)
+def _tracking_state(record) -> dict:
+    """比较业务内容，查询时刻自身变化不触发重复通知。异常与解除异常也属于变化。"""
+    return {key: value for key, value in (record.tracking_payload() or {}).items() if key != 'synced_at'}
 
 
 class CarrierTrackingService:
@@ -360,43 +359,40 @@ class CarrierTrackingService:
     @staticmethod
     @transactional
     def _save(record_id, number, result: dict, problem, started) -> bool:
-        """存跟踪结果与 tracking_problem；状态 / 扫描记录有变化时推 dn.tracking_updated → 有没有变化。
+        """存跟踪结果与 tracking_problem；内容或异常变化时推完整版本快照 → 有没有变化。
         不写：运单已经不是有效的这张（取消了 / 换了号）、或这一轮开始后别人已经存了更新的结果（手动刷新与定时任务撞上时，
-        旧结果不覆盖新的）。查询出错（result.error）保留上次的结果，只记 error"""
+        旧结果不覆盖新的）。查询出错（result.error）保留上次的结果并通知 error"""
         record, dn = CarrierTrackingService._locked(record_id)
         if record is None or record.status != 'active' or record.tracking_number != number:
             return False
         if record.tracking_synced_at is not None and record.tracking_synced_at > started:
             return False
-        record.tracking_synced_at = wms_clock.now()
+        before = _tracking_state(record)
+        # 行锁内生成版本；完整 ISO 微秒同时用于查询响应和 webhook，接收端据此拒绝迟到旧快照。
+        previous = record.tracking_synced_at
+        record.tracking_synced_at = max(wms_clock.now(), previous + timedelta(microseconds=1)) if previous else wms_clock.now()
         if problem is not KEEP:
             record.tracking_problem = problem[:PROBLEM_MAX] if problem else None
         if result.get('error'):
             detail = dict(record.tracking_detail or {})
             detail['error'] = str(result['error'])[:ERROR_MAX]
             record.tracking_detail = detail
-            return False
-        before = _fingerprint(record.tracking_status, record.tracking_code, record.tracking_detail or {})
-        detail = {
-            'status_text': result.get('status_text'),
-            'picked_up_at': result.get('picked_up_at'),
-            'delivered_at': result.get('delivered_at'),
-            'estimated_delivery': result.get('estimated_delivery'),
-            'events': result.get('events') or [],
-            'error': None,
-        }
-        record.tracking_status = result.get('status')
-        record.tracking_code = (str(result['code'])[:10] if result.get('code') else None)
-        record.tracking_detail = detail
-        if _fingerprint(record.tracking_status, record.tracking_code, detail) == before:
+        else:
+            record.tracking_detail = {
+                'status_text': result.get('status_text'),
+                'picked_up_at': result.get('picked_up_at'),
+                'delivered_at': result.get('delivered_at'),
+                'estimated_delivery': result.get('estimated_delivery'),
+                'events': result.get('events') or [],
+                'error': None,
+            }
+            record.tracking_status = result.get('status')
+            record.tracking_code = (str(result['code'])[:10] if result.get('code') else None)
+        if _tracking_state(record) == before:
             return False
         webhook_emit('dn.tracking_updated', {
             'dn_id': dn.id, 'order_number': dn.order_number,
             'carrier': record.carrier, 'tracking_number': record.tracking_number,
-            'tracking': {
-                'status': record.tracking_status, 'code': record.tracking_code,
-                **{k: detail[k] for k in ('status_text', 'picked_up_at', 'delivered_at', 'estimated_delivery',
-                                          'events')},
-            },
+            'tracking': record.tracking_payload(),
         }, api_key_id=dn.api_key_id, dedupe_key=f'dn:{dn.id}')
         return True

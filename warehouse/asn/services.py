@@ -772,7 +772,19 @@ class ASNService:
         for detail in asn.details:
             InventoryService.update_and_calculate_asn_stock(detail.goods_id, asn.warehouse_id)
 
+        ASNService._emit_cancelled(asn)
         return asn
+
+    @staticmethod
+    def _emit_cancelled(asn):
+        """所有关闭路径都通知来源系统；随关闭事务提交，重复关闭由状态校验拒绝。"""
+        webhook_emit('asn.cancelled', {
+            'asn_id': asn.id, 'status': 'closed', 'order_number': asn.order_number,
+            'closed_at': clock.local_iso(asn.closed_at, asn),
+            'closed_at_ms': int(asn.closed_at.timestamp() * 1000) if asn.closed_at else None,
+            'details': [{'goods_code': d.goods.code if d.goods else None,
+                         'quantity': d.quantity} for d in asn.details],
+        }, api_key_id=asn.api_key_id)
 
     @staticmethod
     @transactional
@@ -809,11 +821,7 @@ class ASNService:
         for detail in asn.details:
             InventoryService.update_and_calculate_asn_stock(detail.goods_id, asn.warehouse_id)
 
-        webhook_emit('asn.cancelled', {
-            'asn_id': asn.id, 'status': 'closed', 'order_number': asn.order_number,
-            'details': [{'goods_code': d.goods.code if d.goods else None,
-                         'quantity': d.quantity} for d in asn.details],
-        }, api_key_id=asn.api_key_id)
+        ASNService._emit_cancelled(asn)
 
         return asn
 

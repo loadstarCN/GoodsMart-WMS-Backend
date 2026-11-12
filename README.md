@@ -537,7 +537,7 @@ WMS pushes event notifications to external systems via Webhook with HMAC-SHA256 
 |-------|---------|
 | `asn.received` | ASN marked as received |
 | `asn.completed` | ASN completed with actual quantities (includes the completion time `completed_at` / `completed_at_ms`) |
-| `asn.cancelled` | A received (not yet sorted) ASN was cancelled |
+| `asn.cancelled` | A pending ASN was closed, or a received (not yet sorted) ASN was cancelled; includes `closed_at` / `closed_at_ms` |
 | `dn.in_progress` | DN processing started (includes the start time `started_at`) |
 | `dn.picked` | DN picking completed (includes the planned / picked quantity per goods and `picked_at`) |
 | `dn.packed` | DN packing completed (includes the planned / picked / packed quantity per goods and `packed_at`) |
@@ -1849,9 +1849,12 @@ carrier-agnostic, in `warehouse/dn/tracking_services.py`:
   `status` is normalized to `label_created` / `in_transit` / `out_for_delivery` / `delivered` / `exception` / `unknown`
   (`code` is the carrier's own code such as FedEx `OC` / `PU` / `DL`; unrecognized codes are `unknown` and never trigger
   automatic steps). A failed lookup only records `error` and keeps the last result.
-- Changes of status / scans push `dn.tracking_updated` (`{dn_id, order_number, carrier, tracking_number, tracking{…}}`,
+- Changes of status / scans / `error` / `problem` (including recovery) push `dn.tracking_updated` (`{dn_id, order_number, carrier, tracking_number, tracking{…}}`,
   `dedupe_key = dn:<id>`: an unsent older update is superseded, only the latest is delivered). Automatic steps run before
   the tracking update is pushed.
+  `tracking` is the same complete snapshot as the query response, including `synced_at` (UTC ISO 8601 with microseconds,
+  strictly increasing per waybill). Receivers must compare this source timestamp to reject late snapshots; sender deduplication
+  cannot recall an older request already in transit. A failed first lookup can have no `status` but include an `error`.
 - When a manual refresh and the scheduler overlap, a result saved by someone else after this round started is not
   overwritten; a cancelled / renumbered shipment is not written.
 - `POST /warehouse/dn/<id>/carrier-shipment/track` (`delivery_edit`: it may complete / sign the delivery) checks now

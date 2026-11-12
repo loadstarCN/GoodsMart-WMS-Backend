@@ -134,6 +134,8 @@ def test_label_created_only_records_tracking(client, access_token, fedex):
     events = _events(client, key_id)
     assert [e[0] for e in events] == ['dn.tracking_updated']
     assert events[0][1]['tracking']['status'] == TRACK_LABEL_CREATED
+    assert events[0][1]['tracking'] == state['tracking']
+    assert datetime.fromisoformat(events[0][1]['tracking']['synced_at']).tzinfo is not None
     assert events[0][2] == f'dn:{dn_id}'
 
     # 结果没变：不重复推
@@ -232,6 +234,10 @@ def test_blocked_shipping_is_recorded_then_retried(client, access_token, fedex):
     assert (stats['shipped'], stats['problems']) == (1, 0)
     state = _state(client, dn_id, task_id)
     assert state['dn'] == 'delivered' and state['tracking']['problem'] is None
+    tracking_events = [e[1]['tracking'] for e in _events(client, key_id) if e[0] == 'dn.tracking_updated']
+    assert '16061' in tracking_events[0]['problem']
+    assert tracking_events[-1]['problem'] is None
+    assert datetime.fromisoformat(tracking_events[-1]['synced_at']) > datetime.fromisoformat(tracking_events[0]['synced_at'])
 
 
 def test_outdated_documents_do_not_block_automatic_shipping(client, access_token, fedex):
@@ -272,12 +278,16 @@ def test_lookup_errors_keep_last_result(client, access_token, fedex):
     tracking = _state(client, dn_id, task_id)['tracking']
     assert tracking['status'] == TRACK_LABEL_CREATED
     assert tracking['error'].startswith('TRACKING.TRACKINGNUMBER.NOTFOUND')
-    assert [e[0] for e in _events(client, key_id)] == ['dn.tracking_updated']
+    events = _events(client, key_id)
+    assert [e[0] for e in events] == ['dn.tracking_updated'] * 3
+    assert events[-1][1]['tracking']['error'].startswith('TRACKING.TRACKINGNUMBER.NOTFOUND')
+    assert events[-1][1]['tracking']['status'] == TRACK_LABEL_CREATED
 
     # 恢复后 error 清空
     fedex.set(TRACK, (200, _track_body('OC', [OC])))
     _sync(client)
     assert _state(client, dn_id, task_id)['tracking']['error'] is None
+    assert _events(client, key_id)[-1][1]['tracking']['error'] is None
 
 
 # ---------------------------------------------------------------------------
@@ -325,7 +335,10 @@ def test_scans_older_than_the_shipment_are_ignored(client, access_token, fedex):
     state = _state(client, dn_id, task_id)
     assert (state['dn'], state['task']) == ('packed', 'pending')
     assert state['tracking']['error'].startswith('TRACKING.OLD_SHIPMENT')
-    assert _events(client, key_id) == []
+    events = _events(client, key_id)
+    assert len(events) == 1 and events[0][0] == 'dn.tracking_updated'
+    assert events[0][1]['tracking']['error'].startswith('TRACKING.OLD_SHIPMENT')
+    assert events[0][1]['tracking']['status'] is None
 
 
 def test_newest_of_duplicate_results_is_used():
