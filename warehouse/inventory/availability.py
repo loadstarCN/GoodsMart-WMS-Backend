@@ -38,7 +38,10 @@ def parse_codes(value) -> list:
     return codes
 
 
-def availability(warehouse, codes) -> dict:
+def availability(warehouse, codes, purpose='shipping', pool='standard') -> dict:
+    from warehouse.dn.stock_policy import RESERVED, PHYSICAL
+    if purpose not in ('shipping', 'transfer', 'return_to_supplier', 'damage_to_supplier') or pool not in RESERVED:
+        raise BadRequestException('Invalid outbound purpose or stock source')
     goods_by_code = {}
     for start in range(0, len(codes), 500):
         chunk = codes[start:start + 500]
@@ -53,6 +56,7 @@ def availability(warehouse, codes) -> dict:
                           .filter(Inventory.warehouse_id == warehouse.id, Inventory.goods_id.in_(chunk)).all()):
             inventories[inventory.goods_id] = inventory
 
+    from warehouse.asn.returns import held
     items, not_found = [], []
     for code in codes:
         goods = goods_by_code.get(code)
@@ -64,6 +68,7 @@ def availability(warehouse, codes) -> dict:
             'goods_id': goods.id, 'code': goods.code, 'name': goods.name, 'unit': goods.unit,
             'is_active': bool(goods.is_active), 'thumbnail_url': goods.thumbnail_url,
             'available_stock_for_sale': inventory.available_stock_for_sale if inventory else 0,
+            'available_for_purpose': (inventory.available_stock_for_sale if purpose in ('shipping', 'transfer') else getattr(inventory, PHYSICAL[pool]) - getattr(inventory, RESERVED[pool]) - (inventory.locked_stock if pool == 'standard' else 0) - (held(goods.id,warehouse.id) if pool == 'return' else 0)) if inventory else 0,
             'onhand_stock': inventory.onhand_stock if inventory else 0,
             'dn_stock': inventory.dn_stock if inventory else 0,
             'locked_stock': inventory.locked_stock if inventory else 0,

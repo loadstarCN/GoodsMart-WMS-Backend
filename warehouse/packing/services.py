@@ -45,6 +45,8 @@ class PackingTaskService:
         拿到锁后重读状态。并发的重复提交在调用方现有的状态检查处挡下。
         """
         task = PackingTaskService._get_instance(task_or_id)
+        from warehouse.asn.return_outbound import lock_parent
+        lock_parent(task.dn)
         lock_row(task.dn)
         # 所属 DN 已取消（任务被停用）→ 409 16088
         return require_active_task(lock_row(task), 'Packing Task')

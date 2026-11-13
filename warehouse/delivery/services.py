@@ -212,6 +212,8 @@ class DeliveryTaskService:
         拿到锁后重读状态（全系统统一的加锁顺序：先父单据、后任务）。
         """
         task = DeliveryTaskService._get_instance(task_or_id)
+        from warehouse.asn.return_outbound import lock_parent
+        lock_parent(task.dn)
         lock_row(task.dn)
         # 所属 DN 已取消（任务被停用）→ 409 16088
         return require_active_task(lock_row(task), 'Delivery Task')
@@ -582,7 +584,7 @@ class DeliveryTaskService:
         已有（例如修复前手工建的存量任务）→ 复用那条，不再生成第二条，也不报错（报错会让打包完成整体回滚）。
         """
         # 先锁 DN 行再查已有任务：并发的重复生成串行，不会各建一条
-        dn = lock_row(DNService.get_dn(dn_id))
+        dn = lock_row(DNService._get_instance(dn_id))
         if not dn.details:
             raise BadRequestException("DN has no details to create a Delivery.", 16016)
 

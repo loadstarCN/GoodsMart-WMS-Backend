@@ -39,6 +39,8 @@ inventory_base_model = api_ns.model('InventoryBase', {
                     'removals); null when nothing is waiting'),
     # 发货相关字段
     'dn_stock': fields.Integer(default=0, description='DN stock quantity (pending shipments)'),
+    'damaged_dn_stock': fields.Integer(readOnly=True, description='Reserved damaged stock for supplier returns'),
+    'return_dn_stock': fields.Integer(readOnly=True, description='Reserved return stock for supplier returns'),
     'picked_stock': fields.Integer(default=0, description='Pick stock quantity (to be picked)'),
     'packed_stock': fields.Integer(default=0, description='Packed stock quantity (completed picks)'),
     'delivered_stock': fields.Integer(default=0, description='Delivered stock quantity (ready for delivery)'),

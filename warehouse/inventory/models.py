@@ -105,6 +105,8 @@ class Inventory(db.Model):
     )
 
     # 出库流程字段（增加状态校验）
+    damaged_dn_stock = db.Column(db.Integer, nullable=False, default=0, server_default='0')
+    return_dn_stock = db.Column(db.Integer, nullable=False, default=0, server_default='0')
     dn_stock = db.Column(
         db.Integer,
         default=0,

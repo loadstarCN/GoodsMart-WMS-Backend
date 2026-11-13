@@ -18,23 +18,29 @@ def test_create_dn(client, access_token):
         assert carrier is not None
         assert recipient is not None
         assert goods is not None
+        supplier_id = Supplier.query.filter_by(company_id=warehouse.company_id).first().id
+        add_stock(goods.id, warehouse.id, damaged=10)
+        warehouse_id, carrier_id, recipient_id, goods_id = warehouse.id, carrier.id, recipient.id, goods.id
+        db.session.commit()
 
     response = client.post(
         '/dn/',
         headers={'Authorization': f'Bearer {access_token}'},
         json={
-            'recipient_id': recipient.id,
-            'warehouse_id': warehouse.id,
+            'recipient_id': recipient_id,
+            'warehouse_id': warehouse_id,
             'shipping_address': '456 Another Street',
             'expected_shipping_date': '2025-01-01',
-            'carrier_id': carrier.id,
+            'carrier_id': carrier_id,
             'dn_type': 'damage_to_supplier',
+            'supplier_id': supplier_id,
+            'purpose_reason': 'Damaged goods return',
             'status': 'pending',
             'remark': 'Test DN creation',
             'details': [
                 {
                     "dn_id": 999,  # 这里填什么无所谓，后端会用 path 中的 dn_id
-                    "goods_id": goods.id,
+                    "goods_id": goods_id,
                     "quantity": 10,
                     "picked_quantity": 0,
                     "remark": "Sample detail"

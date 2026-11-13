@@ -32,6 +32,7 @@ IN_WAREHOUSE_STOCK_TYPES = (STOCK_ONHAND, STOCK_DAMAGED, STOCK_RETURN, STOCK_PEN
 
 # 变动类型（movement_type）
 MOVEMENT_TYPES = (
+    'transfer_ship', 'transfer_receive', 'transfer_loss', 'customer_return_receive', 'customer_return_dispose',
     'opening',            # 期初
     'reconcile',          # 系统校正（部署窗口内的差额、人工核实后的校正）
     'sort_in',            # 分拣完成（ASN 完成）：（外）→ 待上架
@@ -89,6 +90,7 @@ class GoodsLot(db.Model):
     created_by = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
     created_at = db.Column(UTCDateTime, default=db.func.now())
     updated_at = db.Column(UTCDateTime, default=db.func.now(), onupdate=db.func.now())
+    status_revision = db.Column(db.Integer, nullable=False, default=0, server_default='0')
     date_revision = db.Column(db.Integer, nullable=False, default=0, server_default='0')
 
 
@@ -290,3 +292,16 @@ class InventoryMetricsDaily(db.Model):
     created_at = db.Column(UTCDateTime, default=db.func.now())
 
     goods = db.relationship('Goods', lazy='joined')
+
+
+class GoodsLotStatusChange(db.Model):
+    __tablename__ = 'goods_lot_status_changes'
+    __table_args__ = (db.UniqueConstraint('lot_id', 'revision', name='uq_lot_status_revision'),)
+    id = _bigint_pk()
+    lot_id = db.Column(db.Integer, db.ForeignKey('goods_lots.id', ondelete='RESTRICT'), nullable=False, index=True)
+    revision = db.Column(db.Integer, nullable=False)
+    previous_status = db.Column(db.String(10), nullable=False)
+    status = db.Column(db.String(10), nullable=False)
+    reason = db.Column(db.String(255), nullable=False)
+    operator_id = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='SET NULL'))
+    created_at = db.Column(UTCDateTime, nullable=False, default=db.func.now())

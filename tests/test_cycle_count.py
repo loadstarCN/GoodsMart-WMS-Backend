@@ -161,11 +161,16 @@ def test_update_cyclecount_detail(client, access_token):
             "operator_id": 999
         }
     )
-    assert response.status_code == 200
-    data = response.get_json()
-    assert data['actual_quantity'] == 100
-    assert data['status'] == "pending"
-    assert data['operator_id'] != 999
+    # Physical counts cannot precede scope freezing.
+    assert response.status_code == 409
+    headers = {'Authorization': f'Bearer {access_token}'}
+    assert client.put(f'/cyclecount/{cycle.id}/process/', headers=headers).status_code == 200
+    response = client.post(f'/cyclecount/{cycle.id}/details-batch-save/', headers=headers,
+        json={'details': [{'id': detail.id, 'actual_quantity': 100}]})
+    assert response.status_code == 201
+    with client.application.app_context():
+        saved = db.session.get(CycleCountTaskDetail, detail.id)
+        assert saved.actual_quantity == 100 and saved.operator_id != 999
 
 
 def test_update_cyclecount_detail_rejects_negative_quantity(client, access_token):
@@ -356,11 +361,9 @@ def test_update_cyclecount_detail_service(client):
             "status": "completed"
         }
 
-        updated_detail = CycleCountTaskService.update_task_detail(cycle_task.id, detail.id, updated_data)
-
-        assert updated_detail is not None
-        assert updated_detail.actual_quantity == updated_data["actual_quantity"]
-        assert updated_detail.status == "pending"  # status 不接受客户端输入
+        from extensions.error import ConflictException
+        with pytest.raises(ConflictException, match='Start the count'):
+            CycleCountTaskService.update_task_detail(cycle_task.id, detail.id, updated_data)
 
 
 def test_delete_cyclecount_detail_service(client):

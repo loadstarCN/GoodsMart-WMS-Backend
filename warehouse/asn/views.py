@@ -434,3 +434,5 @@ class DocumentReportExport(Resource):
     def get(self):
         from warehouse.common.document_reports import export_document_report
         return export_document_report('inbound', g.warehouse)
+
+from . import returns

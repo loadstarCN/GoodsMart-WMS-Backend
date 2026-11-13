@@ -414,3 +414,16 @@ class CycleCountRoutePlan(Resource):
     def get(self, task_id):
         from .route_plan import route_plan
         return route_plan(_get_owned_task(task_id))
+
+
+@api_ns.route('/<int:task_id>/resolve/<string:action>')
+class CycleCountResolution(Resource):
+    @permission_required(['all_access', 'company_all_access', 'cycle_count_edit'])
+    @warehouse_required()
+    @api_ns.marshal_with(cycle_count_task_model)
+    def post(self, task_id, action):
+        from .control import resolve
+        if action not in ('cancel', 'recount'):
+            raise BadRequestException('Invalid count action')
+        _get_owned_task(task_id)
+        return resolve(task_id, require_actor_user_id(), api_ns.payload, recount=action == 'recount')

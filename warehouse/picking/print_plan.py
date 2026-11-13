@@ -7,11 +7,16 @@ from warehouse.location.models import Location
 from .models import PickingTask, PickingTaskDetail
 from warehouse.stock.lots import assert_shippable, lot_priority
 from warehouse.stock.lot_policy import effective_rules
-from extensions.error import BadRequestException
+from extensions.error import BadRequestException, ConflictException
 from warehouse.location.ordering import location_key
 
 
 def print_plan(task):
+    from warehouse.dn.stock_policy import source, assert_lot
+    from warehouse.asn.return_outbound import assert_source, reserved as reserved_return
+    from warehouse.asn.return_models import ReturnDisposition
+    from warehouse.asn.returns import held
+    from warehouse.cyclecount.control import assert_free
     if task.status == 'completed':
         return dict(mode='record', rows=[dict(goods_id=row.goods_id, goods=row.goods.name,
                     code=row.goods.code, location=row.location.code, location_id=row.location_id, quantity=row.picked_quantity,
@@ -27,13 +32,16 @@ def print_plan(task):
         if detail.goods_id in demand:
             demand[detail.goods_id] = max(0, demand[detail.goods_id]-(detail.picked_quantity or 0))
     demand = {gid: quantity for gid, quantity in demand.items() if quantity > 0}
+    protected_dns = db.session.query(ReturnDisposition.linked_dn_id).filter(
+        ReturnDisposition.status == 'approved', ReturnDisposition.linked_dn_id.isnot(None),
+        ReturnDisposition.linked_dn_id != task.dn_id)
     reserved = dict(((gid, lid, lot_id), qty) for gid, lid, lot_id, qty in db.session.query(
         PickingTaskDetail.goods_id, PickingTaskDetail.location_id, PickingTaskDetail.lot_id, func.sum(PickingTaskDetail.picked_quantity)
     ).join(PickingTask).filter(PickingTask.status == 'in_progress', PickingTask.is_active.is_(True),
-        PickingTaskDetail.goods_id.in_(list(demand))).group_by(PickingTaskDetail.goods_id, PickingTaskDetail.location_id, PickingTaskDetail.lot_id))
+        PickingTaskDetail.goods_id.in_(list(demand)), ~PickingTask.dn_id.in_(protected_dns)).group_by(PickingTaskDetail.goods_id, PickingTaskDetail.location_id, PickingTaskDetail.lot_id))
     stock = db.session.query(GoodsLocation).join(
         Location, Location.id == GoodsLocation.location_id).filter(Location.warehouse_id == task.dn.warehouse_id,
-        Location.is_active.is_(True), Location.location_type == 'standard', GoodsLocation.quantity > 0,
+        Location.is_active.is_(True), Location.location_type == source(task.dn), GoodsLocation.quantity > 0,
         GoodsLocation.goods_id.in_(list(demand))).all()
     strategies = {gid: effective_rules(product)['values']['strategy'] for gid, product in goods.items()}
     stock.sort(key=lambda row: (row.goods_id, lot_priority(row.lot, strategies[row.goods_id]), location_key(row.location,task.dn.warehouse), row.id))
@@ -41,10 +49,14 @@ def print_plan(task):
     for stock_row in stock:
         gid, lid, lot_id = stock_row.goods_id, stock_row.location_id, stock_row.lot_id
         try:
-            assert_shippable(gid, lot_id, task.dn.warehouse_id)
-        except BadRequestException:
+            assert_lot(task.dn, gid, lot_id)
+            assert_source(task.dn, lid)
+            assert_free(task.dn.warehouse_id, [(gid, lid, lot_id)])
+        except (BadRequestException, ConflictException):
             continue
-        take = min(demand[gid], max(0, stock_row.quantity-(reserved.get((gid,lid,lot_id)) or 0)))
+        protected = held(gid, task.dn.warehouse_id, lid, lot_id, True)
+        protected += reserved_return(gid, task.dn.warehouse_id, lid, lot_id, task.dn_id)
+        take = min(demand[gid], max(0, stock_row.quantity-(reserved.get((gid,lid,lot_id)) or 0)-protected))
         if take:
             rows.append(dict(goods_id=gid, goods=goods[gid].name, code=goods[gid].code,
                              location=stock_row.location.code, location_id=stock_row.location_id, quantity=take, lot_id=lot_id,

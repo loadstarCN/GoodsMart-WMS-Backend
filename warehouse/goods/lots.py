@@ -19,7 +19,7 @@ def serialize(row):
     return dict(id=row.id, goods_id=row.goods_id, lot_no=row.lot_no,
                 production_date=row.production_date.isoformat() if row.production_date else None,
                 expiry_date=row.expiry_date.isoformat() if row.expiry_date else None,
-                status=row.status, source=row.source, date_revision=row.date_revision)
+                status=row.status, source=row.source, date_revision=row.date_revision, status_revision=row.status_revision)
 
 
 def normalize(value):
@@ -289,3 +289,5 @@ class PutawayLocations(Resource):
                     warehouse_name=warehouse.name, location_type=loc.location_type,
                     same_lot_quantity=int(same_qty), other_lot_quantity=int(quantity-same_qty))
                     for loc, same_qty, quantity in rows], total=total, page=page, per_page=per_page)
+
+from . import lot_control  # register lot hold routes

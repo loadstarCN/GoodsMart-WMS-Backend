@@ -192,7 +192,8 @@ class InventoryAvailability(Resource):
     def post(self):
         """Same as GET, codes in the JSON body {goods_codes: [...]} (warehouse: warehouse_id query / X-WAREHOUSE-ID)"""
         body = request.get_json(silent=True)
-        return availability(g.warehouse, parse_codes(body.get('goods_codes') if isinstance(body, dict) else None)), 200
+        return availability(g.warehouse, parse_codes(body.get('goods_codes') if isinstance(body, dict) else None),
+            purpose=body.get('dn_type', 'shipping'), pool=body.get('stock_source', 'standard')), 200
 
 
 @api_ns.doc(security="jsonWebToken")

@@ -338,6 +338,8 @@ class ASNService:
                 carrier_id = carrier.id
         ASNService._assert_partner_company(company_id, supplier_id=supplier_id, carrier_id=carrier_id)
 
+        if data.get('asn_type') in ('return_from_customer', 'transfer'):
+            raise BadRequestException('Use /asn/returns or /transfer/orders for linked stock operations', field='asn_type')
         asn_type = data.get('asn_type') or 'inbound'  # 默认为 inbound
         if asn_type not in ASN.ASN_TYPES:
             raise BadRequestException(f"Invalid asn_type: {asn_type}", 14007)
@@ -395,7 +397,11 @@ class ASNService:
         :return: 更新后的 ASN 对象
         :raises: NotFound 如果该 ASN 不存在
         """
+        if data.get('asn_type') in ('return_from_customer', 'transfer'):
+            raise BadRequestException('Use linked return or transfer workflows', field='asn_type')
         asn = lock_row(ASNService._get_instance(asn_or_id))
+        if asn.asn_type in ('return_from_customer', 'transfer'):
+            raise ConflictException('Legacy unlinked return/transfer ASN must be cancelled and recreated through the linked workflow', 16236)
         if asn.status != 'pending':
             raise BadRequestException("Cannot update a non-pending ASN", 16001)
 
@@ -646,6 +652,8 @@ class ASNService:
         """
         # 先锁 ASN 行并重读状态：并发的重复收货在下面的状态检查处挡下（不会重复记 received_stock / 建两个分拣任务）
         asn = lock_row(ASNService._get_instance(asn_or_id))
+        if asn.asn_type in ('return_from_customer', 'transfer'):
+            raise ConflictException('Legacy unlinked return/transfer ASN must be cancelled and recreated through the linked workflow', 16236)
 
         if asn.status != 'pending':
             raise BadRequestException("Cannot receive a non-pending ASN", 16021)
@@ -691,6 +699,8 @@ class ASNService:
         """
         # 锁 ASN 行并重读状态（分拣完成已先锁过 ASN，同一事务重复加锁无副作用）
         asn = lock_row(ASNService._get_instance(asn_or_id))
+        if asn.asn_type in ('return_from_customer', 'transfer'):
+            raise ConflictException('Legacy unlinked return/transfer ASN must be cancelled and recreated through the linked workflow', 16236)
 
         # 判断是否是received状态
         if asn.status != 'received':

@@ -37,7 +37,7 @@ def test_count_duplicate_create_add_update_and_distinct_lots(client, access_toke
     url = f"/cyclecount/{task}/details/{added.json['id']}"
     assert client.put(url, headers=h, json={'lot_id': line['lot_id']}).status_code == 409
     assert client.get(url, headers=h).json['lot_id'] == lot_id
-    assert client.put(url, headers=h, json={'actual_quantity': 1}).status_code == 200
+    assert client.put(url, headers=h, json={'actual_quantity': 1}).status_code == 409
 
 
 @pytest.mark.parametrize('status,endpoint', [
@@ -109,6 +109,7 @@ def test_company_admin_keeps_unassigned_warehouse_access(client, access_company_
 def test_legacy_duplicate_adjustment_cannot_change_stock(client, access_token):
     from warehouse.adjustment.services import AdjustmentService
     task, line, _, before = _count(client, access_token)
+    assert client.put(f'/cyclecount/{task}/process/', headers=_h(access_token)).status_code == 200
     with client.application.app_context():
         count = db.session.get(CycleCountTask, task)
         count.status = 'completed'

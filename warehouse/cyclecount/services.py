@@ -1,3 +1,4 @@
+from . import control
 from warehouse.stock.lots import validated_lot_id
 from werkzeug.exceptions import NotFound
 from extensions.db import *
@@ -61,6 +62,8 @@ class CycleCountTaskService:
     @staticmethod
     def _record_actual(detail: CycleCountTaskDetail, actual_quantity: int, operator_id) -> CycleCountTaskDetail:
         """录入实盘：系统数取录入此刻的库位库存，差异按此计算，记录录入人"""
+        task = detail.task or db.session.get(CycleCountTask, detail.task_id)
+        control.activate(task, list(task.task_details) + ([detail] if detail not in task.task_details else []))
         system_quantity = GoodsLocationService.get_quantity(detail.goods_id, detail.location_id, detail.lot_id)
         detail.actual_quantity = actual_quantity
         detail.system_quantity = system_quantity
@@ -182,6 +185,7 @@ class CycleCountTaskService:
         更新指定 CycleCountTask（仅当其状态为 pending 时）
         """
         task = lock_row(CycleCountTaskService.get_task(task_id))
+        control.require_editable(task)
         if task.status != 'pending':
             raise BadRequestException("Cannot update a non-pending CycleCountTask", 16001)
 
@@ -201,6 +205,7 @@ class CycleCountTaskService:
         """
         # 先锁盘点单行并重读：与并发的 process 串行
         task = lock_row(CycleCountTaskService.get_task(task_id))
+        control.require_editable(task)
         if task.status != 'pending':
             raise BadRequestException("Cannot delete a non-pending CycleCountTask", 16002)
 
@@ -255,6 +260,7 @@ class CycleCountTaskService:
         创建新的 CycleCountTaskDetail（仅当所属的 CycleCountTask 为 pending）
         """
         task = lock_row(CycleCountTaskService.get_task(task_id))
+        control.require_editable(task)
         if task.status != 'pending':
             raise BadRequestException("Cannot add CycleCountTaskDetail to a non-pending CycleCountTask", 16003)
 
@@ -268,6 +274,8 @@ class CycleCountTaskService:
         CycleCountTaskService.require_unique_details(task,
             (new_detail.goods_id, new_detail.location_id, new_detail.lot_id))
         db.session.add(new_detail)
+        if task.control_state == 'active':
+            control.activate(task, list(task.task_details) + [new_detail])
         return new_detail
 
     @staticmethod
@@ -291,6 +299,7 @@ class CycleCountTaskService:
         - 只换了商品 / 库位（没给 actual_quantity）：之前的录入作废，需重新录入
         """
         task = lock_row(CycleCountTaskService.get_task(task_id))
+        control.require_editable(task)
         if task.status != 'pending':
             raise BadRequestException("Cannot update detail in a non-pending CycleCountTask", 16005)
 
@@ -298,6 +307,8 @@ class CycleCountTaskService:
 
         # 白名单：goods_id / location_id / actual_quantity；
         # status 与 operator_id 不接受客户端输入（operator_id 取当前操作人）
+        if task.control_state == 'active' and any(k in data for k in ('goods_id', 'location_id', 'lot_id')):
+            raise ConflictException('Frozen count scope cannot be changed; cancel or recount', 16201)
         if data.get('goods_id') is not None:
             require_company_goods(data['goods_id'], task.warehouse.company_id)
         old_key = (detail.goods_id, detail.location_id, detail.lot_id)
@@ -309,8 +320,8 @@ class CycleCountTaskService:
         detail.location_id = location_id
         detail.lot_id = lot_id
         if 'actual_quantity' in data:
-            actual_quantity = require_non_negative_int(data['actual_quantity'], 'actual_quantity')
-            CycleCountTaskService._record_actual(detail, actual_quantity, operator_id)
+            require_non_negative_int(data['actual_quantity'], 'actual_quantity')
+            raise ConflictException('Start the count before recording physical quantities', 16201)
         elif (detail.goods_id, detail.location_id, detail.lot_id) != old_key:
             detail.system_quantity = None
             detail.difference = None
@@ -326,6 +337,7 @@ class CycleCountTaskService:
         删除指定的 CycleCountTaskDetail（仅当所属的 CycleCountTask 状态为 pending）
         """
         task = lock_row(CycleCountTaskService.get_task(task_id))
+        control.require_editable(task)
         if task.status != 'pending':
             raise BadRequestException("Cannot delete detail from a non-pending CycleCountTask", 16005)
 
@@ -389,11 +401,13 @@ class CycleCountTaskService:
         """
         # 先锁盘点单行并重读状态：并发的重复开始在这里挡下，不会重抓一遍账面数量
         task = lock_row(CycleCountTaskService._get_instance(task_or_id))
+        control.require_editable(task)
         if task.status != 'pending':
             raise BadRequestException("Cannot process a non-pending CycleCountTask", 16007)
 
         CycleCountTaskService.require_unique_details(task)
 
+        control.activate(task)
         return CycleCountTaskService._update_task_status(task, 'in_progress', operator_id)
 
     @staticmethod
@@ -404,6 +418,7 @@ class CycleCountTaskService:
         """
         # 先锁盘点单行并重读状态：并发的重复完成在这里挡下
         task = lock_row(CycleCountTaskService._get_instance(task_or_id))
+        control.require_editable(task)
         if task.status != 'in_progress':
             raise BadRequestException("Cannot complete a non-in_progress CycleCountTask", 16008)
 
@@ -418,6 +433,11 @@ class CycleCountTaskService:
                 16114, details={'detail_ids': unrecorded}
             )
 
+        if not any(d.difference for d in task.task_details):
+            control.lock_scope(task)
+            task.control_state = 'settled'
+            task.resolved_at = clock.now()
+            task.resolved_by = operator_id
         return CycleCountTaskService._update_task_status(task, 'completed', operator_id)
 
     # -------------------------------------------------------------------------
@@ -464,6 +484,7 @@ class CycleCountTaskService:
         """
         # 先检查父任务
         task = lock_row(CycleCountTaskService.get_task(task_id))
+        control.require_editable(task)
         if task.status != 'in_progress':
             raise BadRequestException("Cannot complete detail in a task that is not in_progress", 16008)
 
@@ -490,6 +511,7 @@ class CycleCountTaskService:
         - 已录入且值没变的行不动（保留原录入人与录入时的系统数）：别人打开页面后整单提交时不会改写已录入的行
         """
         task = lock_row(CycleCountTaskService.get_task(task_id))
+        control.require_editable(task)
         if task.status != 'in_progress':
             raise BadRequestException("Cannot update details in a non-in_progress CycleCountTask", 16010)
 

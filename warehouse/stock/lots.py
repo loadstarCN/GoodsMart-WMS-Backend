@@ -47,6 +47,8 @@ def assert_shippable(goods_id, lot_id, warehouse_id):
     from .lot_policy import effective_rules
     rules = effective_rules(db.session.get(Goods, goods_id), warehouse_id=warehouse_id)['values']
     lot = lot_for_goods(goods_id, lot_id)
+    if lot is not None:
+        db.session.refresh(lot)
     if lot is None and rules['mode'] != 'none' and not rules['allow_unassigned']:
         raise BadRequestException('Unassigned stock must be labelled before shipping', 16171, field='lot_id')
     if lot and (lot.status != 'active' or (lot.expiry_date and
@@ -70,6 +72,8 @@ def record_picking(dn, details):
 def allocated_moves(dn, detail, op, stage, packed_lots=None):
     """Return False for historical orders without allocations; never infer their lots."""
     from .service import Leg
+    from warehouse.dn.stock_policy import return_leg, assert_lot
+    from warehouse.asn.return_outbound import restore
     rows = DNStockAllocation.query.filter_by(dn_id=dn.id, goods_id=detail.goods_id).all()
     if not rows:
         return False
@@ -88,21 +92,25 @@ def allocated_moves(dn, detail, op, stage, packed_lots=None):
             row.packed_quantity = quantity
             remaining -= quantity
             op.move(detail.goods_id, quantity, src=Leg.picked(row.lot_id), dst=Leg.packed(row.lot_id), doc_line_id=detail.id)
+            destination = return_leg(dn, detail.goods_id, row.lot_id)
             op.move(detail.goods_id, row.picked_quantity - quantity, src=Leg.picked(row.lot_id),
-                    dst=Leg.pending(row.lot_id), movement_type='pack_short_return', doc_line_id=detail.id)
+                    dst=destination, movement_type='pack_short_return', doc_line_id=detail.id)
+            restore(dn, row.picked_quantity - quantity, destination.location_id)
         if remaining:
             raise BadRequestException('Packed quantity exceeds picked lot allocations', 16172)
     else:
         for row in rows:
             if stage == 'ship':
                 if row.packed_quantity:
-                    assert_shippable(row.goods_id, row.lot_id, dn.warehouse_id)
+                    assert_lot(dn, row.goods_id, row.lot_id)
                 src, dst, quantity = Leg.packed(row.lot_id), Leg.in_transit(row.lot_id), row.packed_quantity
             elif stage == 'sign':
                 src, dst, quantity = Leg.in_transit(row.lot_id), None, row.packed_quantity
             elif stage == 'cancel_picked':
-                src, dst, quantity = Leg.picked(row.lot_id), Leg.pending(row.lot_id), row.picked_quantity
+                src, dst, quantity = Leg.picked(row.lot_id), return_leg(dn, detail.goods_id, row.lot_id), row.picked_quantity
             else:
-                src, dst, quantity = Leg.packed(row.lot_id), Leg.pending(row.lot_id), row.packed_quantity
+                src, dst, quantity = Leg.packed(row.lot_id), return_leg(dn, detail.goods_id, row.lot_id), row.packed_quantity
             op.move(detail.goods_id, quantity, src=src, dst=dst, doc_line_id=detail.id)
+            if stage in ('cancel_picked', 'cancel_packed'):
+                restore(dn, quantity, dst.location_id)
     return True

@@ -361,7 +361,7 @@ class InventoryService:
 
     @staticmethod
     @transactional
-    def dn_picked(goods_id: int, warehouse_id: int, quantity: int, picked_quantity: int):
+    def dn_picked(goods_id: int, warehouse_id: int, quantity: int, picked_quantity: int, *, pool='standard'):
         """
         拣货完成：释放 DN 预占（dn_stock）。实物由拣货完成的 pick 记账（库位 → 已拣，warehouse/picking/services.py）
         :param goods_id: 关联的商品 ID
@@ -371,14 +371,16 @@ class InventoryService:
         注意：picked_quantity 可能小于 quantity，表示部分商品缺货；缺的部分不再继续预占（否则会锁死商品 dn 数量）
         """
         inventory = InventoryService._get_for_update(goods_id, warehouse_id)
-        if inventory.dn_stock < picked_quantity:
+        from warehouse.dn.stock_policy import RESERVED
+        column = RESERVED[pool]
+        if getattr(inventory, column) < picked_quantity:
             raise BadRequestException("Not enough DN stock.", 15008)
         # Release this DN's full reservation when picking closes. Only the
         # physically picked amount moved to picked_stock (pick); any short quantity
         # becomes available to other DNs again.
-        if inventory.dn_stock < quantity:
+        if getattr(inventory, column) < quantity:
             raise BadRequestException("Not enough DN stock.", 15008)
-        inventory.dn_stock -= quantity
+        setattr(inventory, column, getattr(inventory, column) - quantity)
 
     @staticmethod
     @transactional
@@ -568,15 +570,12 @@ class InventoryService:
             (DN.status.in_(['pending', 'in_progress']), DNDetail.quantity),
             else_=0
         )
-        total_quantity = db.session.query(func.coalesce(func.sum(reserved_expr), 0)).\
-            join(DN, DNDetail.dn_id == DN.id).\
-            filter(
-                DNDetail.goods_id == goods_id,
-                DN.warehouse_id == warehouse_id,
-                DN.is_active == True,
-            ).scalar()
-
-        inventory.dn_stock = total_quantity
+        from warehouse.dn.stock_policy import RESERVED
+        for pool, column in RESERVED.items():
+            total = (db.session.query(func.coalesce(func.sum(reserved_expr), 0))
+                .join(DN, DNDetail.dn_id == DN.id).filter(DNDetail.goods_id == goods_id,
+                    DN.warehouse_id == warehouse_id, DN.is_active.is_(True), DN.stock_source == pool).scalar())
+            setattr(inventory, column, total)
 
         db.session.add(inventory)
         db.session.flush()

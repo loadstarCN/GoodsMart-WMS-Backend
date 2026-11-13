@@ -82,6 +82,12 @@ cycle_count_task_detail_input_model = api_ns.model('CycleCountTaskDetailInput', 
 # 3. Cycle Count Task 基础模型（输出模型）
 # ------------------------------------------------------------------------------
 cycle_count_task_base_fields = {
+    'control_state': fields.String(readOnly=True),
+    'recount_of_id': fields.Integer(readOnly=True),
+    'recount_ids': fields.List(fields.Integer, readOnly=True, attribute=lambda row: [r.id for r in row.recounts]),
+    'resolution_reason': fields.String(readOnly=True),
+    'resolved_at': fields.DateTime(readOnly=True),
+    'resolved_by': fields.Integer(readOnly=True),
     'id': fields.Integer(readOnly=True, description='Cycle Count Task ID'),
     'task_name': fields.String(description='Task name'),
     'warehouse_id': fields.Integer(description='Warehouse ID to which this task belongs'),

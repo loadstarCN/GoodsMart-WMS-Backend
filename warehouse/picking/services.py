@@ -41,6 +41,8 @@ class PickingTaskService:
         拿到锁后重读状态。并发的重复提交在调用方现有的状态检查处挡下，不再按内存里的旧状态重复扣库存。
         """
         task = PickingTaskService._get_instance(task_or_id)
+        from warehouse.asn.return_outbound import lock_parent
+        lock_parent(task.dn)
         lock_row(task.dn)
         # 所属 DN 已取消（任务被停用）→ 409 16088
         return require_active_task(lock_row(task), 'Picking Task')
@@ -301,10 +303,11 @@ class PickingTaskService:
                 raise BadRequestException(
                     f"Location {location_id} does not belong to the DN warehouse.", 16054
                 )
-            if location_type != PICKABLE_LOCATION_TYPE:
+            from warehouse.dn.stock_policy import source
+            if location_type != source(task.dn):
                 raise BadRequestException(
                     f"Location {location_id} is a {location_type} location; goods can only be picked from "
-                    f"standard locations.", 16162, field='location_id',
+                    f"{source(task.dn)} locations.", 16162, field='location_id',
                     details={'location_id': location_id, 'location_type': location_type},
                 )
 
@@ -332,11 +335,17 @@ class PickingTaskService:
             requested[key] = requested.get(key, 0) + quantity
 
         PickingTaskService._assert_locations_in_warehouse(task, [lid for _, lid, _ in requested])
+        from warehouse.cyclecount.control import assert_free
+        lock_inventory_rows([gid for gid, _, _ in requested], task.dn.warehouse_id)
+        assert_free(task.dn.warehouse_id, requested)
 
         # 按 (goods_id, location_id) 升序逐行加锁（B-103）：两个请求库位顺序相反时不再互相等待
         for (goods_id, location_id, lot_id), quantity in sorted(requested.items(), key=lambda item: lock_order_key(*item[0])):
-            from warehouse.stock.lots import assert_shippable
-            assert_shippable(goods_id, lot_id, task.dn.warehouse_id)
+            from warehouse.dn.stock_policy import assert_lot
+            assert_lot(task.dn, goods_id, lot_id)
+            from warehouse.asn.return_outbound import assert_source, reserved
+            from warehouse.asn.returns import held
+            assert_source(task.dn, location_id)
             stock = lock_goods_location(goods_id, location_id, lot_id)
             if stock is None:
                 raise BadRequestException(
@@ -354,10 +363,19 @@ class PickingTaskService:
                     PickingTask.is_active.is_(True),
                 )
             )
+            # Other approved RMA outbounds reserve their entire inspected balance;
+            # do not count their recorded pick lines a second time.
+            from warehouse.asn.return_models import ReturnDisposition
+            protected_dns = db.session.query(ReturnDisposition.linked_dn_id).filter(
+                ReturnDisposition.status == 'approved', ReturnDisposition.linked_dn_id.isnot(None),
+                ReturnDisposition.linked_dn_id != task.dn_id)
+            reserved_query = reserved_query.filter(~PickingTask.dn_id.in_(protected_dns))
             if exclude_task_id is not None:
                 reserved_query = reserved_query.filter(PickingTask.id != exclude_task_id)
             already_reserved = reserved_query.scalar()
-            available = max((stock.quantity or 0) - (already_reserved or 0), 0)
+            protected = held(goods_id, task.dn.warehouse_id, location_id, lot_id, True)
+            protected += reserved(goods_id, task.dn.warehouse_id, location_id, lot_id, task.dn_id)
+            available = max((stock.quantity or 0) - (already_reserved or 0) - protected, 0)
             if quantity > available:
                 raise BadRequestException(
                     f"Insufficient stock in location {location_id} for goods {goods_id}: "

@@ -106,3 +106,4 @@ class TransferRecord(db.Model):
         backref=db.backref('executed_transfers', lazy='dynamic'),  # 动态反向查询
         info={'description': '操作员对象'}
     )
+from .order_models import TransferOrder, TransferOrderLine, StockOperationEvent

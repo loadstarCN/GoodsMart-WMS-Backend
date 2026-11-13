@@ -20,6 +20,9 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # 所有构造 StockOp 的地方（文件:函数 → 变动类型）及测它的用例
 ENTRY_POINTS = {
+    'warehouse/transfer/orders.py:operate': ({'transfer_ship','transfer_receive','transfer_loss'}, 'test_entry_linked_transfer'),
+    'warehouse/asn/returns.py:receive': ({'customer_return_receive'}, 'test_entry_customer_return'),
+    'warehouse/asn/returns.py:review': ({'customer_return_dispose'}, 'test_entry_customer_return'),
     'warehouse/asn/services.py:complete_asn': ({'sort_in'}, 'test_entry_sort_in'),
     'warehouse/putaway/services.py:create_putaway_record': ({'putaway'}, 'test_entry_putaway_single_and_bulk'),
     'warehouse/removal/services.py:create_removal_record': ({'removal'}, 'test_entry_removal_single_and_bulk'),
@@ -38,6 +41,24 @@ ENTRY_POINTS = {
     'warehouse/inventory/services.py:dn_delivered': ({'ship'}, 'test_entry_inventory_service_fallbacks'),
     'warehouse/inventory/services.py:dn_completed': ({'sign'}, 'test_entry_inventory_service_fallbacks'),
 }
+
+
+def test_entry_linked_transfer(client, access_token):
+    from tests.test_warehouse_custody import test_transfer_partial_receive_idempotency_loss_and_cancel
+    test_transfer_partial_receive_idempotency_loss_and_cancel(client, access_token)
+    lines = _lines(client, doc_type='warehouse_transfer')
+    assert {r['movement_type'] for r in lines} == {'transfer_ship','transfer_receive','transfer_loss'}
+    assert all(r['doc_line_id'] and r['doc_id'] and r['reason'] and r['operator_id'] for r in lines)
+    assert sum(r['quantity'] for r in lines) == -2
+
+
+def test_entry_customer_return(client, access_token, access_company_admin_token):
+    from tests.test_warehouse_custody import test_return_limit_quarantine_review_and_receipt_replay
+    test_return_limit_quarantine_review_and_receipt_replay(client, access_token, access_company_admin_token)
+    lines = _lines(client, doc_type='customer_return')
+    assert {r['movement_type'] for r in lines} == {'customer_return_receive','customer_return_dispose'}
+    assert all(r['doc_line_id'] and r['doc_id'] and r['reason'] and r['operator_id'] for r in lines)
+    assert sum(r['quantity'] for r in lines) == 3
 
 
 def _lines(client, **filters):

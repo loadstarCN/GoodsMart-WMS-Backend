@@ -349,9 +349,6 @@ class StockService:
         # 1. 校验
         locations = {}
         for move in moves:
-            if move.src is not None and move.movement_type in ('pick', 'ship'):
-                from .lots import assert_shippable
-                assert_shippable(move.goods_id, move.src.lot_id, warehouse_id)
             if move.src is not None and move.dst is not None and move.src.lot_id != move.dst.lot_id and move.movement_type != 'lot_relabel':
                 raise BadRequestException('Stock movement must preserve lot identity', 16173, field='lot_id')
             for leg, inbound in ((move.src, False), (move.dst, True)):
@@ -400,6 +397,14 @@ class StockService:
                 else:
                     key = (move.goods_id, leg.lot_id)
                     lot_keys[key] = lot_keys.get(key, False) or inbound
+        from warehouse.cyclecount.control import guard_movement
+        from warehouse.dn.stock_policy import assert_movement_lot
+        for move in moves:
+            if move.src is not None and move.movement_type in ('pick', 'ship'):
+                assert_movement_lot(op, move.goods_id, move.src.lot_id)
+        guard_movement(op, location_keys)
+        from warehouse.asn.returns import guard_quarantine
+        guard_quarantine(op, moves)
         location_rows = {}
         for key in sorted(location_keys, key=lambda k: lock_order_key(*k)):
             goods_id, location_id, lot_id = key

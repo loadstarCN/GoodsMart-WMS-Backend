@@ -511,7 +511,7 @@ def test_complete_task_transaction_rollback(client, monkeypatch):
         _drop_off_plan_details(task)
 
         # 模拟 InventoryService.picking_completed 抛出异常
-        def fake_picking_completed(goods_id, warehouse_id, quantity, commit=True):
+        def fake_picking_completed(goods_id, warehouse_id, quantity, picked_quantity, **kwargs):
             raise Exception("Simulated inventory update error")
         monkeypatch.setattr(InventoryService, "dn_picked", fake_picking_completed)
 

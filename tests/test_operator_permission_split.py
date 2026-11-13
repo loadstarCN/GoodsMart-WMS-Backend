@@ -144,6 +144,7 @@ def test_old_permissions_still_accepted(client, access_token):
     response = client.post('/cyclecount/', headers=counter, json=task_body)
     assert response.status_code == 201, response.get_json()
     assert client.put(f"/cyclecount/{response.get_json()['id']}/process/", headers=counter).status_code == 200
+    assert client.post(f"/cyclecount/{response.get_json()['id']}/resolve/cancel", headers=counter, json={'reason':'Next permission check'}).status_code == 200
     response = client.post('/cyclecount/', headers=_h(access_token), json=task_body)
     assert client.put(f"/cyclecount/{response.get_json()['id']}/process/", headers=executor).status_code == 200
 

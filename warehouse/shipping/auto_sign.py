@@ -98,7 +98,8 @@ class AutoSignService:
     def _sign(dn_id, task_id, now) -> bool:
         """锁 DN 后重新判断，满足条件就按规则签收 → 签了没有"""
         from warehouse.delivery.services import DeliveryTaskService
-        dn = lock_row(db.session.get(DN, dn_id))
+        from .common import lock_dn
+        dn = lock_dn(db.session.get(DN, dn_id))
         if dn is None or dn.status != 'delivered':
             return False
         task = current_delivery_task(dn)

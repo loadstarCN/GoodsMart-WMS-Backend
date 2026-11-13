@@ -197,54 +197,41 @@ def _cc(client, detail_id):
 
 
 def test_cycle_count_system_quantity_taken_when_counted(client, access_token, access_company_admin_token):
-    """开始盘点时快照 100；之后正常拣走 20（库位 80）；实盘 75 → 差异按录入时算 −5，调整后库位 75（旧逻辑 55）"""
-    w = _world(client)
-    g = w['g1']
-    _inbound(client, access_token, w, [(g, 100)], [(g, w['std1'], 100)])
-    task_id, (d1,) = _cycle_task(client, w, [(g, w['std1'])])
-    assert _cc(client, d1)['system'] == 100
-
-    _picked_dn(client, access_token, w, [(g, 20)], [(g, w['std1'], 20)])
-    assert _bin(client, g, w['std1']) == 80
-
-    _ok(client.post(f'/cyclecount/{task_id}/details-batch-save/', json={'details': [{'id': d1, 'actual_quantity': 75}]},
-                    headers=_h(access_token)))
-    assert _cc(client, d1)['system'] == 80 and _cc(client, d1)['difference'] == -5
-    _ok(client.put(f'/cyclecount/{task_id}/complete/', headers=_h(access_token)))
-
-    adjustment = _ok(client.post(f'/adjustment/create_adjustment_by_cyclecount/{task_id}', headers=_h(access_token)))
-    (line,) = adjustment['details']
-    assert (line['system_quantity'], line['actual_quantity'], line['adjustment_quantity']) == (80, 75, -5)
-    _ok(client.put(f"/adjustment/{adjustment['id']}/approve/", headers=_h(access_company_admin_token)))
-    _ok(client.put(f"/adjustment/{adjustment['id']}/complete/", headers=_h(access_token)))
-    assert _bin(client, g, w['std1']) == 75
-    _assert_consistent(_inv(client, g, w['wh']))
+    w = _world(client);g = w['g1'];h = _h(access_token)
+    _inbound(client, access_token, w, [(g,100)], [(g,w['std1'],100)])
+    task_id,(d1,) = _cycle_task(client,w,[(g,w['std1'])],start=False)
+    # Work can continue while a count is only a draft.
+    _picked_dn(client,access_token,w,[(g,20)],[(g,w['std1'],20)])
+    _ok(client.put(f'/cyclecount/{task_id}/process/',headers=h))
+    assert client.post('/removal/',headers=h,json={'goods_id':g,'location_id':w['std1'],'quantity':1,'reason':'damaged'}).status_code==409
+    _ok(client.post(f'/cyclecount/{task_id}/details-batch-save/',headers=h,json={'details':[{'id':d1,'actual_quantity':75}]}))
+    assert _cc(client,d1)['system']==80 and _cc(client,d1)['difference']==-5
+    _ok(client.put(f'/cyclecount/{task_id}/complete/',headers=h))
+    adjustment=_ok(client.post(f'/adjustment/create_adjustment_by_cyclecount/{task_id}',headers=h))
+    (line,)=adjustment['details']
+    assert (line['system_quantity'],line['actual_quantity'],line['adjustment_quantity'])==(80,75,-5)
+    for action in ('approve','complete'):
+        _ok(client.put(f"/adjustment/{adjustment['id']}/{action}/",headers=_h(access_company_admin_token)))
+    assert _bin(client,g,w['std1'])==75
+    _assert_consistent(_inv(client,g,w['wh']))
 
 
 def test_cycle_count_detail_complete_and_update_record_current_system(client, access_token):
-    """单行完成（没批量保存过）、pending 时改明细实盘数，都按录入那一刻取系统数并记录录入人"""
-    w = _world(client)
-    g = w['g1']
-    _inbound(client, access_token, w, [(g, 10)], [(g, w['std1'], 10)])
-
-    # pending 时修改明细给了实盘数 = 录入；开始盘点不覆盖已录入明细的系统数
-    task_id, (d1, d2) = _cycle_task(client, w, [(g, w['std1']), (w['g2'], w['std1'])], start=False)
-    _ok(client.put(f'/cyclecount/{task_id}/details/{d1}', json={'actual_quantity': 9}, headers=_h(access_token)))
-    recorded = _cc(client, d1)
-    assert (recorded['system'], recorded['actual'], recorded['difference']) == (10, 9, -1)
+    w=_world(client);g=w['g1'];h=_h(access_token)
+    _inbound(client,access_token,w,[(g,10)],[(g,w['std1'],10)])
+    task_id,(d1,d2)=_cycle_task(client,w,[(g,w['std1']),(w['g2'],w['std1'])],start=False)
+    assert client.put(f'/cyclecount/{task_id}/details/{d1}',headers=h,json={'actual_quantity':9}).status_code==409
+    _ok(client.put(f'/cyclecount/{task_id}/process/',headers=h))
+    _ok(client.post(f'/cyclecount/{task_id}/details-batch-save/',headers=h,json={'details':[{'id':d1,'actual_quantity':9}]}))
+    recorded=_cc(client,d1)
+    assert (recorded['system'],recorded['actual'],recorded['difference'])==(10,9,-1)
     assert recorded['operator'] is not None
-    _ok(client.post('/removal/', json={'goods_id': g, 'location_id': w['std1'], 'quantity': 2, 'reason': 'damaged'},
-                    headers=_h(access_token)))
-    _ok(client.put(f'/cyclecount/{task_id}/process/', headers=_h(access_token)))
-    assert (_cc(client, d1)['system'], _cc(client, d1)['difference']) == (10, -1)
-    assert _cc(client, d2)['operator'] is None        # 未录入的只做展示快照
-
-    # 单行完成一条没录入过的：按当前实盘（默认 0）录入，系统数取此刻（std1 没有商品 2）
-    _ok(client.put(f'/cyclecount/{task_id}/details/{d2}/complete/', headers=_h(access_token)))
-    done = _cc(client, d2)
-    assert (done['system'], done['actual'], done['difference'], done['status']) == (0, 0, 0, 'completed')
+    assert client.post('/removal/',headers=h,json={'goods_id':g,'location_id':w['std1'],'quantity':2,'reason':'damaged'}).status_code==409
+    _ok(client.put(f'/cyclecount/{task_id}/details/{d2}/complete/',headers=h))
+    done=_cc(client,d2)
+    assert (done['system'],done['actual'],done['difference'],done['status'])==(0,0,0,'completed')
     assert done['operator'] is not None
-    _ok(client.put(f'/cyclecount/{task_id}/complete/', headers=_h(access_token)))
+    _ok(client.put(f'/cyclecount/{task_id}/complete/',headers=h))
 
 
 def test_cycle_count_complete_requires_all_details_recorded(client, access_token):

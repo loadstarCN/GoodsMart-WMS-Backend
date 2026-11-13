@@ -31,7 +31,7 @@ def _setup(client, token):
         db.session.commit()
         return task.id, {'Authorization': f'Bearer {token}', 'X-Warehouse-ID': str(task.warehouse_id)}, dict(
             goods_code=goods.code, location_code=location.code, lot_no='qa-new-lot',
-            expiry_date='2027-06-30', actual_quantity=2)
+            expiry_date='2027-06-30')
 
 
 def test_supplement_records_zero_system_without_changing_stock(client, access_company_admin_token):
@@ -42,9 +42,11 @@ def test_supplement_records_zero_system_without_changing_stock(client, access_co
     result = client.post(url, headers=headers, json=body)
     assert result.status_code == 201
     row = result.json
-    assert row['system_quantity'] == 0 and row['actual_quantity'] == row['difference'] == 2
+    assert row['system_quantity'] == 0 and not row['operator_id']
+    assert client.post(url,headers=headers,json={**body,'actual_quantity':2}).status_code==409
+    saved=client.post(f'/cyclecount/{task_id}/details-batch-save/',headers=headers,json={'details':[{'id':row['id'],'actual_quantity':2}]})
+    assert saved.status_code==201
     assert row['lot_no'] == 'QA-NEW-LOT' and row['is_supplemental'] is True
-    assert row['operator_id']
     assert client.post(url, headers=headers, json=body).status_code == 409
     with client.application.app_context():
         assert StockLedger.query.count() == before
@@ -64,7 +66,7 @@ def test_supplement_scope_quantity_expiry_and_locked_states(client, access_compa
     assert client.post(url, headers=headers, json={**body, 'goods_code': 'NO-GOODS'}).status_code == 404
     assert client.post(url, headers=headers, json={**body, 'expiry_date': '2027-02-30'}).status_code == 400
     assert client.post(url, headers=headers, json={**body, 'lot_no': ''}).status_code == 400
-    row = client.post(url, headers=headers, json={**body, 'actual_quantity': 0}).json
+    row = client.post(url, headers=headers, json=body).json
     assert row['actual_quantity'] == 0
     with client.application.app_context():
         task = get_cyclecount_task()
@@ -110,6 +112,8 @@ def test_supplement_survives_completed_count_into_pending_adjustment(client, acc
     result = client.post(f'/cyclecount/{task_id}/supplements/', headers=headers, json=body)
     assert result.status_code == 201
     lot_id = result.json['lot_id']
+    assert client.put(f'/cyclecount/{task_id}/complete/',headers=headers).status_code==409
+    assert client.post(f'/cyclecount/{task_id}/details-batch-save/',headers=headers,json={'details':[{'id':result.json['id'],'actual_quantity':2}]}).status_code==201
     assert client.put(f'/cyclecount/{task_id}/complete/', headers=headers).status_code == 200
     result = client.post(f'/adjustment/create_adjustment_by_cyclecount/{task_id}', headers=headers)
     assert result.status_code == 201

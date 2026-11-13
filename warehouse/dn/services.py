@@ -134,21 +134,27 @@ class DNService:
         lock_inventory_rows([d.goods_id for d in dn.details], dn.warehouse_id)
 
     @staticmethod
-    def _assert_dn_stock_available(warehouse_id: int, requested_by_goods: dict, dn: DN | None = None):
+    def _assert_dn_stock_available(warehouse_id: int, requested_by_goods: dict, dn: DN | None = None, pool=None):
         """校验各商品「本 DN 变更后的计划总量」不超过可用量。
 
         可用量 = onhand - locked - dn_stock + 本 DN 自身已预占量：dn_stock 已经包含了
         本 DN 现有明细，改量 / 加行 / 同步时必须把自己排除，否则会把自己算成别人的预占。
         create / create_detail / update_detail / sync 四处复用。
         """
+        from .stock_policy import source, RESERVED, PHYSICAL
+        pool = pool or (source(dn) if dn else 'standard')
         own = DNService._own_reserved_by_goods(dn)
         # 按 goods_id 升序逐行加锁（B-103）：两个请求商品顺序相反时不再互相等待（PG 死锁 → 500）
         for goods_id, quantity in sorted(requested_by_goods.items(), key=lambda item: lock_order_key(item[0])):
             inventory = InventoryService._get_for_update(goods_id, warehouse_id)
             available = (
-                inventory.available_stock_for_sale
+                (inventory.available_stock_for_sale if pool == 'standard' and (not dn or dn.dn_type not in ('return_to_supplier', 'damage_to_supplier')) else
+                 getattr(inventory, PHYSICAL[pool]) - getattr(inventory, RESERVED[pool]) - (inventory.locked_stock if pool == 'standard' else 0))
                 + own.get(goods_id, 0)
             )
+            if pool == 'return':
+                from warehouse.asn.returns import held
+                available -= held(goods_id, warehouse_id)
             if quantity > available:
                 raise BadRequestException(
                     f"Insufficient available stock for goods {goods_id}: "
@@ -307,6 +313,8 @@ class DNService:
         from warehouse.common.address_format import format_single_line
         from warehouse.shipping.common import lock_dn
         dn = lock_dn(dn)
+        from warehouse.asn.return_outbound import require_independent
+        require_independent(dn)
         lock = DNService.ship_to_lock(dn)
         if lock is not None:
             if lock['reason_code'] == 'DN_CLOSED':
@@ -330,9 +338,10 @@ class DNService:
         如果参数为 int，则调用 get_dn 获取 DN 实例；
         否则直接返回传入的 DN 实例。
         """
-        if isinstance(dn_or_id, int):
-            return DNService.get_dn(dn_or_id)
-        return dn_or_id
+        dn = DNService.get_dn(dn_or_id) if isinstance(dn_or_id, int) else dn_or_id
+        from warehouse.asn.return_outbound import lock_parent
+        lock_parent(dn)
+        return dn
 
     @staticmethod
     @transactional
@@ -604,9 +613,14 @@ class DNService:
 
         # 新单一律 pending 并预占库存：这里拒绝超额预占，
         # 让不可能完成的集成报文根本进不了拣货。
-        DNService._assert_dn_stock_available(warehouse_id, requested_by_goods)
+        from .stock_policy import parse
+        stock_policy = parse(data, company_id)
+        from types import SimpleNamespace
+        policy_dn = SimpleNamespace(stock_source=stock_policy['stock_source'], dn_type=payload.get('dn_type') or 'shipping', is_active=False)
+        DNService._assert_dn_stock_available(warehouse_id, requested_by_goods, policy_dn)
 
         new_dn = DN(
+            **stock_policy,
             recipient_id=payload['recipient_id'],
             shipping_address=shipping_address,
             ship_to=ship_to,
@@ -663,6 +677,8 @@ class DNService:
         """
 
         dn = lock_row(DNService._get_instance(dn_or_id))
+        from warehouse.asn.return_outbound import require_independent
+        require_independent(dn)
         if dn.status != 'pending':
             raise BadRequestException("Cannot update a non-pending DN", 16001)
 
@@ -697,6 +713,8 @@ class DNService:
             dn.shipping_options = DNService._shipping_options(payload['shipping_options'], carrier_id)
 
         # NOT NULL 字段：传 None 视为不改
+        if any(k in data and data[k] != getattr(dn, k) for k in ('dn_type', 'stock_source', 'supplier_id', 'purpose_reason')):
+            raise BadRequestException('Outbound purpose is fixed; cancel and recreate to change it', field='dn_type')
         for field in ('recipient_id', 'shipping_address', 'expected_shipping_date', 'dn_type'):
             if payload.get(field) is not None:
                 setattr(dn, field, payload[field])
@@ -724,6 +742,8 @@ class DNService:
         """
         # 先锁 DN 行并重读：与并发的 progress / cancel 串行
         dn = lock_row(DNService._get_instance(dn_or_id))
+        from warehouse.asn.return_outbound import require_independent
+        require_independent(dn)
         if dn.status != 'pending':
             raise BadRequestException("Cannot delete a non-pending DN", 16002)
 
@@ -746,6 +766,8 @@ class DNService:
         将指定的 DN 标记为非活动状态（is_active=False）。
         """
         dn = lock_row(DNService._get_instance(dn_or_id))
+        from warehouse.asn.return_outbound import require_independent
+        require_independent(dn)
         DNService._lock_inventories(dn)
         dn.is_active = False
         db.session.add(dn)
@@ -783,7 +805,9 @@ class DNService:
         在指定 DN 下创建一条 DNDetail（仅当 DN 状态为 pending 时）。
         同一商品在一张 DN 上只能有一行；数量不得超过排除本单预占后的可用量。
         """
-        dn = lock_row(DNService.get_dn(dn_id))
+        dn = lock_row(DNService._get_instance(dn_id))
+        from warehouse.asn.return_outbound import require_independent
+        require_independent(dn)
         if dn.status != 'pending':
             raise BadRequestException("Cannot add details to a non-pending DN", 16003)
 
@@ -820,7 +844,9 @@ class DNService:
         更新指定 DNDetail（仅当所属的 DN 状态为 pending 时）。
         只接受 goods_id / goods_code / quantity / remark；picked/packed/delivered_quantity 忽略。
         """
-        dn = lock_row(DNService.get_dn(dn_id))
+        dn = lock_row(DNService._get_instance(dn_id))
+        from warehouse.asn.return_outbound import require_independent
+        require_independent(dn)
         if dn.status != 'pending':
             raise BadRequestException("Cannot update details in a non-pending DN", 16004)
 
@@ -871,7 +897,9 @@ class DNService:
         """
         删除指定的 DNDetail（仅当其所属 DN 状态为 pending 时）。
         """
-        dn = lock_row(DNService.get_dn(dn_id))
+        dn = lock_row(DNService._get_instance(dn_id))
+        from warehouse.asn.return_outbound import require_independent
+        require_independent(dn)
         if dn.status != 'pending':
             raise BadRequestException("Cannot delete details from a non-pending DN", 16005)
 
@@ -895,6 +923,8 @@ class DNService:
         每个商品变更后的计划量都要通过「排除本单预占后的可用量」校验。
         """
         dn = lock_row(DNService._get_instance(dn_or_id))
+        from warehouse.asn.return_outbound import require_independent
+        require_independent(dn)
 
         if dn.status != 'pending':
             raise BadRequestException("Cannot sync details in non-pending DN", 16006)
@@ -968,6 +998,8 @@ class DNService:
         """
         # 先锁 DN 行并重读状态：并发的重复提交在下面的状态检查处挡下（不会建两个拣货任务）
         dn = lock_row(DNService._get_instance(dn_or_id))
+        if dn.dn_type == 'transfer':
+            raise ConflictException('Cancel this unlinked transfer DN and create a linked warehouse transfer order', 16236)
         if dn.status != 'pending':
             raise BadRequestException("Cannot mark a DN as 'in progress' that is not in 'pending' status.", 16000)
 
@@ -980,7 +1012,16 @@ class DNService:
                 detail.goods_id, dn.warehouse_id
             )
             from warehouse.stock.lot_policy import blocked_onhand
-            physical_available = inventory.onhand_stock - inventory.locked_stock - blocked_onhand(detail.goods_id, dn.warehouse_id)
+            from .stock_policy import source, PHYSICAL
+            pool = source(dn)
+            physical_available = getattr(inventory, PHYSICAL[pool])
+            if pool == 'standard':
+                physical_available -= inventory.locked_stock
+                if dn.dn_type == 'shipping':
+                    physical_available -= blocked_onhand(detail.goods_id, dn.warehouse_id)
+            elif pool == 'return':
+                from warehouse.asn.returns import held
+                physical_available -= held(detail.goods_id, dn.warehouse_id)
             if detail.quantity > physical_available:
                 raise BadRequestException(
                     f"Insufficient physical stock for goods {detail.goods_id}: "
@@ -1018,9 +1059,12 @@ class DNService:
         dn = DNService._update_dn_status(dn, "picked")
         DNService._update_and_calculate_quantity(dn_or_id)
 
+        from warehouse.asn.return_outbound import restore_unpicked
+        restore_unpicked(dn)
+
         for detail in dn.details:
             # 更新库存信息
-            InventoryService.dn_picked(detail.goods_id,dn.warehouse_id,detail.quantity,detail.picked_quantity)
+            InventoryService.dn_picked(detail.goods_id,dn.warehouse_id,detail.quantity,detail.picked_quantity, pool=dn.stock_source)
 
         # 创建打包任务
         from warehouse.packing.services import PackingTaskService
@@ -1110,6 +1154,8 @@ class DNService:
         """
         # 锁 DN 行并重读状态（完成发货已先锁过 DN，同一事务重复加锁无副作用）
         dn = lock_row(DNService._get_instance(dn_or_id))
+        if dn.dn_type == 'transfer':
+            raise ConflictException('Cancel this unlinked transfer DN and create a linked warehouse transfer order', 16236)
         if dn.status != 'packed':
             raise BadRequestException("Cannot ship a DN that is not in 'packed' status.", 16000)
         DNService._lock_inventories(dn)
@@ -1246,6 +1292,8 @@ class DNService:
         for detail in dn.details:
             InventoryService.update_and_calculate_dn_stock(detail.goods_id,dn.warehouse_id)
 
+        from warehouse.asn.return_outbound import restore_unpicked
+        restore_unpicked(dn, cancelled=True)
         return dn
 
     @staticmethod
@@ -1312,6 +1360,8 @@ class DNService:
         for detail in dn.details:
             InventoryService.update_and_calculate_dn_stock(detail.goods_id, dn.warehouse_id)
 
+        from warehouse.asn.return_outbound import restore_unpicked
+        restore_unpicked(dn, cancelled=True)
         return dn
 
     @staticmethod

@@ -14,6 +14,13 @@ class CycleCountTask(db.Model):
 
     CYCLE_COUNT_TASK_STATUSES = ('pending', 'in_progress', 'completed')
 
+    control_state = db.Column(db.String(16), nullable=False, default='draft', server_default='draft', index=True)
+    recount_of_id = db.Column(db.Integer, db.ForeignKey('cycle_count_tasks.id', ondelete='RESTRICT', name='fk_count_recount'))
+    recounts = db.relationship('CycleCountTask', foreign_keys=[recount_of_id], lazy='selectin')
+    resolution_reason = db.Column(db.String(255))
+    resolved_by = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='RESTRICT', name='fk_count_resolver'))
+    resolved_at = db.Column(UTCDateTime)
+
     id = db.Column(db.Integer, primary_key=True)
     task_name = db.Column(
         db.String(100), 
@@ -81,7 +88,7 @@ class CycleCountTask(db.Model):
         info={'description': '仓库对象'}
     )
     creator = db.relationship(
-        'User',
+        'User', foreign_keys=[created_by],
         backref=db.backref('created_cycle_count_tasks', lazy='dynamic'),
         lazy='joined',  # 立即加载创建人信息
         info={'description': '创建人对象'}

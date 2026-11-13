@@ -80,7 +80,7 @@ def test_update_asn(client, access_token):
         f'/asn/{asn_id}',
         headers={'Authorization': f'Bearer {access_token}'},
         json={
-            'asn_type': 'return_from_customer',
+            'asn_type': 'inbound',
             'status': 'received',
             'is_active': False,
             'remark': 'Updated remark'
@@ -88,7 +88,7 @@ def test_update_asn(client, access_token):
     )
     assert response.status_code == 200
     data = response.get_json()
-    assert data['asn_type'] == 'return_from_customer'
+    assert data['asn_type'] == 'inbound'
     assert data['remark'] == 'Updated remark'
     # status / is_active 只能经动作端点变更，PUT 里传了也被忽略（B-12）
     assert data['status'] == 'pending'

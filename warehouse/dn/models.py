@@ -55,6 +55,10 @@ class DN(db.Model):
         
     )
 
+    stock_source = db.Column(db.String(10), nullable=False, default='standard', server_default='standard')
+    supplier_id = db.Column(db.Integer, db.ForeignKey('suppliers.id', ondelete='RESTRICT', name='fk_dn_supplier_return'))
+    purpose_reason = db.Column(db.String(255))
+
     DN_TYPES = ('shipping', 'return_to_supplier', 'damage_to_supplier', 'transfer')
     DN_STATUSES = ('pending','in_progress', 'picked', 'packed', 'delivered', 'completed','closed')
     DN_TRANSPORTATION_MODES = ('express', 'pickup', 'courier', 'air', 'sea', 'land', 'rail', 'drone')

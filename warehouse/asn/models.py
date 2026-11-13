@@ -349,3 +349,5 @@ class ASNDetail(db.Model):
         lazy='select',
         info={'description': '规格采集 / 跳过的人'}
     )
+
+from .return_models import CustomerReturn, CustomerReturnLine, ReturnHolding, ReturnDisposition

@@ -391,6 +391,8 @@ class AdjustmentService:
         - 差值为 0 的明细不动库存
         """
         # 先锁调整单行并重读状态（再锁库位 / 库存行）：并发的重复完成在这里挡下，库位数量不会调两次
+        from warehouse.cyclecount.control import parent_for_adjustment
+        parent_count = parent_for_adjustment(AdjustmentService._get_instance(task_or_id))
         adjustment = AdjustmentService._assert_active(lock_row(AdjustmentService._get_instance(task_or_id)))
         if adjustment.status != 'approved':
             raise BadRequestException("Cannot complete an Adjustment that is not approved", 16019)
@@ -425,6 +427,10 @@ class AdjustmentService:
                               errors={'insufficient': (15002, f"Insufficient stock for goods_id={detail.goods_id} "
                                                               f"in location_id={detail.location_id}")})
         stock_op.commit()
+        if parent_count:
+            parent_count.control_state = 'settled'
+            parent_count.resolved_at = clock.now()
+            parent_count.resolved_by = operator_id
 
         return adjustment
 
@@ -498,6 +504,8 @@ class AdjustmentService:
         # 只有盘点完成后 system_quantity / difference 才是最终值，未完成不能据此生成调整单
         if cyclecount.status != 'completed':
             raise BadRequestException("CycleCountTask must be completed before creating an Adjustment", 16041)
+        if cyclecount.control_state != 'active':
+            raise ConflictException('Count scope is not active; create a linked recount', 16201)
 
         existing = (
             db.session.query(Adjustment.id)

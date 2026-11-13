@@ -149,3 +149,5 @@ class TransferRecordBulk(Resource):
 
         new_records = TransferService.bulk_create_transfer_records(data_list, created_by)
         return new_records, 201
+
+from . import orders

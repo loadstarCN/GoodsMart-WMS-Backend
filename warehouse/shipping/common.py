@@ -15,6 +15,9 @@ LOCKED_DN_STATUSES = ('delivered', 'completed')       # 发货后锁定（报关
 def lock_dn(dn):
     """对 DN 行加锁（只查主键，避免 joined eager load 撞 PostgreSQL 的 FOR UPDATE 限制）并刷新状态。
     与 DN / 出库任务状态转换共用 lock_row：同一把 DN 行锁，先 DN 后任务。"""
+    if dn is not None:
+        from warehouse.asn.return_outbound import lock_parent
+        lock_parent(dn)
     return lock_row(dn)
 
 

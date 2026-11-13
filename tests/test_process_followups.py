@@ -299,7 +299,7 @@ def test_picking_complete_locks_inventory_before_bins(client, access_token):
             {'goods_id': w['g2'], 'location_id': w['std1'], 'picked_quantity': 3},
             {'goods_id': w['g1'], 'location_id': w['std2'], 'picked_quantity': 3},
         ]}, headers=_h(access_token)))
-    _assert_lock_order(seen, expect_inv=False, expect_gl=True)
+    _assert_lock_order(seen, expect_gl=True)
 
     with _lock_spy() as seen:
         _ok(client.put(f'/picking/{task_id}/complete/', headers=_h(access_token)))
