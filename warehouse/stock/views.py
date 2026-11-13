@@ -1089,7 +1089,8 @@ class InventoryThresholds(Resource):
         Response `{updated, created, unchanged, dry_run, items: [{goods_id, goods_code, goods_name, before {low,
         high}, after {low, high}, changed}]}`. Any invalid item → 400 15017 `details {errors: [{index, goods_id,
         goods_code, field, code (15013 low < -1 / 15014 high < -1 / 15015 high ≤ low / 16030 goods not found /
-        15017), message}]}` and nothing changes.
+        15017), message}]}` and nothing changes. Concurrent threshold changes return 409;
+        reload before retrying. A conflict rolls back the whole batch.
         """
         from .thresholds import apply_thresholds
         data = _body()
@@ -1112,6 +1113,7 @@ class InventoryThresholdsByFilter(Resource):
         Suggested low = max(min_quantity, ceil(average daily outbound of window_days × cover_days)), high =
         ceil(average × overstock_days) (> low); goods without outbound in 90 days get no suggestion (listed in
         `skipped` with reason NO_OUTBOUND_90D). Response as PUT /inventory/thresholds plus `skipped`; errors 400 15017.
+        Concurrent threshold changes return 409 and roll back the whole batch; reload before retrying.
         """
         from .thresholds import apply_by_filter
         data = _body()

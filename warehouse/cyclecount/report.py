@@ -1,6 +1,6 @@
 """Accuracy from immutable completed count snapshots, never today's live balance."""
 from datetime import date, timedelta
-from sqlalchemy import func, case, and_
+from sqlalchemy import func, case, and_, or_
 from extensions.db import db
 from warehouse.common import clock, require_warehouse_scope
 from warehouse.common.document_reports import report_period
@@ -17,7 +17,10 @@ def accuracy_report(warehouse):
         month=date(n//12,n%12+1,1).isoformat()[:7]
         months[month]=dict(month=month,lines=0,different=0,tasks=0,partial=month==asof.isoformat()[:7])
     first=min(start,date.fromisoformat(next(iter(months))+'-01'))
-    valid=and_(Detail.status=='completed',Detail.system_quantity.isnot(None),Detail.difference.isnot(None))
+    # Batch saves and supplemental counts record the operator without completing
+    # each line individually (the same recorded predicate as the task service).
+    valid=and_(or_(Detail.status=='completed', Detail.operator_id.isnot(None)),
+               Detail.system_quantity.isnot(None),Detail.difference.isnot(None))
     query=db.session.query(Task.id,Task.task_name,Task.completed_at,
         func.count(Detail.id).label('all_lines'),func.sum(case((valid,1),else_=0)).label('lines'),
         func.sum(case((and_(valid,Detail.difference!=0),1),else_=0)).label('different'),

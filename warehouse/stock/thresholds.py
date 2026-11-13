@@ -12,7 +12,8 @@ details {errors: [{index, goods_id, goods_code, field, code, message}]}，全部
 from sqlalchemy import func, or_
 
 from extensions.db import db
-from extensions.error import BadRequestException
+from extensions.error import BadRequestException, ConflictException
+from extensions.transaction import transactional
 from warehouse.goods.models import Goods
 from warehouse.inventory.models import Inventory
 
@@ -119,6 +120,7 @@ def apply_thresholds(warehouse, items, dry_run=False) -> dict:
     return _apply(warehouse, plans, dry_run)
 
 
+@transactional
 def _apply(warehouse, plans, dry_run):
     from warehouse.inventory.services import InventoryService
     result = {'updated': 0, 'created': 0, 'unchanged': 0, 'dry_run': bool(dry_run), 'items': []}
@@ -133,15 +135,23 @@ def _apply(warehouse, plans, dry_run):
         result['items'].append({'goods_id': goods.id, 'goods_code': goods.code, 'goods_name': goods.name,
                                 'before': {'low': before[0], 'high': before[1]},
                                 'after': {'low': after[0], 'high': after[1]}, 'changed': changed})
-        if dry_run or not changed:
+    # Keep response order, but acquire database write locks in goods order.
+    # Compare both thresholds atomically: validation used this exact pair.
+    for goods, inventory, before, after in sorted(plans, key=lambda plan: plan[0].id):
+        if dry_run or before == after:
             continue
         if inventory is None:
             inventory = InventoryService.ensure_inventory(goods.id, warehouse.id)
-        inventory.low_stock_threshold, inventory.high_stock_threshold = after
+        updated = Inventory.query.filter_by(goods_id=goods.id, warehouse_id=warehouse.id,
+            low_stock_threshold=before[0], high_stock_threshold=before[1]).update(
+                {Inventory.low_stock_threshold: after[0], Inventory.high_stock_threshold: after[1]},
+                synchronize_session=False)
+        if updated != 1:
+            raise ConflictException('Thresholds changed; reload before saving. Nothing was changed.',
+                                    field='items', details={'goods_id': goods.id})
+        db.session.expire(inventory, list(FIELDS))
     if dry_run:
         db.session.rollback()
-    else:
-        db.session.commit()
     return result
 
 
