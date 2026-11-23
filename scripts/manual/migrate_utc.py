@@ -158,10 +158,10 @@ def health_ok(url: str, expected_commit: str) -> bool:
         return False
 
 
-def backup(pg_env: dict[str, str]) -> Path:
+def backup(pg_env: dict[str, str], prefix: str = 'wms-before-utc') -> Path:
     BACKUP_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
     os.chmod(BACKUP_DIR, 0o700)
-    target = BACKUP_DIR / ('wms-before-utc-' + datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ') + '.dump')
+    target = BACKUP_DIR / (prefix + '-' + datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ') + '.dump')
     # An offline backup is the recovery point. Keep it outside the Git checkout and only readable by the
     # deploy account.
     checked(['pg_dump', '-Fc', '--no-owner', '--no-privileges', '-f', str(target)], env=pg_env)
