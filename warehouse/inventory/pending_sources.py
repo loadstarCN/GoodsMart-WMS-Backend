@@ -51,7 +51,7 @@ def pending_source_rows(warehouse_id, *, keyword='', source=None, damaged=False,
         expiry_state = ('unknown' if remaining is None else 'below_acceptance' if remaining < rule['receive_days']
                         else 'warning' if remaining <= rule['warning_days'] else 'normal')
         base = dict(goods_id=goods.id, warehouse_id=warehouse_id,
-                    goods=dict(id=goods.id, name=goods.name, code=goods.code),
+                    goods=dict(id=goods.id, name=goods.name, code=goods.code, **goods.image_fields),
                     lot_id=stock.lot_id, lot_no=lot.lot_no if lot else None,
                     expiry_date=lot.expiry_date.isoformat() if lot and lot.expiry_date else None,
                     tracks_lots=goods.id in tracked, remaining_days=remaining, expiry_status=expiry_state,

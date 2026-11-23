@@ -66,7 +66,7 @@ def availability(warehouse, codes, purpose='shipping', pool='standard') -> dict:
         inventory = inventories.get(goods.id)
         items.append({
             'goods_id': goods.id, 'code': goods.code, 'name': goods.name, 'unit': goods.unit,
-            'is_active': bool(goods.is_active), 'thumbnail_url': goods.thumbnail_url,
+            'is_active': bool(goods.is_active), 'thumbnail_url': goods.thumbnail_url, 'image_url': goods.image_url,
             'available_stock_for_sale': inventory.available_stock_for_sale if inventory else 0,
             'available_for_purpose': (inventory.available_stock_for_sale if purpose in ('shipping', 'transfer') else getattr(inventory, PHYSICAL[pool]) - getattr(inventory, RESERVED[pool]) - (inventory.locked_stock if pool == 'standard' else 0) - (held(goods.id,warehouse.id) if pool == 'return' else 0)) if inventory else 0,
             'onhand_stock': inventory.onhand_stock if inventory else 0,

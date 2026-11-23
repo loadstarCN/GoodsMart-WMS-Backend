@@ -191,6 +191,14 @@ class Goods(db.Model):
         info={'description': '库存变动记录'}
     )
 
+    @property
+    def image_fields(self):
+        """Image references already loaded with this product, for compact read responses."""
+        return {key: value for key, value in (
+            ('thumbnail_url', self.thumbnail_url), ('image_url', self.image_url)
+        ) if value}
+
+
 class GoodsLocation(db.Model):
     """商品库位存储表"""
     __tablename__ = 'goods_locations'

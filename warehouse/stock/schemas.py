@@ -14,6 +14,7 @@ def _csv(value):
 
 goods_ref_model = api_ns.model('StockGoodsRef', {
     'id': fields.Integer(), 'code': fields.String(), 'name': fields.String(),
+    'thumbnail_url': fields.String(), 'image_url': fields.String(),
 })
 location_ref_model = api_ns.model('StockLocationRef', {
     'id': fields.Integer(), 'code': fields.String(), 'location_type': fields.String(),

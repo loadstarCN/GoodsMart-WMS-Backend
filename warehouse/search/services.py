@@ -384,6 +384,7 @@ class _SearchType:
                     highlights += _Text(value, spans).highlights(f'columns.{key}')
         return {
             'type': self.name,
+            **(obj.image_fields if self.name == 'goods' else {}),
             'id': obj.id,
             'code': code.text(),
             'title': title.text(),

@@ -32,7 +32,7 @@ def serialize(order):
     from warehouse.stock.models import GoodsLot
     def line(row):
         goods, lot = db.session.get(Goods,row.goods_id), db.session.get(GoodsLot,row.lot_id) if row.lot_id else None
-        return dict(id=row.id,goods_id=row.goods_id,goods_code=goods.code,goods_name=goods.name,lot_id=row.lot_id,
+        return dict(id=row.id,goods_id=row.goods_id,goods_code=goods.code,goods_name=goods.name, **goods.image_fields,lot_id=row.lot_id,
             lot_no=lot.lot_no if lot else None,source_location_id=row.source_location_id,
             source_location_code=db.session.get(Location,row.source_location_id).code,quantity=row.quantity,cancelled=row.cancelled,
             shipped=row.shipped,received=row.received,lost=row.lost,outstanding=row.shipped-row.received-row.lost)

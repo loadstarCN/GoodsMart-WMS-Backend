@@ -494,6 +494,20 @@ def test_query_is_trimmed_and_cut(client, access_token):
     assert set(result['counts']) == set(SEARCH_TYPES) and set(result['counts'].values()) == {0}
 
 
+def test_goods_image_available_in_grouped_search_and_single_type(client, access_token):
+    with client.application.app_context():
+        goods_id = _new_goods('PHOTO-SKU', 'Photographed product')
+        goods = db.session.get(Goods, goods_id)
+        goods.image_url = '/product-photo.png'
+        goods.thumbnail_url = '/product-thumb.png'
+        db.session.commit()
+
+    for filters in ({}, {'types': 'goods'}):
+        result = _search(client, _h(access_token), q='PHOTO-SKU', **filters)
+        item = _group(result, 'goods')['items'][0]
+        assert (item['thumbnail_url'], item['image_url']) == ('/product-thumb.png', '/product-photo.png')
+
+
 def test_types_limit_and_single_type_paging(client, access_token):
     with client.application.app_context():
         created = [_new_goods(f'PG-{i:02d}', f'Paged {i}') for i in range(7)]

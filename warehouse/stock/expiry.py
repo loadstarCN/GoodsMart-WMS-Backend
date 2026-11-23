@@ -59,7 +59,7 @@ def expiry_balances(warehouse, page=1, per_page=50, keyword='', status=None, fil
         summary[state] += int(quantity)
         if lot is None:
             summary['unassigned'] += int(quantity)
-        items.append(dict(goods_id=goods.id, goods_name=goods.name, goods_code=goods.code,
+        items.append(dict(goods_id=goods.id, goods_name=goods.name, goods_code=goods.code, **goods.image_fields,
             lot_id=lot.id if lot else None, lot_no=lot.lot_no if lot else None,
             production_date=lot.production_date.isoformat() if lot and lot.production_date else None,
             location_count=int(row[-1]), **composition,

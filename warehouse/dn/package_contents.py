@@ -20,7 +20,7 @@ def options(dn):
             rows = [(None, detail.packed_quantity)]
         for lot_id, quantity in rows:
             lot = db.session.get(GoodsLot, lot_id) if lot_id else None
-            result.append(dict(goods_id=detail.goods_id, goods_code=detail.goods.code, goods_name=detail.goods.name,
+            result.append(dict(goods_id=detail.goods_id, goods_code=detail.goods.code, goods_name=detail.goods.name, **detail.goods.image_fields,
                                lot_id=lot_id, lot_no=lot.lot_no if lot else None,
                                expiry_date=lot.expiry_date.isoformat() if lot and lot.expiry_date else None,
                                quantity=quantity))

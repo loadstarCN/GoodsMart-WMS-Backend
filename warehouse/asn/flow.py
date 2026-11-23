@@ -266,6 +266,7 @@ class InboundFlowService:
             'put_away_quantity': quantity - pending,
             'goods': [{'goods_id': r['goods_id'], 'code': getattr(goods.get(r['goods_id']), 'code', None),
                        'name': getattr(goods.get(r['goods_id']), 'name', None), 'quantity': r['quantity'],
+                       **(goods[r['goods_id']].image_fields if r['goods_id'] in goods else {}),
                        'pending': r['pending'],
                        # 仓库里该商品的待上架库存（不只本单）与其中的破损品（只能上到 damaged 库位，其余可上到
                        # standard / return 库位）：上架时界面据此提示

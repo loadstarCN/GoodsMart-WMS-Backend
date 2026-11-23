@@ -60,6 +60,8 @@ url_hint_model = api_ns.model('GlobalSearchUrlHint', {
 
 search_item_model = api_ns.model('GlobalSearchItem', {
     'type': fields.String(description='Type', enum=list(SEARCH_TYPES)),
+    'thumbnail_url': fields.String(description='Goods thumbnail, when available'),
+    'image_url': fields.String(description='Goods image, when available'),
     'id': fields.Integer(description='Record ID'),
     'code': fields.String(description='Document number (DN-163, PICK-5, …) / goods or location code; '
                                       'recipients have none'),

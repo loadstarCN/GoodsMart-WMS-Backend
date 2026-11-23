@@ -104,14 +104,19 @@ class WarehouseOverview(Resource):
         today = local_today(warehouse)
         result = {'date': today.isoformat()}
         if allowed('location_read'):
-            result['locations'] = Location.query.filter_by(warehouse_id=warehouse_id, is_active=True).count()
-            from warehouse.stock.queries import shelf_of, location_stock, location_summary
+            from warehouse.stock.queries import shelf_of
             codes = db.session.query(Location.code).filter_by(warehouse_id=warehouse_id, is_active=True).all()
+            result['locations'] = len(codes)
             result['zones'] = len({shelf_of(row.code) for row in codes})
             result['location_records'] = Location.query.filter_by(warehouse_id=warehouse_id).count()
             if allowed('inventory_read'):
-                result['empty_locations'] = sum(int(location_summary(location, stocks)['is_empty'])
-                    for location, stocks in location_stock({'warehouse_id': warehouse_id, 'include_empty': True}))
+                from warehouse.goods.models import GoodsLocation
+                has_stock = db.session.query(GoodsLocation.id).filter(
+                    GoodsLocation.location_id == Location.id, GoodsLocation.quantity > 0
+                ).exists()
+                result['empty_locations'] = db.session.query(func.count(Location.id)).filter(
+                    Location.warehouse_id == warehouse_id, Location.is_active.is_(True), ~has_stock
+                ).scalar()
         if allowed('inventory_read'):
             # Picking and packing move stock inside the warehouse; only dispatch
             # removes it. Keep shelf quantity separate from physical total.

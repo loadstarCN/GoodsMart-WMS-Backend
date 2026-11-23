@@ -23,7 +23,7 @@ def options(task):
         required=required or mixed
         for row in allocations:
             lot=db.session.get(GoodsLot,row.lot_id) if row.lot_id else None
-            items.append(dict(id=row.id,goods_id=goods_id,goods_code=goods.code,goods_name=goods.name,
+            items.append(dict(id=row.id,goods_id=goods_id,goods_code=goods.code,goods_name=goods.name, **goods.image_fields,
                 lot_id=row.lot_id,lot_no=lot.lot_no if lot else None,picked_quantity=row.picked_quantity,
                 goods_packed_quantity=quantity,requires_selection=mixed,
                 packed_quantity=row.packed_quantity if task.status=='completed' else

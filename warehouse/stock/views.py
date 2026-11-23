@@ -248,7 +248,7 @@ def _location_map(ids):
 def _goods_ref(goods):
     if goods is None:
         return None
-    return {'id': goods.id, 'code': goods.code, 'name': goods.name}
+    return {'id': goods.id, 'code': goods.code, 'name': goods.name, **getattr(goods, 'image_fields', {})}
 
 
 def _location_ref(location):

@@ -831,6 +831,7 @@ class CustomsService:
                 'goods_id': goods_id,
                 'goods_code': code,
                 'goods_name': goods.name if goods else None,
+                **(goods.image_fields if goods else {}),
                 'planned_quantity': row['planned'],
                 'packed_quantity': packed,
                 'unit_value': _num(unit_value),

@@ -21,6 +21,7 @@ goods_simple_model = api_ns.model('GoodsSimple', {
     'id': fields.Integer(readOnly=True, description='Goods ID'),
     'code': fields.String(required=True, description='Goods Code'),
     'name': fields.String(required=True, description='Goods Name'),
+    'image_url': fields.String(description='Goods Image URL'),
     'thumbnail_url': fields.String(description='Goods Thumbnail URL'),
     'price': fields.Float(description='Goods Price'),
     'discount_price': fields.Float(description='Discounted Price'),

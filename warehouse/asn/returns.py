@@ -53,7 +53,7 @@ def guard_quarantine(op, moves):
 def serialize(doc):
     def line(row):
         goods=db.session.get(Goods,row.goods_id);lot=db.session.get(GoodsLot,row.lot_id) if row.lot_id else None
-        return dict(id=row.id,goods_id=row.goods_id,goods_code=goods.code,goods_name=goods.name,lot_id=row.lot_id,
+        return dict(id=row.id,goods_id=row.goods_id,goods_code=goods.code,goods_name=goods.name, **goods.image_fields,lot_id=row.lot_id,
             lot_no=lot.lot_no if lot else None,quantity=row.quantity,received=row.received,disposed=row.disposed,
             holdings=[dict(location_id=h.location_id,location_code=db.session.get(Location,h.location_id).code,quantity=h.quantity)
                 for h in ReturnHolding.query.filter_by(line_id=row.id).filter(ReturnHolding.quantity>0).all()])

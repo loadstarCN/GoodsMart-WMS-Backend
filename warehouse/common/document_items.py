@@ -108,7 +108,7 @@ def preview(warehouse, *, outbound):
                 Goods.company_id == warehouse.company_id, Goods.code.in_(codes[start:start + 500])
             ).all():
                 goods[item.code] = {'goods_id': item.id, 'code': item.code, 'name': item.name,
-                                    'unit': item.unit, 'thumbnail_url': item.thumbnail_url, 'is_active': bool(item.is_active)}
+                                    'unit': item.unit, 'thumbnail_url': item.thumbnail_url, 'image_url': item.image_url, 'is_active': bool(item.is_active)}
     result = list(errors)
     for code, item in grouped.items():
         match = goods.get(code)
