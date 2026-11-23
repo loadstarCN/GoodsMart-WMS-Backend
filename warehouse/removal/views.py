@@ -17,6 +17,10 @@ from .schemas import (
 )
 from warehouse.goods.services import GoodsLocationService
 from .services import RemovalService
+from warehouse.common.stock_requests import register_stock_requests
+
+register_stock_requests(api_ns, removal_record_input_model, RemovalService.create_removal_record, 'location_id')
+
 
 @api_ns.doc(security="jsonWebToken")
 @api_ns.route('/')

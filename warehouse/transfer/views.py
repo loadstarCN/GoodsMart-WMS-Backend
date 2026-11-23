@@ -18,7 +18,11 @@ from .schemas import (
 )
 from system.common import paginate
 from .services import TransferService
+from warehouse.common.stock_requests import register_stock_requests
 from warehouse.goods.services import GoodsLocationService
+
+register_stock_requests(api_ns, transfer_record_input_model, TransferService.create_transfer_record, 'from_location_id', 'to_location_id')
+
 
 @api_ns.doc(security="jsonWebToken")
 @api_ns.route('/')

@@ -18,6 +18,10 @@ from .schemas import (
 )
 from system.common import paginate
 from .services import PutawayService
+from warehouse.common.stock_requests import register_stock_requests
+
+register_stock_requests(api_ns, putaway_record_input_model, PutawayService.create_putaway_record, 'location_id')
+
 
 @api_ns.doc(security="jsonWebToken")
 @api_ns.route('/')
