@@ -8,9 +8,27 @@ depends_on = None
 
 
 def upgrade():
-    if op.get_bind().dialect.name == 'postgresql':
-        op.execute("ALTER TYPE dn_type_enum ADD VALUE IF NOT EXISTS 'damage_to_supplier'")
-        op.execute("ALTER TYPE payment_status_enum ADD VALUE IF NOT EXISTS 'failed'")
+    if op.get_bind().dialect.name != 'postgresql':
+        return
+
+    # PostgreSQL checks ownership on ALTER TYPE even when the value already exists.
+    # A database owner can add the labels before the application runs this migration.
+    for enum_name, label in (
+        ('dn_type_enum', 'damage_to_supplier'),
+        ('payment_status_enum', 'failed'),
+    ):
+        op.execute(f"""
+            DO $migration$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM pg_catalog.pg_enum
+                    WHERE enumtypid = '{enum_name}'::regtype AND enumlabel = '{label}'
+                ) THEN
+                    ALTER TYPE {enum_name} ADD VALUE IF NOT EXISTS '{label}';
+                END IF;
+            END;
+            $migration$;
+        """)
 
 
 def downgrade():
