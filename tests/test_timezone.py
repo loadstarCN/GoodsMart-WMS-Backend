@@ -182,8 +182,9 @@ def test_parse_input_datetime(client):
         # 只给日期 = 仓库当地 00:00
         assert parse('2026-10-24', warehouse) == datetime(2026, 10, 24, 7, 0, tzinfo=UTC)
         assert parse(date(2026, 10, 24), warehouse) == datetime(2026, 10, 24, 7, 0, tzinfo=UTC)
-        # 没有仓库 = 默认时区（测试里 UTC）；结果总是 UTC
-        assert parse('2026-10-24T17:30:00', None) == datetime(2026, 10, 24, 17, 30, tzinfo=UTC)
+        # 没有仓库按配置的默认时区解释，结果仍为 UTC。
+        client.application.config['WMS_DEFAULT_TIMEZONE'] = 'Asia/Tokyo'
+        assert parse('2026-10-24T17:30:00', None) == datetime(2026, 10, 24, 8, 30, tzinfo=UTC)
         assert parse('2026-10-24T17:30:00', 'Asia/Tokyo').tzinfo == UTC
         assert parse(None, warehouse) is None and parse('  ', warehouse) is None
         for bad in ('tomorrow', '2026-13-01', 12345):
@@ -263,7 +264,8 @@ def test_warehouse_timezone_validation_and_output(client, access_token):
 
     response = client.put(f'/warehouse/{warehouse_id}', json={'name': 'LA Warehouse 2'}, headers=_h(access_token))
     assert response.get_json()['timezone_configured'] == 'America/Los_Angeles'       # 没带 timezone = 不改
-    # 清空 = 用默认时区（测试里没设 WMS_DEFAULT_TIMEZONE / WMS_TIMEZONE → UTC）
+    # 清空后使用部署默认时区，两项都没设时回退到 UTC。
+    client.application.config.update(WMS_DEFAULT_TIMEZONE='', WMS_TIMEZONE='')
     response = client.put(f'/warehouse/{warehouse_id}', json={'timezone': ''}, headers=_h(access_token))
     body = response.get_json()
     assert response.status_code == 200 and body['timezone_configured'] is None and body['timezone'] == 'UTC'

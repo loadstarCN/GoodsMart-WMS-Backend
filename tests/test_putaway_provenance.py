@@ -60,6 +60,7 @@ def test_putaway_timing_weights_units_and_never_uses_unrelated_records(client, a
 
 def test_newer_receipt_putaway_does_not_age_out_older_pending_source(client, access_token):
     from warehouse.inventory.pending import overdue_summary
+    client.application.config['WMS_LEGACY_TIMEZONE'] = 'Asia/Tokyo'
     w = _world(client)
     older = _sort_in(client, access_token, w, w['g1'], 4, 0)
     newer = _sort_in(client, access_token, w, w['g1'], 4, 0)

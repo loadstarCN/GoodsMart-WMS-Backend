@@ -119,7 +119,7 @@ def test_company_admin_cannot_extend_own_company(client, access_company_admin_to
     with client.application.app_context():
         company_id = get_company_admin_user().company_id
         company = get_company_by_id(company_id)
-        company.expired_at = datetime.datetime(2030, 1, 1)
+        company.expired_at = datetime.datetime(2030, 1, 1, tzinfo=datetime.timezone.utc)
         db.session.commit()
 
     response = client.put(f'/company/{company_id}', headers=headers,

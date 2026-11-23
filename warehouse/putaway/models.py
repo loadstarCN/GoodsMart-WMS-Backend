@@ -17,7 +17,7 @@ class ReceiptPendingStock(db.Model):
     asn_id = db.Column(db.Integer, db.ForeignKey('asn.id', ondelete='RESTRICT'), nullable=True, index=True)
     dn_id = db.Column(db.Integer, db.ForeignKey('dn.id', ondelete='RESTRICT'), nullable=True, index=True)
     source_type = db.Column(db.String(32), nullable=False, default='asn', server_default='asn')
-    entered_at = db.Column(db.DateTime(timezone=True), nullable=True)
+    entered_at = db.Column(UTCDateTime, nullable=True)
     warehouse_id = db.Column(db.Integer, db.ForeignKey('warehouses.id', ondelete='RESTRICT'), nullable=False)
     goods_id = db.Column(db.Integer, db.ForeignKey('goods.id', ondelete='RESTRICT'), nullable=False)
     lot_id = db.Column(db.Integer, db.ForeignKey('goods_lots.id', ondelete='RESTRICT'), nullable=True)
