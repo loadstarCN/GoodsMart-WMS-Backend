@@ -134,9 +134,17 @@ class SortingTaskComplete(Resource):
         Complete a specific Sorting Task (in_progress -> completed) and its ASN
         """
         operator_id = require_actor_user_id()
-        updated_task = SortingTaskService.complete_task(_owned_task(task_id), operator_id)
+        updated_task = SortingTaskService.complete_task(_owned_task(task_id), operator_id, request.get_json(silent=True))
         return updated_task
 
+
+@api_ns.route('/<int:task_id>/variance-resolution')
+class SortingVarianceResolution(Resource):
+    @permission_required(["all_access", "company_all_access", "sorting_edit"])
+    @warehouse_required()
+    @api_ns.marshal_with(sorting_task_model)
+    def post(self, task_id):
+        return SortingTaskService.resolve_variance(_owned_task(task_id), require_actor_user_id(), api_ns.payload)
 
 
 @api_ns.doc(security="jsonWebToken")

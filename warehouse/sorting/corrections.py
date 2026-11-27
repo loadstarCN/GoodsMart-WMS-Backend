@@ -91,8 +91,9 @@ def _asn_lines(task, goods_id):
 
 
 def _check_plan(lines, delta):
-    quantity = sum((getattr(line, field) or 0) for line in lines for field in QUANTITIES) + sum(delta.values())
-    if quantity > sum(line.quantity for line in lines) + SortingTaskService.OVERAGE_TOLERANCE:
+    current = sum((getattr(line, field) or 0) for line in lines for field in QUANTITIES)
+    planned = sum(line.quantity for line in lines) + SortingTaskService.OVERAGE_TOLERANCE
+    if current + sum(delta.values()) > max(current, planned):
         raise BadRequestException('Corrected quantity exceeds the ASN planned quantity', 17033, field='quantities')
 
 

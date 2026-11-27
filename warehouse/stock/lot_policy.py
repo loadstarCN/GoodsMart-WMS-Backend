@@ -23,16 +23,23 @@ def validate_rules(value):
     return dict(value)
 
 
-def effective_rules(goods, overrides=None, company_rules=None, warehouse_id=None):
-    company = company_rules if company_rules is not None else db.session.get(CompanyLotRules, goods.company_id)
-    own = db.session.get(GoodsLotRules, goods.id) if goods.id else None
+def _layered_rules(goods, overrides, company):
     layers = [('company', company.defaults if company else {}),
               ('category', (company.categories or {}).get(goods.category, {}) if company else {}),
-              ('goods', overrides if overrides is not None else (own.overrides if own else {}))]
+              ('goods', overrides)]
     values, sources = dict(DEFAULTS), {key: 'default' for key in DEFAULTS}
     for source, layer in layers:
         for key, val in (layer or {}).items():
             values[key], sources[key] = val, source
+    return values, sources
+
+
+def effective_rules(goods, overrides=None, company_rules=None, warehouse_id=None):
+    company = company_rules if company_rules is not None else db.session.get(CompanyLotRules, goods.company_id)
+    if overrides is None and goods.id:
+        own = db.session.get(GoodsLotRules, goods.id)
+        overrides = own.overrides if own else None
+    values, sources = _layered_rules(goods, overrides, company)
     if warehouse_id is not None:
         from warehouse.warehouse.models import Warehouse
         warehouse = db.session.get(Warehouse, warehouse_id)
@@ -40,6 +47,19 @@ def effective_rules(goods, overrides=None, company_rules=None, warehouse_id=None
         if warehouse and warehouse.company_id == goods.company_id and configured is not None:
             values['allow_unassigned'], sources['allow_unassigned'] = configured, 'warehouse'
     return dict(values=values, sources=sources)
+
+
+def receiving_lot_rules(asn):
+    products = {line.goods_id: line.goods for line in asn.details if line.goods is not None}
+    if not products:
+        return {}
+    company = db.session.get(CompanyLotRules, asn.warehouse.company_id)
+    overrides = {row.goods_id: row.overrides for row in GoodsLotRules.query.filter(GoodsLotRules.goods_id.in_(products))}
+    result = {}
+    for goods_id, goods in products.items():
+        values, _ = _layered_rules(goods, overrides.get(goods_id), company)
+        result[str(goods_id)] = {key: values[key] for key in ('mode', 'source')}
+    return result
 
 
 def has_lot_stock(goods_id):

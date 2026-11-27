@@ -31,6 +31,18 @@ def test_queue_keeps_receipts_separate_and_unknown_unattributed(client, access_t
     assert len({row['id'] for row in data['items']}) == 3
     assert data['items'][-1]['pending_since'] is None
     assert data['items'][0]['good_quantity'] == 3
+
+    inventory_url = f'/inventory/?pending_putaway=true&goods_id={w["g1"]}'
+    rows = _ok(client.get(inventory_url + '&include_pending_sources=true', headers=headers))['items']
+    assert len(rows) == 1
+    lots_url = f'/inventory/goods/{w["g1"]}/warehouse/{w["wh"]}/pending-lots'
+    source_details = _ok(client.get(lots_url, headers=headers))['items']
+    assert rows[0]['pending_sources'] == source_details
+    assert [(row['asn_id'], row['sorted_stock'], row['sorted_damage_stock']) for row in source_details] == [
+        (older, 5, 2), (newer, 4, 0), (None, 2, 0),
+    ]
+    assert 'pending_sources' not in _ok(client.get(inventory_url, headers=headers))['items'][0]
+
     for query, count, quantity in [('source=unknown',1,2), ('source=asn',2,9),
                                   ('damaged=true',1,5), ('has_lot=true',0,0),
                                   ('overdue_days=3',1,5), ('overdue_days=7',0,0),
@@ -68,6 +80,41 @@ def test_queue_validates_scope_filters_permissions_and_inconsistent_sources(clie
         db.session.commit()
     result = client.get(URL, headers=headers)
     assert result.status_code == 400 and result.get_json()['code'] == 16173
+
+
+def test_asn_queue_and_partial_putaway_keep_same_product_receipts_separate(client, access_token):
+    w = _world(client)
+    asn = _sort_in(client, access_token, w, w['g1'], 5, 0)
+    other_asn = _sort_in(client, access_token, w, w['g1'], 7, 0)
+    _sort_in(client, access_token, w, w['g2'], 9, 0)
+    headers = {**_h(access_token), 'X-WAREHOUSE-ID': str(w['wh'])}
+
+    def queue(asn_id):
+        return _ok(client.get(URL, query_string={'asn_id': asn_id}, headers=headers))
+
+    data = queue(asn)
+    assert data['asn'] == dict(id=asn, warehouse_id=w['wh'], putaway_tracked=True)
+    assert data['total'] == 1 and data['summary']['quantity'] == 5
+    source = data['items'][0]
+    assert source['asn_id'] == asn and source['lot_id'] is None
+    record = dict(goods_id=source['goods_id'], location_id=w['std1'], lot_id=source['lot_id'],
+                  receipt_source_id=source['receipt_source_id'])
+
+    uploaded = _ok(client.post('/putaway/bulk', json=[dict(record, quantity=2)], headers=headers))
+    assert uploaded[0]['source_asn_id'] == asn
+    assert queue(asn)['summary']['quantity'] == 3
+    assert queue(other_asn)['summary']['quantity'] == 7
+    assert client.post('/putaway/bulk', json=[dict(record, quantity=4)], headers=headers).status_code == 400
+
+    exported = client.get(URL+'/export', query_string={'asn_id': asn}, headers=headers)
+    assert exported.status_code == 200
+    rows = list(csv.DictReader(io.StringIO(exported.data.decode('utf-8-sig'))))
+    assert [(row['asn_id'], row['total_quantity']) for row in rows] == [(str(asn), '3')]
+    _ok(client.post('/putaway/bulk', json=[dict(record, quantity=3)], headers=headers))
+    assert queue(asn)['items'] == []
+    assert queue(other_asn)['summary']['quantity'] == 7
+    for suffix in ['?asn_id=', '?asn_id=0', f'?asn_id={asn}&asn_id={other_asn}']:
+        assert client.get(URL+suffix, headers=headers).status_code == 400
 
 
 def test_queue_lot_removal_stays_unknown_and_foreign_warehouse_is_denied(client, access_token, foreign):

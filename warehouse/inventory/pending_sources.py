@@ -1,7 +1,9 @@
 """Current pending stock split by proven receipt source; residual provenance stays unknown."""
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
+from itertools import groupby
 
+from sqlalchemy import and_, tuple_
 from sqlalchemy.orm import lazyload
 from extensions.db import db, as_utc
 from extensions.error import BadRequestException
@@ -14,13 +16,65 @@ from warehouse.stock.models import GoodsLot, InventoryLotStock
 from warehouse.stock.lot_policy import effective_rules
 
 
-def pending_source_rows(warehouse_id, *, keyword='', source=None, damaged=False,
+def pending_lot_rows(pairs):
+    """Receipt balances for the requested (goods, warehouse) inventory rows."""
+    pairs = sorted(set(pairs))
+    result = {pair: [] for pair in pairs}
+    for start in range(0, len(pairs), 300):
+        stock = InventoryLotStock
+        receipt = ReceiptPendingStock
+        rows = (
+            db.session.query(stock, GoodsLot.lot_no, GoodsLot.expiry_date, receipt)
+            .options(lazyload('*'))
+            .outerjoin(GoodsLot, GoodsLot.id == stock.lot_id)
+            .outerjoin(receipt, and_(
+                receipt.goods_id == stock.goods_id,
+                receipt.warehouse_id == stock.warehouse_id,
+                receipt.lot_id.is_not_distinct_from(stock.lot_id),
+                receipt.good_remaining + receipt.damaged_remaining > 0,
+            ))
+            .filter(tuple_(stock.goods_id, stock.warehouse_id).in_(pairs[start:start + 300]), stock.sorted_stock > 0)
+            .order_by(stock.goods_id, stock.warehouse_id, stock.lot_id, receipt.id)
+        )
+        for (goods_id, warehouse_id, lot_id), group in groupby(rows, lambda row: (
+                row[0].goods_id, row[0].warehouse_id, row[0].lot_id)):
+            entries = list(group)
+            lot_stock, lot_no, expiry, _ = entries[0]
+            base = dict(lot_id=lot_id, lot_no=lot_no, expiry_date=expiry.isoformat() if expiry else None)
+            unknown, unknown_bad = lot_stock.sorted_stock, lot_stock.sorted_damage_stock
+            details = result[goods_id, warehouse_id]
+            for _, _, _, source in entries:
+                if source is None:
+                    continue
+                quantity = source.good_remaining + source.damaged_remaining
+                details.append(dict(**base, receipt_source_id=source.id, asn_id=source.asn_id,
+                                    dn_id=source.dn_id, source_type=source.source_type, sorted_stock=quantity,
+                                    sorted_damage_stock=source.damaged_remaining))
+                unknown -= quantity
+                unknown_bad -= source.damaged_remaining
+            if unknown > 0:
+                details.append(dict(**base, receipt_source_id=0, asn_id=None, sorted_stock=unknown,
+                                    sorted_damage_stock=unknown_bad))
+    return result
+
+
+def pending_source_rows(warehouse_id, *, asn_id=None, keyword='', source=None, damaged=False,
                         has_lot=False, overdue_days=None):
-    stocks = (db.session.query(InventoryLotStock, Goods, GoodsLot).options(lazyload('*'))
+    stock_query = (db.session.query(InventoryLotStock, Goods, GoodsLot).options(lazyload('*'))
               .join(Goods, Goods.id == InventoryLotStock.goods_id)
               .outerjoin(GoodsLot, GoodsLot.id == InventoryLotStock.lot_id)
               .filter(InventoryLotStock.warehouse_id == warehouse_id,
-                      InventoryLotStock.sorted_stock > 0).all())
+                      InventoryLotStock.sorted_stock > 0))
+    if asn_id is not None:
+        matching_receipt = db.session.query(ReceiptPendingStock.id).filter(
+            ReceiptPendingStock.asn_id == asn_id,
+            ReceiptPendingStock.warehouse_id == InventoryLotStock.warehouse_id,
+            ReceiptPendingStock.goods_id == InventoryLotStock.goods_id,
+            ReceiptPendingStock.lot_id.is_not_distinct_from(InventoryLotStock.lot_id),
+            ReceiptPendingStock.good_remaining + ReceiptPendingStock.damaged_remaining > 0,
+        ).exists()
+        stock_query = stock_query.filter(matching_receipt)
+    stocks = stock_query.all()
     if not stocks:
         return []
     goods_ids = {stock.goods_id for stock, _, _ in stocks}
@@ -61,6 +115,8 @@ def pending_source_rows(warehouse_id, *, keyword='', source=None, damaged=False,
         for receipt, at in receipts[key]:
             known_good += receipt.good_remaining
             known_bad += receipt.damaged_remaining
+            if asn_id is not None and receipt.asn_id != asn_id:
+                continue
             rows.append(dict(base, receipt_source_id=receipt.id, asn_id=receipt.asn_id,
                              dn_id=receipt.dn_id, source_type=receipt.source_type, pending_since=as_utc(at).isoformat() if at else None,
                              sorted_stock=receipt.good_remaining + receipt.damaged_remaining,
@@ -69,7 +125,7 @@ def pending_source_rows(warehouse_id, *, keyword='', source=None, damaged=False,
         unknown_bad = stock.sorted_damage_stock - known_bad
         if min(unknown_good, unknown_bad) < 0:
             raise BadRequestException('Receipt source balance is inconsistent; reconcile before putaway', 16173)
-        if unknown_good + unknown_bad:
+        if asn_id is None and unknown_good + unknown_bad:
             rows.append(dict(base, receipt_source_id=0, asn_id=None, dn_id=None, source_type='unknown',
                              pending_since=None, sorted_stock=unknown_good + unknown_bad,
                              sorted_damage_stock=unknown_bad))

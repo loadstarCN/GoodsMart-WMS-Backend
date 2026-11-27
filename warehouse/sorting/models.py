@@ -1,5 +1,7 @@
 from extensions import db
 from extensions.db import UTCDateTime
+from sqlalchemy import and_, func, select
+from sqlalchemy.ext.hybrid import hybrid_property
 
 class SortingTask(db.Model):
     """分拣任务主表
@@ -65,6 +67,11 @@ class SortingTask(db.Model):
         nullable=True,
         info={'description': '实际完成时间'}
     )
+    variance_reason = db.Column(db.String(500), nullable=True)
+    variance_resolution = db.Column(db.String(500), nullable=True)
+    variance_resolved_at = db.Column(UTCDateTime, nullable=True)
+    variance_resolved_by = db.Column(
+        db.Integer, db.ForeignKey('users.id', name='fk_sorting_variance_resolver', ondelete='RESTRICT'), nullable=True)
 
     # 关系加载策略优化
     asn = db.relationship(
@@ -75,6 +82,7 @@ class SortingTask(db.Model):
     )
     creator = db.relationship(
         'User',
+        foreign_keys=[created_by],
         backref=db.backref('created_sorting_tasks', lazy='dynamic'),
         lazy='joined',
         info={'description': '创建人对象'}
@@ -114,6 +122,24 @@ class SortingTask(db.Model):
     def has_pending_correction(self):
         return self.status == 'completed' and any(row.status == 'pending' for row in self.quantity_corrections)
 
+    @hybrid_property
+    def has_variance(self):
+        if self.status != 'completed':
+            return False
+        differences = {}
+        for row in self.asn.details:
+            differences[row.goods_id] = differences.get(row.goods_id, 0) + (row.actual_quantity or 0) - (row.quantity or 0)
+        return any(differences.values())
+
+    @has_variance.expression
+    def has_variance(cls):
+        from warehouse.asn.models import ASNDetail
+        differences = (select(ASNDetail.goods_id)
+                       .where(ASNDetail.asn_id == cls.asn_id)
+                       .group_by(ASNDetail.goods_id)
+                       .having(func.sum(func.coalesce(ASNDetail.actual_quantity, 0) - ASNDetail.quantity) != 0)
+                       .correlate(cls).exists())
+        return and_(cls.status == 'completed', differences)
 
 class SortingQuantityCorrection(db.Model):
     """A reviewed change to the recorded quantities for one SKU and lot."""

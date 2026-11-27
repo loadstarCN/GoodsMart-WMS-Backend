@@ -582,7 +582,10 @@ def test_complete_block_until_captured_or_skipped(client, access_token):
     # 跳过并填原因 → 放行
     response = _capture(client, _h(access_token), asn_id, lines[1]['id'], {'note': '包装无原产国标识'})
     assert response.status_code == 200
-    response = client.put(f'/sorting/{task_id}/complete/', headers=_h(access_token))
+    response = client.put(f'/sorting/{task_id}/complete/', headers=_h(access_token), json={
+        'variances': [{'goods_id': 2, 'planned': 3, 'received': 0, 'rejected': 0}],
+        'variance_reason': '供应商未发商品 2',
+    })
     assert response.status_code == 200, response.get_json()
     data = response.get_json()
     assert data['spec_pending'] == []

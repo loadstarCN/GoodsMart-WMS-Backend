@@ -10,6 +10,81 @@ def _new_sorting_task(asn_id, user_id):
     db.session.commit()
     return task
 
+
+def test_sorting_short_receipt_requires_current_review_and_can_be_resolved(client, access_token):
+    from tests.test_inventory_guards import _create_asn, _h, _ok, _task_ids, _world
+
+    world = _world(client)
+    asn_id = _create_asn(client, access_token, world, [(world['g1'], 5), (world['g2'], 2)])
+    headers = _h(access_token)
+    _ok(client.put(f'/asn/{asn_id}/receive/', headers=headers))
+    task = _task_ids(client, SortingTask, asn_id=asn_id, is_active=True)[0]
+    base = f'/sorting/{task}'
+    _ok(client.put(base + '/process/', headers=headers))
+
+    def save(quantity):
+        _ok(client.post(base + '/batches/', json={'details': [
+            {'goods_id': world['g1'], 'sorted_quantity': quantity, 'damage_quantity': 0},
+        ]}, headers=headers))
+
+    save(3)
+    denied = client.put(base + '/complete/', headers=headers, json={'review_variance': True})
+    assert denied.status_code == 409 and denied.json['code'] == 17030
+    first_review = denied.json['details']['variances']
+    assert first_review == [
+        dict(goods_id=world['g1'], planned=5, received=3, rejected=0),
+        dict(goods_id=world['g2'], planned=2, received=0, rejected=0),
+    ]
+    assert _ok(client.get(f'/asn/{asn_id}', headers=headers))['status'] == 'received'
+    save(1)
+    changed = client.put(base + '/complete/', headers=headers,
+                         json=dict(variances=first_review, variance_reason='Supplier confirmed shortage'))
+    assert changed.status_code == 409 and changed.json['details']['variances'][0]['received'] == 4
+    latest = changed.json['details']['variances']
+    assert client.put(base + '/complete/', headers=headers, json=dict(variances=latest)).status_code == 409
+    done = _ok(client.put(base + '/complete/', headers=headers,
+                          json=dict(variances=latest, variance_reason='Supplier confirmed shortage')))
+    assert done['status'] == 'completed' and done['has_variance']
+    assert done['variance_reason'] == 'Supplier confirmed shortage'
+    assert {row['goods_id']: row['actual_quantity'] for row in done['asn']['details']} == {
+        world['g1']: 4, world['g2']: 0,
+    }
+    reviewed = _ok(client.post(base + '/variance-resolution', headers=headers, json={'note': 'Supplier issued a credit'}))
+    assert reviewed['variance_resolved_at'] and reviewed['variance_resolved_by']
+    assert reviewed['variance_resolution'] == 'Supplier issued a credit'
+    assert client.post(base + '/variance-resolution', headers=headers, json={'note': 'Overwrite'}).status_code == 409
+
+
+def test_confirmed_overage_posts_once_against_original_asn(client, access_token):
+    from tests.test_inventory_guards import _create_asn, _h, _ok, _task_ids, _world
+
+    world = _world(client)
+    goods = world['g1']
+    asn_id = _create_asn(client, access_token, world, [(goods, 5)])
+    headers = _h(access_token)
+    _ok(client.put(f'/asn/{asn_id}/receive/', headers=headers))
+    task = _task_ids(client, SortingTask, asn_id=asn_id, is_active=True)[0]
+    base = f'/sorting/{task}'
+    _ok(client.put(base + '/process/', headers=headers))
+    batch = {'client_batch_id': 'review-overage', 'details': [
+        {'goods_id': goods, 'sorted_quantity': 6, 'damage_quantity': 1},
+    ]}
+    straight = client.post(base + '/batches/', json=batch, headers=headers)
+    assert straight.status_code == 400 and straight.json['code'] == 16062
+
+    preview = client.put(base + '/complete/', json={'batch': batch}, headers=headers)
+    assert preview.status_code == 409 and preview.json['code'] == 17030
+    variances = preview.json['details']['variances']
+    assert variances == [dict(goods_id=goods, planned=5, received=7, rejected=0)]
+    assert _ok(client.get(base + '/batches/', headers=headers)) == []
+    request = dict(batch=batch, variances=variances, variance_reason='Counted seven units in the original shipment')
+    done = _ok(client.put(base + '/complete/', json=request, headers=headers))
+    assert done['asn_id'] == asn_id and done['asn']['details'][0]['actual_quantity'] == 7
+    assert client.put(base + '/complete/', json=request, headers=headers).status_code == 400
+    assert len(_ok(client.get(base + '/batches/', headers=headers))) == 1
+    pending = _ok(client.get(f'/inventory/goods/{goods}/warehouse/{world["wh"]}/pending-lots', headers=headers))['items']
+    assert [(row['asn_id'], row['sorted_stock'], row['sorted_damage_stock']) for row in pending] == [(asn_id, 7, 1)]
+
 # ---------------------------------------------------------
 # 测试视图层 (views.py) 逻辑的用例
 # ---------------------------------------------------------
