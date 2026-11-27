@@ -15,7 +15,7 @@ from warehouse.asn.models import ASN, ASNDetail
 from warehouse.asn.services import ASNService
 from warehouse.asn.spec_capture import assert_capturable_on_complete, pending_condition
 from warehouse.stock.lots import assert_receivable
-from .models import SortingTask, SortingTaskDetail, SortingTaskStatusLog, SortingBatch
+from .models import SortingTask, SortingTaskDetail, SortingTaskStatusLog, SortingBatch, SortingQuantityCorrection
 
 class SortingTaskService:
 
@@ -182,6 +182,7 @@ class SortingTaskService:
             SortingTask.query
             .options(
                 selectinload(SortingTask.task_details),
+                selectinload(SortingTask.quantity_corrections),
                 joinedload(SortingTask.asn).selectinload(ASN.details),
             )
             .order_by(SortingTask.id.desc())
@@ -215,7 +216,11 @@ class SortingTaskService:
             raise BadRequestException('received_from must not be after received_to', 10022)
         query = clock.filter_time_range(query, ASN.received_at, start, end, filters.get('warehouse_id'))
         conditions = {
-            'has_damage': SortingTask.task_details.any(SortingTaskDetail.damage_quantity > 0),
+            'has_pending_correction': SortingTask.quantity_corrections.any(SortingQuantityCorrection.status == 'pending'),
+            'has_damage': db.or_(
+                and_(SortingTask.status != 'completed', SortingTask.task_details.any(SortingTaskDetail.damage_quantity > 0)),
+                and_(SortingTask.status == 'completed', ASN.details.any(ASNDetail.damage_quantity > 0)),
+            ),
             'has_variance': and_(SortingTask.status == 'completed', ASN.details.any(and_(
                 ASNDetail.actual_quantity.isnot(None), ASNDetail.actual_quantity != ASNDetail.quantity))),
             'spec_pending': pending_condition(),
@@ -359,6 +364,12 @@ class SortingTaskService:
             raise BadRequestException("Cannot update Sorting Task Detail in a non-in-progress Sorting Task", 16010)
 
         detail = SortingTaskService.get_task_detail(task.id, detail_id)
+
+        expected = data.get('expected_quantities')
+        current = {field: getattr(detail, field) or 0
+                   for field in ('sorted_quantity', 'damage_quantity', 'rejected_quantity')}
+        if expected is not None and expected != current:
+            raise ConflictException('The recorded quantities changed. Reload the sorting task', 17035)
 
         # 如果要更新 batch_id，必须仍是本任务的批次
         if 'batch_id' in data:

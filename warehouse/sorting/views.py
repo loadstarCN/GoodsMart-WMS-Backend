@@ -1,4 +1,4 @@
-from flask import g
+from flask import g, request
 from flask_restx import Resource
 from warehouse.common import warehouse_required, add_warehouse_filter, get_warehouse_owned, require_fields, require_actor_user_id
 from warehouse.asn.models import ASN
@@ -17,6 +17,7 @@ from .schemas import (
     sorting_monthly_stats_parser
 )
 from .services import SortingTaskService
+from . import corrections
 from system.common import permission_required
 from system.common import paginate
 
@@ -53,6 +54,7 @@ class SortingTaskList(Resource):
             'asn_id': args.get('asn_id'),
             'status': args.get('status'),
             'is_active': args.get('is_active'),
+            'has_pending_correction': args.get('has_pending_correction'),
             'keyword': args.get('keyword'),
             'has_variance': args.get('has_variance') ,
             'has_damage': args.get('has_damage'),
@@ -135,6 +137,33 @@ class SortingTaskComplete(Resource):
         updated_task = SortingTaskService.complete_task(_owned_task(task_id), operator_id)
         return updated_task
 
+
+
+@api_ns.doc(security="jsonWebToken")
+@api_ns.route('/<int:task_id>/quantity-corrections')
+class SortingQuantityCorrections(Resource):
+    @permission_required(["all_access", "company_all_access", "sorting_read"])
+    @warehouse_required()
+    def get(self, task_id):
+        """Read effective quantities and the correction history for a completed sorting task."""
+        return corrections.snapshot(_owned_task(task_id))
+
+    @permission_required(["all_access", "company_all_access", "sorting_edit"])
+    @warehouse_required()
+    def post(self, task_id):
+        """Request a correction to one product and lot."""
+        return corrections.submit(_owned_task(task_id), require_actor_user_id(), request.get_json(silent=True))
+
+
+@api_ns.doc(security="jsonWebToken")
+@api_ns.route('/<int:task_id>/quantity-corrections/<int:correction_id>/review')
+class SortingQuantityCorrectionReview(Resource):
+    @permission_required(["all_access", "company_all_access", "adjustment_approve"])
+    @warehouse_required()
+    def post(self, task_id, correction_id):
+        """Approve or reject a correction submitted by a different user."""
+        return corrections.review(_owned_task(task_id), correction_id, require_actor_user_id(),
+                                  request.get_json(silent=True))
 
 
 @api_ns.doc(security="jsonWebToken")

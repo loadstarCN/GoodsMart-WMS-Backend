@@ -85,6 +85,7 @@ sorting_task_detail_model = api_ns.inherit('SortingTaskDetail', sorting_task_det
 # status / is_active / started_at / completed_at 只能经 process / complete 动作端点变更，不接受客户端输入
 sorting_task_base_model = api_ns.model('SortingTaskBase', {
     'spec_pending_count': fields.Integer(readOnly=True, attribute=lambda x: asn_spec_pending_count(x.asn) if x.asn else 0),
+    'has_pending_correction': fields.Boolean(readOnly=True),
     'has_variance': fields.Boolean(readOnly=True, attribute=lambda x: x.status == 'completed' and any(d.actual_quantity is not None and d.actual_quantity != d.quantity for d in x.asn.details)),
     'id': fields.Integer(readOnly=True, description='Sorting Task ID'),
     'warehouse_id': fields.Integer(attribute='asn.warehouse_id', readOnly=True),
@@ -114,20 +115,14 @@ sorting_task_base_model = api_ns.model('SortingTaskBase', {
     ),
     'total_sorted_quantity': fields.Integer(
         readOnly=True,
-        attribute=lambda x: sum(
-            (d.sorted_quantity if d.sorted_quantity is not None else 0)  # 处理 None 值
-            for d in x.task_details
-        ), # 计算所有明细的实际数量总和
+        attribute=lambda x: x.quantity_total('sorted_quantity'),
         description='Sum of all sorted goods quantities in the task'
     ),
-    'total_rejected_quantity': fields.Integer(readOnly=True, attribute=lambda x: sum(d.rejected_quantity or 0 for d in x.task_details)),
+    'total_rejected_quantity': fields.Integer(readOnly=True, attribute=lambda x: x.quantity_total('rejected_quantity')),
         
     'total_damage_quantity': fields.Integer(
         readOnly=True,
-        attribute=lambda x: sum(
-            (d.damage_quantity if d.damage_quantity is not None else 0)  # 处理 None 值
-            for d in x.task_details
-        ), # 计算所有明细的实际数量总和
+        attribute=lambda x: x.quantity_total('damage_quantity'),
         description='Sum of all damaged goods quantities in the task'
     ),
 })
@@ -183,6 +178,7 @@ sorting_pagination_parser = pagination_parser.copy()
 sorting_pagination_parser.add_argument('asn_id',type=int,help='Associated ASN ID',location='args')
 sorting_pagination_parser.add_argument('status',type=str,help='Sorting Task Status',location='args',choices=SortingTask.SORTING_TASK_STATUSES)
 sorting_pagination_parser.add_argument('is_active',type=inputs.boolean,help='Is the task active?',location='args')
+sorting_pagination_parser.add_argument('has_pending_correction', type=inputs.boolean, location='args')
 sorting_pagination_parser.add_argument('warehouse_id', type=int, help='Filter by Warehouse ID')
 sorting_pagination_parser.add_argument('keyword', type=str, help='Keyword search')
 sorting_pagination_parser.add_argument('has_variance', type=inputs.boolean, location='args', help='Completed tasks with confirmed quantity differences')

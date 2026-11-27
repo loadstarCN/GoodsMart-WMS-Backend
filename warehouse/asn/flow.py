@@ -201,6 +201,9 @@ class InboundFlowService:
     @staticmethod
     def _sorting_totals(asn):
         """有效分拣任务已记的合格 / 损坏数量（分拣中也有，完成时汇总到入库单明细）"""
+        if asn.status == 'completed':
+            return (sum(line.sorted_quantity or 0 for line in asn.details),
+                    sum(line.damage_quantity or 0 for line in asn.details))
         from warehouse.sorting.models import SortingTask, SortingTaskDetail
         sorted_qty, damage_qty = db.session.query(
             func.coalesce(func.sum(SortingTaskDetail.sorted_quantity), 0),

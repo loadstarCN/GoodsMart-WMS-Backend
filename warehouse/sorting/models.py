@@ -101,6 +101,44 @@ class SortingTask(db.Model):
         cascade='all, delete-orphan',
         info={'description': '状态变更记录'}
     )
+    quantity_corrections = db.relationship('SortingQuantityCorrection', lazy='select')
+
+    def quantity_total(self, field):
+        total = sum(getattr(row, field) or 0 for row in self.task_details)
+        if self.status == 'completed':
+            total += sum(row.after[field] - row.before[field] for row in self.quantity_corrections
+                         if row.status == 'approved')
+        return total
+
+    @property
+    def has_pending_correction(self):
+        return self.status == 'completed' and any(row.status == 'pending' for row in self.quantity_corrections)
+
+
+class SortingQuantityCorrection(db.Model):
+    """A reviewed change to the recorded quantities for one SKU and lot."""
+    __tablename__ = 'sorting_quantity_corrections'
+    __table_args__ = (
+        db.Index('ix_sorting_quantity_corrections_task', 'task_id'),
+        db.CheckConstraint("status IN ('pending','approved','rejected')", name='chk_sorting_correction_status'),
+    )
+
+    id = db.Column(db.Integer, primary_key=True)
+    task_id = db.Column(db.Integer, db.ForeignKey('sorting_tasks.id', ondelete='RESTRICT'), nullable=False)
+    goods_id = db.Column(db.Integer, db.ForeignKey('goods.id', ondelete='RESTRICT'), nullable=False)
+    lot_id = db.Column(db.Integer, db.ForeignKey('goods_lots.id', ondelete='RESTRICT'), nullable=True)
+    before = db.Column(db.JSON, nullable=False)
+    after = db.Column(db.JSON, nullable=False)
+    reason = db.Column(db.String(500), nullable=False)
+    status = db.Column(db.String(8), nullable=False, default='pending')
+    requested_by = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='RESTRICT'), nullable=False)
+    requested_at = db.Column(UTCDateTime, nullable=False)
+    reviewed_by = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='RESTRICT'), nullable=True)
+    reviewed_at = db.Column(UTCDateTime, nullable=True)
+    review_note = db.Column(db.String(500), nullable=True)
+    requester = db.relationship('User', foreign_keys=[requested_by], lazy='joined')
+    reviewer = db.relationship('User', foreign_keys=[reviewed_by], lazy='joined')
+
 
 class SortingTaskDetail(db.Model):
     """分拣任务明细表

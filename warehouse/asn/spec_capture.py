@@ -132,6 +132,8 @@ def _line_ref(detail, pending) -> dict:
 
 def sorted_goods_ids(asn) -> set:
     """本单有效分拣任务里分拣到的商品（合格 + 破损 > 0）"""
+    if asn.status == 'completed':
+        return {line.goods_id for line in asn.details if (line.actual_quantity or 0) > 0}
     from warehouse.sorting.models import SortingTask, SortingTaskDetail
     rows = (
         db.session.query(SortingTaskDetail.goods_id)
