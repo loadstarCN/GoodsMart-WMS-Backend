@@ -1,12 +1,13 @@
-import pytest
 from uuid import uuid4
+
+import pytest
 
 from tests.helpers import *  # noqa: F401,F403
 from tests.test_damaged_putaway import _inv
 from tests.test_inventory_guards import _create_asn, _err, _h, _ok, _task_ids, _world
 from system.user.seed import seed_builtin
 from warehouse.putaway.models import ReceiptPendingStock
-from warehouse.stock.models import StockLedger
+from warehouse.stock.models import GoodsLot, StockLedger
 
 
 @pytest.fixture(autouse=True)
@@ -154,6 +155,13 @@ def test_grouped_correction_reviews_all_rows_atomically(client, access_token, ac
         dict(goods_id=good_b, before=_counts(4), after=_counts(1)),
     ]
     body = dict(request_group=group, rows=rows, reason='Recounted receiving cartons')
+    with client.application.app_context():
+        lot = GoodsLot(goods_id=good_a, lot_no='OTHER-LOT')
+        db.session.add(lot)
+        db.session.commit()
+        lot_id = lot.id
+    invalid_lot = dict(goods_id=good_a, lot_id=lot_id, before=_counts(0), after=_counts(1))
+    assert client.post(endpoint, headers=headers, json={**body, 'rows': [invalid_lot]}).status_code == 400
     proposals = _ok(client.post(endpoint, headers=headers, json=body))['corrections']
     assert len(proposals) == 2 and all(row['request_group'] == group for row in proposals)
     assert _ok(client.post(endpoint, headers=headers, json=body))['corrections'] == proposals

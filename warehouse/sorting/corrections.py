@@ -163,9 +163,12 @@ def submit(task, actor_id, data):
             return _view(previous, lot_no), 200
         raise ConflictException('This SKU and lot already have a pending correction', 17034)
     current = _current(task, history)
+    recorded_goods = {goods_id for goods_id, _ in current}
     requested_at = clock.now()
     result = []
     for (goods_id, lot_id), (before, after, lot_no) in changes.items():
+        if (goods_id, lot_id) not in current and (lot_id is not None or goods_id in recorded_goods):
+            raise BadRequestException('Quantity corrections cannot add a lot to the receipt', field='lot_id')
         if current.get((goods_id, lot_id), ZERO) != before:
             raise ConflictException('The recorded quantities changed. Reload the sorting task', 17035)
         if before == after:
