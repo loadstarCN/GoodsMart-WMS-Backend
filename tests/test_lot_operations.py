@@ -243,11 +243,19 @@ def test_receiving_policy_auto_number_and_pending_lot_selection(client, access_t
     today = warehouse_today()
     lot = _ok(client.post(f'/goods/{w["g1"]}/lots', json={'production_date': today.isoformat()}, headers=_h(access_token)))
     assert lot['source'] == 'auto' and lot['expiry_date'] == (today + timedelta(days=90)).isoformat()
-    asn = _create_asn(client, access_token, w, [(w['g1'], 4)])
+    asn = _create_asn(client, access_token, w, [(w['g1'], 4), (w['g2'], 1)])
     _ok(client.put(f'/asn/{asn}/receive/', headers=_h(access_token)))
     task = _task_ids(client, SortingTask, asn_id=asn, is_active=True)[0]
     _ok(client.put(f'/sorting/{task}/process/', headers=_h(access_token)))
-    body = {'client_batch_id': 'policy-receive', 'details': [{'goods_id': w['g1'], 'sorted_quantity': 4, 'damage_quantity': 0}]}
+    detail = _ok(client.get(f'/sorting/{task}', headers=_h(access_token)))
+    assert detail['receipt_lot_rules'] == {
+        str(w['g1']): {'mode': 'expiry', 'source': 'auto'},
+        str(w['g2']): {'mode': 'none', 'source': 'manual'},
+    }
+    body = {'client_batch_id': 'policy-receive', 'details': [
+        {'goods_id': w['g1'], 'sorted_quantity': 4, 'damage_quantity': 0},
+        {'goods_id': w['g2'], 'sorted_quantity': 1, 'damage_quantity': 0},
+    ]}
     bad = client.post(f'/sorting/{task}/batches/', json=body, headers=_h(access_token))
     assert bad.status_code == 400 and bad.json['code'] == 16175
     body['details'][0]['lot_id'] = lot['id']

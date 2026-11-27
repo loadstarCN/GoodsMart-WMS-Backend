@@ -156,7 +156,11 @@ def test_sorting_batch_client_batch_id_replay_and_conflict(client, access_token)
     assert other.status_code == 201 and other.get_json()['id'] != created['id']
 
     # 任务完成后，迟到的重放仍按已存在的批次返回 200（不会报「任务不在进行中」）
-    _ok(client.put(f'/sorting/{task_id}/complete/', headers=_h(access_token)))
+    _ok(client.put(f'/sorting/{task_id}/complete/', headers=_h(access_token), json={
+        'variances': [{'goods_id': w['g1'], 'planned': 10, 'received': 6, 'rejected': 0},
+                      {'goods_id': w['g2'], 'planned': 10, 'received': 2, 'rejected': 0}],
+        'variance_reason': 'Confirmed supplier shortage',
+    }))
     late = client.post(url, json=body, headers=_h(access_token))
     assert late.status_code == 200 and late.get_json()['id'] == created['id']
 

@@ -32,6 +32,8 @@ inventory_base_model = api_ns.model('InventoryBase', {
         description='Damaged part of sorted_stock (waiting to be put away; only to damaged locations). '
                     'Good items waiting = sorted_stock - sorted_damage_stock (the only part that can go to '
                     'standard / return locations, else 400 15016)'),
+    'pending_sources': fields.List(fields.Raw, readOnly=True,
+                                   description='Remaining receipts grouped by lot and source when requested'),
     'pending_since': fields.DateTime(
         readOnly=True,
         description='When the oldest item still waiting to be put away entered sorted_stock (UTC, +00:00; '
@@ -102,6 +104,9 @@ inventory_pagination_parser.add_argument(
     'pending_putaway', type=inputs.boolean, location='args',
     help='true: only rows with stock waiting to be put away (sorted_stock > 0; '
          'sorted_damage_stock of it can only go to damaged locations)')
+inventory_pagination_parser.add_argument(
+    'include_pending_sources', type=inputs.boolean, location='args',
+    help='Include lot and receipt balances for rows in the pending putaway list')
 
 # 待上架汇总（首页 / 侧栏的数字）：范围与库存列表相同（X-WAREHOUSE-ID / warehouse_id → 该仓库；否则调用方可访问的仓库）
 inventory_pagination_parser.add_argument('pending_damaged', type=inputs.boolean, location='args',

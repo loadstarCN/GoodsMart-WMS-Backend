@@ -1,7 +1,7 @@
 from flask import g, request, Response
 from flask_restx import Resource
 from system.common import paginate,permission_required
-from warehouse.common import warehouse_required, add_warehouse_filter, require_warehouse_scope
+from warehouse.common import warehouse_required, add_warehouse_filter, require_warehouse_scope, get_warehouse_owned
 from .schemas import (
     api_ns, inventory_model, inventory_pagination_parser, pagination_model,
     pending_putaway_summary_model, pending_putaway_summary_parser,
@@ -15,13 +15,23 @@ _AVAILABILITY_PERMISSIONS = ["all_access", "company_all_access", "inventory_read
 
 
 def _pending_sources():
+    from warehouse.asn.models import ASN
     from warehouse.stock.views import _bad, _bool, _int
     from .pending_sources import pending_source_rows
     source = request.args.get('source') or None
     if source not in (None, 'asn', 'unknown', 'pack_short_return', 'dn_cancel_return'):
         raise _bad('Invalid pending source', 'source')
-    return pending_source_rows(g.warehouse_id, keyword=request.args.get('keyword', ''), source=source,
+    asn_id = _int('asn_id', low=1, high=2147483647)
+    asn = None
+    if 'asn_id' in request.args:
+        if asn_id is None or len(request.args.getlist('asn_id')) != 1:
+            raise _bad('A single ASN ID is required', 'asn_id')
+        asn = get_warehouse_owned(ASN, asn_id)
+        if asn.warehouse_id != g.warehouse_id:
+            raise _bad('ASN does not belong to the selected warehouse', 'asn_id')
+    rows = pending_source_rows(g.warehouse_id, asn_id=asn_id, keyword=request.args.get('keyword', ''), source=source,
         damaged=_bool('damaged'), has_lot=_bool('has_lot'), overdue_days=_int('overdue_days', low=1, high=365))
+    return rows, asn
 
 
 @api_ns.route('/pending-putaway/sources')
@@ -31,12 +41,15 @@ class PendingPutawaySources(Resource):
     def get(self):
         from warehouse.stock.views import _page
         page, per_page = _page()
-        rows = _pending_sources()
-        return dict(items=rows[(page-1)*per_page:page*per_page], total=len(rows), page=page, per_page=per_page,
+        rows, asn = _pending_sources()
+        result = dict(items=rows[(page-1)*per_page:page*per_page], total=len(rows), page=page, per_page=per_page,
                     summary=dict(goods_count=len({row['goods_id'] for row in rows}),
                                  quantity=sum(row['sorted_stock'] for row in rows),
                                  damaged_quantity=sum(row['sorted_damage_stock'] for row in rows),
                                  unknown_quantity=sum(row['sorted_stock'] for row in rows if row['source_type']=='unknown')))
+        if asn is not None:
+            result['asn'] = dict(id=asn.id, warehouse_id=asn.warehouse_id, putaway_tracked=asn.putaway_tracked)
+        return result
 
 
 @api_ns.route('/pending-putaway/sources/export')
@@ -47,7 +60,7 @@ class PendingPutawaySourcesExport(Resource):
         from warehouse.goods.tabular import write_csv
         from warehouse.stock.queries import MAX_EXPORT_ROWS, EXPORT_TOO_LARGE
         from extensions.error import BadRequestException
-        rows = _pending_sources()
+        rows, _ = _pending_sources()
         if len(rows) > MAX_EXPORT_ROWS:
             raise BadRequestException('Too many pending source rows to export', EXPORT_TOO_LARGE)
         def text(value):
@@ -119,6 +132,11 @@ class InventoryList(Resource):
         query = InventoryService.list_inventories(filters)
 
         result = paginate(query, page, per_page, get_all)
+        if filters.get('pending_putaway') and args.get('include_pending_sources'):
+            from .pending_sources import pending_lot_rows
+            balances = pending_lot_rows((row.goods_id, row.warehouse_id) for row in result['items'])
+            for row in result['items']:
+                row.pending_sources = balances[row.goods_id, row.warehouse_id]
         # 每行的 pending_since（最早一件待上架的进入时刻，先进先上估算）：一页几条查询
         attach_pending_since(result['items'])
         from .ui_metrics import attach_latest_metrics
@@ -204,29 +222,11 @@ class PendingLotStock(Resource):
     def get(self, goods_id, warehouse_id):
         from warehouse.common import get_company_owned
         from warehouse.goods.models import Goods
-        from warehouse.stock.models import InventoryLotStock, GoodsLot
-        from extensions.db import db
+        from .pending_sources import pending_lot_rows
         require_warehouse_scope(warehouse_id, 'Inventory')
         get_company_owned(Goods, goods_id)
-        rows = InventoryLotStock.query.filter_by(goods_id=goods_id, warehouse_id=warehouse_id).filter(
-            InventoryLotStock.sorted_stock > 0).order_by(InventoryLotStock.lot_id).all()
-        result = []
-        for row in rows:
-            lot = db.session.get(GoodsLot, row.lot_id) if row.lot_id else None
-            from warehouse.putaway.provenance import sources
-            receipt_rows = sources(goods_id, warehouse_id, row.lot_id)
-            base = dict(lot_id=row.lot_id, lot_no=lot.lot_no if lot else None,
-                        expiry_date=lot.expiry_date.isoformat() if lot and lot.expiry_date else None)
-            for source in receipt_rows:
-                result.append(dict(**base, receipt_source_id=source.id, asn_id=source.asn_id, dn_id=source.dn_id, source_type=source.source_type,
-                    sorted_stock=source.good_remaining+source.damaged_remaining,
-                    sorted_damage_stock=source.damaged_remaining))
-            unknown = row.sorted_stock-sum(source.good_remaining+source.damaged_remaining for source in receipt_rows)
-            unknown_bad = row.sorted_damage_stock-sum(source.damaged_remaining for source in receipt_rows)
-            if unknown > 0:
-                result.append(dict(**base, receipt_source_id=0, asn_id=None,
-                    sorted_stock=unknown, sorted_damage_stock=unknown_bad))
-        return dict(items=result)
+        pair = (goods_id, warehouse_id)
+        return dict(items=pending_lot_rows([pair])[pair])
 
 
 @api_ns.route('/goods/<int:goods_id>/warehouse/<int:warehouse_id>')

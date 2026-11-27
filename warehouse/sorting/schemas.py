@@ -4,6 +4,7 @@ from system.user.schemas import user_simple_model as original_user_model
 from warehouse.asn.schemas import asn_model
 from warehouse.asn.spec_capture import sorted_pending_lines, asn_spec_pending_count
 from warehouse.goods.schemas import goods_simple_model as goods_model
+from warehouse.stock.lot_policy import receiving_lot_rules
 from system.common import pagination_parser, create_pagination_model,generate_input_fields
 from .models import SortingTask
 
@@ -85,7 +86,8 @@ sorting_task_detail_model = api_ns.inherit('SortingTaskDetail', sorting_task_det
 # status / is_active / started_at / completed_at 只能经 process / complete 动作端点变更，不接受客户端输入
 sorting_task_base_model = api_ns.model('SortingTaskBase', {
     'spec_pending_count': fields.Integer(readOnly=True, attribute=lambda x: asn_spec_pending_count(x.asn) if x.asn else 0),
-    'has_variance': fields.Boolean(readOnly=True, attribute=lambda x: x.status == 'completed' and any(d.actual_quantity is not None and d.actual_quantity != d.quantity for d in x.asn.details)),
+    'has_variance': fields.Boolean(readOnly=True),
+    'variance_resolved_at': fields.DateTime(readOnly=True),
     'id': fields.Integer(readOnly=True, description='Sorting Task ID'),
     'warehouse_id': fields.Integer(attribute='asn.warehouse_id', readOnly=True),
     'asn_id': fields.Integer(required=True, description='Associated ASN ID'),
@@ -136,7 +138,13 @@ sorting_task_base_model = api_ns.model('SortingTaskBase', {
 # 6. Sorting Task 主输出模型（继承自基础模型，添加关联信息）
 # ---------------------------------------------------------------------------------
 sorting_task_model = api_ns.inherit('SortingTask', sorting_task_base_model, {
+    'variance_reason': fields.String(readOnly=True),
+    'variance_resolution': fields.String(readOnly=True),
+    'variance_resolved_by': fields.Integer(readOnly=True),
     'asn': fields.Nested(asn_model, readOnly=True, description='Details of the associated ASN'),
+    'receipt_lot_rules': fields.Raw(readOnly=True,
+        attribute=lambda task: receiving_lot_rules(task.asn) if task.asn and task.status == 'in_progress' else {},
+        description='Receiving lot mode and numbering source by goods ID'),
     'task_details': fields.List(fields.Nested(sorting_task_detail_model),readOnly=True,  description='Sorting Task Details'),
     'batches': fields.List(fields.Nested(sorting_batch_model), readOnly=True, description='Sorting Batches of this task'),
     'status_logs': fields.List(fields.Nested(sorting_task_status_log_model), readOnly=True, description='Logs of status changes'),

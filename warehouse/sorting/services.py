@@ -91,7 +91,7 @@ class SortingTaskService:
 
     @staticmethod
     def _assert_within_planned(task: SortingTask, incoming_by_goods: dict | None = None,
-                               exclude_detail_id: int | None = None):
+                               exclude_detail_id: int | None = None, *, reviewing_overage=False):
         """
         按商品维度校验分拣累计量（合格 + 损坏）不超过 ASN 计划量。
 
@@ -112,25 +112,34 @@ class SortingTaskService:
         query = (
             db.session.query(
                 SortingTaskDetail.goods_id,
-                func.coalesce(func.sum(SortingTaskDetail.sorted_quantity + SortingTaskDetail.damage_quantity + SortingTaskDetail.rejected_quantity), 0),
+                func.sum(SortingTaskDetail.sorted_quantity + SortingTaskDetail.damage_quantity),
+                func.sum(SortingTaskDetail.rejected_quantity),
             )
             .join(SortingTask, SortingTaskDetail.sorting_task_id == SortingTask.id)
             .filter(SortingTask.asn_id == asn.id, SortingTask.is_active == True)
         )
         if exclude_detail_id is not None:
             query = query.filter(SortingTaskDetail.id != exclude_detail_id)
-        existing = dict(query.group_by(SortingTaskDetail.goods_id).all())
+        existing = {gid: (received or 0, rejected or 0)
+                    for gid, received, rejected in query.group_by(SortingTaskDetail.goods_id).all()}
 
         for gid in set(existing) | set(incoming_by_goods):
             if gid not in planned:
                 raise BadRequestException(f"Goods {gid} is not part of ASN {asn.id}", 16057)
-            total = existing.get(gid, 0) + incoming_by_goods.get(gid, 0)
-            if total > planned[gid] + SortingTaskService.OVERAGE_TOLERANCE:
+            received, rejected = existing.get(gid, (0, 0))
+            total = received + rejected + incoming_by_goods.get(gid, 0)
+            if not reviewing_overage and total > planned[gid] + SortingTaskService.OVERAGE_TOLERANCE:
                 raise BadRequestException(
                     f"Sorted quantity exceeds planned quantity for goods {gid}: "
                     f"total {total} > planned {planned[gid]}.",
                     16062
                 )
+        variances = []
+        for gid, quantity in sorted(planned.items()):
+            received, rejected = existing.get(gid, (0, 0))
+            if received + rejected != quantity:
+                variances.append(dict(goods_id=gid, planned=quantity, received=received, rejected=rejected))
+        return variances
 
     # 状态更新 & 状态日志
     @staticmethod
@@ -216,8 +225,7 @@ class SortingTaskService:
         query = clock.filter_time_range(query, ASN.received_at, start, end, filters.get('warehouse_id'))
         conditions = {
             'has_damage': SortingTask.task_details.any(SortingTaskDetail.damage_quantity > 0),
-            'has_variance': and_(SortingTask.status == 'completed', ASN.details.any(and_(
-                ASNDetail.actual_quantity.isnot(None), ASNDetail.actual_quantity != ASNDetail.quantity))),
+            'has_variance': SortingTask.has_variance,
             'spec_pending': pending_condition(),
         }
         for key, condition in conditions.items():
@@ -448,7 +456,8 @@ class SortingTaskService:
 
     @staticmethod
     @transactional
-    def submit_batch(task_or_id: int | SortingTask, data: dict, operator_id: int) -> tuple[SortingBatch, bool]:
+    def submit_batch(task_or_id: int | SortingTask, data: dict, operator_id: int, *,
+                     reviewing_overage=False) -> tuple[SortingBatch, bool]:
         """
         同时适用于：
         1) 只创建批次
@@ -496,7 +505,7 @@ class SortingTaskService:
             if sorted_quantity+damage_quantity > 0:
                 assert_receivable(goods_id, lot_id or None, task.asn.warehouse_id, concession_reason)
             incoming_by_goods[goods_id] = incoming_by_goods.get(goods_id, 0) + sorted_quantity + damage_quantity + rejected_quantity
-        SortingTaskService._assert_within_planned(task, incoming_by_goods)
+        SortingTaskService._assert_within_planned(task, incoming_by_goods, reviewing_overage=reviewing_overage)
 
         # 1) 创建批次
         new_batch = SortingBatch(
@@ -506,14 +515,19 @@ class SortingTaskService:
             operation_time=SortingTaskService._parse_datetime(data.get('operation_time'), task.asn) or clock.now(),
             remark=data.get('remark', '')
         )
-        # flush 拿新批次 ID；唯一约束兜底撞上时按已存在的批次重放 / 409
-        new_batch, created = insert_batch(
-            new_batch, batch_model=SortingBatch, task_fk='sorting_task_id', task_id=task.id,
-            client_batch_id=client_batch_id, existing_rows=SortingTaskService._batch_rows,
-            incoming_rows=parsed_details,
-        )
-        if not created:
-            return new_batch, False
+        if reviewing_overage:
+            # The enclosing completion holds the ASN and task locks and must roll the batch back with the task.
+            # On SQLite a first write inside a savepoint can survive a later outer rollback.
+            db.session.add(new_batch)
+            db.session.flush()
+        else:
+            new_batch, created = insert_batch(
+                new_batch, batch_model=SortingBatch, task_fk='sorting_task_id', task_id=task.id,
+                client_batch_id=client_batch_id, existing_rows=SortingTaskService._batch_rows,
+                incoming_rows=parsed_details,
+            )
+            if not created:
+                return new_batch, False
 
         # 2) 如果有 details，就批量创建 detail
         for goods_id, sorted_quantity, damage_quantity, lot_id, rejected_quantity, rejection_reason, concession_reason in parsed_details:
@@ -589,26 +603,59 @@ class SortingTaskService:
 
     @staticmethod
     @transactional
-    def complete_task(task_or_id: int | SortingTask, operator_id: int) -> SortingTask:
+    def complete_task(task_or_id: int | SortingTask, operator_id: int, confirmation=None) -> SortingTask:
         """
-        更新 SortingTask 的状态为 completed，并完成其 ASN。
-        完成前再验一次累计分拣量不超过 ASN 计划量。
+        Complete sorting and its ASN, optionally with the final draft batch.
+        An unconfirmed variance rolls back the draft batch and leaves the task open.
         """
         # 先锁 ASN、再锁任务并重读状态：并发的重复完成在这里挡下，不会再记一遍 sorted_stock
         task = SortingTaskService._lock(task_or_id)
         if task.status != 'in_progress':
             raise BadRequestException("Cannot complete a non-in_progress Sorting Task", 16008)
 
-        SortingTaskService._assert_within_planned(task)
-        # 规格采集：仓库为 block 时分拣到的商品还有未采集（也没填跳过原因）的 → 409 17021；warn 照常完成，
-        # 响应的 spec_pending 列出这些行（warehouse/asn/spec_capture.py）
+        confirmation = {} if confirmation is None else confirmation
+        if not isinstance(confirmation, dict):
+            raise BadRequestException('Invalid sorting completion payload')
+        batch = confirmation.get('batch')
+        if batch is not None:
+            if not isinstance(batch, dict) or not batch.get('details'):
+                raise BadRequestException('A completion batch must contain sorting details', field='batch')
+            # The task and ASN are already locked. Any later failure rolls this draft back too.
+            SortingTaskService.submit_batch(task, batch, operator_id, reviewing_overage=True)
+        variances = SortingTaskService._assert_within_planned(task, reviewing_overage=batch is not None)
         assert_capturable_on_complete(task.asn)
-
+        reason = confirmation.get('variance_reason')
+        if variances and (confirmation.get('variances') != variances
+                          or not isinstance(reason, str) or not 1 <= len(reason.strip()) <= 500):
+            raise ConflictException('Review the receiving quantity differences before completing sorting', 17030,
+                                    details={'variances': variances})
+        if not variances and confirmation.get('variances'):
+            raise ConflictException('Receiving quantities have changed. Review the updated numbers', 17030,
+                                    details={'variances': []})
+        if variances:
+            task.variance_reason = reason.strip()
         task = SortingTaskService._update_task_status(task, 'completed', operator_id)
 
         # 更新 ASN Detail 的数量字段
         ASNService.complete_asn(task.asn)
 
+        return task
+
+    @staticmethod
+    @transactional
+    def resolve_variance(task_or_id, operator_id, data):
+        """Retain the original quantities and record how the discrepancy was handled."""
+        task = SortingTaskService._lock(task_or_id)
+        if not task.has_variance:
+            raise BadRequestException('This task has no completed receiving quantity difference')
+        if task.variance_resolved_at:
+            raise ConflictException('This receiving quantity difference has already been resolved', 17031)
+        note = data.get('note') if isinstance(data, dict) else None
+        if not isinstance(note, str) or not 1 <= len(note.strip()) <= 500:
+            raise BadRequestException('Enter a resolution note of 1 to 500 characters', field='note')
+        task.variance_resolution = note.strip()
+        task.variance_resolved_by = operator_id
+        task.variance_resolved_at = clock.now()
         return task
 
     @staticmethod
