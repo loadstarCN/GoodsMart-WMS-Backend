@@ -24,6 +24,7 @@ ENTRY_POINTS = {
     'warehouse/asn/returns.py:receive': ({'customer_return_receive'}, 'test_entry_customer_return'),
     'warehouse/asn/returns.py:review': ({'customer_return_dispose'}, 'test_entry_customer_return'),
     'warehouse/asn/services.py:complete_asn': ({'sort_in'}, 'test_entry_sort_in'),
+    'warehouse/sorting/corrections.py:_update_stock': ({'correction'}, 'test_entry_sorting_quantity_correction'),
     'warehouse/putaway/services.py:create_putaway_record': ({'putaway'}, 'test_entry_putaway_single_and_bulk'),
     'warehouse/removal/services.py:create_removal_record': ({'removal'}, 'test_entry_removal_single_and_bulk'),
     'warehouse/picking/services.py:complete_task': ({'pick'}, 'test_entry_pick'),
@@ -99,6 +100,29 @@ def test_entry_sort_in(client, access_token):
     assert len({l['trace_id'] for l in lines}) == 1
     assert {l['source'] for l in lines} == {'web'} and {l['operator_id'] for l in lines} == {admin_id}
     assert [l['balance_after'] for l in sorted(lines, key=lambda l: l['stock_type'])] == [7, 3]
+
+
+def test_entry_sorting_quantity_correction(client, access_token, access_company_admin_token):
+    world = _world(client)
+    goods_id = world['g1']
+    asn_id = _inbound(client, access_token, world, [(goods_id, 10)], [])
+    task_id, = _task_ids(client, SortingTask, asn_id=asn_id, is_active=True)
+    endpoint = f'/sorting/{task_id}/quantity-corrections'
+    correction = _ok(client.post(endpoint, headers=_h(access_token), json={
+        'goods_id': goods_id,
+        'before': {'sorted_quantity': 10, 'damage_quantity': 0, 'rejected_quantity': 0},
+        'after': {'sorted_quantity': 8, 'damage_quantity': 1, 'rejected_quantity': 0},
+        'reason': 'Recounted sealed cartons',
+    }))
+    _ok(client.post(f"{endpoint}/{correction['id']}/review", headers=_h(access_company_admin_token),
+                    json={'decision': 'approved'}))
+    lines = _lines(client, doc_type='sorting_correction', doc_id=correction['id'])
+    assert _legs(lines) == [('pending', None, -2), ('pending_damaged', None, 1)]
+    assert {line['movement_type'] for line in lines} == {'correction'}
+    assert {line['reason'] for line in lines} == {'receipt_quantity'}
+    assert len({line['trace_id'] for line in lines}) == 1
+    with client.application.app_context():
+        assert {line['operator_id'] for line in lines} == {get_company_admin_user().id}
 
 
 def test_entry_putaway_single_and_bulk(client, access_token):
