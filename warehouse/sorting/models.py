@@ -162,6 +162,7 @@ class SortingQuantityCorrection(db.Model):
     reviewed_by = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='RESTRICT'), nullable=True)
     reviewed_at = db.Column(UTCDateTime, nullable=True)
     review_note = db.Column(db.String(500), nullable=True)
+    request_group = db.Column(db.String(36), nullable=True)
     requester = db.relationship('User', foreign_keys=[requested_by], lazy='joined')
     reviewer = db.relationship('User', foreign_keys=[reviewed_by], lazy='joined')
 

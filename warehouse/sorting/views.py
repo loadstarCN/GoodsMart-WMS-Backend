@@ -159,7 +159,7 @@ class SortingQuantityCorrections(Resource):
     @permission_required(["all_access", "company_all_access", "sorting_edit"])
     @warehouse_required()
     def post(self, task_id):
-        """Request a correction to one product and lot."""
+        """Request corrections to one or more product and lot rows."""
         return corrections.submit(_owned_task(task_id), require_actor_user_id(), request.get_json(silent=True))
 
 
@@ -169,7 +169,7 @@ class SortingQuantityCorrectionReview(Resource):
     @permission_required(["all_access", "company_all_access", "adjustment_approve"])
     @warehouse_required()
     def post(self, task_id, correction_id):
-        """Approve or reject a correction submitted by a different user."""
+        """Approve or reject the full correction request submitted by a different user."""
         return corrections.review(_owned_task(task_id), correction_id, require_actor_user_id(),
                                   request.get_json(silent=True))
 

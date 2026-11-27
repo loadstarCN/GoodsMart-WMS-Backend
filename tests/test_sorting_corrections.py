@@ -1,4 +1,5 @@
 import pytest
+from uuid import uuid4
 
 from tests.helpers import *  # noqa: F401,F403
 from tests.test_damaged_putaway import _inv
@@ -130,3 +131,59 @@ def test_review_adds_stock_for_a_product_omitted_during_sorting(client, access_t
     with client.application.app_context():
         source = ReceiptPendingStock.query.filter_by(asn_id=asn_id, goods_id=goods_id).one()
         assert source.good_received == source.good_remaining == 2
+
+
+def test_grouped_correction_reviews_all_rows_atomically(client, access_token, access_warehouse_admin_token):
+    world = _world(client)
+    good_a, good_b = world['g1'], world['g2']
+    headers = _h(access_token)
+    reviewer = {**_h(access_warehouse_admin_token), 'X-Warehouse-ID': str(world['wh'])}
+    asn_id = _create_asn(client, access_token, world, [(good_a, 5), (good_b, 6)])
+    _ok(client.put(f'/asn/{asn_id}/receive/', headers=headers))
+    task_id, = _task_ids(client, SortingTask, asn_id=asn_id, is_active=True)
+    task = f'/sorting/{task_id}'
+    _ok(client.put(f'{task}/process/', headers=headers))
+    _ok(client.post(f'{task}/batches/', headers=headers, json={'details': [
+        {'goods_id': good_a, **_counts(2)}, {'goods_id': good_b, **_counts(4)},
+    ]}))
+    _ok(client.put(f'{task}/complete/', headers=headers))
+    endpoint = f'{task}/quantity-corrections'
+    group = str(uuid4())
+    rows = [
+        dict(goods_id=good_a, before=_counts(2), after=_counts(3)),
+        dict(goods_id=good_b, before=_counts(4), after=_counts(1)),
+    ]
+    body = dict(request_group=group, rows=rows, reason='Recounted receiving cartons')
+    proposals = _ok(client.post(endpoint, headers=headers, json=body))['corrections']
+    assert len(proposals) == 2 and all(row['request_group'] == group for row in proposals)
+    assert _ok(client.post(endpoint, headers=headers, json=body))['corrections'] == proposals
+    decision = f"{endpoint}/{proposals[0]['id']}/review"
+    assert client.post(decision, headers=reviewer, json={'decision': 'approved'}).status_code == 400
+    with client.application.app_context():
+        source_id = ReceiptPendingStock.query.filter_by(asn_id=asn_id, goods_id=good_b).one().id
+    _ok(client.post('/putaway/', headers=headers, json={
+        'goods_id': good_b, 'location_id': world['std1'], 'quantity': 2, 'receipt_source_id': source_id,
+    }))
+    _err(client.post(decision, headers=reviewer, json={'decision': 'approved', 'request_group': group}), 409, 17037)
+    assert _inv(client, good_a, world['wh'])['sorted_stock'] == 2
+    assert _ok(client.get(task, headers=headers))['total_sorted_quantity'] == 6
+    snapshot = _ok(client.get(endpoint, headers=headers))
+    assert {row['status'] for row in snapshot['corrections']} == {'pending'}
+
+    rejected = _ok(client.post(decision, headers=reviewer, json={
+        'decision': 'rejected', 'request_group': group, 'note': 'Already put away',
+    }))
+    assert {row['status'] for row in rejected['corrections']} == {'rejected'}
+    new_group = str(uuid4())
+    rows[1]['after'] = _counts(5)
+    approved_request = _ok(client.post(endpoint, headers=headers, json={
+        **body, 'request_group': new_group,
+    }))['corrections']
+    review_body = {'decision': 'approved', 'request_group': new_group}
+    decision = f"{endpoint}/{approved_request[0]['id']}/review"
+    approved = _ok(client.post(decision, headers=reviewer, json=review_body))
+    assert len(approved['corrections']) == 2 and {row['status'] for row in approved['corrections']} == {'approved'}
+    assert _ok(client.post(decision, headers=reviewer, json=review_body)) == approved
+    assert _ok(client.get(task, headers=headers))['total_sorted_quantity'] == 8
+    assert _inv(client, good_a, world['wh'])['sorted_stock'] == 3
+    assert _inv(client, good_b, world['wh'])['sorted_stock'] == 3

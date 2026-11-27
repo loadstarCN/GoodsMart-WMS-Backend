@@ -1,4 +1,7 @@
 """Corrections to a completed receipt. Original sorting details remain intact."""
+from collections import defaultdict
+from uuid import UUID
+
 from extensions.db import db
 from extensions.error import BadRequestException, ConflictException, NotFoundException
 from extensions.transaction import transactional
@@ -63,6 +66,7 @@ def _current(task, history):
 
 def _view(correction, lot_no):
     return dict(id=correction.id, goods_id=correction.goods_id, lot_id=correction.lot_id, lot_no=lot_no,
+                request_group=correction.request_group,
                 before=correction.before, after=correction.after, reason=correction.reason, status=correction.status,
                 requested_by=correction.requested_by, requester=correction.requester.user_name,
                 requested_at=clock.local_iso(correction.requested_at),
@@ -77,6 +81,7 @@ def snapshot(task):
     lot_ids = {lot_id for _, lot_id in counts if lot_id} | {row.lot_id for row in history if row.lot_id}
     lots = dict(db.session.query(GoodsLot.id, GoodsLot.lot_no).filter(GoodsLot.id.in_(lot_ids)).all())
     return {
+        'bulk_supported': True,
         'rows': [dict(goods_id=goods_id, lot_id=lot_id, lot_no=lots.get(lot_id), quantities=quantities)
                  for (goods_id, lot_id), quantities in counts.items()],
         'corrections': [_view(row, lots.get(row.lot_id)) for row in reversed(history)],
@@ -101,41 +106,82 @@ def _delta(before, after):
     return {field: after[field] - before[field] for field in QUANTITIES}
 
 
+def _request_group(value):
+    try:
+        return str(UUID(value))
+    except (ValueError, TypeError, AttributeError):
+        raise BadRequestException('A valid request ID is required', field='request_group') from None
+
+
+def _prepare_row(data):
+    data = _body(data)
+    goods_id = require_positive_int(data.get('goods_id'), 'goods_id')
+    lot = lot_for_goods(goods_id, data.get('lot_id'))
+    return (goods_id, lot.id if lot else None), (
+        _counts(data.get('before')), _counts(data.get('after')), lot.lot_no if lot else None,
+    )
+
+
+def _check_plans(task, changes):
+    totals = defaultdict(lambda: ZERO.copy())
+    for (goods_id, _), (before, after, _) in changes.items():
+        for field, change in _delta(before, after).items():
+            totals[goods_id][field] += change
+    for goods_id, delta in totals.items():
+        _check_plan(_asn_lines(task, goods_id), delta)
+
+
 @transactional
 def submit(task, actor_id, data):
     task = SortingTaskService._lock(task)
     _assert_completed(task)
     data = _body(data)
-    goods_id = require_positive_int(data.get('goods_id'), 'goods_id')
-    lines = _asn_lines(task, goods_id)
-    lot = lot_for_goods(goods_id, data.get('lot_id'))
-    lot_id = lot.id if lot else None
-    before, after = _counts(data.get('before')), _counts(data.get('after'))
+    grouped = 'rows' in data
+    group = _request_group(data.get('request_group')) if grouped else None
+    rows = data.get('rows') if grouped else [data]
+    if not isinstance(rows, list) or not rows:
+        raise BadRequestException('At least one correction row is required', field='rows')
+    changes = dict(map(_prepare_row, rows))
+    if len(changes) != len(rows):
+        raise BadRequestException('A product and lot can only appear once', field='rows')
     reason = _note(data.get('reason'), 'reason')
     history = _history(task)
-    for previous in reversed(history):
-        if (previous.goods_id, previous.lot_id) != (goods_id, lot_id):
-            continue
-        if previous.status != 'pending':
-            continue
-        if (previous.requested_by == actor_id and previous.before == before and previous.after == after
-                and previous.reason == reason):
-            return _view(previous, lot.lot_no if lot else None), 200
+    existing = [row for row in history if group and row.request_group == group]
+    if existing:
+        matches = {(row.goods_id, row.lot_id): (row.before, row.after) for row in existing}
+        if (all(row.requested_by == actor_id and row.reason == reason for row in existing)
+                and matches == {key: (row[0], row[1]) for key, row in changes.items()}):
+            return {'corrections': [_view(row, changes[row.goods_id, row.lot_id][2]) for row in existing]}, 200
+        raise ConflictException('This correction request ID is already in use', 17034)
+
+    pending = [row for row in history if row.status == 'pending' and (row.goods_id, row.lot_id) in changes]
+    if pending:
+        previous = pending[0]
+        before, after, lot_no = changes[previous.goods_id, previous.lot_id]
+        if (not grouped and not previous.request_group and previous.requested_by == actor_id
+                and previous.before == before and previous.after == after and previous.reason == reason):
+            return _view(previous, lot_no), 200
         raise ConflictException('This SKU and lot already have a pending correction', 17034)
-    current = _current(task, history).get((goods_id, lot_id), ZERO)
-    if current != before:
-        raise ConflictException('The recorded quantities changed. Reload the sorting task', 17035)
-    delta = _delta(before, after)
-    if not any(delta.values()):
-        raise BadRequestException('Change at least one quantity', field='quantities')
-    _check_plan(lines, delta)
-    if sum(delta[field] for field in STOCK_QUANTITIES) > 0:
-        assert_receivable(goods_id, lot_id, task.asn.warehouse_id)
-    correction = SortingQuantityCorrection(task_id=task.id, goods_id=goods_id, lot_id=lot_id, before=before,
-                                           after=after, reason=reason, requested_by=actor_id, requested_at=clock.now())
-    db.session.add(correction)
+    current = _current(task, history)
+    requested_at = clock.now()
+    result = []
+    for (goods_id, lot_id), (before, after, lot_no) in changes.items():
+        if current.get((goods_id, lot_id), ZERO) != before:
+            raise ConflictException('The recorded quantities changed. Reload the sorting task', 17035)
+        if before == after:
+            raise BadRequestException('Change at least one quantity', field='quantities')
+        if sum(after[field] - before[field] for field in STOCK_QUANTITIES) > 0:
+            assert_receivable(goods_id, lot_id, task.asn.warehouse_id)
+        correction = SortingQuantityCorrection(
+            task_id=task.id, goods_id=goods_id, lot_id=lot_id, before=before, after=after,
+            reason=reason, requested_by=actor_id, requested_at=requested_at, request_group=group,
+        )
+        db.session.add(correction)
+        result.append((correction, lot_no))
+    _check_plans(task, changes)
     db.session.flush()
-    return _view(correction, lot.lot_no if lot else None), 201
+    views = [_view(row, lot_no) for row, lot_no in result]
+    return ({'corrections': views} if grouped else views[0]), 201
 
 
 def _update_stock(asn, correction, delta, reviewer_id):
@@ -180,6 +226,50 @@ def _update_stock(asn, correction, delta, reviewer_id):
     db.session.add(source)
 
 
+def _apply_approved(task, history, rows, actor_id):
+    current = _current(task, history)
+    changes = {}
+    quantities_by_goods = {}
+    lines = {}
+    capture_required = False
+    for correction, lot_no in rows:
+        goods_id, lot_id = correction.goods_id, correction.lot_id
+        if current.get((goods_id, lot_id), ZERO) != correction.before:
+            raise ConflictException('The recorded quantities changed. Reject this correction and submit it again', 17035)
+        changes[goods_id, lot_id] = (correction.before, correction.after, lot_no)
+        line = lines.get(goods_id)
+        if line is None:
+            line = lines[goods_id] = _asn_lines(task, goods_id)[0]
+            quantities_by_goods[goods_id] = {field: getattr(line, field) or 0 for field in QUANTITIES}
+        delta = _delta(correction.before, correction.after)
+        for field, change in delta.items():
+            quantities_by_goods[goods_id][field] += change
+        capture_required |= sum(delta[field] for field in STOCK_QUANTITIES) > 0
+    _check_plans(task, changes)
+
+    for goods_id, quantities in quantities_by_goods.items():
+        if min(quantities.values()) < 0:
+            raise ConflictException('The ASN total cannot be reconciled with the sorting details', 17036)
+        line = lines[goods_id]
+        for field, quantity in quantities.items():
+            setattr(line, field, quantity)
+        line.actual_quantity = sum(quantities[field] for field in STOCK_QUANTITIES)
+
+    for correction, lot_no in rows:
+        delta = _delta(correction.before, correction.after)
+        if any(delta[field] for field in STOCK_QUANTITIES):
+            _update_stock(task.asn, correction, delta, actor_id)
+        line = lines[correction.goods_id]
+        emit('asn.quantity_corrected', dict(
+            asn_id=task.asn_id, order_number=task.asn.order_number, correction_id=correction.id,
+            goods_code=line.goods.code, lot_no=lot_no,
+            before=correction.before, after=correction.after, quantities=quantities_by_goods[correction.goods_id],
+            actual_quantity=line.actual_quantity,
+        ), api_key_id=task.asn.api_key_id)
+    if capture_required:
+        assert_capturable_on_complete(task.asn)
+
+
 @transactional
 def review(task, correction_id, actor_id, data):
     task = SortingTaskService._lock(task)
@@ -193,40 +283,31 @@ def review(task, correction_id, actor_id, data):
     correction = next((row for row in history if row.id == correction_id), None)
     if correction is None:
         raise NotFoundException('Quantity correction not found', 13001)
-    if correction.requested_by == actor_id:
+    group = correction.request_group
+    if group and data.get('request_group') != group:
+        raise BadRequestException('Review this request with all its rows', field='request_group')
+    corrections = [row for row in history if row.request_group == group] if group else [correction]
+    if any(row.requested_by == actor_id for row in corrections):
         raise ConflictException('A different user must review this correction', 17038)
-    lot = lot_for_goods(correction.goods_id, correction.lot_id)
-    if correction.status != 'pending':
-        if correction.status == decision and correction.reviewed_by == actor_id and correction.review_note == note:
-            return _view(correction, lot.lot_no if lot else None)
+    corrections.sort(key=lambda row: (row.goods_id, row.lot_id or 0))
+    lots = [lot_for_goods(row.goods_id, row.lot_id) for row in corrections]
+    rows = [(row, lot.lot_no if lot else None) for row, lot in zip(corrections, lots)]
+    if any(row.status != 'pending' for row in corrections):
+        if all(row.status == decision and row.reviewed_by == actor_id and row.review_note == note
+               for row in corrections):
+            views = [_view(row, lot_no) for row, lot_no in rows]
+            return {'corrections': views} if group else views[0]
         raise ConflictException('This correction has already been reviewed', 17039)
     if decision == 'approved':
-        current = _current(task, history).get((correction.goods_id, correction.lot_id), ZERO)
-        if current != correction.before:
-            raise ConflictException('The recorded quantities changed. Reject this correction and submit it again', 17035)
-        lines = _asn_lines(task, correction.goods_id)
-        delta = _delta(correction.before, correction.after)
-        _check_plan(lines, delta)
-        line = lines[0]
-        quantities = {field: (getattr(line, field) or 0) + delta[field] for field in QUANTITIES}
-        if min(quantities.values()) < 0:
-            raise ConflictException('The ASN total cannot be reconciled with the sorting details', 17036)
-        if any(delta[field] for field in STOCK_QUANTITIES):
-            _update_stock(task.asn, correction, delta, actor_id)
-        for field, quantity in quantities.items():
-            setattr(line, field, quantity)
-        line.actual_quantity = sum(quantities[field] for field in STOCK_QUANTITIES)
-        if sum(delta[field] for field in STOCK_QUANTITIES) > 0:
-            assert_capturable_on_complete(task.asn)
-        emit('asn.quantity_corrected', dict(
-            asn_id=task.asn_id, order_number=task.asn.order_number, correction_id=correction.id,
-            goods_code=line.goods.code, lot_no=lot.lot_no if lot else None,
-            before=correction.before, after=correction.after, quantities=quantities, actual_quantity=line.actual_quantity,
-        ), api_key_id=task.asn.api_key_id)
-    correction.status = decision
-    correction.reviewed_by = actor_id
-    correction.reviewed_at = clock.now()
-    correction.review_note = note
+        _apply_approved(task, history, rows, actor_id)
+    reviewed_at = clock.now()
+    for row in corrections:
+        row.status = decision
+        row.reviewed_by = actor_id
+        row.reviewed_at = reviewed_at
+        row.review_note = note
     db.session.flush()
-    db.session.expire(correction, ['reviewer'])
-    return _view(correction, lot.lot_no if lot else None)
+    for row in corrections:
+        db.session.expire(row, ['reviewer'])
+    views = [_view(row, lot_no) for row, lot_no in rows]
+    return {'corrections': views} if group else views[0]
