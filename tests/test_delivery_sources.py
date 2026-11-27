@@ -13,6 +13,7 @@ from .test_carrier_shipment import fedex  # noqa: F401  fedex 是 fixture
 from .test_carrier_tracking import AWB, DL, IT, OC, PU, TRACK, _shipped_ready, _track_body
 
 from datetime import datetime, timedelta, timezone      # helpers 的 import * 会把 datetime 换成模块，放在它后面
+from zoneinfo import ZoneInfo
 
 from system.webhook.models import WebhookEvent
 from warehouse.dn.models import DNCarrierShipment
@@ -40,13 +41,18 @@ def _payload(client, key_id, event_type):
 
 def test_complete_with_shipped_at_and_sources(client, access_token):
     dn_id, task_id, key_id = _domestic(client, access_token)
-    shipped = (datetime.now(timezone.utc) - timedelta(days=1)).replace(microsecond=0)
+    warehouse_zone = ZoneInfo('Asia/Tokyo')
+    with client.application.app_context():
+        db.session.get(DN, dn_id).warehouse.timezone = warehouse_zone.key
+        db.session.commit()
+    shipped = (datetime.now(timezone.utc) - timedelta(days=1)).replace(hour=16, minute=0, second=0, microsecond=0)
     response = _ship(client, access_token, task_id, shipped_at=shipped.isoformat())
     assert response.status_code == 200, response.get_json()
     assert response.get_json()['completed_source'] == 'warehouse'
     with client.application.app_context():
         task = db.session.get(DeliveryTask, task_id)
-        assert task.completed_at == shipped and task.actual_shipping_date == shipped.date()
+        assert task.completed_at == shipped
+        assert task.actual_shipping_date == shipped.astimezone(warehouse_zone).date()
         assert task.completed_source == 'warehouse'
         assert db.session.get(DN, dn_id).delivered_at == shipped
     delivered = _payload(client, key_id, 'dn.delivered')
